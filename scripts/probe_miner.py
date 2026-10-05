@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import secrets
 import statistics
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -100,7 +102,10 @@ def main() -> None:
     print(f"requests {tally.requests}, receipts valid {receipts_ok}/{tally.requests}, "
           f"round trip median {statistics.median(latencies):.0f} ms")
     print(f"mean abs diff vs reference {tally.mean_abs:.4f}, hard failures {len(tally.hard_failures)} -> verdict {tally.verdict().value}")
+    st.close()
 
 
 if __name__ == "__main__":
     main()
+    sys.stdout.flush()
+    os._exit(0)  # the SDK leaves non-daemon threads behind that would keep the process alive
