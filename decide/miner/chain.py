@@ -37,11 +37,15 @@ def publish(subtensor: bt.Subtensor, wallet: bt.Wallet, config: MinerConfig, sig
     if (axon.ip, axon.port) != (config.public_host, config.port):
         result = subtensor.serve_axon(netuid=config.netuid, axon=bt.Axon(wallet=wallet, port=config.port,
                                       external_ip=config.public_host, external_port=config.port))
-        log.info("serve_axon %s:%d -> %s", config.public_host, config.port, getattr(result, "success", result))
+        if not getattr(result, "success", False):
+            raise RuntimeError(f"serve_axon failed: {getattr(result, 'message', result)}")
+        log.info("serve_axon %s:%d", config.public_host, config.port)
     value = commitment_value(signed.manifest.digest())
     if subtensor.get_commitment(config.netuid, neuron.uid) != value:
         result = subtensor.set_commitment(wallet, config.netuid, value)
-        log.info("set_commitment %s -> %s", value, getattr(result, "success", result))
+        if not getattr(result, "success", False):
+            raise RuntimeError(f"set_commitment failed: {getattr(result, 'message', result)}")
+        log.info("set_commitment %s", value)
 
 
 class PermitAuthorizer:

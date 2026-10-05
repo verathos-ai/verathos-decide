@@ -1,0 +1,106 @@
+"""Validator-style probe of one miner on a live network (bittensor SDK 10.x).
+
+Discovers the miner from chain (axon + manifest commitment), checks endpoint control with the identity challenge,
+sends signed SystemOne requests, verifies every receipt, and compares the answers with stored reference answers
+for the same requests (``tests/fixtures/drift``: 30 generated tickets, 6 questions each).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import secrets
+import statistics
+import time
+import urllib.request
+from pathlib import Path
+
+import bittensor as bt
+
+from decide.miner.app import IDENTITY_DOMAIN, identity_payload
+from decide.protocol import signing
+from decide.protocol.api import distributions
+from decide.protocol.manifest import SignedManifest, accept
+from decide.protocol.receipts import SignedReceipt
+from decide.protocol.requests import sign_request
+from decide.verify.compare import EndpointTally, Tolerance, compare_request
+
+TOPICS = ["billed twice for March", "the export button returns a 500 error", "I want to upgrade to the enterprise plan",
+          "my package arrived broken", "please delete my account and all data", "the app crashes when I open settings",
+          "I was promised a discount that never applied", "our API key stopped working this morning",
+          "can you send the invoice in German", "the delivery is three weeks late"]
+TONES = ["", "This is unacceptable. ", "Thanks a lot for your help! ", "If this is not fixed by Friday we will cancel. ", "No rush. "]
+QUESTIONS = {
+    "department": {"type": "choice", "instructions": "Which team should handle this?",
+                   "criteria": {"billing": "Charges and refunds", "technical": "Bugs or outages", "sales": "Pricing and plans",
+                                "logistics": "Shipping and delivery", "privacy": "Data and account deletion", "other": "Everything else"}},
+    "urgency": {"type": "score", "instructions": "How urgent is this?", "criteria": ["Can wait", "This week", "Today", "Right now"]},
+    "churn": {"type": "noul", "instructions": "Does the customer threaten to cancel?"},
+    "bug": {"type": "noul", "instructions": "Is a product bug reported?"},
+    "refund": {"type": "noul", "instructions": "Is a refund requested?"},
+    "angry": {"type": "noul", "instructions": "Is the customer angry?"},
+}
+
+
+def states(n: int = 30) -> list[str]:
+    """The same tickets the reference fixtures were computed on."""
+    rng = random.Random(1234)
+    out = []
+    for i in range(n):
+        t = rng.sample(TOPICS, 2)
+        out.append(f"Ticket {1000 + i}. {rng.choice(TONES)}Hi team, {t[0]}. Also, {t[1]}. {rng.choice(TONES)}Regards, customer {i}.")
+    return out
+
+
+def post(url: str, path: str, payload: dict, caller, receiver: str) -> dict:
+    body = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json", **sign_request(caller, "POST", path, body, receiver)}
+    req = urllib.request.Request(url + path, body, headers)
+    return json.loads(urllib.request.urlopen(req, timeout=120).read())
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--network", default="test")
+    p.add_argument("--netuid", type=int, default=405)
+    p.add_argument("--uid", type=int, required=True)
+    p.add_argument("--caller-wallet", required=True)
+    p.add_argument("--caller-hotkey", required=True)
+    p.add_argument("--reference", type=Path, required=True, help="fixture JSON with reference answers")
+    p.add_argument("--endpoint", default=None)
+    args = p.parse_args()
+
+    st = bt.Subtensor(network=args.network)
+    mg = st.metagraph(args.netuid, lite=True)
+    hotkey, axon = mg.hotkeys[args.uid], mg.axons[args.uid]
+    base = f"http://{axon.ip}:{axon.port}"
+    signed = SignedManifest.model_validate_json(urllib.request.urlopen(base + "/v1/manifest", timeout=10).read())
+    manifest = accept(signed, hotkey=hotkey, netuid=args.netuid, commitment=st.get_commitment(args.netuid, args.uid))
+    print(f"manifest accepted: seq {manifest.seq}, endpoints {[e.endpoint_id for e in manifest.endpoints]}")
+
+    caller = bt.Wallet(name=args.caller_wallet, hotkey=args.caller_hotkey).hotkey
+    endpoint = next(e for e in manifest.endpoints if args.endpoint in (None, e.endpoint_id))
+    prefix = "/" + endpoint.url.split("/", 3)[3]
+    challenge = secrets.token_hex(16)
+    ident = post(base, prefix + "/v1/identity", {"challenge": challenge}, caller, hotkey)
+    ok = signing.verify(hotkey, IDENTITY_DOMAIN, identity_payload(endpoint.endpoint_id, challenge, caller.ss58_address), ident["signature"])
+    print(f"identity challenge for {endpoint.endpoint_id}: {'verified' if ok else 'FAILED'}")
+
+    reference = [distributions(r["answers"]) for r in json.loads(args.reference.read_text())]
+    tally, latencies, receipts_ok = EndpointTally(Tolerance()), [], 0
+    for state, ref in zip(states(len(reference)), reference):
+        request = {"model": endpoint.model_id, "state": state, "questions": QUESTIONS}
+        t0 = time.time()
+        response = post(base, prefix + "/v1/systemone", request, caller, hotkey)
+        latencies.append((time.time() - t0) * 1000)
+        receipt = SignedReceipt.model_validate(response["receipt"])
+        receipts_ok += receipt.signature_valid() and receipt.binds(request, response["answers"]) and receipt.receipt.miner_hotkey == hotkey
+        tally.add(compare_request(ref, distributions(response["answers"]), tally.tolerance))
+    print(f"requests {tally.requests}, receipts valid {receipts_ok}/{tally.requests}, "
+          f"round trip median {statistics.median(latencies):.0f} ms")
+    print(f"mean abs diff vs reference {tally.mean_abs:.4f}, hard failures {len(tally.hard_failures)} -> verdict {tally.verdict().value}")
+
+
+if __name__ == "__main__":
+    main()
