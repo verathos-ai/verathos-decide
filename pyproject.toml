@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verathos-decide"
+version = "0.0.1"
+description = "Decision-model network on Bittensor: typed answers with calibrated probabilities, verified by reference recomputation"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+    "pydantic>=2.9",
+    "bittensor-wallet>=4.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+chain = ["bittensor>=10.3,<11"]
+
+[tool.setuptools.packages.find]
+include = ["decide*"]
+
+[tool.setuptools.package-data]
+"decide.catalog" = ["catalog.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "revision": "draft-2026-10-06",
+  "models": [
+    {
+      "model_id": "kev-4b",
+      "status": "candidate",
+      "engine": "kev",
+      "hf_repo": "jaredpalmer/kev-4b",
+      "hf_revision": "6cfce5c2fa4b4bd64026336ab649c5ca78857d52",
+      "base_repo": "Qwen/Qwen3.5-4B-Base",
+      "base_revision": "1001bb4d826a52d1f399e183466143f4da7b741b",
+      "license": "apache-2.0",
+      "max_state_tokens": 65536
+    },
+    {
+      "model_id": "kev-9b",
+      "status": "candidate",
+      "engine": "kev",
+      "hf_repo": "jaredpalmer/kev-9b",
+      "hf_revision": "db029f08b290afd9fee4aa4bbcd9ae48602d1eb0",
+      "base_repo": "Qwen/Qwen3.5-9B-Base",
+      "base_revision": "68c46c4b3498877f3ef123c856ecfde50c39f404",
+      "license": "apache-2.0",
+      "max_state_tokens": 65536
+    },
+    {
+      "model_id": "clef-flash",
+      "status": "candidate",
+      "engine": "clef",
+      "hf_repo": "Cloudflare/clef-flash",
+      "hf_revision": "17f0b0ad64efb65d273590632833508766b2aae6",
+      "license": "apache-2.0",
+      "max_state_tokens": 65536
+    }
+  ]
+}
