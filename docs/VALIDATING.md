@@ -75,7 +75,8 @@ needs about 36 GB of RAM in fp32.
 | Field | Default | Meaning |
 |---|---|---|
 | `mechid` | 1 | mechanism the weights are set on |
-| `references` | | model id -> reference engine URL; models without one are not audited by this validator |
+| `references` | | model id -> the model's fp32 reference engine: a URL, or `{"url", "api_key"}` for a remote engine behind https (the Kev server takes its key from `KEV_API_KEY`); models without one are not audited by this validator |
+| `audit_screens` | {} | auditor only: model id -> a bf16 engine (same forms) that screens the sampled test answers; an answer it flags counts as wrong only once the fp32 reference confirms it |
 | `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database |
 | `dry_run` | false | compute weights without setting them |
 | `public_host`, `port` | -, 8091 | public IP and port of the validator's service; needed by the subnet owner and the auditor |

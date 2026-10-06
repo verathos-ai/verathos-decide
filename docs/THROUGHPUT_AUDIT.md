@@ -83,11 +83,12 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
    up answers the window's requests late and delivers less.
 4. **Samples.** For `samples_per_test` (10) random delivered responses per endpoint the auditor checks the receipt:
    signed by the miner, binding the request and the answers, naming the auditor and the request id. Delivered is
-   scaled by the share of valid receipts. Every signed answer must be well formed, and the auditor's reference
-   engine recomputes `answer_checks_per_test` (2) of them, picked at random: an answer that fails the hard check
-   (`SCORING.md`) is a wrong answer, proven by the miner's own signature. The request, the answers and the receipt
-   are kept as evidence. Recomputing is the expensive check (about 2 per second for Kev-4B in fp32 on an A100), and
-   a wrong model is wrong on every request.
+   scaled by the share of valid receipts. Every signed answer must be well formed, and the auditor recomputes
+   `answer_checks_per_test` (2) of them, picked at random: an answer that fails the hard check (`SCORING.md`) is a
+   wrong answer, proven by the miner's own signature. The request, the answers and the receipt are kept as evidence.
+   A wrong model is wrong on every request, so two recomputes per endpoint suffice. The auditor may recompute on a
+   bf16 screen (`audit_screens`, several times faster than fp32); two bf16 runs on different GPUs can differ by
+   about 0.06, so an answer the screen flags counts only once the fp32 reference confirms it.
 5. **Credit.** What was delivered, up to the tested rate. If delivered falls short of `pass_fraction` (0.95) of the
    tested rate, the credit is scaled by delivered / tested once more: an endpoint that declares twice what it serves
    is credited a quarter of its declaration, so declaring more than an endpoint serves never pays. A result with a
@@ -169,8 +170,10 @@ Per model: `workload` (the request mix), `score_per_rps` and `first_test_rps`.
 
 The auditor needs:
 - the load generator: `verathos-build-loadgen` (Rust) builds `native/loadgen` and installs it next to the code;
-- a reference engine per model on a GPU: `answer_checks_per_test` recomputes per endpoint and test, at about 2 per
-  second for Kev-4B's request mix in fp32 on an A100, so one GPU checks about 1,000 endpoints in under 20 minutes;
+- the answer recomputes: `answer_checks_per_test` per endpoint and test. In fp32 an A100 recomputes about 2 per
+  second for Kev-4B's request mix, so about 1,000 endpoints take 17 minutes; a bf16 screen on a GPU is several times
+  faster, with the fp32 reference (CPU is enough) confirming only what it flags. The screen can run on another
+  machine behind https with a key; while it is unreachable, recomputes are skipped and receipts are still checked;
 - a public IP and port for its service, and a steady connection: one machine sends the whole network's test
   traffic in one burst.
 

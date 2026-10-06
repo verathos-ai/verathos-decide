@@ -20,7 +20,7 @@ from verathos.miner.app import create_app
 from verathos.miner.config import MinerConfig
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest
 from verathos.throughput import loadgen
-from verathos.throughput.auditor import Auditor, Slot, planned_rate
+from verathos.throughput.auditor import Auditor, Checks, Slot, planned_rate
 from verathos.throughput.measure import MeasurementStore, Target, measure_all, measure_and_store, stored
 from verathos.throughput.policy import (
     AuditPolicy,
@@ -314,7 +314,7 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
         selection = chain.head_block - policy.lead_blocks
         test = ScheduledTest(3, selection, block_hash(selection).hex(), chain.head_block)
         auditor.follower.poll()
-        await auditor.run_test(test, {"kev-4b": reference})
+        await auditor.run_test(test, Checks({"kev-4b": reference}, {}))
         # two recomputed answers per endpoint at most (the wrong one stops at its first)
         assert 4 <= CountingReference.calls <= 2 * 5
         auditor.settle()
@@ -405,7 +405,7 @@ def test_auditor_with_the_load_generator_over_tcp(tmp_path) -> None:
     auditor.follower.poll()
     try:
         asyncio.run(auditor.run_test(ScheduledTest(3, selection, block_hash(selection).hex(), chain.head_block),
-                                     {"kev-4b": MockEngine("kev-4b")}))
+                                     Checks({"kev-4b": MockEngine("kev-4b")}, {})))
     finally:
         for server in servers:
             server.should_exit = True
@@ -413,3 +413,34 @@ def test_auditor_with_the_load_generator_over_tcp(tmp_path) -> None:
     assert honest.outcome == "passed" and honest.credited_rps == pytest.approx(40.0, rel=0.05), honest
     # delivers what is left after the warmup backlog, about 17 of 40, and is credited 17 x 17 / 40
     assert over.outcome == "partial" and 3 < over.credited_rps < 12, over
+
+
+def test_a_screen_flag_counts_only_once_the_fp32_reference_confirms_it() -> None:
+    request = make_request("kev-4b", KEV.workload, random.Random(5))
+
+    async def run():
+        honest = (await MockEngine("kev-4b").answer(request))["answers"]
+        wrong = (await MockEngine("kev-4b", salt="other").answer(request))["answers"]
+        tol = KEV.tolerance
+        noisy_screen = Checks({"kev-4b": MockEngine("kev-4b")}, {"kev-4b": MockEngine("kev-4b", salt="bf16 noise")})
+        assert await noisy_screen.fault("kev-4b", request, honest, tol, recompute=True) is None  # not confirmed
+        assert "differ from the reference" in await noisy_screen.fault("kev-4b", request, wrong, tol, recompute=True)
+        assert await noisy_screen.fault("kev-4b", request, wrong, tol, recompute=False) is None  # form only
+        assert await noisy_screen.fault("kev-4b", request, {"q": []}, tol, recompute=False) == "malformed answers"
+        unconfirmable = Checks({}, {"kev-4b": MockEngine("kev-4b")})
+        assert await unconfirmable.fault("kev-4b", request, wrong, tol, recompute=True) is None
+
+    asyncio.run(run())
+
+
+def test_reference_engines_take_a_url_or_a_keyed_tls_endpoint() -> None:
+    from verathos.validator.config import ValidatorConfig
+
+    base = {"netuid": 405, "wallet_name": "w", "hotkey_name": "h"}
+    cfg = ValidatorConfig.model_validate({**base, "references": {"kev-4b": "http://127.0.0.1:8101"},
+                                          "audit_screens": {"kev-4b": {"url": "https://gpu.example.org:8443",
+                                                                       "api_key": "k"}}})
+    assert cfg.references["kev-4b"].api_key is None and cfg.audit_screens["kev-4b"].api_key == "k"
+    with pytest.raises(ValueError, match="needs https"):
+        ValidatorConfig.model_validate({**base, "references": {"kev-4b": {"url": "http://203.0.113.7:8101",
+                                                                          "api_key": "k"}}})

@@ -41,11 +41,12 @@ from typing import Any
 from bittensor_wallet import Keypair
 
 from verathos import catalog as catalog_module
-from verathos.miner.engine import Engine, HttpEngine
+from verathos.miner.engine import Engine
 from verathos.protocol.status import ThroughputOutcome
 from verathos.throughput import loadgen
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.feed import (
+    MALFORMED,
     MAX_EVIDENCE_BYTES,
     Credit,
     Evidence,
@@ -58,6 +59,8 @@ from verathos.throughput.feed import (
 from verathos.throughput.follow import POLL_S, ScheduleFollower
 from verathos.throughput.policy import AuditPolicy, ScheduledTest, Session, session_headers
 from verathos.throughput.workload import WORDS
+from verathos.validator.compare import Tolerance
+from verathos.validator.config import ReferenceEngine
 
 log = logging.getLogger(__name__)
 START_DELAY_MS = 500  # from observing the start block to the first request
@@ -77,6 +80,29 @@ class BoundedEngine:
     async def answer(self, request: dict[str, Any]) -> dict[str, Any]:
         async with self._slots:
             return await self.engine.answer(request)
+
+
+@dataclass(frozen=True)
+class Checks:
+    """Answer checks per model: the fp32 reference, and optionally a faster screen whose flags the reference must
+    confirm before an answer counts as wrong."""
+
+    references: dict[str, Engine]
+    screens: dict[str, Engine]
+
+    async def fault(self, model_id: str, request: dict[str, Any], answers: Any, tolerance: Tolerance, *,
+                    recompute: bool) -> str | None:
+        """Why the answers are wrong, or None. Without ``recompute`` only their form is checked. Raises
+        ReferenceUnavailable."""
+        reference = self.references.get(model_id)
+        screen = self.screens.get(model_id) if recompute else None
+        fault = await answer_fault(request, answers, screen or (reference if recompute else None), tolerance)
+        if fault is None or screen is None or fault == MALFORMED:
+            return fault
+        if reference is None:
+            log.warning("the %s screen flagged an answer but there is no fp32 reference to confirm it", model_id)
+            return None
+        return await answer_fault(request, answers, reference, tolerance)
 
 
 @dataclass(frozen=True)
@@ -258,11 +284,15 @@ def parse_response(text: str) -> dict[str, Any] | None:
 
 class Auditor:
     def __init__(self, *, netuid: int, mechid: int, keypair: Keypair, chain: SubtensorChainView,
-                 policy: AuditPolicy, catalog: Callable[[], catalog_module.Catalog], references: dict[str, str],
-                 db_path: Path, runner: Runner = loadgen.run) -> None:
+                 policy: AuditPolicy, catalog: Callable[[], catalog_module.Catalog],
+                 references: dict[str, ReferenceEngine], db_path: Path, runner: Runner = loadgen.run,
+                 screens: dict[str, ReferenceEngine] | None = None) -> None:
+        """``references`` recompute answers in fp32; a model with an entry in ``screens`` is screened there first
+        (bf16), and the fp32 reference only confirms what the screen flags."""
         self.netuid, self.mechid, self.keypair, self.chain = netuid, mechid, keypair, chain
         self.hotkey = keypair.ss58_address
-        self.policy, self.catalog, self.reference_urls, self.runner = policy, catalog, references, runner
+        self.policy, self.catalog, self.runner = policy, catalog, runner
+        self.reference_specs, self.screen_specs = references, screens or {}
         self.store = Store(db_path)
         self.follower = ScheduleFollower(chain, policy)
         self._slots: list[Slot] = []
@@ -288,12 +318,13 @@ class Auditor:
         threading.Thread(target=lambda: asyncio.run(self.run()), name="throughput-auditor", daemon=True).start()
 
     async def run(self) -> None:
-        references: dict[str, Engine] = {m: BoundedEngine(HttpEngine(url)) for m, url in self.reference_urls.items()}
+        checks = Checks({m: BoundedEngine(r.engine()) for m, r in self.reference_specs.items()},
+                        {m: BoundedEngine(r.engine()) for m, r in self.screen_specs.items()})
         tasks: set[asyncio.Task] = set()
         while True:
             try:
                 for test in await asyncio.to_thread(self.follower.poll):
-                    task = asyncio.create_task(self.run_test(test, references))
+                    task = asyncio.create_task(self.run_test(test, checks))
                     tasks.add(task)
                     task.add_done_callback(tasks.discard)
                 await asyncio.to_thread(self.settle)
@@ -331,18 +362,18 @@ class Auditor:
                 "grace_s": policy.max_latency_s, "timeout_s": policy.request_timeout_s, "words": list(WORDS),
                 "seed": secrets.token_hex(16), "targets": planned}
 
-    async def run_test(self, test: ScheduledTest, references: dict[str, Engine]) -> None:
+    async def run_test(self, test: ScheduledTest, checks: Checks) -> None:
         """Run one test; any failure of the auditor itself voids it."""
         if self.store.known(test.test_id) or self.follower.head > test.start_block:
             return  # already run, or selected before this auditor was following
         try:
-            await self._run_test(test, references)
+            await self._run_test(test, checks)
         except Exception as exc:
             log.exception("throughput test of epoch %d failed", test.epoch)
             if self.store.known(test.test_id):
                 self.store.set_state(test.test_id, "void", f"the auditor failed: {type(exc).__name__}")
 
-    async def _run_test(self, test: ScheduledTest, references: dict[str, Engine]) -> None:
+    async def _run_test(self, test: ScheduledTest, checks: Checks) -> None:
         policy = self.policy
         targets = self.targets(policy)
         if not targets:
@@ -367,7 +398,7 @@ class Auditor:
         if result.late_start_ms > MAX_LATE_START_MS:
             self.store.set_state(test.test_id, "void", "the auditor's load generator started late")
             return
-        results = await asyncio.gather(*(self.evaluate(test, t, r, references, policy)
+        results = await asyncio.gather(*(self.evaluate(test, t, r, checks, policy)
                                          for t, r in zip(targets, result.targets)))
         self.store.add_results(test.test_id, results)
         counts = {o: sum(r.outcome == o for r in results) for o in ("passed", "partial", "invalid", "void")}
@@ -376,7 +407,7 @@ class Auditor:
                  sum(t.tested_rps for t in targets))
 
     async def evaluate(self, test: ScheduledTest, target: Target, r: loadgen.TargetResult,
-                       references: dict[str, Engine], policy: AuditPolicy) -> Result:
+                       checks: Checks, policy: AuditPolicy) -> Result:
         detail = json.dumps({"sent": r.sent, "completed": r.completed, "skipped": r.skipped, "errors": r.errors,
                              "late_sends": r.late_sends, "samples": len(r.samples)}, sort_keys=True)
         latency = {"latency_p50_ms": r.latency_ms.p50 or 0.0, "latency_p95_ms": r.latency_ms.p95 or 0.0,
@@ -397,9 +428,9 @@ class Auditor:
         # Every signed answer is checked for form; the reference recomputes a few of them.
         recomputed = {id(s) for s, _, _ in random.sample(signed, min(policy.answer_checks_per_test, len(signed)))}
         for sample, response, answers in signed if model is not None else []:
-            reference = references.get(slot.model_id) if id(sample) in recomputed else None
             try:
-                fault = await answer_fault(sample.request, answers, reference, model.tolerance)
+                fault = await checks.fault(slot.model_id, sample.request, answers, model.tolerance,
+                                           recompute=id(sample) in recomputed)
             except ReferenceUnavailable as exc:
                 log.warning("reference for %s unavailable, a sample of %s is unchecked: %s", slot.model_id,
                             slot.key, exc)

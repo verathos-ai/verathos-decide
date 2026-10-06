@@ -25,6 +25,7 @@ VERDICTS_PATH = "/v1/throughput/{epoch}"
 VERDICTS_DOMAIN = "verathos/throughput-verdicts/v1"
 MAX_EVIDENCE_BYTES = 64 << 10  # a response larger than this is not a valid answer
 MAX_VERDICTS_BYTES = 32 << 20  # at most one piece of evidence per hotkey
+MALFORMED = "malformed answers"
 
 
 class Credit(BaseModel):
@@ -116,7 +117,7 @@ async def answer_fault(request: dict[str, Any], answers: Any, reference: Engine 
     try:
         got = distributions(answers)
     except Exception:  # whatever the miner signed, unreadable answers are wrong answers
-        return "malformed answers"
+        return MALFORMED
     if reference is None:
         return None
     try:

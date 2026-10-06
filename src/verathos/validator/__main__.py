@@ -22,7 +22,6 @@ import bittensor as bt
 import httpx
 
 from verathos import catalog
-from verathos.miner.engine import HttpEngine
 from verathos.throughput.feed import Verdicts
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator import chain, status
@@ -71,7 +70,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     cat = current.catalog
     sc, policy = cat.scoring, cat.audit_policy()
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
-    references = {m: HttpEngine(url) for m, url in cfg.references.items()
+    references = {m: r.engine() for m, r in cfg.references.items()
                   if cat.get(m) is not None and cat.get(m).status != "retired"}
     tolerances = {m.model_id: m.tolerance for m in cat.models}
     async with httpx.AsyncClient() as client:
@@ -159,6 +158,7 @@ def main() -> None:
     current = CatalogFollower(st, cfg.network, cfg.netuid, catalog.CatalogStore(cfg.catalog_dir), cfg.catalog_mirrors)
     throughput = Throughput.start(network=cfg.network, netuid=cfg.netuid, mechid=cfg.mechid,
                                   current=lambda: current.catalog, st=st, wallet=wallet, references=cfg.references,
+                                  screens=cfg.audit_screens,
                                   state_dir=state_dir)
     board = StatusBoard()
     is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)

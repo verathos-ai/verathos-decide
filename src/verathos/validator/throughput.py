@@ -27,6 +27,7 @@ from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.follow import ScheduleFollower
 from verathos.throughput.policy import AuditPolicy
 from verathos.validator import chain as validator_chain
+from verathos.validator.config import ReferenceEngine
 from verathos.validator.discovery import DiscoveredMiner, Neuron, discover
 
 log = logging.getLogger(__name__)
@@ -53,7 +54,8 @@ class Throughput:
 
     @classmethod
     def start(cls, *, network: str, netuid: int, mechid: int, current: Callable[[], catalog.Catalog],
-              st: bt.Subtensor, wallet: bt.Wallet, references: dict[str, str], state_dir: Path) -> Throughput:
+              st: bt.Subtensor, wallet: bt.Wallet, references: dict[str, ReferenceEngine],
+              screens: dict[str, ReferenceEngine], state_dir: Path) -> Throughput:
         """The auditor role if this validator's hotkey is the auditor, else a schedule follower."""
         policy = current().audit_policy()
         auditor_hotkey = policy.auditor_hotkey or st.get_subnet_owner_hotkey(netuid)
@@ -65,7 +67,8 @@ class Throughput:
             return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
                        follower=follower)
         auditor = Auditor(netuid=netuid, mechid=mechid, keypair=wallet.hotkey, chain=chain, policy=policy,
-                          catalog=current, references=references, db_path=state_dir / "throughput.sqlite")
+                          catalog=current, references=references, screens=screens,
+                          db_path=state_dir / "throughput.sqlite")
         auditor.start()
         log.info("throughput auditor running (%s mode)", policy.mode)
         return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
