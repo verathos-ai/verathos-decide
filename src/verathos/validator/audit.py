@@ -12,6 +12,7 @@ import json
 import logging
 import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +28,8 @@ from verathos.validator.compare import EndpointTally, Tolerance, compare_request
 from verathos.validator.discovery import DiscoveredEndpoint, verify_identity
 
 log = logging.getLogger(__name__)
+DRAIN_POLL_S = 2.0
+MAX_DRAIN_WAIT_S = 600.0
 
 
 @dataclass
@@ -58,13 +61,18 @@ async def reference_answers(pool: list[dict[str, Any]], engine: Engine) -> list[
 
 
 async def _audit_endpoint(result: EndpointResult, canaries: list[tuple[dict[str, Any], dict[str, dict[str, float]]]],
-                          keypair: Keypair, client: httpx.AsyncClient, spread_s: float, rng: random.Random) -> None:
+                          keypair: Keypair, client: httpx.AsyncClient, spread_s: float, rng: random.Random,
+                          drained: Callable[[str, str], bool]) -> None:
     ep = result.endpoint
     result.identity_ok = await verify_identity(ep, keypair, client)
     path = ep.path_prefix + "/v1/systemone"
     for request, reference in canaries:
         if spread_s:
             await asyncio.sleep(rng.uniform(0, spread_s))
+        waited = 0.0
+        while drained(ep.hotkey, ep.endpoint.endpoint_id) and waited < MAX_DRAIN_WAIT_S:
+            await asyncio.sleep(DRAIN_POLL_S)  # the endpoint is inside a capacity-audit hold
+            waited += DRAIN_POLL_S
         body = json.dumps(request).encode()
         headers = {"Content-Type": "application/json", **sign_request(keypair, "POST", path, body, ep.hotkey)}
         result.sent += 1
@@ -105,6 +113,7 @@ async def audit_epoch(
     pool_size: int = 10,
     per_endpoint: int = 6,
     spread_s: float = 0.0,
+    drained: Callable[[str, str], bool] = lambda hotkey, endpoint_id: False,
 ) -> dict[str, EndpointResult]:
     """Audit every endpoint whose model has a reference engine. Returns results keyed by endpoint key."""
     pools: dict[str, list[tuple[dict[str, Any], dict[str, dict[str, float]] | None]]] = {}
@@ -125,6 +134,6 @@ async def audit_epoch(
         picked = [pool[i] for i in assignment(secret, epoch, ep.key, len(pool), per_endpoint) if pool[i][1] is not None]
         res = EndpointResult(ep, tolerances[ep.endpoint.model_id])
         results[ep.key] = res
-        tasks.append(_audit_endpoint(res, picked, keypair, client, spread_s, random.Random(rng.random())))
+        tasks.append(_audit_endpoint(res, picked, keypair, client, spread_s, random.Random(rng.random()), drained))
     await asyncio.gather(*tasks)
     return results

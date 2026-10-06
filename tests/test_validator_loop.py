@@ -131,3 +131,36 @@ def test_window_catches_subtle_drift_no_single_epoch_shows() -> None:
         scores, failed = epoch_scores({"hkA/gpu0": r}, {"kev-4b": 1.0}, state)
         verdicts.append(bool(failed))
     assert verdicts == [False, True, True]  # 60 probabilities: insufficient; 120 and 180: mean 0.01 > 0.005
+
+
+def test_capacity_gate_and_unauditable_endpoints() -> None:
+    """Gated endpoints fail verification (probation); open endpoints without a calibrated GPU class score zero."""
+    from verathos.capacity.core import AuditPolicy
+    from verathos.validator.audit import EndpointResult
+    from verathos.validator.capacity import capacity_slots, unauditable_endpoints
+    from verathos.validator.discovery import DiscoveredEndpoint, DiscoveredMiner
+
+    audited, undeclared = kp().ss58_address, kp().ss58_address
+    hardware = {audited: {"kind": "cuda", "device_id": "GPU-a", "gpu_name": "NVIDIA GeForce RTX 5090", "vram_gb": 32},
+                undeclared: {"kind": "cuda", "device_id": "GPU-b"}}
+    miners = []
+    for uid, hotkey in enumerate((audited, undeclared), start=1):
+        endpoint = Endpoint(endpoint_id="gpu0", url=f"http://h{uid}/e/gpu0", model_id="kev-4b",
+                            hardware=hardware[hotkey], max_concurrency=8)
+        miners.append(DiscoveredMiner(uid, hotkey, f"http://h{uid}", Manifest(
+            netuid=405, mechid=1, hotkey=hotkey, seq=1, issued_block=1, catalog_digest=catalog.load().digest(),
+            endpoints=[endpoint])))
+    assert [s.hotkey for s in capacity_slots(miners, 405)] == [audited]
+    assert unauditable_endpoints(miners, AuditPolicy()) == {f"{undeclared}/gpu0"}
+
+    tol = Tolerance(min_probabilities=1)
+    results = {}
+    for m in miners:
+        ep = DiscoveredEndpoint(m.uid, m.hotkey, m.base_url, m.manifest.endpoints[0])
+        results[ep.key] = EndpointResult(ep, tol, identity_ok=True, sent=4, answered=4, latencies_ms=[40.0] * 4)
+    state = ScoreState()
+    record_window(state, results, 3)
+    scores, failed = epoch_scores(results, {"kev-4b": 1.0}, state, capacity_gated={f"{audited}/gpu0"},
+                                  unauditable={f"{undeclared}/gpu0"})
+    assert scores == {f"{audited}/gpu0": 0.0, f"{undeclared}/gpu0": 0.0}
+    assert failed == {f"{audited}/gpu0"}

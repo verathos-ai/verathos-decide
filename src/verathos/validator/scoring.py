@@ -1,10 +1,11 @@
 """Epoch scores, EMA, probation and weights.
 
 Per endpoint and epoch:
-- zero if the identity challenge failed or verification failed. A hard failure counts in the epoch it happens; the
-  statistical bound is evaluated over a rolling window of epochs, because one epoch of canaries is too few
-  probabilities to separate a lower-precision substitute from honest drift. A verification failure also starts
-  probation, during which the endpoint scores zero regardless of later results;
+- zero if the identity challenge failed, verification failed, or the capacity audit gated the endpoint (the
+  auditor's evidence of shared or missing hardware counts as a verification failure). A hard failure counts in the
+  epoch it happens; the statistical bound is evaluated over a rolling window of epochs, because one epoch of
+  canaries is too few probabilities to separate a lower-precision substitute from honest drift. A verification
+  failure also starts probation, during which the endpoint scores zero regardless of later results;
 - otherwise model weight x availability (answered / sent) x latency factor, where the latency factor compares the
   endpoint's median latency with the median of all endpoints serving the same model, capped to [0.7, 1.3].
 Per UID: sum of its endpoints' EMAs. Weights: UID sums normalised to 1.
@@ -15,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import statistics
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -60,23 +62,30 @@ def windowed_verdict(state: ScoreState, key: str, result: EndpointResult) -> Ver
     return Verdict.FAIL_STATISTICAL if sum(s for s, _ in entries) / count > tol.mean_abs else Verdict.PASS
 
 
-def epoch_scores(results: dict[str, EndpointResult], model_weight: dict[str, float],
-                 state: ScoreState) -> tuple[dict[str, float], set[str]]:
-    """-> (score per endpoint key, keys that failed verification this epoch). Call after ``record_window``."""
+def epoch_scores(results: dict[str, EndpointResult], model_weight: dict[str, float], state: ScoreState,
+                 capacity_gated: Collection[str] = (), unauditable: Collection[str] = ()) -> tuple[dict[str, float],
+                                                                                                     set[str]]:
+    """-> (score per endpoint key, keys that failed verification this epoch). Call after ``record_window``.
+
+    ``capacity_gated`` holds endpoint keys the capacity audit gated this epoch (a verification failure);
+    ``unauditable`` holds open endpoints the audit cannot cover (no calibrated GPU class declared), which score zero.
+    """
     medians_by_model: dict[str, list[float]] = {}
     for r in results.values():
         if r.latencies_ms:
             medians_by_model.setdefault(r.endpoint.endpoint.model_id, []).append(statistics.median(r.latencies_ms))
     model_median = {m: statistics.median(v) for m, v in medians_by_model.items()}
 
-    scores, failed = {}, set()
+    scores, failed = dict.fromkeys(capacity_gated, 0.0), set(capacity_gated)
     for key, r in results.items():
+        if key in failed:
+            continue
         verdict = windowed_verdict(state, key, r)
         if verdict in (Verdict.FAIL_HARD, Verdict.FAIL_STATISTICAL):
             failed.add(key)
             scores[key] = 0.0
             continue
-        if not r.identity_ok or r.answered == 0 or r.sent == 0:
+        if key in unauditable or not r.identity_ok or r.answered == 0 or r.sent == 0:
             scores[key] = 0.0
             continue
         model = r.endpoint.endpoint.model_id

@@ -65,6 +65,11 @@ class SubtensorChainView:
     def block_hash(self, block_number: int) -> bytes | None:
         return _hash_bytes(self._rpc("chain_getBlockHash", [int(block_number)]))
 
+    def finalized_block(self) -> int:
+        header = self._rpc("chain_getHeader", [self._rpc("chain_getFinalizedHead", [])])
+        number = header.get("number") if isinstance(header, dict) else None
+        return int(number, 0) if isinstance(number, str) else int(number or 0)
+
     def epoch_blocks(self) -> int:
         now = time.monotonic()
         if self._tempo is None or now - self._tempo[0] > self._cache_s:

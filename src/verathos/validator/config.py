@@ -21,6 +21,9 @@ class ValidatorConfig(BaseModel):
     audit_fraction: float = Field(0.6, gt=0, le=0.9, description="Share of the epoch over which canaries are spread")
     ema_alpha: float = Field(0.2, gt=0, le=1)
     probation_epochs: int = Field(6, ge=1)
+    capacity_public_host: str | None = Field(None, description="Public IP the capacity-audit ingest is reachable "
+                                             "at; required when this validator is the auditor")
+    capacity_port: int = Field(8091, ge=1, le=65535)
     state_dir: Path = Path("~/.verathos/validator")
     dry_run: bool = False
 

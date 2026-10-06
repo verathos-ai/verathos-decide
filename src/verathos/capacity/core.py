@@ -155,7 +155,7 @@ class AuditPolicy:
 
     auditor_hotkey: str = ""
     mode: str = "observe"  # observe | score_gate
-    cohort_fraction: float = 0.2
+    cohort_fraction: float = 0.3
     windows_per_epoch: int = 5
     max_drain_fraction: float = 0.1
     group_stress_fraction: float = 0.35
@@ -167,7 +167,7 @@ class AuditPolicy:
     payload_deadline_s: float = 90.0
     max_proof_payload_bytes: int = DEFAULT_MAX_PROOF_PAYLOAD_BYTES
     repeat_window_epochs: int = 10
-    timing_misses_for_zero_score: int = 3
+    timing_misses_for_zero_score: int = 2
     hard_proof_misses_for_zero_score: int = 2
     invalid_proof_misses_for_zero_score: int = 1
     gpu_classes: tuple[GpuClass, ...] = DEFAULT_GPU_CLASSES
