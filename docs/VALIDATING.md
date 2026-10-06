@@ -4,8 +4,9 @@ A validator discovers miners from chain state, sends every endpoint a few canary
 answers with its own reference computation, and sets weights on mechanism 1. How answers are compared and scored
 is in `SCORING.md`.
 
-The validator whose hotkey is the capacity auditor (the subnet owner unless the catalog names another hotkey) also
-runs the capacity audit; see `CAPACITY_AUDIT.md` and the section below.
+Every validator takes part in the capacity audit (`CAPACITY_AUDIT.md`). The validator whose hotkey is the
+auditor (the subnet owner unless the catalog names another hotkey) runs it; every other validator applies the
+auditor's signed verdicts. Each validator finds its role at startup from the catalog and the chain.
 
 ## Requirements
 
@@ -91,13 +92,17 @@ Per epoch (one subnet tempo) the validator:
 `--once` runs one epoch immediately and exits. Keep `state_dir` across restarts: it holds the canary secret and the
 score history.
 
-## Running the capacity audit
+## Capacity audit
+
+Every validator derives the audit windows from chain data, like the miners, and holds its canaries for an
+endpoint while that endpoint is inside an audit hold. In `score_gate` mode it fetches the auditor's verdicts for
+the epoch from the auditor's axon (`GET /capacity/v1/verdicts`), checks they are signed by the auditor hotkey, and
+scores the gated endpoints zero with probation. Without a valid feed it gates nothing that epoch.
 
 If the validator's hotkey is the auditor, it also:
-- serves the ingest (`/capacity/v1/receipt`, `/capacity/v1/proof`) on `capacity_port` and points its axon at
-  `capacity_public_host:capacity_port`, where miners find it;
+- serves the ingest (`/capacity/v1/receipt`, `/capacity/v1/proof`) and the verdicts on `capacity_port` and
+  points its axon at `capacity_public_host:capacity_port`, where miners and validators find it;
 - follows every block, drafts audit windows, times receipts and verifies proofs;
-- keeps canaries away from endpoints while they are inside an audit hold;
 - in `score_gate` mode, scores gated endpoints zero with probation, and open endpoints without a calibrated GPU
   class zero.
 

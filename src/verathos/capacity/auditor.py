@@ -140,30 +140,18 @@ class Auditor:
             self._expire(now)
             if block_number % FINALITY_CHECK_BLOCKS == 0:
                 self._check_finality()
-            epoch_blocks = self.chain.epoch_blocks()
-            if core.window_triggered(block_number, block_hash, epoch_blocks, self.policy) \
-                    and core.window_fits_epoch(block_number, epoch_blocks, self.policy) \
-                    and head < block_number + self.policy.lead_blocks:
-                self._schedule(block_number, block_hash, epoch_blocks)
+            window = core.open_window(self.netuid, block_number, block_hash, self.chain.epoch_blocks(), self.policy)
+            if window is not None and head < window.start_block:
+                self._schedule(window, block_hash)
 
-    def _schedule(self, block_number: int, block_hash: bytes, epoch_blocks: int) -> None:
-        epoch = block_number // epoch_blocks
-        seed = core.derive_audit_seed(block_hash, epoch)
-        start_block = block_number + self.policy.lead_blocks
-        proof_block = start_block + max(1, self.policy.proof_challenge_delay_blocks)
-        audit_id = core.derive_audit_id(netuid=self.netuid, epoch_number=epoch, selection_block=block_number,
-                                        audit_block=start_block, cohort_seed=seed)
-        busy = self._busy_slots(block_number)
-        drafted = []
-        for slot in core.select_slots([s for s in self._slots if s.slot_id not in busy], seed, self.policy):
-            ok, _reason, row = core.gpu_support_status(slot.gpu_name, slot.vram_gb, self.policy)
-            if ok and row is not None and core.gpu_pass_count(row) > 0:
-                drafted.append((slot, row))
+    def _schedule(self, window: core.Window, block_hash: bytes) -> None:
+        drafted = core.draft(window, self._slots, self.policy, self._busy_slots(window.selection_block))
         if not drafted:
             return
+        audit_id, epoch, block_number = window.audit_id, window.epoch, window.selection_block
         self._db.execute("INSERT OR IGNORE INTO windows (audit_id, epoch, selection_block, start_block, proof_block, "
                          "selection_hash) VALUES (?, ?, ?, ?, ?, ?)",
-                         (audit_id, epoch, block_number, start_block, proof_block, block_hash.hex()))
+                         (audit_id, epoch, block_number, window.start_block, window.proof_block, block_hash.hex()))
         for slot, row in drafted:
             spec = core.gpu_workload_spec(row)
             self._db.execute(

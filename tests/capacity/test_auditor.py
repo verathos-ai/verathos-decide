@@ -17,10 +17,13 @@ from fastapi.testclient import TestClient
 
 from verathos.capacity import core
 from verathos.capacity.auditor import INVALID, PASSED, TIMING_MISS, Auditor
+from verathos.capacity.holds import HoldTracker
 from verathos.capacity.ingest import create_ingest_app
 from verathos.capacity.miner import AuditEndpoint, AuditWorker, DrainState
+from verathos.capacity.verdicts import accepted_verdicts
 
 REPO = Path(__file__).resolve().parents[2]
+AUDITOR_KEY = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
 BLOCK_S = 0.4
 TEST_GPU = core.GpuClass("Test GPU", 8, matrix_dim=8, capacity_passes=2, capacity_rounds=2, capacity_block_size=4,
                          fp64_matrix_dim=4, fp64_passes=1, fp64_block_size=2, spot_checks=2, deadline_s=0.6,
@@ -92,7 +95,7 @@ def run(tmp_path_factory: pytest.TempPathFactory):
     script.write_text(BENCH)
     chain = Chain(start=1000)
     auditor = Auditor(netuid=405, policy=POLICY, chain=chain, db_path=tmp / "auditor.sqlite", block_time_s=BLOCK_S)
-    client = TestClient(create_ingest_app(auditor))
+    client = TestClient(create_ingest_app(auditor, AUDITOR_KEY))
     miners = {}
     for behaviour in ("honest", "late", "forge"):
         kp = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
@@ -108,14 +111,20 @@ def run(tmp_path_factory: pytest.TempPathFactory):
                              block_time_s=BLOCK_S, work_dir=tmp)
         miners[behaviour] = (kp, worker, core.Slot(405, kp.ss58_address, "gpu0", url, "kev-4b", "Test GPU", 8))
     auditor.update_slots([slot for _, _, slot in miners.values()])
+    holds = HoldTracker(netuid=405, policy=POLICY, chain=chain, block_time_s=BLOCK_S)
+    holds.update_slots([slot for _, _, slot in miners.values()])
+    drained_seen = set()
 
     auditor.poll_once()
+    holds.poll_once()
     for _, worker, _ in miners.values():
         worker.start()
     # One window is enough: every slot is drafted at the first block and busy until its payload cooldown ends.
     for _ in range(45):
         chain.tick()
         auditor.poll_once()
+        holds.poll_once()
+        drained_seen |= {b for b, (kp, _, _) in miners.items() if holds.drained(kp.ss58_address, "gpu0")}
         time.sleep(BLOCK_S)
     for _, worker, _ in miners.values():
         worker.stop()
@@ -124,6 +133,7 @@ def run(tmp_path_factory: pytest.TempPathFactory):
         chain.tick()
         auditor.poll_once()
         time.sleep(0.05)
+    auditor.drained_seen_by_follower = drained_seen
     yield auditor, miners
     auditor.stop()
 
@@ -163,7 +173,7 @@ def test_windows_are_confirmed_before_counting(run) -> None:
 def test_ingest_rejects_unknown_and_unsigned_artifacts(run) -> None:
     auditor, miners = run
     kp = miners["honest"][0]
-    client = TestClient(create_ingest_app(auditor))
+    client = TestClient(create_ingest_app(auditor, AUDITOR_KEY))
     artifact = {"protocol_version": core.PROTOCOL_VERSION, "artifact_type": "capacity_audit_pass0_receipt",
                 "audit_id": "ff" * 32, "slot_id": "ee" * 32, "hotkey": kp.ss58_address, "pass0_root": "aa" * 32}
     unsigned = client.post("/capacity/v1/receipt", json=artifact)
@@ -173,3 +183,20 @@ def test_ingest_rejects_unknown_and_unsigned_artifacts(run) -> None:
     assert unknown.status_code == 400 and unknown.json()["error"] == "unknown audit slot"
     wrong_path = client.post("/capacity/v1/proof", json=artifact)
     assert wrong_path.status_code == 400
+
+
+def test_follower_sees_the_same_holds(run) -> None:
+    auditor, miners = run
+    assert auditor.drained_seen_by_follower == set(miners)
+
+
+def test_signed_verdicts_reach_followers(run) -> None:
+    auditor, miners = run
+    client = TestClient(create_ingest_app(auditor, AUDITOR_KEY))
+    document = client.get("/capacity/v1/verdicts", params={"epoch": 2}).json()
+    gated = accepted_verdicts(document, auditor_hotkey=AUDITOR_KEY.ss58_address, netuid=405, epoch=2)
+    assert gated == auditor.gated(2) and (miners["forge"][0].ss58_address, "gpu0") in gated
+    with pytest.raises(ValueError, match="not signed by the auditor"):
+        accepted_verdicts(document, auditor_hotkey=miners["honest"][0].ss58_address, netuid=405, epoch=2)
+    with pytest.raises(ValueError, match="another netuid or epoch"):
+        accepted_verdicts(document, auditor_hotkey=AUDITOR_KEY.ss58_address, netuid=405, epoch=3)

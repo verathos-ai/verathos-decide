@@ -303,31 +303,17 @@ class AuditWorker:
     # ---- selection ----
 
     def on_block(self, block_number: int, block_hash: bytes) -> None:
-        epoch_blocks = self.chain.epoch_blocks()
-        if not core.window_triggered(block_number, block_hash, epoch_blocks, self.policy):
+        window = core.open_window(self.netuid, block_number, block_hash, self.chain.epoch_blocks(), self.policy)
+        if window is None:
             return
-        if not core.window_fits_epoch(block_number, epoch_blocks, self.policy):
-            return
-        epoch = block_number // epoch_blocks
-        seed = core.derive_audit_seed(block_hash, epoch)
-        audit_block = block_number + self.policy.lead_blocks
-        proof_block = audit_block + max(1, self.policy.proof_challenge_delay_blocks)
-        audit_id = core.derive_audit_id(netuid=self.netuid, epoch_number=epoch, selection_block=block_number,
-                                        audit_block=audit_block, cohort_seed=seed)
-        for ep in self.endpoints:
-            slot = core.Slot(self.netuid, self.keypair.ss58_address, ep.endpoint_id, ep.url, ep.model_id,
-                             ep.gpu_name, ep.vram_gb)
-            if not core.slot_selected(slot, seed, self.policy):
-                continue
-            ok, reason, row = core.gpu_support_status(ep.gpu_name, ep.vram_gb, self.policy)
-            if not ok or row is None or core.gpu_pass_count(row) <= 0:
-                log.warning("endpoint %s drafted for audit %s but its GPU class is not auditable: %s",
-                            ep.endpoint_id, audit_id[:12], reason)
-                continue
-            if block_number <= self._busy_until_block.get(ep.endpoint_id, 0):
-                continue  # the auditor applies the same cooldown and does not draft this slot
+        endpoint_of = {self._slot(ep).slot_id: ep for ep in self.endpoints}
+        busy = {slot_id for slot_id, ep in endpoint_of.items()
+                if block_number <= self._busy_until_block.get(ep.endpoint_id, 0)}
+        for slot, row in core.draft(window, [self._slot(ep) for ep in self.endpoints], self.policy, busy):
+            ep = endpoint_of[slot.slot_id]
+            audit_id, audit_block, proof_block = window.audit_id, window.start_block, window.proof_block
             audit = SelectedAudit(ep, slot, row, core.gpu_workload_spec(row), audit_id, block_number, audit_block,
-                                  proof_block, core.lease_id(slot, epoch))
+                                  proof_block, core.lease_id(slot, window.epoch))
             self._busy_until_block[ep.endpoint_id] = proof_block + core.payload_cooldown_blocks(self.policy,
                                                                                                 self.block_time_s)
             self.drain.set(ep.endpoint_id, time.time() + core.active_hold_seconds(self.policy, self.block_time_s))
@@ -337,6 +323,10 @@ class AuditWorker:
             t.start()
             log.info("endpoint %s drafted: audit %s B_select=%d B_start=%d B_proof=%d", ep.endpoint_id, audit_id[:12],
                      block_number, audit_block, proof_block)
+
+    def _slot(self, ep: AuditEndpoint) -> core.Slot:
+        return core.Slot(self.netuid, self.keypair.ss58_address, ep.endpoint_id, ep.url, ep.model_id, ep.gpu_name,
+                         ep.vram_gb)
 
     # ---- one audit ----
 

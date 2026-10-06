@@ -1,21 +1,23 @@
-"""HTTP ingest for capacity-audit artifacts, served by the auditor on its axon."""
+"""The auditor's HTTP service on its axon: artifact ingest for miners, signed verdicts for validators."""
 
 from __future__ import annotations
 
 import json
 
-from fastapi import FastAPI, Request
+from bittensor_wallet import Keypair
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from verathos.capacity import core
 from verathos.capacity.auditor import Auditor
+from verathos.capacity.verdicts import VERDICTS_PATH, signed_verdicts
 
 RECEIPT_PATH = "/capacity/v1/receipt"
 PROOF_PATH = "/capacity/v1/proof"
 MAX_RECEIPT_BYTES = 64 * 1024
 
 
-def create_ingest_app(auditor: Auditor) -> FastAPI:
+def create_ingest_app(auditor: Auditor, keypair: Keypair) -> FastAPI:
     app = FastAPI(title="verathos capacity audit", docs_url=None, redoc_url=None, openapi_url=None)
 
     async def ingest(request: Request, kind: str, limit: int) -> JSONResponse:
@@ -38,6 +40,10 @@ def create_ingest_app(auditor: Auditor) -> FastAPI:
     @app.get("/capacity/v1/health")
     async def health() -> dict:
         return {"status": "ok", "protocol_version": core.PROTOCOL_VERSION, "mode": auditor.policy.mode}
+
+    @app.get(VERDICTS_PATH)
+    async def verdicts(epoch: int = Query(ge=0)) -> dict:
+        return signed_verdicts(keypair, auditor.netuid, epoch, auditor.gated(epoch))
 
     @app.post(RECEIPT_PATH)
     async def receipt(request: Request) -> JSONResponse:

@@ -11,6 +11,7 @@ import uvicorn
 
 from verathos import catalog
 from verathos.capacity.chain import SubtensorChainView
+from verathos.capacity.core import AuditPolicy, gpu_support_status
 from verathos.capacity.miner import AuditEndpoint, AuditWorker, DrainState, bench_extension_available
 from verathos.chain import committed_catalog
 from verathos.miner.app import create_app
@@ -21,7 +22,7 @@ from verathos.miner.engine import HttpEngine
 log = logging.getLogger("verathos.miner")
 
 
-def audit_endpoints(config: MinerConfig) -> list[AuditEndpoint]:
+def audit_endpoints(config: MinerConfig, policy: AuditPolicy) -> list[AuditEndpoint]:
     """Open-tier CUDA endpoints with a declared GPU class and device: the ones the capacity audit covers."""
     out = []
     for e in config.endpoints:
@@ -31,6 +32,9 @@ def audit_endpoints(config: MinerConfig) -> list[AuditEndpoint]:
         if not hw.gpu_name or not hw.vram_gb or e.cuda_device is None:
             raise SystemExit(f"endpoint {e.endpoint_id}: CUDA endpoints need hardware.gpu_name, hardware.vram_gb "
                              "and cuda_device for the capacity audit")
+        if not gpu_support_status(hw.gpu_name, hw.vram_gb, policy)[0]:
+            log.warning("endpoint %s: %s (%d GB) is not a calibrated GPU class; it is never audited and scores zero "
+                        "once the audit gates", e.endpoint_id, hw.gpu_name, hw.vram_gb)
         out.append(AuditEndpoint(e.endpoint_id, config.endpoint_url(e.endpoint_id), e.model_id, hw.gpu_name,
                                  hw.vram_gb, e.cuda_device))
     return out
@@ -61,7 +65,7 @@ def main() -> None:
         publish(subtensor, wallet, config, signed)
 
     drain = DrainState()
-    endpoints = audit_endpoints(config)
+    endpoints = audit_endpoints(config, policy)
     if endpoints:
         ok, error = bench_extension_available()
         if ok:

@@ -22,7 +22,7 @@ import json
 import math
 import re
 import struct
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -419,6 +419,46 @@ def select_slots(slots: Iterable[Slot], audit_seed_hex: str, policy: AuditPolicy
     unique = {s.slot_id: s for s in slots}
     return sorted((s for s in unique.values() if slot_selected(s, audit_seed_hex, policy)),
                   key=lambda s: (s.hotkey, s.endpoint_id))
+
+
+@dataclass(frozen=True)
+class Window:
+    """An audit window opened by ``selection_block``."""
+
+    audit_id: str
+    epoch: int
+    seed: str
+    selection_block: int
+    start_block: int
+    proof_block: int
+
+
+def open_window(netuid: int, block_number: int, block_hash: bytes, epoch_blocks: int,
+                policy: AuditPolicy) -> Window | None:
+    """The window this current-head block opens, if any."""
+    if not window_triggered(block_number, block_hash, epoch_blocks, policy) \
+            or not window_fits_epoch(block_number, epoch_blocks, policy):
+        return None
+    epoch = block_number // epoch_blocks
+    seed = derive_audit_seed(block_hash, epoch)
+    start_block = block_number + policy.lead_blocks
+    proof_block = start_block + max(1, policy.proof_challenge_delay_blocks)
+    audit_id = derive_audit_id(netuid=netuid, epoch_number=epoch, selection_block=block_number,
+                               audit_block=start_block, cohort_seed=seed)
+    return Window(audit_id, epoch, seed, block_number, start_block, proof_block)
+
+
+def draft(window: Window, slots: Iterable[Slot], policy: AuditPolicy,
+          busy: Collection[str] = ()) -> list[tuple[Slot, GpuClass]]:
+    """Slots the window drafts, with their workload rows. ``busy`` holds slot ids still in an earlier window's
+    cooldown; slots without an auditable GPU class are never drafted. Miners, the auditor and other validators
+    all derive the same list."""
+    drafted = []
+    for slot in select_slots([s for s in slots if s.slot_id not in busy], window.seed, policy):
+        ok, _reason, row = gpu_support_status(slot.gpu_name, slot.vram_gb, policy)
+        if ok and row is not None and gpu_pass_count(row) > 0:
+            drafted.append((slot, row))
+    return drafted
 
 
 def _canonical_gpu_name(gpu_name: str) -> str:

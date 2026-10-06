@@ -7,8 +7,9 @@ each drafted endpoint must run a GPU workload calibrated for its declared GPU cl
 resident model, and then prove the work. Endpoints that share hardware cannot all finish in time; their misses
 accumulate until they are gated.
 
-Only one validator evaluates audits: the auditor, by default the subnet owner's validator. The policy lives in the
-catalog (`capacity_audit`), so the subnet owner commits it on chain together with the model list.
+One validator evaluates audits: the auditor, by default the subnet owner's validator (the catalog can name another
+hotkey). It publishes the endpoints it gates, signed by its hotkey, and every other validator applies them. The
+policy lives in the catalog (`capacity_audit`), so the subnet owner commits it on chain with the model list.
 
 ## Roles and code
 
@@ -16,7 +17,8 @@ catalog (`capacity_audit`), so the subnet owner commits it on chain together wit
 |---|---|
 | Public derivations (windows, cohorts, seeds, workload rows) | `src/verathos/capacity/core.py` |
 | Miner worker and GPU bench | `capacity/miner.py`, `capacity/bench/` |
-| Auditor and ingest | `capacity/auditor.py`, `capacity/ingest.py` |
+| Auditor, ingest and verdicts | `capacity/auditor.py`, `capacity/ingest.py`, `capacity/verdicts.py` |
+| Holds on other validators | `capacity/holds.py`, `validator/capacity.py` |
 | Proof verification | `capacity/proof/`, `capacity/zk/`, `native/gemm` |
 
 ## Slots
@@ -94,6 +96,10 @@ In `score_gate` mode the auditor gates an endpoint when, over the last `repeat_w
 Timing misses and no-shows of the running epoch are not counted until it closes. A gated endpoint scores zero and
 enters probation like an endpoint that failed answer verification. Evidence ages out of the window; nothing else
 clears it.
+
+The auditor serves the gated endpoints of an epoch at `GET /capacity/v1/verdicts?epoch=N`, signed by its hotkey.
+Other validators fetch them from the auditor's axon each epoch, verify the signature, and gate the same endpoints;
+if the feed is unreachable or invalid they gate nothing that epoch.
 
 In `observe` mode (the initial setting) the audit runs and records outcomes but gates nothing.
 
