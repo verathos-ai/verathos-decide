@@ -4,16 +4,19 @@ Discovery uses only native chain state:
 - the hotkey's axon (``serve_axon``) points at the miner's manifest server, ``GET /v1/manifest``;
 - the manifest lists every endpoint (one per GPU or Mac) with its model, and is signed by the hotkey;
 - the hotkey's commitment (``set_commitment``) holds the manifest digest, so every validator scores the same
-  version and the commitment block records when an endpoint was first claimed.
+  version.
 
-A fetched manifest is accepted only if its signature verifies against the hotkey and its digest equals the
-hotkey's current commitment.
+A fetched manifest is accepted only if its signature verifies against the hotkey, its digest equals the hotkey's
+current commitment, and every endpoint URL is on the hotkey's axon. Signature and digest cover the JSON exactly as
+received, so nodes running different code versions agree on them.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import re
-from typing import Literal
+from collections.abc import Collection
+from typing import Any, Literal
 
 from bittensor_wallet import Keypair
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -63,8 +66,6 @@ class Manifest(BaseModel):
     netuid: int = Field(ge=0)
     mechid: int = Field(ge=0)
     hotkey: str
-    seq: int = Field(ge=0)
-    issued_block: int = Field(ge=0)
     catalog_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     endpoints: list[Endpoint] = Field(max_length=MAX_ENDPOINTS)
 
@@ -93,10 +94,6 @@ class SignedManifest(BaseModel):
         return cls(manifest=manifest,
                    signature=signing.sign(keypair, MANIFEST_DOMAIN, manifest.model_dump(mode="json")))
 
-    def signature_valid(self) -> bool:
-        return signing.verify(self.manifest.hotkey, MANIFEST_DOMAIN, self.manifest.model_dump(mode="json"),
-                              self.signature)
-
 
 def commitment_value(manifest_digest: str) -> str:
     """The string a miner commits on chain for a manifest digest."""
@@ -115,21 +112,46 @@ class ManifestRejected(Exception):
     pass
 
 
-def accept(signed: SignedManifest, *, hotkey: str, netuid: int, commitment: str | None,
-           catalog_digest: str) -> Manifest:
-    """Validator-side acceptance of a fetched manifest built for the current catalog. Raises ManifestRejected."""
-    manifest = signed.manifest
-    if manifest.hotkey != hotkey:
-        raise ManifestRejected("manifest hotkey does not match the axon's hotkey")
-    if manifest.netuid != netuid:
-        raise ManifestRejected("manifest is for another netuid")
-    if not signed.signature_valid():
-        raise ManifestRejected("signature does not verify against the hotkey")
+def axon_base(ip: str, port: int) -> str:
+    """The base URL of an axon (``http://ip:port``)."""
+    return f"http://[{ip}]:{port}" if ":" in ip else f"http://{ip}:{port}"
+
+
+def endpoint_url(axon: str, endpoint_id: str) -> str:
+    """The URL of an endpoint on its hotkey's axon; manifests must list exactly this URL."""
+    return f"{axon}/e/{endpoint_id}"
+
+
+def public_ip(value: str) -> str:
+    """``value`` if it is an IP address literal (the chain stores axons as IPs); raises ValueError otherwise."""
+    ipaddress.ip_address(value)
+    return value
+
+
+def accept(document: Any, *, hotkey: str, netuid: int, mechid: int, axon: str, commitment: str | None,
+           catalog_digests: Collection[str]) -> Manifest:
+    """Validator-side acceptance of a fetched manifest document (the parsed JSON body). Raises ManifestRejected."""
+    if not isinstance(document, dict) or not isinstance(document.get("manifest"), dict):
+        raise ManifestRejected("not a signed manifest")
+    raw = document["manifest"]
+    if not signing.verify(hotkey, MANIFEST_DOMAIN, raw, document.get("signature")):
+        raise ManifestRejected("signature does not verify against the axon's hotkey")
     expected = committed_digest(commitment)
     if expected is None:
         raise ManifestRejected("hotkey has no manifest commitment")
-    if manifest.digest() != expected:
-        raise ManifestRejected("manifest digest differs from the on-chain commitment")
-    if manifest.catalog_digest != catalog_digest:
+    try:
+        if digest(raw) != expected:
+            raise ManifestRejected("manifest digest differs from the on-chain commitment")
+        manifest = Manifest.model_validate(raw)
+    except (ValueError, TypeError) as exc:
+        if isinstance(exc, ManifestRejected):
+            raise
+        raise ManifestRejected(f"malformed manifest: {exc}") from None
+    if manifest.hotkey != hotkey or manifest.netuid != netuid or manifest.mechid != mechid:
+        raise ManifestRejected("manifest is for another hotkey, netuid or mechanism")
+    if manifest.catalog_digest not in catalog_digests:
         raise ManifestRejected("manifest was built for another catalog")
+    for e in manifest.endpoints:
+        if e.url != endpoint_url(axon, e.endpoint_id):
+            raise ManifestRejected(f"endpoint {e.endpoint_id} is not served at the hotkey's axon")
     return manifest

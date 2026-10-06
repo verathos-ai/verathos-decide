@@ -10,10 +10,18 @@ def test_shipped_catalog_loads_and_digest_is_stable() -> None:
     assert catalog.committed_digest(catalog.commitment_value(c.digest())) == c.digest()
 
 
+def variant(**changes) -> catalog.Catalog:
+    return catalog.Catalog.parse({**catalog.load().document(), **changes})
+
+
 def test_digest_changes_with_content() -> None:
-    c = catalog.load()
-    changed = c.model_copy(update={"revision": c.revision + "x"})
-    assert changed.digest() != c.digest()
+    assert variant(revision="next").digest() != catalog.load().digest()
+
+
+def test_digest_covers_fields_this_code_does_not_know() -> None:
+    newer = variant(future_setting={"x": 1})
+    assert newer.get("kev-4b") is not None
+    assert newer.digest() != catalog.load().digest()
 
 
 def test_rejects_non_catalog_commitment() -> None:
@@ -22,27 +30,16 @@ def test_rejects_non_catalog_commitment() -> None:
 
 
 def test_resolve_prefers_shipped_then_store_then_verified_download(tmp_path, monkeypatch) -> None:
-    import httpx
     import pytest
 
     shipped = catalog.load()
     store = catalog.CatalogStore(tmp_path)
     assert catalog.resolve(shipped.digest(), store=store, sources=[]) is not None
 
-    newer = shipped.model_copy(update={"revision": "next"})
-    served = {"good": newer.model_dump_json(), "forged": shipped.model_copy(update={"revision": "x"}).model_dump_json()}
-
-    def fake_get(url, **_):
-        return httpx.Response(200, text=served[url.split("/")[2]], request=httpx.Request("GET", url))
-
-    monkeypatch.setattr(httpx, "get", fake_get)
+    newer = variant(revision="next", future_setting=True)
+    served = {"good": newer.document(), "forged": variant(revision="x").document()}
+    monkeypatch.setattr(catalog, "get_json", lambda url, **_: served[url.split("/")[2]])
     with pytest.raises(catalog.CatalogUnavailable):
         catalog.resolve(newer.digest(), store=store, sources=["http://forged/{digest}"])
     got = catalog.resolve(newer.digest(), store=store, sources=["http://forged/{digest}", "http://good/{digest}"])
-    assert got.digest() == newer.digest() and store.get(newer.digest()) is not None
-
-
-def test_only_active_models_are_scored() -> None:
-    c = catalog.load()
-    candidate = c.model_copy(update={"models": [c.models[0].model_copy(update={"status": "candidate"})]})
-    assert c.scored("kev-4b") and not candidate.scored("kev-4b") and not c.scored("unknown")
+    assert got.digest() == newer.digest() and store.get(newer.digest()).digest() == newer.digest()

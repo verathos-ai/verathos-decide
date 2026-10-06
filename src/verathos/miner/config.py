@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from verathos.protocol.manifest import Hardware
+from verathos.protocol.manifest import Hardware, axon_base, endpoint_url, public_ip
 
 
 class EndpointConfig(BaseModel):
@@ -29,9 +29,8 @@ class MinerConfig(BaseModel):
     mechid: int = 1
     wallet_name: str
     hotkey_name: str
-    public_host: str = Field(description="IP or DNS name validators and gateways reach this miner at")
+    public_host: str = Field(description="Public IP address validators and gateways reach this miner at")
     port: int = Field(ge=1, le=65535)
-    scheme: Literal["http", "https"] = "http"
     listen_host: str = "0.0.0.0"
     gateway_hotkeys: list[str] = Field(default_factory=list,
                                        description="Extra caller hotkeys allowed besides permitted validators")
@@ -39,6 +38,11 @@ class MinerConfig(BaseModel):
     catalog_mirrors: list[str] = Field(default_factory=list, description="Catalog URL templates with {digest}, "
                                        "tried after the subnet owner's axon")
     catalog_dir: Path = Path("~/.verathos/catalog")
+
+    @field_validator("public_host")
+    @classmethod
+    def _public_ip(cls, value: str) -> str:
+        return public_ip(value)
 
     @model_validator(mode="after")
     def _unique(self) -> MinerConfig:
@@ -48,7 +52,7 @@ class MinerConfig(BaseModel):
         return self
 
     def endpoint_url(self, endpoint_id: str) -> str:
-        return f"{self.scheme}://{self.public_host}:{self.port}/e/{endpoint_id}"
+        return endpoint_url(axon_base(self.public_host, self.port), endpoint_id)
 
     @classmethod
     def load(cls, path: Path) -> MinerConfig:

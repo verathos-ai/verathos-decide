@@ -27,10 +27,11 @@ from verathos.protocol.api import SystemOneRequest
 from verathos.protocol.canonical import digest
 from verathos.protocol.manifest import SignedManifest
 from verathos.protocol.receipts import Receipt, SignedReceipt
-from verathos.protocol.requests import NonceCache, RequestRejected, verify_request
+from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, verify_request
 
 log = logging.getLogger(__name__)
 IDENTITY_DOMAIN = "verathos/identity/v1"
+MAX_REQUEST_BYTES = 1 << 20
 
 
 class IdentityChallenge(BaseModel):
@@ -59,14 +60,35 @@ def create_app(
     def error(status: int, message: str) -> JSONResponse:
         return JSONResponse(status_code=status, content={"error": message})
 
-    async def caller_of(request: Request, body: bytes):
+    async def read_body(request: Request) -> bytes | None:
+        """The request body, or None if it exceeds MAX_REQUEST_BYTES."""
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
+            return None
+        body = bytearray()
+        async for chunk in request.stream():
+            body += chunk
+            if len(body) > MAX_REQUEST_BYTES:
+                return None
+        return bytes(body)
+
+    async def authenticate(request: Request):
+        """-> (caller, body, None) or (None, None, error response). The claimed caller must be permitted before its
+        body is read or its signature checked."""
+        if not authorized(request.headers.get(HDR_HOTKEY, "")):
+            return None, None, error(403, "caller is not a permitted validator or gateway")
+        body = await read_body(request)
+        if body is None:
+            return None, None, error(413, "request too large")
         try:
             caller = verify_request(dict(request.headers), request.method, request.url.path, body, hotkey, nonces)
         except RequestRejected as e:
-            return None, error(401, str(e))
-        if not authorized(caller.hotkey):
-            return None, error(403, "caller is not a permitted validator or gateway")
-        return caller, None
+            return None, None, error(401, str(e))
+        return caller, body, None
+
+    def listed(endpoint_id: str) -> bool:
+        """Whether the current manifest lists the endpoint (a catalog change can withdraw one)."""
+        return any(e.endpoint_id == endpoint_id for e in manifest().manifest.endpoints)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -78,10 +100,9 @@ def create_app(
 
     @app.post("/e/{endpoint_id}/v1/identity")
     async def identity(endpoint_id: str, request: Request):
-        if endpoint_id not in endpoints:
+        if endpoint_id not in endpoints or not listed(endpoint_id):
             return error(404, "unknown endpoint")
-        body = await request.body()
-        caller, rejected = await caller_of(request, body)
+        caller, body, rejected = await authenticate(request)
         if rejected:
             return rejected
         try:
@@ -94,11 +115,10 @@ def create_app(
     @app.post("/e/{endpoint_id}/v1/systemone")
     async def systemone(endpoint_id: str, request: Request):
         endpoint = endpoints.get(endpoint_id)
-        if endpoint is None:
+        if endpoint is None or not listed(endpoint_id):
             return error(404, "unknown endpoint")
         received_ms = int(time.time() * 1000)
-        body = await request.body()
-        caller, rejected = await caller_of(request, body)
+        caller, body, rejected = await authenticate(request)
         if rejected:
             return rejected
         try:

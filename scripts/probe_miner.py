@@ -24,9 +24,10 @@ from verathos import catalog
 from verathos.miner.app import IDENTITY_DOMAIN, identity_payload
 from verathos.protocol import signing
 from verathos.protocol.api import distributions
-from verathos.protocol.manifest import SignedManifest, accept
+from verathos.protocol.manifest import accept, axon_base
 from verathos.protocol.receipts import SignedReceipt
 from verathos.protocol.requests import sign_request
+from verathos.subnet.chain import current_catalog
 from verathos.validator.compare import EndpointTally, Tolerance, compare_request
 
 TOPICS = ["billed twice for March", "the export button returns a 500 error", "I want to upgrade to the enterprise plan",
@@ -73,6 +74,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--network", default="test")
     p.add_argument("--netuid", type=int, default=405)
+    p.add_argument("--mechid", type=int, default=1)
     p.add_argument("--uid", type=int, required=True)
     p.add_argument("--caller-wallet", required=True)
     p.add_argument("--caller-hotkey", required=True)
@@ -83,11 +85,13 @@ def main() -> None:
     st = bt.Subtensor(network=args.network)
     mg = st.metagraph(args.netuid, lite=True)
     hotkey, axon = mg.hotkeys[args.uid], mg.axons[args.uid]
-    base = f"http://{axon.ip}:{axon.port}"
-    signed = SignedManifest.model_validate_json(urllib.request.urlopen(base + "/v1/manifest", timeout=10).read())
-    manifest = accept(signed, hotkey=hotkey, netuid=args.netuid, commitment=st.get_commitment(args.netuid, args.uid),
-                      catalog_digest=catalog.load().digest())
-    print(f"manifest accepted: seq {manifest.seq}, endpoints {[e.endpoint_id for e in manifest.endpoints]}")
+    base = axon_base(axon.ip, axon.port)
+    cat = current_catalog(st, args.netuid, catalog.CatalogStore(), [])
+    document = json.loads(urllib.request.urlopen(base + "/v1/manifest", timeout=10).read())
+    manifest = accept(document, hotkey=hotkey, netuid=args.netuid, mechid=args.mechid, axon=base,
+                      commitment=st.get_commitment(args.netuid, args.uid), catalog_digests={cat.digest()})
+    print(f"manifest accepted: catalog {manifest.catalog_digest[:12]}, "
+          f"endpoints {[e.endpoint_id for e in manifest.endpoints]}")
 
     caller = bt.Wallet(name=args.caller_wallet, hotkey=args.caller_hotkey).hotkey
     endpoint = next(e for e in manifest.endpoints if args.endpoint in (None, e.endpoint_id))
@@ -102,7 +106,8 @@ def main() -> None:
     print(f"identity challenge for {endpoint.endpoint_id}: {'verified' if ok else 'FAILED'}")
 
     reference = [distributions(r["answers"]) for r in json.loads(args.reference.read_text())]
-    tally, latencies, receipts_ok = EndpointTally(Tolerance()), [], 0
+    tolerance = cat.get(endpoint.model_id).tolerance if cat.get(endpoint.model_id) else Tolerance()
+    tally, latencies, receipts_ok = EndpointTally(tolerance), [], 0
     for state, ref in zip(states(len(reference)), reference):
         request = {"model": endpoint.model_id, "state": state, "questions": QUESTIONS}
         t0 = time.time()

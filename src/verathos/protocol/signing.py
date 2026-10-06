@@ -22,10 +22,15 @@ def sign(keypair: Keypair, domain: str, value: Any) -> str:
     return keypair.sign(signing_payload(domain, value)).hex()
 
 
-def verify(ss58_address: str, domain: str, value: Any, signature_hex: str) -> bool:
-    """Whether ``signature_hex`` is ``ss58_address``'s signature of ``value`` under ``domain``."""
+def verify(ss58_address: Any, domain: str, value: Any, signature_hex: Any) -> bool:
+    """Whether ``signature_hex`` is ``ss58_address``'s signature of ``value`` under ``domain``. Never raises: any
+    malformed address, signature or value is simply not a valid signature."""
+    if not isinstance(ss58_address, str) or not isinstance(signature_hex, str):
+        return False
     try:
         signature = bytes.fromhex(signature_hex)
-    except ValueError:
+        if len(signature) != 64:
+            return False
+        return Keypair(ss58_address=ss58_address).verify(signing_payload(domain, value), signature)
+    except (ValueError, TypeError):
         return False
-    return Keypair(ss58_address=ss58_address).verify(signing_payload(domain, value), signature)

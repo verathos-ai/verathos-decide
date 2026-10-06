@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from verathos.protocol.manifest import public_ip
 
 
 class ValidatorConfig(BaseModel):
@@ -29,6 +31,11 @@ class ValidatorConfig(BaseModel):
     catalog_dir: Path = Path("~/.verathos/catalog")
     state_dir: Path = Path("~/.verathos/validator")
     dry_run: bool = False
+
+    @field_validator("public_host")
+    @classmethod
+    def _public_ip(cls, value: str | None) -> str | None:
+        return None if value is None else public_ip(value)
 
     @classmethod
     def load(cls, path: Path) -> ValidatorConfig:

@@ -14,6 +14,7 @@ compares those distributions, so the derived fields (choice, score, confidence) 
 
 from __future__ import annotations
 
+import math
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -80,19 +81,33 @@ class SystemOneResponse(BaseModel):
 Distribution = dict[str, float]
 
 
-def answer_distribution(answer: dict[str, Any]) -> Distribution:
-    """One answer -> its probability distribution keyed like ``question_keys``.
+def probability(value: Any) -> float:
+    """A JSON number in [0, 1]; raises ValueError for anything else (strings, booleans, NaN, infinities)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("probability must be a number")
+    p = float(value)
+    if not (math.isfinite(p) and 0.0 <= p <= 1.0):
+        raise ValueError("probability must be finite and within [0, 1]")
+    return p
+
+
+def answer_distribution(answer: Any) -> Distribution:
+    """One answer -> its probability distribution keyed like ``question_keys``. Raises ValueError if malformed.
 
     noul answers carry only p(yes); the distribution is completed as {"false": 1 - p, "true": p}.
     """
-    if "probabilities" in answer and isinstance(answer["probabilities"], dict):
-        return {str(k): float(v) for k, v in answer["probabilities"].items()}
+    if not isinstance(answer, dict):
+        raise ValueError("answer must be an object")
+    if isinstance(answer.get("probabilities"), dict):
+        return {str(k): probability(v) for k, v in answer["probabilities"].items()}
     if "noul" in answer:
-        p = float(answer["noul"])
+        p = probability(answer["noul"])
         return {"false": 1.0 - p, "true": p}
     raise ValueError("answer carries neither probabilities nor noul")
 
 
-def distributions(answers: dict[str, dict[str, Any]]) -> dict[str, Distribution]:
-    """All answers of a response -> {question id: distribution}."""
+def distributions(answers: Any) -> dict[str, Distribution]:
+    """All answers of a response -> {question id: distribution}. Raises ValueError if malformed."""
+    if not isinstance(answers, dict):
+        raise ValueError("answers must be an object")
     return {qid: answer_distribution(a) for qid, a in answers.items()}

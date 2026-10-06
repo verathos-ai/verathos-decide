@@ -14,7 +14,7 @@ from verathos.miner.app import IDENTITY_DOMAIN, create_app, identity_payload
 from verathos.miner.config import MinerConfig
 from verathos.protocol import signing
 from verathos.protocol.api import distributions
-from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, accept, commitment_value
+from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, accept, axon_base, commitment_value
 from verathos.protocol.receipts import SignedReceipt
 from verathos.protocol.requests import sign_request
 
@@ -41,7 +41,7 @@ def setup():
     })
     cat_digest = catalog.load().digest()
     manifest = SignedManifest.create(Manifest(
-        netuid=405, mechid=1, hotkey=miner.ss58_address, seq=1, issued_block=1, catalog_digest=cat_digest,
+        netuid=405, mechid=1, hotkey=miner.ss58_address, catalog_digest=cat_digest,
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
                             hardware=config.endpoints[0].hardware, max_concurrency=4)]), miner)
     app = create_app(config=config, keypair=miner, manifest=lambda: manifest, engines={"gpu0": MockEngine("kev-4b")},
@@ -57,10 +57,9 @@ def post(client: TestClient, caller: Keypair, miner: Keypair, path: str, payload
 
 def test_manifest_is_public_and_acceptable(setup) -> None:
     client, miner, *_ , manifest = setup
-    served = SignedManifest.model_validate(client.get("/v1/manifest").json())
-    assert accept(served, hotkey=miner.ss58_address, netuid=405,
-                  commitment=commitment_value(manifest.manifest.digest()),
-                  catalog_digest=manifest.manifest.catalog_digest)
+    assert accept(client.get("/v1/manifest").json(), hotkey=miner.ss58_address, netuid=405, mechid=1,
+                  axon=axon_base("203.0.113.5", 8091), commitment=commitment_value(manifest.manifest.digest()),
+                  catalog_digests={manifest.manifest.catalog_digest})
 
 
 def test_answer_carries_binding_receipt(setup) -> None:
@@ -76,9 +75,16 @@ def test_answer_carries_binding_receipt(setup) -> None:
 
 
 def test_unsigned_and_unpermitted_callers_are_refused(setup) -> None:
+    from verathos.miner.app import MAX_REQUEST_BYTES
+    from verathos.protocol.requests import HDR_HOTKEY
+
     client, miner, validator, stranger, _ = setup
-    assert client.post("/e/gpu0/v1/systemone", json=REQUEST).status_code == 401
+    assert client.post("/e/gpu0/v1/systemone", json=REQUEST).status_code == 403
     assert post(client, stranger, miner, "/e/gpu0/v1/systemone", REQUEST).status_code == 403
+    forged = client.post("/e/gpu0/v1/systemone", json=REQUEST, headers={HDR_HOTKEY: validator.ss58_address})
+    assert forged.status_code == 401
+    big = {**REQUEST, "state": "x" * MAX_REQUEST_BYTES}
+    assert post(client, validator, miner, "/e/gpu0/v1/systemone", big).status_code == 413
 
 
 def test_wrong_model_and_unknown_endpoint(setup) -> None:

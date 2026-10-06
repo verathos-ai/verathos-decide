@@ -242,11 +242,13 @@ class AuditWorker:
         self._threads: list[threading.Thread] = []
 
     # ---- lifecycle ----
-    def set_policy(self, policy: core.AuditPolicy) -> None:
-        """Adopt a newly committed policy; windows already drafted keep their scheduled workload."""
+    def set_policy(self, policy: core.AuditPolicy, endpoints: list[AuditEndpoint] | None = None) -> None:
+        """Adopt a newly committed policy (and the endpoints the new manifest lists); windows already drafted keep
+        their scheduled workload."""
         policy.validate(self.block_time_s)
         self.policy = policy
-
+        if endpoints is not None:
+            self.endpoints = list(endpoints)
 
     def start(self) -> None:
         self._running = True

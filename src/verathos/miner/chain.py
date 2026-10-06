@@ -9,22 +9,24 @@ import time
 
 import bittensor as bt
 
-from verathos.miner.config import MinerConfig
+from verathos.miner.config import EndpointConfig, MinerConfig
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
 from verathos.subnet.chain import serve_axon
 
 log = logging.getLogger(__name__)
 
 
-def build_manifest(config: MinerConfig, keypair, catalog_digest: str, block: int) -> SignedManifest:
-    """Sign a manifest for the configured endpoints. ``seq`` is the block it was issued at, so it only grows."""
-    endpoints = [
+def build_manifest(config: MinerConfig, endpoints: list[EndpointConfig], keypair,
+                   catalog_digest: str) -> SignedManifest:
+    """Sign a manifest for ``endpoints``. The same configuration and catalog always give the same manifest, so a
+    restart does not change the on-chain commitment."""
+    listed = [
         Endpoint(endpoint_id=e.endpoint_id, url=config.endpoint_url(e.endpoint_id), model_id=e.model_id, tier=e.tier,
                  hardware=e.hardware, max_concurrency=e.max_concurrency)
-        for e in config.endpoints
+        for e in endpoints
     ]
-    manifest = Manifest(netuid=config.netuid, mechid=config.mechid, hotkey=keypair.ss58_address, seq=block,
-                        issued_block=block, catalog_digest=catalog_digest, endpoints=endpoints)
+    manifest = Manifest(netuid=config.netuid, mechid=config.mechid, hotkey=keypair.ss58_address,
+                        catalog_digest=catalog_digest, endpoints=listed)
     return SignedManifest.create(manifest, keypair)
 
 

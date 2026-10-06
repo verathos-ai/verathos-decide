@@ -14,6 +14,7 @@ import hashlib
 import secrets
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from bittensor_wallet import Keypair
@@ -47,18 +48,20 @@ class NonceCache:
 
     def __init__(self, window_ms: int = 2 * MAX_SKEW_MS) -> None:
         self._window_ms = window_ms
-        self._seen: dict[str, int] = {}
+        self._seen: set[str] = set()
+        self._order: deque[tuple[int, str]] = deque()
         self._lock = threading.Lock()
 
     def check_and_add(self, key: str, now_ms: int) -> bool:
         """True if ``key`` is new; records it. False if it was already seen inside the window."""
         with self._lock:
-            if len(self._seen) > 100_000:
-                cutoff = now_ms - self._window_ms
-                self._seen = {k: t for k, t in self._seen.items() if t >= cutoff}
+            cutoff = now_ms - self._window_ms
+            while self._order and self._order[0][0] < cutoff:
+                self._seen.discard(self._order.popleft()[1])
             if key in self._seen:
                 return False
-            self._seen[key] = now_ms
+            self._seen.add(key)
+            self._order.append((now_ms, key))
             return True
 
 

@@ -49,5 +49,8 @@ class SignedReceipt(BaseModel):
                               self.signature)
 
     def binds(self, request: dict[str, Any], answers: dict[str, Any]) -> bool:
-        """Whether this receipt commits to exactly this request and these answers."""
-        return self.receipt.request_sha256 == digest(request) and self.receipt.answers_sha256 == digest(answers)
+        """Whether this receipt commits to exactly this request and these answers (False for non-JSON values)."""
+        try:
+            return self.receipt.request_sha256 == digest(request) and self.receipt.answers_sha256 == digest(answers)
+        except (ValueError, TypeError):
+            return False

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import bittensor as bt
@@ -17,17 +19,35 @@ from verathos.capacity.core import AuditPolicy, gpu_support_status
 from verathos.capacity.miner import AuditEndpoint, AuditWorker, DrainState, bench_extension_available
 from verathos.miner.app import create_app
 from verathos.miner.chain import PermitAuthorizer, build_manifest, publish
-from verathos.miner.config import MinerConfig
+from verathos.miner.config import EndpointConfig, MinerConfig
 from verathos.miner.engine import HttpEngine
+from verathos.protocol.manifest import SignedManifest
 from verathos.subnet.chain import committed_catalog, current_catalog
 
 log = logging.getLogger("verathos.miner")
+CATALOG_WATCH_S = 120.0
 
 
-def audit_endpoints(config: MinerConfig, policy: AuditPolicy) -> list[AuditEndpoint]:
-    """Open-tier CUDA endpoints with a declared GPU class and device: the ones the capacity audit covers."""
+def servable(config: MinerConfig, cat: catalog.Catalog) -> list[EndpointConfig]:
+    """The configured endpoints whose model the catalog serves; the others are withdrawn from the manifest."""
     out = []
     for e in config.endpoints:
+        model = cat.get(e.model_id)
+        if model is None or model.status == "retired":
+            log.error("endpoint %s: model %r is not served by catalog %s; endpoint withdrawn", e.endpoint_id,
+                      e.model_id, cat.digest()[:12])
+            continue
+        if model.status != "active":
+            log.warning("endpoint %s: %s is a %s model; validators check it but do not score it", e.endpoint_id,
+                        e.model_id, model.status)
+        out.append(e)
+    return out
+
+
+def audit_endpoints(config: MinerConfig, endpoints: list[EndpointConfig], policy: AuditPolicy) -> list[AuditEndpoint]:
+    """Open-tier CUDA endpoints with a declared GPU class and device: the ones the capacity audit covers."""
+    out = []
+    for e in endpoints:
         hw = e.hardware
         if e.tier != "open" or hw.kind != "cuda":
             continue
@@ -48,18 +68,25 @@ class Publisher:
     def __init__(self, config: MinerConfig, wallet: bt.Wallet, cat: catalog.Catalog, *, publish_on_chain: bool,
                  subtensor: bt.Subtensor) -> None:
         self.config, self.wallet, self.publish_on_chain = config, wallet, publish_on_chain
-        self.catalog = cat
-        self.signed = self._build(subtensor)
-        self.on_catalog: list = []
+        self.catalog, self.signed = cat, self._build(cat, subtensor)
+        self.on_catalog: list[Callable[[catalog.Catalog, list[EndpointConfig]], None]] = []
 
-    def _build(self, subtensor: bt.Subtensor):
-        check_models(self.config, self.catalog)
-        signed = build_manifest(self.config, self.wallet.hotkey, self.catalog.digest(), subtensor.get_current_block())
+    def _build(self, cat: catalog.Catalog, subtensor: bt.Subtensor) -> SignedManifest:
+        endpoints = servable(self.config, cat)
+        if not endpoints:
+            raise SystemExit(f"no configured endpoint serves a model of catalog {cat.digest()[:12]}")
+        signed = build_manifest(self.config, endpoints, self.wallet.hotkey, cat.digest())
         if self.publish_on_chain:
             publish(subtensor, self.wallet, self.config, signed)
         return signed
 
-    def watch(self, interval_s: float = 600.0) -> None:
+    def endpoints(self) -> list[EndpointConfig]:
+        listed = {e.endpoint_id for e in self.signed.manifest.endpoints}
+        return [e for e in self.config.endpoints if e.endpoint_id in listed]
+
+    def watch(self, interval_s: float = CATALOG_WATCH_S) -> None:
+        """Follow the owner's catalog commitment; a catalog that cannot be applied yet is retried."""
+
         def run() -> None:
             st = bt.Subtensor(network=self.config.network)
             store = catalog.CatalogStore(self.config.catalog_dir)
@@ -68,27 +95,20 @@ class Publisher:
                 try:
                     if committed_catalog(st, self.config.netuid) == self.catalog.digest():
                         continue
-                    self.catalog = current_catalog(st, self.config.netuid, store, self.config.catalog_mirrors)
-                    self.signed = self._build(st)
-                    log.info("catalog %s committed; manifest re-published", self.catalog.digest()[:12])
-                    for callback in self.on_catalog:
-                        callback(self.catalog)
-                except (catalog.CatalogUnavailable, SystemExit, RuntimeError) as exc:
-                    log.error("new catalog not applied: %s", exc)
+                    cat = current_catalog(st, self.config.netuid, store, self.config.catalog_mirrors)
+                    signed = self._build(cat, st)
+                except SystemExit as exc:
+                    log.critical("%s; stopping", exc)
+                    os._exit(1)
                 except Exception:
-                    log.exception("catalog watch failed")
+                    log.exception("new catalog not applied; retrying")
+                    continue
+                self.catalog, self.signed = cat, signed
+                log.info("catalog %s committed; manifest re-published", cat.digest()[:12])
+                for callback in self.on_catalog:
+                    callback(cat, self.endpoints())
 
         threading.Thread(target=run, name="catalog-watch", daemon=True).start()
-
-
-def check_models(config: MinerConfig, cat: catalog.Catalog) -> None:
-    for e in config.endpoints:
-        model = cat.get(e.model_id)
-        if model is None or model.status == "retired":
-            raise SystemExit(f"endpoint {e.endpoint_id}: model {e.model_id!r} is not served by the current catalog")
-        if model.status != "active":
-            log.warning("endpoint %s: %s is a %s model; validators check it but do not score it", e.endpoint_id,
-                        e.model_id, model.status)
 
 
 def resolve_catalog(subtensor: bt.Subtensor, config: MinerConfig) -> catalog.Catalog:
@@ -113,30 +133,35 @@ def main() -> None:
     wallet = bt.Wallet(name=config.wallet_name, hotkey=config.hotkey_name)
     subtensor = bt.Subtensor(network=config.network)
     cat = catalog.load() if args.no_publish else resolve_catalog(subtensor, config)
+    policy = cat.audit_policy()
+    endpoints = servable(config, cat)
+    if not endpoints:
+        raise SystemExit(f"no configured endpoint serves a model of catalog {cat.digest()[:12]}")
+
+    audited = audit_endpoints(config, endpoints, policy)
+    bench_ok, bench_error = bench_extension_available() if audited else (True, "")
+    if not bench_ok and policy.mode != "observe":
+        raise SystemExit(f"capacity audit bench extension unavailable: {bench_error[-300:]}")
+
     publisher = Publisher(config, wallet, cat, publish_on_chain=not args.no_publish, subtensor=subtensor)
     if not args.no_publish:
         publisher.watch()
-    policy = cat.audit_policy()
 
     drain = DrainState()
-    endpoints = audit_endpoints(config, policy)
-    if endpoints:
-        ok, error = bench_extension_available()
-        if ok:
-            chain = SubtensorChainView(config.network, config.netuid, policy.auditor_hotkey)
-            worker = AuditWorker(netuid=config.netuid, keypair=wallet.hotkey, endpoints=endpoints, policy=policy,
-                                 chain=chain, drain=drain)
+    if audited and bench_ok:
+        chain = SubtensorChainView(config.network, config.netuid, policy.auditor_hotkey)
+        worker = AuditWorker(netuid=config.netuid, keypair=wallet.hotkey, endpoints=audited, policy=policy,
+                             chain=chain, drain=drain)
 
-            def adopt(cat: catalog.Catalog) -> None:
-                worker.set_policy(cat.audit_policy())
-                chain.set_auditor_hotkey(cat.audit_policy().auditor_hotkey)
+        def adopt(cat: catalog.Catalog, served: list[EndpointConfig]) -> None:
+            policy = cat.audit_policy()
+            chain.set_auditor_hotkey(policy.auditor_hotkey)
+            worker.set_policy(policy, audit_endpoints(config, served, policy))
 
-            publisher.on_catalog.append(adopt)
-            worker.start()
-        elif policy.mode == "observe":
-            log.warning("capacity audit bench extension unavailable (%s); audits will be missed", error[-200:])
-        else:
-            raise SystemExit(f"capacity audit bench extension unavailable: {error[-300:]}")
+        publisher.on_catalog.append(adopt)
+        worker.start()
+    elif audited:
+        log.warning("capacity audit bench extension unavailable (%s); audits will be missed", bench_error[-200:])
 
     authorizer = PermitAuthorizer(subtensor, config.netuid, config.gateway_hotkeys)
     engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key) for e in config.endpoints}

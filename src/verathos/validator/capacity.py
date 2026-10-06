@@ -12,7 +12,7 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from pathlib import Path
 
 import bittensor as bt
@@ -72,7 +72,8 @@ class Capacity:
         self.policy = policy
         (self.auditor or self.holds).set_policy(policy)
 
-    def start_slot_refresh(self, network: str, catalog_digest: Callable[[], str], interval_s: float = 600.0) -> None:
+    def start_slot_refresh(self, network: str, mechid: int, catalog_digests: Callable[[], Collection[str]],
+                           interval_s: float = 600.0) -> None:
         """Re-discover miners every ``interval_s`` so new or changed endpoints join the audit within minutes rather
         than at the next epoch."""
 
@@ -82,15 +83,15 @@ class Capacity:
                 time.sleep(interval_s)
                 try:
                     neurons, _ = validator_chain.snapshot(st, self.netuid)
-                    self.update_slots(asyncio.run(self._discover(neurons, catalog_digest())))
+                    self.update_slots(asyncio.run(self._discover(neurons, mechid, catalog_digests())))
                 except Exception:
                     log.exception("capacity slot refresh failed")
 
         threading.Thread(target=run, name="capacity-slots", daemon=True).start()
 
-    async def _discover(self, neurons: list, catalog_digest: str) -> list[DiscoveredMiner]:
+    async def _discover(self, neurons: list, mechid: int, catalog_digests: Collection[str]) -> list[DiscoveredMiner]:
         async with httpx.AsyncClient() as client:
-            return await discover(neurons, self.netuid, client, catalog_digest)
+            return await discover(neurons, self.netuid, mechid, client, catalog_digests)
 
     def update_slots(self, miners: list[DiscoveredMiner]) -> None:
         slots = capacity_slots(miners, self.netuid)

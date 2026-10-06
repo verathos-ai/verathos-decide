@@ -45,7 +45,7 @@ def miner(host: str, keypair: Keypair, validator: Keypair, engine: MockEngine):
                        "hardware": {"kind": "cuda", "device_id": f"GPU-{host}"}, "max_concurrency": 8}]})
     digest = catalog.load().digest()
     signed = SignedManifest.create(Manifest(
-        netuid=405, mechid=1, hotkey=keypair.ss58_address, seq=1, issued_block=1, catalog_digest=digest,
+        netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest=digest,
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
                             hardware=config.endpoints[0].hardware, max_concurrency=8)]), keypair)
     app = create_app(config=config, keypair=keypair, manifest=lambda: signed, engines={"gpu0": engine},
@@ -64,24 +64,25 @@ def test_canary_pool_is_deterministic_and_assignment_rotates() -> None:
 
 def test_epoch_scores_honest_and_zeroes_cheater() -> None:
     validator, honest_kp, cheat_kp, ghost_kp = kp(), kp(), kp(), kp()
-    honest_app, honest_commit = miner("honest", honest_kp, validator, MockEngine("kev-4b"))
-    cheat_app, cheat_commit = miner("cheat", cheat_kp, validator, MockEngine("kev-4b", salt="other-model"))
-    ghost_app, _ = miner("ghost", ghost_kp, validator, MockEngine("kev-4b"))
+    honest, cheat, ghost = "10.0.0.1", "10.0.0.2", "10.0.0.3"
+    honest_app, honest_commit = miner(honest, honest_kp, validator, MockEngine("kev-4b"))
+    cheat_app, cheat_commit = miner(cheat, cheat_kp, validator, MockEngine("kev-4b", salt="other-model"))
+    ghost_app, _ = miner(ghost, ghost_kp, validator, MockEngine("kev-4b"))
     neurons = [
-        Neuron(1, honest_kp.ss58_address, "honest", 80, honest_commit),
-        Neuron(2, cheat_kp.ss58_address, "cheat", 80, cheat_commit),
-        Neuron(3, ghost_kp.ss58_address, "ghost", 80, None),  # serves a manifest but never committed it
+        Neuron(1, honest_kp.ss58_address, honest, 80, honest_commit),
+        Neuron(2, cheat_kp.ss58_address, cheat, 80, cheat_commit),
+        Neuron(3, ghost_kp.ss58_address, ghost, 80, None),  # serves a manifest but never committed it
     ]
 
     async def run():
-        transport = HostRouter({"honest": honest_app, "cheat": cheat_app, "ghost": ghost_app})
+        transport = HostRouter({honest: honest_app, cheat: cheat_app, ghost: ghost_app})
         async with httpx.AsyncClient(transport=transport) as client:
-            miners = await discover(neurons, 405, client, catalog.load().digest())
+            miners = await discover(neurons, 405, 1, client, {catalog.load().digest()})
             endpoints = [e for m in miners for e in m.endpoints()]
             results = await audit_epoch(endpoints, epoch=1, secret=b"k" * 32, keypair=validator,
                                         references={"kev-4b": MockEngine("kev-4b")},
                                         tolerances={"kev-4b": Tolerance(min_probabilities=20)}, client=client,
-                                        pool_size=10, per_endpoint=6)
+                                        netuid=405, mechid=1, pool_size=10, per_endpoint=6)
             return miners, results
 
     miners, results = asyncio.run(run())
@@ -99,12 +100,12 @@ def test_epoch_scores_honest_and_zeroes_cheater() -> None:
     update(state, results, scores, failed)
     w = weights(state, {1: honest_kp.ss58_address, 2: cheat_kp.ss58_address})
     assert w == {1: pytest.approx(1.0)}
-    assert state.probation == {f"{cheat_kp.ss58_address}/gpu0": 6}
+    assert state.probation == {f"{cheat_kp.ss58_address}/gpu0": 5}  # the failing epoch is the first of six
 
     # probation holds even if the cheater behaves next epoch
     update(state, results, {k: 1.0 for k in scores}, set())
     assert state.ema[f"{cheat_kp.ss58_address}/gpu0"] == 0.0
-    assert state.probation[f"{cheat_kp.ss58_address}/gpu0"] == 5
+    assert state.probation[f"{cheat_kp.ss58_address}/gpu0"] == 4
 
 
 def test_weights_ignore_reassigned_uids() -> None:
@@ -148,7 +149,7 @@ def test_capacity_gate_and_unauditable_endpoints() -> None:
         endpoint = Endpoint(endpoint_id="gpu0", url=f"http://h{uid}/e/gpu0", model_id="kev-4b",
                             hardware=hardware[hotkey], max_concurrency=8)
         miners.append(DiscoveredMiner(uid, hotkey, f"http://h{uid}", Manifest(
-            netuid=405, mechid=1, hotkey=hotkey, seq=1, issued_block=1, catalog_digest=catalog.load().digest(),
+            netuid=405, mechid=1, hotkey=hotkey, catalog_digest=catalog.load().digest(),
             endpoints=[endpoint])))
     assert [s.hotkey for s in capacity_slots(miners, 405)] == [audited]
     assert unauditable_endpoints(miners, AuditPolicy()) == {f"{undeclared}/gpu0"}
@@ -164,3 +165,78 @@ def test_capacity_gate_and_unauditable_endpoints() -> None:
                                   unauditable={f"{undeclared}/gpu0"})
     assert scores == {f"{audited}/gpu0": 0.0, f"{undeclared}/gpu0": 0.0}
     assert failed == {f"{audited}/gpu0"}
+
+
+def test_hostile_replies_fail_the_endpoint_without_aborting_the_epoch() -> None:
+    """Malformed identity replies, NaN probabilities and junk receipts are recorded against the endpoint."""
+    from fastapi import FastAPI
+    from fastapi.responses import PlainTextResponse
+
+    from verathos.validator.discovery import DiscoveredEndpoint
+
+    validator, hostile_kp = kp(), kp()
+    app = FastAPI()
+
+    @app.post("/e/gpu0/v1/identity")
+    async def identity():
+        return PlainTextResponse('{"signature": 5}', media_type="application/json")
+
+    @app.post("/e/gpu0/v1/systemone")
+    async def systemone():
+        return PlainTextResponse('{"answers": {"q": {"noul": NaN}}, "receipt": []}', media_type="application/json")
+
+    ep = DiscoveredEndpoint(1, hostile_kp.ss58_address, "http://10.0.0.9:80", Endpoint(
+        endpoint_id="gpu0", url="http://10.0.0.9:80/e/gpu0", model_id="kev-4b",
+        hardware={"kind": "cuda", "device_id": "GPU-x"}, max_concurrency=1))
+
+    async def run():
+        async with httpx.AsyncClient(transport=HostRouter({"10.0.0.9": app})) as client:
+            return await audit_epoch([ep], epoch=1, secret=b"k" * 32, keypair=validator,
+                                     references={"kev-4b": MockEngine("kev-4b")},
+                                     tolerances={"kev-4b": Tolerance()}, client=client, netuid=405, mechid=1,
+                                     pool_size=4, per_endpoint=3)
+
+    result = asyncio.run(run())[ep.key]
+    assert not result.identity_ok
+    assert result.sent == 3 and len(result.tally.hard_failures) == 3
+    assert result.tally.verdict() is Verdict.FAIL_HARD
+
+
+def test_non_finite_or_out_of_range_probabilities_are_malformed() -> None:
+    from verathos.protocol.api import distributions
+
+    for bad in ({"q": {"noul": float("nan")}}, {"q": {"probabilities": {"a": "0.5"}}}, {"q": {"noul": 1.5}},
+                {"q": {"noul": True}}, {"q": []}, []):
+        with pytest.raises(ValueError):
+            distributions(bad)
+    assert distributions({"q": {"noul": 0.25}}) == {"q": {"false": 0.75, "true": 0.25}}
+
+
+def test_renamed_endpoint_inherits_probation() -> None:
+    from verathos.validator.audit import EndpointResult
+    from verathos.validator.discovery import DiscoveredEndpoint
+
+    def result(endpoint_id: str) -> EndpointResult:
+        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(
+            endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}", model_id="kev-4b",
+            hardware={"kind": "cuda", "device_id": "GPU-a"}, max_concurrency=1))
+        return EndpointResult(ep, Tolerance(), identity_ok=True, sent=4, answered=4, latencies_ms=[40.0] * 4)
+
+    state = ScoreState()
+    update(state, {"hkA/gpu0": result("gpu0")}, {"hkA/gpu0": 0.0}, {"hkA/gpu0"}, probation_epochs=6)
+    update(state, {"hkA/renamed": result("renamed")}, {"hkA/renamed": 1.0}, set(), probation_epochs=6)
+    assert state.ema["hkA/renamed"] == 0.0 and state.probation["hkA/renamed"] == 4
+
+
+def test_uid_value_is_its_best_endpoint_until_capacity_gates() -> None:
+    state = ScoreState(ema={"hkA/gpu0": 0.5, "hkA/gpu1": 0.5, "hkB/gpu0": 0.5},
+                       uid_of={"hkA/gpu0": 1, "hkA/gpu1": 1, "hkB/gpu0": 2})
+    hotkeys = {1: "hkA", 2: "hkB"}
+    assert weights(state, hotkeys, per_uid="max") == {1: pytest.approx(0.5), 2: pytest.approx(0.5)}
+    assert weights(state, hotkeys, per_uid="sum") == {1: pytest.approx(2 / 3), 2: pytest.approx(1 / 3)}
+
+
+def test_gone_endpoints_are_forgotten() -> None:
+    state = ScoreState(ema={"hkA/gpu0": 1e-5}, uid_of={"hkA/gpu0": 1}, window={"hkA/gpu0": [[0.0, 1.0]]})
+    update(state, {}, {}, set())
+    assert state.ema == {} and state.uid_of == {} and state.window == {}

@@ -2,7 +2,8 @@
 
 The catalog is a JSON document. The subnet owner commits its digest on chain; miners and validators use the catalog
 whose digest equals the owner's current commitment, whatever its source: the copy shipped with the code, a local
-cache, the owner's axon, or a mirror. A new catalog therefore takes effect without a code release.
+cache, the owner's axon, or a mirror. A new catalog therefore takes effect without a code release. The digest covers
+the JSON document as published, so nodes whose code knows fewer fields still agree on it.
 
 Only ``active`` models are scored. ``candidate`` models may be served and checked on the network but earn nothing;
 ``retired`` models are ignored.
@@ -19,10 +20,11 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_validator
 
 from verathos.capacity.core import AuditPolicy
 from verathos.protocol.canonical import digest
+from verathos.protocol.http import get_json
 from verathos.validator.compare import Tolerance
 
 log = logging.getLogger(__name__)
@@ -30,6 +32,7 @@ log = logging.getLogger(__name__)
 COMMITMENT_PREFIX = "verathos/catalog/v1 sha256:"
 CATALOG_PATH = "/v1/catalog/{digest}"
 DEFAULT_CACHE_DIR = Path("~/.verathos/catalog")
+MAX_CATALOG_BYTES = 1 << 20
 
 
 class Engine(BaseModel):
@@ -63,6 +66,19 @@ class Catalog(BaseModel):
     revision: str
     models: list[CatalogModel]
     capacity_audit: dict[str, Any] = Field(default_factory=dict, description="Overrides of the capacity-audit policy")
+    _document: Any = PrivateAttr(None)
+
+    @classmethod
+    def parse(cls, document: Any) -> Catalog:
+        """Validate a catalog document (parsed JSON), keeping the document for the digest. Raises ValueError."""
+        catalog = cls.model_validate(document)
+        digest(document)  # raises ValueError for documents without a canonical encoding (NaN)
+        catalog._document = document
+        return catalog
+
+    def document(self) -> Any:
+        """The JSON document this catalog was parsed from (or its own fields if built in code)."""
+        return self._document if self._document is not None else self.model_dump(mode="json")
 
     @model_validator(mode="after")
     def _check(self) -> Catalog:
@@ -80,14 +96,10 @@ class Catalog(BaseModel):
         return dataclasses.replace(AuditPolicy(), **self.capacity_audit)
 
     def digest(self) -> str:
-        return digest(self.model_dump(mode="json"))
+        return digest(self.document())
 
     def get(self, model_id: str) -> CatalogModel | None:
         return next((m for m in self.models if m.model_id == model_id), None)
-
-    def scored(self, model_id: str) -> bool:
-        model = self.get(model_id)
-        return model is not None and model.status == "active"
 
 
 class CatalogUnavailable(Exception):
@@ -97,7 +109,7 @@ class CatalogUnavailable(Exception):
 def load(path: Path | None = None) -> Catalog:
     """Load the catalog from ``path``, or the one shipped with the package."""
     text = path.read_text() if path else resources.files(__package__).joinpath("catalog.json").read_text()
-    return Catalog.model_validate(json.loads(text))
+    return Catalog.parse(json.loads(text))
 
 
 class CatalogStore:
@@ -120,7 +132,7 @@ class CatalogStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.path(catalog.digest())
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(catalog.model_dump_json(indent=2) + "\n")
+        tmp.write_text(json.dumps(catalog.document(), indent=2, ensure_ascii=False) + "\n")
         tmp.replace(path)
         return path
 
@@ -139,9 +151,7 @@ def resolve(catalog_digest: str, *, store: CatalogStore, sources: list[str]) -> 
     for template in sources:
         url = template.format(digest=catalog_digest)
         try:
-            response = httpx.get(url, timeout=15, follow_redirects=True)
-            response.raise_for_status()
-            catalog = Catalog.model_validate(response.json())
+            catalog = Catalog.parse(get_json(url, limit=MAX_CATALOG_BYTES, timeout=15))
         except (httpx.HTTPError, ValueError, ValidationError) as exc:
             log.info("catalog %s not available from %s: %s", catalog_digest[:12], url, exc)
             continue
