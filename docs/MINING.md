@@ -48,18 +48,25 @@ kernels, the block prover and the Rust GEMM prover. Run it again after every upd
 
 ## 3. Start one engine per GPU
 
-Each catalog model names its engine and the exact engine revision (`engine.source` at `engine.revision`). Kev
-models run on the Kev engine, which serves `POST /v1/systemone`:
+Validators check answers, not engines: any engine that serves `POST /v1/systemone` and returns the reference
+probabilities within the model's tolerances passes, and a faster engine earns more through the latency factor.
+Each catalog model names a known-good engine and revision (`engine.source` at `engine.revision`); a different
+engine or version is the miner's risk, since answers that drift past the tolerances fail like a wrong model.
+
+What must be exact are the weights: the catalog pins `hf_repo` at `hf_revision`. Download that revision and serve
+it from disk, so an update of the model repository never changes what the endpoint serves. Quantised or other
+weights fail verification.
+
+Kev models on the Kev engine:
 
 ```bash
 git clone https://github.com/jaredpalmer/kev && cd kev && git checkout <engine.revision>
 uv sync --extra serve -p 3.12 && VIRTUAL_ENV=$PWD/.venv uv pip install flash-linear-attention
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m kev.serve --run jaredpalmer/kev-4b --port 8008
-CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m kev.serve --run jaredpalmer/kev-9b --port 8009
+.venv/bin/huggingface-cli download jaredpalmer/kev-4b --revision <hf_revision> --local-dir models/kev-4b
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m kev.serve --run models/kev-4b --port 8008
 ```
 
-Serve the exact weights the catalog pins (`hf_repo` at `hf_revision`). Any other weights, quantisation or model
-fails verification. Keep each engine on its own GPU and bind it to localhost.
+Keep each engine on its own GPU and bind it to localhost.
 
 Clef models run on `verathos-engine`, which loads the inference code shipped in the model repository at the pinned
 revision. Install it in its own environment:

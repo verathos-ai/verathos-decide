@@ -39,14 +39,17 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,capacity]"
 
 ## 2. Start the reference engines
 
+The reference defines the right answer, so it runs exactly what the catalog pins: the engine at `engine.revision`
+and the weights at `hf_revision`, in float32.
+
 ```bash
-git clone https://github.com/jaredpalmer/kev && cd kev
+git clone https://github.com/jaredpalmer/kev && cd kev && git checkout <engine.revision>
 uv sync --extra serve -p 3.12
-CUDA_VISIBLE_DEVICES="" KEV_DTYPE=fp32 .venv/bin/python -m kev.serve --run jaredpalmer/kev-4b --port 8101
-CUDA_VISIBLE_DEVICES="" KEV_DTYPE=fp32 .venv/bin/python -m kev.serve --run jaredpalmer/kev-9b --port 8102
+.venv/bin/huggingface-cli download jaredpalmer/kev-4b --revision <hf_revision> --local-dir models/kev-4b
+CUDA_VISIBLE_DEVICES="" KEV_DTYPE=fp32 .venv/bin/python -m kev.serve --run models/kev-4b --port 8101
 ```
 
-Run them on CPU without `flash-linear-attention` installed. Each engine must serve the catalog's pinned weights.
+Run them on CPU without `flash-linear-attention` installed.
 Clef models use `verathos-engine` in float32 (see `MINING.md` for the install):
 
 ```bash
