@@ -33,7 +33,8 @@ DEFAULT_CACHE_DIR = Path("~/.verathos/catalog")
 
 
 class Engine(BaseModel):
-    """The SystemOne engine that serves a model, pinned to a source revision."""
+    """The reference engine of a model, pinned to a source revision. Validators compute reference answers with it;
+    miners may serve the model with any engine whose answers stay within the model's tolerances."""
 
     name: str = Field(min_length=1, max_length=64)
     source: str = Field(pattern=r"^https://")
