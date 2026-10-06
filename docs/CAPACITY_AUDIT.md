@@ -136,33 +136,37 @@ a switch for the subnet owner if the audit misbehaves, not a normal operating mo
 ## Downtime, detection and qualification
 
 An endpoint stops serving only during its timed work: from `B_start` until its final receipt, about 20 s on a
-calibrated GPU and at most `deadline_s + transport_grace_s`. Validators hold their canaries for a drafted endpoint
-during those blocks (one block before `B_start` to one after the deadline), so an audit never costs an endpoint
-score.
+calibrated GPU and at most `deadline_s + transport_grace_s`. Serving during the timed work is not possible: the
+engine and the bench take turns on the GPU, so on an RTX 5090 serving Kev-4B at 25% of its capacity (19 requests/s)
+stretched the timed work from 19.8 s to 36.4 s, past the deadline, and even one request at a time back to back took
+it to 40 s. Validators hold their canaries for a drafted endpoint during those blocks (one block before `B_start` to
+one after the deadline), so an audit never costs an endpoint score.
 
 A sybil is caught only when two endpoints sharing one GPU are drafted into the same window: both then need about
-40 s and miss the deadline. Gating takes two such windows (the timing threshold), and verdicts count closed epochs
-only, so add one epoch. A new endpoint is therefore scored only after `qualification_epochs` epochs; most sybils are
-gated before they are ever scored. Renaming an endpoint restarts its qualification, and new endpoints of a hotkey on
-probation inherit the probation.
+43 s and miss the deadline. Gating takes two such windows (the timing threshold), and verdicts count closed epochs
+only, so add one epoch. A new endpoint is therefore scored only after `qualification_epochs` epochs; almost all
+sybils are gated before they are ever scored. Renaming an endpoint restarts its qualification, and new endpoints of
+a hotkey on probation inherit the probation.
 
-Simulated with the selection and draft code over block-by-block windows (300 runs, 180-block epochs,
-`windows_per_epoch` 4, busy slots excluded as on the network), for the hardest case of two endpoints on one GPU,
-endpoints of different hotkeys on different IPs (no shared grouping token), plus the cheaper shapes. Epochs to gate
-are epochs until the second shared window:
+The share of the network that pauses at once is the per-window draft share. Spreading audits over more windows with
+a smaller share keeps detection while flattening that peak, until the busy period after each audit (a slot cannot
+be drafted again until its proof is delivered, about 18 blocks) limits how often a slot can be audited. Simulated
+with the selection and draft code over block-by-block windows (200 runs, 180-block epochs, about 22 s pause per
+audit, busy slots excluded as on the network), for the hardest case of two endpoints on one GPU behind different
+hotkeys and IPs (no shared grouping token). Epochs to gate are epochs until the second shared window:
 
-| `draft_probability` | audits per endpoint and epoch | downtime | 2 hotkeys, 2 IPs: median / 90% / 99% | 2 hotkeys, 1 IP: median / 90% | 1 hotkey, 1 IP: median / 90% |
-|---|---|---|---|---|---|
-| 0.25 | 1.6 | 2.6% | 2.1 / 5.1 / - | 1.6 / 3.5 | 1.2 / 3.0 |
-| 0.35 | 1.9 | 3.1% | 1.5 / 3.1 / 6.2 | 1.1 / 2.4 | 0.9 / 2.1 |
-| **0.5 (default)** | 2.2 | 3.5% | 0.9 / 1.9 / 3.3 | 0.8 / 1.8 | 0.8 / 1.6 |
+| `draft_probability`, `windows_per_epoch` | endpoints paused per window | downtime per endpoint | epochs to gate: median / 90% / 99% |
+|---|---|---|---|
+| 0.5, 4 | 60% | 2.4% | 0.9 / 2.0 / 3.6 |
+| 0.35, 8 | 43% | 3.4% | 0.8 / 1.8 / 3.0 |
+| **0.25, 12 (default)** | 32% | 3.8% | 1.0 / 2.3 / 3.6 |
+| 0.2, 16 | 26% | 4.0% | 1.2 / 3.1 / 5.3 |
+| 0.15, 20 | 21% | 4.0% | 1.6 / 3.7 / 6.6 |
 
-Downtime is the share of time an endpoint does not serve (about 35 s per audit). A drafted slot stays busy until its
-proof is delivered (about 21 blocks), which caps audits at about two per epoch, so a higher draft probability mostly
-adds shared windows rather than downtime. With the default, about half of the endpoints run their timed work in the
-same window. A two-endpoint sybil is gated within 3.3 epochs in 99% of cases (4.3 with the closed-epoch lag), hence
-4 qualification epochs (about 2.4 hours): almost all sybils are gated before they are ever scored. More endpoints
-per GPU are caught faster.
+With the default a window opens about every 3 minutes and a third of the endpoints pause in it for about 20 s; each
+endpoint is audited about 3.7 times per epoch. A two-endpoint sybil is gated within 3.6 epochs in 99% of cases (4.6
+with the closed-epoch lag), hence 5 qualification epochs (3 hours). Sybils that share a hotkey or an IP, or put more
+endpoints on one GPU, are caught faster.
 
 ## Policy
 
@@ -170,13 +174,13 @@ per GPU are caught faster.
 |---|---|---|
 | `mode` | `score_gate` | `score_gate` or `observe` |
 | `auditor_hotkey` | subnet owner | hotkey that evaluates audits |
-| `windows_per_epoch` | 4 | expected windows per epoch |
-| `draft_probability` | 0.5 | `t`, the probability of each draw (slot id, each grouping token) per window |
+| `windows_per_epoch` | 12 | expected windows per epoch |
+| `draft_probability` | 0.25 | `t`, the probability of each draw (slot id, each grouping token) per window |
 | `group_stress_fraction` | 0.35 | share of `t` drawn on grouping tokens instead of the slot id |
-| `qualification_epochs` | 4 | epochs a new endpoint is checked before it is scored |
+| `qualification_epochs` | 5 | epochs a new endpoint is checked before it is scored |
 | `lead_blocks`, `proof_challenge_delay_blocks` | 5, 4 | `B_select` to `B_start` to `B_proof` |
 | `deadline_s`, `transport_grace_s` | 30, 3 | must be shorter than `proof_challenge_delay_blocks` blocks |
-| `payload_deadline_s` | 90 | proof delivery after `B_proof` |
+| `payload_deadline_s` | 45 | proof delivery after `B_proof` |
 | `max_proof_payload_bytes` | 32 MiB | |
 | `repeat_window_epochs` | 10 | evidence window |
 | `gpu_classes` | none | calibrated workload rows; only these GPU classes can be audited |

@@ -148,7 +148,7 @@ logs it once per epoch, plus every capacity audit once its outcome is final:
 
 ```
 endpoint gpu0: kev-4b (active) on NVIDIA GeForce RTX 5090 32 GB, CUDA device 0, engine http://127.0.0.1:8008
-new endpoints are checked for 4 epochs (about 2.4 h) before they are scored
+new endpoints are checked for 5 epochs (about 3.0 h) before they are scored
 manifest committed on chain (2968f3219dc7)
 serving 1 endpoints on port 8091; status is logged once per epoch
 capacity audit at block 8163045, gpu0: drafted, timed work starts at block 8163050
