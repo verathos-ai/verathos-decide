@@ -23,7 +23,7 @@ import httpx
 
 from verathos import catalog
 from verathos.miner.engine import HttpEngine
-from verathos.validator import chain
+from verathos.validator import chain, status
 from verathos.validator.audit import audit_epoch
 from verathos.validator.capacity import Capacity, unauditable_endpoints
 from verathos.validator.config import ValidatorConfig
@@ -31,6 +31,7 @@ from verathos.validator.discovery import discover
 from verathos.validator.follow import CatalogFollower
 from verathos.validator.scoring import ScoreState, epoch_scores, note_seen, record_window, update, weights
 from verathos.validator.service import start_service
+from verathos.validator.status import StatusBoard
 
 log = logging.getLogger("verathos.validator")
 BLOCK_S = 12.0
@@ -53,7 +54,8 @@ def load_secret(state_dir: Path) -> bytes:
 
 
 async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, secret: bytes, state: ScoreState,
-                    epoch: int, blocks_left: int, capacity: Capacity, current: CatalogFollower) -> None:
+                    epoch: int, blocks_left: int, capacity: Capacity, current: CatalogFollower,
+                    board: StatusBoard) -> None:
     cat = current.catalog
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
     references = {m: HttpEngine(url) for m, url in cfg.references.items()
@@ -98,6 +100,11 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         log.info("  %s epoch_verdict=%s answered=%d/%d identity=%s mean_abs=%.4f score=%.3f%s",
                  key, r.tally.verdict().value, r.answered, r.sent, r.identity_ok, r.tally.mean_abs,
                  scores.get(key, 0.0), f" errors={sorted(set(r.errors))}" if r.errors else "")
+    board.publish(status.build(
+        epoch=epoch, epoch_blocks=cat.epoch_blocks, endpoints=endpoints, results=results, scores=scores, failed=failed,
+        gated={f"{hk}/{ep}": rule for (hk, ep), rule in gated.items()}, unauditable=unauditable,
+        qualifying=qualifying, scored_models={m.model_id for m in cat.models if m.status == "active"},
+        qualification_epochs=capacity.policy.qualification_epochs, state=state))
     # The epoch is scored; a failure from here on must not run it again.
     try:
         set_weights(cfg, st, wallet, weights(state, hotkey_of_uid), hotkey_of_uid)
@@ -121,6 +128,7 @@ def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: di
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--once", action="store_true", help="Run one epoch immediately and exit")
@@ -137,6 +145,7 @@ def main() -> None:
     current = CatalogFollower(st, cfg.network, cfg.netuid, catalog.CatalogStore(cfg.catalog_dir), cfg.catalog_mirrors)
     capacity = Capacity.start(network=cfg.network, netuid=cfg.netuid, policy=current.catalog.audit_policy(), st=st,
                               wallet=wallet, state_dir=state_dir)
+    board = StatusBoard()
     is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)
     if is_owner or capacity.auditor is not None:
         if not cfg.public_host:
@@ -144,7 +153,7 @@ def main() -> None:
         if is_owner:
             current.store.put(current.catalog)
         start_service(st=st, wallet=wallet, netuid=cfg.netuid, public_host=cfg.public_host, port=cfg.port,
-                      store=current.store if is_owner else None, auditor=capacity.auditor)
+                      store=current.store if is_owner else None, auditor=capacity.auditor, board=board)
     current.on_change.append(lambda cat: capacity.set_policy(cat.audit_policy()))
     current.start()
     capacity.start_slot_refresh(cfg.network, cfg.mechid, current.accepted)
@@ -159,7 +168,7 @@ def main() -> None:
             if epoch != done:
                 blocks_left = max(next_start - block, 1)
                 asyncio.run(run_epoch(cfg, st, wallet, secret, state, epoch, 1 if args.once else blocks_left,
-                                      capacity, current))
+                                      capacity, current, board))
                 state.save(state_path)
                 done = epoch
                 if args.once:

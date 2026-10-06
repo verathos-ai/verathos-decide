@@ -130,6 +130,10 @@ def default_bench_command(audit: SelectedAudit, *, out_dir: Path, challenge_file
             "--challenge-file", str(challenge_file), "--challenge-timeout-s", str(challenge_timeout_s)]
 
 
+def _where(audit: SelectedAudit) -> str:
+    return f"capacity audit at block {audit.selection_block}, {audit.endpoint.endpoint_id}"
+
+
 class _Lane:
     """One ordered delivery lane to the audit validator. Each artifact is retried until its deadline."""
 
@@ -345,8 +349,7 @@ class AuditWorker:
                                  daemon=True)
             self._threads.append(t)
             t.start()
-            log.info("endpoint %s drafted: audit %s B_select=%d B_start=%d B_proof=%d", ep.endpoint_id, audit_id[:12],
-                     block_number, audit_block, proof_block)
+            log.info("%s: drafted, timed work starts at block %d", _where(audit), audit_block)
 
     def _slot(self, ep: AuditEndpoint) -> core.Slot:
         return core.Slot(self.netuid, self.keypair.ss58_address, ep.endpoint_id, ep.url, ep.model_id, ep.gpu_name,
@@ -392,10 +395,10 @@ class AuditWorker:
 
         start_hash = self._wait_hash(audit.audit_block, lead_s + 60.0)
         if start_hash is None:
-            log.warning("audit %s: B_start %d not observed in time", audit.audit_id[:12], audit.audit_block)
+            log.warning("%s: B_start %d not observed in time", _where(audit), audit.audit_block)
             return proc
         if proc.poll() is not None:
-            log.warning("audit %s: bench exited before B_start: %s", audit.audit_id[:12], proc.stderr.read()[-500:])
+            log.warning("%s: bench exited before B_start: %s", _where(audit), proc.stderr.read()[-500:])
             return proc
         started = time.time()
         # the endpoint stops serving only while the timed work runs
@@ -413,10 +416,10 @@ class AuditWorker:
                 timing = json.loads(files["final_timing.json"].read_text())
                 transcript = str(timing.get("transcript_root") or "")
                 if not transcript:
-                    log.warning("audit %s: bench reported no transcript root", audit.audit_id[:12])
+                    log.warning("%s: bench reported no transcript root", _where(audit))
                     return proc
                 if self._hashes.get(audit.proof_block) is not None:
-                    log.warning("audit %s: timed work finished after B_proof; no receipt sent", audit.audit_id[:12])
+                    log.warning("%s: timed work finished after B_proof; no receipt sent", _where(audit))
                     return proc
                 # retried only while the auditor can still time it: a receipt after B_proof would be invalid
                 self.publisher.receipts.publish(core.RECEIPT_PATH, self._artifact(
@@ -424,19 +427,21 @@ class AuditWorker:
                     combined=final_commitment(timing), B_start_hash=start_hash.hex()),
                     until=started + p.deadline_s + p.transport_grace_s, retry_delay_s=0.25)
                 self.drain.clear(audit.endpoint.endpoint_id)
+                log.info("%s: timed work done in %.1f s, final receipt sent",
+                         _where(audit), time.time() - started)
                 break
             if proc.poll() is not None:
-                log.warning("audit %s: bench ended without final receipt: %s", audit.audit_id[:12],
+                log.warning("%s: bench ended without final receipt: %s", _where(audit),
                             proc.stderr.read()[-500:])
                 return proc
             time.sleep(0.02)
         if not transcript:
-            log.warning("audit %s: no final receipt within the deadline", audit.audit_id[:12])
+            log.warning("%s: no final receipt within the deadline", _where(audit))
             return proc
 
         proof_hash = self._wait_hash(audit.proof_block, challenge_wait_s)
         if proof_hash is None:
-            log.warning("audit %s: B_proof %d not observed in time", audit.audit_id[:12], audit.proof_block)
+            log.warning("%s: B_proof %d not observed in time", _where(audit), audit.proof_block)
             return proc
         challenge = core.derive_proof_challenge_seed(transcript, proof_hash, audit.lease, audit.slot.slot_id, 0)
         proof_seen = time.time()
@@ -452,12 +457,12 @@ class AuditWorker:
         summary = json.loads(files["final.json"].read_text()) if files["final.json"].exists() else {}
         payload = summary.get("proof_payload")
         if not isinstance(payload, dict) or payload.get("format") != COMBINED_PROOF_FORMAT:
-            log.warning("audit %s: bench produced no proof payload", audit.audit_id[:12])
+            log.warning("%s: bench produced no proof payload", _where(audit))
             return proc
         upload = signing.sign(self.keypair, core.UPLOAD_DOMAIN, core.upload_claim(audit.audit_id, audit.slot.slot_id))
         self.publisher.proofs.publish(core.PROOF_PATH, self._artifact(
             audit, artifact_type="capacity_audit_proof_payload", sampled_pass_proof=payload,
             B_proof_hash=proof_hash.hex()), until=proof_seen + p.payload_deadline_s, retry_delay_s=5.0,
             headers={core.HDR_UPLOAD_SIGNATURE: upload})
-        log.info("audit %s: proof published", audit.audit_id[:12])
+        log.info("%s: proof sent", _where(audit))
         return proc

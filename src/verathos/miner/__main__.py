@@ -21,6 +21,7 @@ from verathos.miner.app import create_app
 from verathos.miner.chain import PermitAuthorizer, build_manifest, publish
 from verathos.miner.config import EndpointConfig, MinerConfig
 from verathos.miner.engine import HttpEngine
+from verathos.miner.status import StatusWatcher
 from verathos.protocol.manifest import SignedManifest
 from verathos.subnet.chain import committed_catalog, current_catalog
 
@@ -124,6 +125,7 @@ def resolve_catalog(subtensor: bt.Subtensor, config: MinerConfig) -> catalog.Cat
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--no-publish", action="store_true",
@@ -147,28 +149,44 @@ def main() -> None:
     publisher = Publisher(config, wallet, cat, publish_on_chain=not args.no_publish, subtensor=subtensor)
     if not args.no_publish:
         publisher.watch()
+    for e in publisher.endpoints():
+        hw = e.hardware
+        log.info("endpoint %s: %s (%s) on %s %s GB, CUDA device %s, engine %s", e.endpoint_id, e.model_id,
+                 cat.get(e.model_id).status, hw.gpu_name, hw.vram_gb, e.cuda_device, e.engine_url)
+    if policy.mode == "score_gate":
+        log.info("new endpoints are checked for %d epochs (about %.1f h) before they are scored",
+                 policy.qualification_epochs, policy.qualification_epochs * policy.epoch_blocks * 12 / 3600)
 
     drain = DrainState()
+    chain = SubtensorChainView(config.network, config.netuid, policy.auditor_hotkey)
+    current = {"policy": policy}
+    worker = None
     if audited and bench_ok:
-        chain = SubtensorChainView(config.network, config.netuid, policy.auditor_hotkey)
         worker = AuditWorker(netuid=config.netuid, keypair=wallet.hotkey, endpoints=audited, policy=policy,
                              chain=chain, drain=drain)
-
-        def adopt(cat: catalog.Catalog, served: list[EndpointConfig]) -> None:
-            policy = cat.audit_policy()
-            chain.set_auditor_hotkey(policy.auditor_hotkey)
-            worker.set_policy(policy, audit_endpoints(config, served, policy))
-
-        publisher.on_catalog.append(adopt)
         worker.start()
     elif audited:
         log.warning("capacity audit bench extension unavailable (%s); audits will be missed", bench_error[-200:])
+
+    def adopt(cat: catalog.Catalog, served: list[EndpointConfig]) -> None:
+        current["policy"] = policy = cat.audit_policy()
+        chain.set_auditor_hotkey(policy.auditor_hotkey)
+        if worker is not None:
+            worker.set_policy(policy, audit_endpoints(config, served, policy))
+
+    publisher.on_catalog.append(adopt)
+    if not args.no_publish:
+        StatusWatcher(hotkey=wallet.hotkey.ss58_address, auditor_url=chain.auditor_url, head=lambda: chain.head()[0],
+                      listed=lambda: [e.endpoint_id for e in publisher.signed.manifest.endpoints],
+                      policy=lambda: current["policy"]).start()
 
     authorizer = PermitAuthorizer(subtensor, config.netuid, config.gateway_hotkeys)
     engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key) for e in config.endpoints}
     app = create_app(config=config, keypair=wallet.hotkey, manifest=lambda: publisher.signed, engines=engines,
                      authorized=authorizer, drained=drain.drained)
-    uvicorn.run(app, host=config.listen_host, port=config.port, log_level="info")
+    log.info("serving %d endpoints on port %d; status is logged once per epoch", len(publisher.endpoints()),
+             config.port)
+    uvicorn.run(app, host=config.listen_host, port=config.port, log_level="warning", access_log=False)
 
 
 if __name__ == "__main__":

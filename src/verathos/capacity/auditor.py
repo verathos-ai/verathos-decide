@@ -449,6 +449,17 @@ class Auditor:
                 "s.endpoint_id = ? AND w.start_block >= ?", (hotkey, endpoint_id, self._last_block - 10))]
         return any(core.in_hold(start, self._last_block, self.policy, self.block_time_s) for start in starts)
 
+    def recent_outcomes(self, hotkey: str, limit: int = 20) -> list[dict[str, Any]]:
+        """The hotkey's latest audit slots, newest first, for its status page."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT s.endpoint_id, w.selection_block, w.chain_status, s.outcome, s.reason, "
+                "s.final_at - w.start_observed_at AS final_s FROM slots s JOIN windows w USING (audit_id) "
+                "WHERE s.hotkey = ? ORDER BY w.selection_block DESC LIMIT ?", (hotkey, limit)).fetchall()
+        return [{"endpoint_id": r["endpoint_id"], "selection_block": r["selection_block"], "window": r["chain_status"],
+                 "outcome": r["outcome"], "reason": r["reason"],
+                 "final_s": round(r["final_s"], 1) if r["final_s"] is not None else None} for r in rows]
+
     def evidence(self, epoch: int) -> dict[tuple[str, str], dict[str, int]]:
         """Final outcomes per endpoint from confirmed windows of the ``repeat_window_epochs`` epochs before
         ``epoch``. Only closed epochs count, so every validator that asks during ``epoch`` gets the same answer."""

@@ -38,7 +38,9 @@ def publish(subtensor: bt.Subtensor, wallet: bt.Wallet, config: MinerConfig, sig
         result = subtensor.set_commitment(wallet, config.netuid, value)
         if not getattr(result, "success", False):
             raise RuntimeError(f"set_commitment failed: {getattr(result, 'message', result)}")
-        log.info("set_commitment %s", value)
+        log.info("manifest committed on chain (%s)", value.rsplit(":", 1)[1][:12])
+    else:
+        log.info("manifest already committed on chain")
 
 
 class PermitAuthorizer:
@@ -47,6 +49,7 @@ class PermitAuthorizer:
     def __init__(self, subtensor: bt.Subtensor, netuid: int, extra: list[str], refresh_s: float = 600.0) -> None:
         self._subtensor, self._netuid, self._extra = subtensor, netuid, set(extra)
         self._allowed: set[str] = set(extra)
+        self._logged = False
         self._refresh_s = refresh_s
         self.refresh()
         threading.Thread(target=self._loop, daemon=True).start()
@@ -54,8 +57,11 @@ class PermitAuthorizer:
     def refresh(self) -> None:
         mg = self._subtensor.metagraph(self._netuid, lite=True)
         permitted = {hk for hk, permit in zip(mg.hotkeys, mg.validator_permit) if bool(permit)}
-        self._allowed = permitted | self._extra
-        log.info("permitted callers: %d", len(self._allowed))
+        allowed = permitted | self._extra
+        if allowed != self._allowed or not self._logged:
+            log.info("accepting requests from %d validators and %d gateway hotkeys", len(permitted), len(self._extra))
+            self._logged = True
+        self._allowed = allowed
 
     def _loop(self) -> None:
         while True:

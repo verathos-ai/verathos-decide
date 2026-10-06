@@ -120,6 +120,10 @@ scores the gated endpoints zero with probation. Without a valid feed it gates no
 mode every validator also scores zero the open endpoints the audit cannot cover (not CUDA, or a GPU without a
 class in the catalog).
 
+Validators that run a service (the subnet owner's and the auditor's) also serve each hotkey's status for its miners
+at `GET /v1/status/<hotkey>`: per endpoint the state in the last epoch (scored, qualifying, candidate, failed, gated,
+probation), its checks and scores, and the auditor's recent audit outcomes for the hotkey.
+
 If the validator's hotkey is the auditor, it also:
 - serves the ingest (`/capacity/v1/receipt`, `/capacity/v1/proof`) and the verdicts on `port` and points its
   axon at `public_host:port`, where miners and validators find it;

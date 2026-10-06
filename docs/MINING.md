@@ -140,6 +140,38 @@ Run it under a supervisor (systemd, pm2) so it restarts after updates and crashe
 from hotkeys holding a validator permit and from `gateway_hotkeys`, each signed and bound to this miner; other
 callers are refused before their request body is read, and bodies are capped at 1 MiB.
 
+## Reading the log
+
+The miner logs its setup once, then what happens to its endpoints. Every two minutes it reads its status from the
+capacity auditor's validator (`GET /v1/status/<hotkey>` on its axon, that validator's view of the last epoch) and
+logs it once per epoch, plus every capacity audit once its outcome is final:
+
+```
+endpoint gpu0: kev-4b (active) on NVIDIA GeForce RTX 5090 32 GB, CUDA device 0, engine http://127.0.0.1:8008
+new endpoints are checked for 4 epochs (about 2.4 h) before they are scored
+manifest committed on chain (2968f3219dc7)
+serving 1 endpoints on port 8091; status is logged once per epoch
+capacity audit at block 8163045, gpu0: drafted, timed work starts at block 8163050
+capacity audit at block 8163045, gpu0: timed work done in 20.4 s, final receipt sent
+capacity audit at block 8163045, gpu0: proof sent
+validator's epoch 45351:
+  gpu0 (kev-4b): qualifying, checked but not scored until epoch 45354 (in about 96 min); answers pass 10/10, mean diff 0.0014
+capacity audit at block 8163045, gpu0: passed, timed work done in 20.4 s
+validator's epoch 45354:
+  gpu0 (kev-4b): scored 0.99 this epoch, average 0.20; answers pass 10/10, mean diff 0.0014
+```
+
+| Endpoint state | Meaning |
+|---|---|
+| `scored` | checks passed; the score and its average (EMA) |
+| `qualifying` | new endpoint, checked but not scored until the epoch shown |
+| `candidate model` | the catalog lists the model as a candidate: checked, not scored |
+| `answers FAILED` | an answer failed verification; zero score for the probation epochs shown |
+| `GATED by the capacity audit` | audits were missed or a proof was invalid; zero score for the probation epochs shown |
+| `on probation` | still serving out an earlier failure |
+| `not scored, ... cannot be audited` | the declared GPU has no class in the catalog |
+| `not in that epoch` | the validator did not accept the manifest in that epoch (published after it started, or rejected: check the validator's reason with `scripts/probe_miner.py`) |
+
 ## Capacity audit duty
 
 When an endpoint is drafted, the miner warms the bench up while still serving, answers `503` for that endpoint only
