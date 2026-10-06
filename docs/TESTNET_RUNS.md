@@ -39,6 +39,19 @@ The auditor set weights on mechanism 1 for UID 12 only. Found in this run and fi
 canaries only while an audit was open, so 3 of the sybil's canaries hit its audit-hold `503`s (holds are now timed
 like the miners'); a cached empty auditor URL stopped receipt delivery until restart.
 
+## 2026-10-06: Clef-flash drift
+
+`verathos-engine clef` (`Cloudflare/clef-flash` at `17f0b0ad`, torch 2.10, transformers 5.18, reference PyTorch
+kernels) on an A100 80GB in bfloat16, on the same A100 in float32, and on CPU in float32; the 30 tickets with six
+questions used for Kev (420 probabilities):
+
+| Pair | Max abs diff | Mean | Median | Changed choices |
+|---|---|---|---|---|
+| A100 bf16 vs CPU fp32 | 0.0085 | 0.0010 | 0.0004 | 0 |
+| A100 fp32 vs CPU fp32 | 0.0000 | 0.0000 | 0.0000 | 0 |
+
+Honest drift is below Kev's (max 0.017), so the default tolerances (`hard_abs` 0.10, `mean_abs` 0.005) fit Clef.
+
 ## 2026-10-06: first validator epoch on mechanism 1 (testnet 405)
 
 Owner setup with `scripts/testnet_owner_ops.py` (owner coldkey from the OS keyring): `max_allowed_uids` 256 -> 128
