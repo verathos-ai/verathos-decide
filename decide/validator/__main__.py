@@ -23,7 +23,7 @@ from decide.validator import chain
 from decide.validator.audit import audit_epoch
 from decide.validator.config import ValidatorConfig
 from decide.validator.discovery import discover
-from decide.validator.scoring import ScoreState, epoch_scores, update, weights
+from decide.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
 
 log = logging.getLogger("decide.validator")
 BLOCK_S = 12.0
@@ -54,10 +54,11 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                                     pool_size=cfg.pool_size, per_endpoint=cfg.per_endpoint, spread_s=spread_s)
     for e in references.values():
         await e.close()
-    scores, failed = epoch_scores(results, {m.model_id: m.score_weight for m in cat.models})
+    record_window(state, results, cfg.window_epochs)
+    scores, failed = epoch_scores(results, {m.model_id: m.score_weight for m in cat.models}, state)
     update(state, results, scores, failed, alpha=cfg.ema_alpha, probation_epochs=cfg.probation_epochs)
     for key, r in sorted(results.items()):
-        log.info("  %s verdict=%s answered=%d/%d identity=%s mean_abs=%.4f score=%.3f", key, r.tally.verdict().value,
+        log.info("  %s epoch_verdict=%s answered=%d/%d identity=%s mean_abs=%.4f score=%.3f", key, r.tally.verdict().value,
                  r.answered, r.sent, r.identity_ok, r.tally.mean_abs, scores.get(key, 0.0))
     w = weights(state, hotkey_of_uid)
     if not w:

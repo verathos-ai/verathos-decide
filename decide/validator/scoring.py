@@ -1,8 +1,10 @@
 """Epoch scores, EMA, probation and weights.
 
 Per endpoint and epoch:
-- zero if the identity challenge failed or verification failed (hard or statistical); a verification failure also
-  starts probation, during which the endpoint scores zero regardless of later results;
+- zero if the identity challenge failed or verification failed. A hard failure counts in the epoch it happens; the
+  statistical bound is evaluated over a rolling window of epochs, because one epoch of canaries is too few
+  probabilities to separate a lower-precision substitute from honest drift. A verification failure also starts
+  probation, during which the endpoint scores zero regardless of later results;
 - otherwise model weight x availability (answered / sent) x latency factor, where the latency factor compares the
   endpoint's median latency with the median of all endpoints serving the same model, capped to [0.7, 1.3].
 Per UID: sum of its endpoints' EMAs. Weights: UID sums normalised to 1.
@@ -27,6 +29,7 @@ class ScoreState:
     ema: dict[str, float] = field(default_factory=dict)
     probation: dict[str, int] = field(default_factory=dict)
     uid_of: dict[str, int] = field(default_factory=dict)
+    window: dict[str, list[list[float]]] = field(default_factory=dict)  # key -> [[sum_abs, count], ...] newest last
 
     @classmethod
     def load(cls, path: Path) -> ScoreState:
@@ -38,8 +41,28 @@ class ScoreState:
         tmp.replace(path)
 
 
-def epoch_scores(results: dict[str, EndpointResult], model_weight: dict[str, float]) -> tuple[dict[str, float], set[str]]:
-    """-> (score per endpoint key, keys that failed verification this epoch)."""
+def record_window(state: ScoreState, results: dict[str, EndpointResult], window_epochs: int) -> None:
+    """Append this epoch's comparison totals and keep the last ``window_epochs`` epochs per endpoint."""
+    for key, r in results.items():
+        entries = state.window.get(key, []) + [[r.tally.sum_abs, float(r.tally.count)]]
+        state.window[key] = entries[-window_epochs:]
+
+
+def windowed_verdict(state: ScoreState, key: str, result: EndpointResult) -> Verdict:
+    """Hard failures count in the epoch they happen; the statistical bound uses the rolling window."""
+    if result.tally.hard_failures:
+        return Verdict.FAIL_HARD
+    entries = state.window.get(key, [])
+    count = sum(c for _, c in entries)
+    tol = result.tolerance
+    if count < tol.min_probabilities:
+        return Verdict.INSUFFICIENT
+    return Verdict.FAIL_STATISTICAL if sum(s for s, _ in entries) / count > tol.mean_abs else Verdict.PASS
+
+
+def epoch_scores(results: dict[str, EndpointResult], model_weight: dict[str, float],
+                 state: ScoreState) -> tuple[dict[str, float], set[str]]:
+    """-> (score per endpoint key, keys that failed verification this epoch). Call after ``record_window``."""
     medians_by_model: dict[str, list[float]] = {}
     for key, r in results.items():
         if r.latencies_ms:
@@ -48,7 +71,7 @@ def epoch_scores(results: dict[str, EndpointResult], model_weight: dict[str, flo
 
     scores, failed = {}, set()
     for key, r in results.items():
-        verdict = r.tally.verdict()
+        verdict = windowed_verdict(state, key, r)
         if verdict in (Verdict.FAIL_HARD, Verdict.FAIL_STATISTICAL):
             failed.add(key)
             scores[key] = 0.0

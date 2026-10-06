@@ -20,7 +20,7 @@ from decide.protocol.manifest import Endpoint, Manifest, SignedManifest, commitm
 from decide.validator.audit import audit_epoch
 from decide.validator.canaries import assignment, canary_pool
 from decide.validator.discovery import Neuron, discover
-from decide.validator.scoring import ScoreState, epoch_scores, update, weights
+from decide.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
 from decide.verify.compare import Tolerance, Verdict
 
 
@@ -94,7 +94,8 @@ def test_epoch_scores_honest_and_zeroes_cheater() -> None:
     assert cheat.tally.verdict() is Verdict.FAIL_HARD
 
     state = ScoreState()
-    scores, failed = epoch_scores(results, {"kev-4b": 1.0})
+    record_window(state, results, 3)
+    scores, failed = epoch_scores(results, {"kev-4b": 1.0}, state)
     update(state, results, scores, failed)
     w = weights(state, {1: honest_kp.ss58_address, 2: cheat_kp.ss58_address})
     assert w == {1: pytest.approx(1.0)}
@@ -109,3 +110,23 @@ def test_epoch_scores_honest_and_zeroes_cheater() -> None:
 def test_weights_ignore_reassigned_uids() -> None:
     state = ScoreState(ema={"hkA/gpu0": 0.5, "hkB/gpu0": 0.5}, uid_of={"hkA/gpu0": 1, "hkB/gpu0": 2})
     assert weights(state, {1: "hkA", 2: "someone-else"}) == {1: pytest.approx(1.0)}
+
+
+def test_window_catches_subtle_drift_no_single_epoch_shows() -> None:
+    """Each epoch alone has too few probabilities for the statistical bound; three epochs together fail it."""
+    from decide.validator.audit import EndpointResult
+    from decide.validator.discovery import DiscoveredEndpoint
+    from decide.verify.compare import RequestComparison
+
+    tol = Tolerance(min_probabilities=100, mean_abs=0.005)
+    ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id="gpu0", url="http://x/e/gpu0", model_id="kev-4b",
+                            hardware={"kind": "cuda", "device_id": "GPU-a"}, max_concurrency=1))
+    state = ScoreState()
+    verdicts = []
+    for _ in range(3):
+        r = EndpointResult(ep, tol, identity_ok=True, sent=10, answered=10, latencies_ms=[40.0] * 10)
+        r.tally.add(RequestComparison(max_abs=0.03, sum_abs=0.6, count=60, confident_flips=0))  # mean 0.01, no hard fail
+        record_window(state, {"hkA/gpu0": r}, 3)
+        scores, failed = epoch_scores({"hkA/gpu0": r}, {"kev-4b": 1.0}, state)
+        verdicts.append(bool(failed))
+    assert verdicts == [False, True, True]  # 60 probabilities: insufficient; 120 and 180: mean 0.01 > 0.005
