@@ -26,7 +26,7 @@ from verathos import catalog
 from verathos.capacity.auditor import Auditor
 from verathos.capacity.chain import SubtensorChainView
 from verathos.capacity.ingest import create_ingest_app
-from verathos.chain import serve_axon
+from verathos.chain import committed_catalog, serve_axon
 from verathos.miner.engine import HttpEngine
 from verathos.validator import chain
 from verathos.validator.audit import audit_epoch
@@ -70,11 +70,16 @@ def start_auditor(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, sta
 async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, secret: bytes, state: ScoreState,
                     epoch: int, blocks_left: int, auditor: Auditor | None) -> None:
     cat = catalog.load()
+    committed = committed_catalog(st, cfg.netuid)
+    if committed != cat.digest():
+        log.error("epoch %d skipped: the subnet owner commits catalog %s, this release has %s; update verathos",
+                  epoch, committed, cat.digest())
+        return
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
     references = {m: HttpEngine(url) for m, url in cfg.references.items() if cat.get(m) is not None}
     tolerances = {m.model_id: m.tolerance for m in cat.models}
     async with httpx.AsyncClient() as client:
-        miners = await discover(neurons, cfg.netuid, client)
+        miners = await discover(neurons, cfg.netuid, client, cat.digest())
         if auditor is not None:
             auditor.update_slots(capacity_slots(miners, cfg.netuid))
         endpoints = [e for m in miners for e in m.endpoints() if cat.get(e.endpoint.model_id) is not None

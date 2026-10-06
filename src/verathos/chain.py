@@ -22,3 +22,12 @@ def serve_axon(subtensor: bt.Subtensor, wallet: bt.Wallet, netuid: int, host: st
             raise RuntimeError(f"serve_axon failed: {getattr(result, 'message', result)}")
         log.info("serve_axon %s:%d", host, port)
     return neuron.uid
+
+
+def committed_catalog(subtensor: bt.Subtensor, netuid: int) -> str | None:
+    """The catalog digest the subnet owner hotkey currently commits, or None."""
+    from verathos import catalog
+
+    owner = subtensor.get_subnet_owner_hotkey(netuid)
+    uid = subtensor.get_uid_for_hotkey_on_subnet(owner, netuid)
+    return catalog.committed_digest(subtensor.get_commitment(netuid, uid)) if uid is not None else None

@@ -76,7 +76,7 @@ def test_epoch_scores_honest_and_zeroes_cheater() -> None:
     async def run():
         transport = HostRouter({"honest": honest_app, "cheat": cheat_app, "ghost": ghost_app})
         async with httpx.AsyncClient(transport=transport) as client:
-            miners = await discover(neurons, 405, client)
+            miners = await discover(neurons, 405, client, catalog.load().digest())
             endpoints = [e for m in miners for e in m.endpoints()]
             results = await audit_epoch(endpoints, epoch=1, secret=b"k" * 32, keypair=validator,
                                         references={"kev-4b": MockEngine("kev-4b")},

@@ -20,6 +20,7 @@ from pathlib import Path
 
 import bittensor as bt
 
+from verathos import catalog
 from verathos.miner.app import IDENTITY_DOMAIN, identity_payload
 from verathos.protocol import signing
 from verathos.protocol.api import distributions
@@ -84,7 +85,8 @@ def main() -> None:
     hotkey, axon = mg.hotkeys[args.uid], mg.axons[args.uid]
     base = f"http://{axon.ip}:{axon.port}"
     signed = SignedManifest.model_validate_json(urllib.request.urlopen(base + "/v1/manifest", timeout=10).read())
-    manifest = accept(signed, hotkey=hotkey, netuid=args.netuid, commitment=st.get_commitment(args.netuid, args.uid))
+    manifest = accept(signed, hotkey=hotkey, netuid=args.netuid, commitment=st.get_commitment(args.netuid, args.uid),
+                      catalog_digest=catalog.load().digest())
     print(f"manifest accepted: seq {manifest.seq}, endpoints {[e.endpoint_id for e in manifest.endpoints]}")
 
     caller = bt.Wallet(name=args.caller_wallet, hotkey=args.caller_hotkey).hotkey

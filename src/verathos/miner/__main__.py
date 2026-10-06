@@ -12,6 +12,7 @@ import uvicorn
 from verathos import catalog
 from verathos.capacity.chain import SubtensorChainView
 from verathos.capacity.miner import AuditEndpoint, AuditWorker, DrainState, bench_extension_available
+from verathos.chain import committed_catalog
 from verathos.miner.app import create_app
 from verathos.miner.chain import PermitAuthorizer, build_manifest, publish
 from verathos.miner.config import MinerConfig
@@ -51,6 +52,10 @@ def main() -> None:
     wallet = bt.Wallet(name=config.wallet_name, hotkey=config.hotkey_name)
     keypair = wallet.hotkey
     subtensor = bt.Subtensor(network=config.network)
+    committed = committed_catalog(subtensor, config.netuid)
+    if committed != cat.digest() and not args.no_publish:
+        raise SystemExit(f"the subnet owner commits catalog {committed}; this release has {cat.digest()}. "
+                         "Update verathos.")
     signed = build_manifest(config, keypair, cat.digest(), subtensor.get_current_block())
     if not args.no_publish:
         publish(subtensor, wallet, config, signed)

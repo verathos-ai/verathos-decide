@@ -115,8 +115,9 @@ class ManifestRejected(Exception):
     pass
 
 
-def accept(signed: SignedManifest, *, hotkey: str, netuid: int, commitment: str | None) -> Manifest:
-    """Validator-side acceptance of a fetched manifest. Raises ManifestRejected with the reason."""
+def accept(signed: SignedManifest, *, hotkey: str, netuid: int, commitment: str | None,
+           catalog_digest: str) -> Manifest:
+    """Validator-side acceptance of a fetched manifest built for the current catalog. Raises ManifestRejected."""
     manifest = signed.manifest
     if manifest.hotkey != hotkey:
         raise ManifestRejected("manifest hotkey does not match the axon's hotkey")
@@ -129,4 +130,6 @@ def accept(signed: SignedManifest, *, hotkey: str, netuid: int, commitment: str 
         raise ManifestRejected("hotkey has no manifest commitment")
     if manifest.digest() != expected:
         raise ManifestRejected("manifest digest differs from the on-chain commitment")
+    if manifest.catalog_digest != catalog_digest:
+        raise ManifestRejected("manifest was built for another catalog")
     return manifest

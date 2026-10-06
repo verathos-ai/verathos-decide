@@ -57,7 +57,8 @@ class DiscoveredMiner:
         return [DiscoveredEndpoint(self.uid, self.hotkey, self.base_url, e) for e in self.manifest.endpoints]
 
 
-async def discover(neurons: list[Neuron], netuid: int, client: httpx.AsyncClient) -> list[DiscoveredMiner]:
+async def discover(neurons: list[Neuron], netuid: int, client: httpx.AsyncClient,
+                   catalog_digest: str) -> list[DiscoveredMiner]:
     """Fetch and accept the manifest of every neuron that has a manifest commitment and a served axon."""
     found = []
     for n in neurons:
@@ -68,7 +69,7 @@ async def discover(neurons: list[Neuron], netuid: int, client: httpx.AsyncClient
             r = await client.get(base + "/v1/manifest", timeout=10)
             r.raise_for_status()
             manifest = accept(SignedManifest.model_validate_json(r.content), hotkey=n.hotkey, netuid=netuid,
-                              commitment=n.commitment)
+                              commitment=n.commitment, catalog_digest=catalog_digest)
         except (httpx.HTTPError, ManifestRejected, ValueError) as e:
             log.info("uid %d manifest not accepted: %s", n.uid, e)
             continue

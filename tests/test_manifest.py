@@ -45,7 +45,8 @@ def test_accepts_signed_and_committed(keypair: Keypair) -> None:
     signed = SignedManifest.create(make(keypair), keypair)
     commitment = commitment_value(signed.manifest.digest())
     assert committed_digest(commitment) == signed.manifest.digest()
-    assert accept(signed, hotkey=keypair.ss58_address, netuid=405, commitment=commitment) == signed.manifest
+    assert accept(signed, hotkey=keypair.ss58_address, netuid=405, commitment=commitment,
+               catalog_digest=CATALOG) == signed.manifest
 
 
 def test_round_trip_keeps_digest_and_signature(keypair: Keypair) -> None:
@@ -61,14 +62,16 @@ def test_rejects_tampered_manifest(keypair: Keypair) -> None:
     tampered = signed.model_copy(deep=True)
     tampered.manifest.endpoints[0].url = "https://198.51.100.9:8443"
     with pytest.raises(ManifestRejected, match="signature"):
-        accept(tampered, hotkey=keypair.ss58_address, netuid=405, commitment=commitment)
+        accept(tampered, hotkey=keypair.ss58_address, netuid=405, commitment=commitment,
+               catalog_digest=CATALOG)
 
 
 def test_rejects_uncommitted_version(keypair: Keypair) -> None:
     old = SignedManifest.create(make(keypair, seq=1), keypair)
     new = SignedManifest.create(make(keypair, seq=2), keypair)
     with pytest.raises(ManifestRejected, match="commitment"):
-        accept(new, hotkey=keypair.ss58_address, netuid=405, commitment=commitment_value(old.manifest.digest()))
+        accept(new, hotkey=keypair.ss58_address, netuid=405, commitment=commitment_value(old.manifest.digest()),
+               catalog_digest=CATALOG)
 
 
 def test_rejects_other_hotkey(keypair: Keypair) -> None:
@@ -76,7 +79,8 @@ def test_rejects_other_hotkey(keypair: Keypair) -> None:
     signed = SignedManifest.create(make(keypair), keypair)
     commitment = commitment_value(signed.manifest.digest())
     with pytest.raises(ManifestRejected, match="hotkey"):
-        accept(signed, hotkey=other.ss58_address, netuid=405, commitment=commitment)
+        accept(signed, hotkey=other.ss58_address, netuid=405, commitment=commitment,
+               catalog_digest=CATALOG)
     with pytest.raises(ValueError):
         SignedManifest.create(make(keypair), other)
 
@@ -86,3 +90,10 @@ def test_one_device_per_endpoint(keypair: Keypair) -> None:
     dup[1].hardware = Hardware(kind="cuda", device_id="GPU-aaaa")
     with pytest.raises(ValueError, match="hardware device"):
         make(keypair, endpoints=dup)
+
+
+def test_rejects_manifest_for_another_catalog(keypair: Keypair) -> None:
+    signed = SignedManifest.create(make(keypair), keypair)
+    with pytest.raises(ManifestRejected, match="another catalog"):
+        accept(signed, hotkey=keypair.ss58_address, netuid=405, commitment=commitment_value(signed.manifest.digest()),
+               catalog_digest="1" * 64)

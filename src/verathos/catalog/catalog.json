@@ -23,15 +23,6 @@
       "base_revision": "68c46c4b3498877f3ef123c856ecfde50c39f404",
       "license": "apache-2.0",
       "max_state_tokens": 65536
-    },
-    {
-      "model_id": "clef-flash",
-      "status": "candidate",
-      "engine": "clef",
-      "hf_repo": "Cloudflare/clef-flash",
-      "hf_revision": "17f0b0ad64efb65d273590632833508766b2aae6",
-      "license": "apache-2.0",
-      "max_state_tokens": 65536
     }
   ],
   "capacity_audit": {
