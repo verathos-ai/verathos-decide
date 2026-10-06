@@ -22,12 +22,12 @@ import httpx
 
 from verathos import catalog
 from verathos.miner.engine import HttpEngine
-from verathos.subnet.chain import current_catalog
 from verathos.validator import chain
 from verathos.validator.audit import audit_epoch
 from verathos.validator.capacity import Capacity, unauditable_endpoints
 from verathos.validator.config import ValidatorConfig
 from verathos.validator.discovery import discover
+from verathos.validator.follow import CatalogFollower
 from verathos.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
 from verathos.validator.service import start_service
 
@@ -51,46 +51,8 @@ def load_secret(state_dir: Path) -> bytes:
     return secret
 
 
-class CurrentCatalog:
-    """The catalog the subnet owner commits, re-resolved each epoch. After a change, manifests built for the
-    previous catalog stay acceptable for one more epoch while miners re-publish."""
-
-    def __init__(self, cfg: ValidatorConfig, st: bt.Subtensor) -> None:
-        self.cfg, self.st = cfg, st
-        self.store = catalog.CatalogStore(cfg.catalog_dir)
-        self.catalog = self._wait()
-        self.previous: str | None = None
-
-    def _wait(self) -> catalog.Catalog:
-        while True:
-            try:
-                return current_catalog(self.st, self.cfg.netuid, self.store, self.cfg.catalog_mirrors)
-            except catalog.CatalogUnavailable as exc:
-                log.error("%s; retrying in 60 s", exc)
-                time.sleep(60)
-
-    def refresh(self) -> bool:
-        """Re-resolve; True if the committed catalog changed. Keeps the last catalog when the new one is unavailable."""
-        try:
-            new = current_catalog(self.st, self.cfg.netuid, self.store, self.cfg.catalog_mirrors)
-        except Exception as exc:
-            log.error("committed catalog unavailable, keeping %s: %s", self.catalog.digest()[:12], exc)
-            return False
-        changed = new.digest() != self.catalog.digest()
-        self.previous = self.catalog.digest() if changed else None
-        self.catalog = new
-        return changed
-
-    def accepted(self) -> set[str]:
-        """Catalog digests a manifest may be built for."""
-        return {self.catalog.digest()} | ({self.previous} if self.previous else set())
-
-
 async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, secret: bytes, state: ScoreState,
-                    epoch: int, blocks_left: int, capacity: Capacity, current: CurrentCatalog) -> None:
-    if current.refresh():
-        log.info("catalog %s committed", current.catalog.digest()[:12])
-        capacity.set_policy(current.catalog.audit_policy())
+                    epoch: int, blocks_left: int, capacity: Capacity, current: CatalogFollower) -> None:
     cat = current.catalog
     capacity_epoch = capacity.tempo_epoch()
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
@@ -119,7 +81,10 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     model_weight = {m.model_id: m.score_weight if m.status == "active" else 0.0 for m in cat.models}
     scores, failed = epoch_scores(results, model_weight, state,
                                   {f"{hk}/{ep}" for hk, ep in gated}, unauditable)
-    update(state, results, scores, failed, alpha=cfg.ema_alpha, probation_epochs=cfg.probation_epochs)
+    held = {e.key for e in endpoints} - set(results)
+    if held:
+        log.info("  %d endpoints not audited this epoch (no usable reference answers); scores held", len(held))
+    update(state, results, scores, failed, alpha=cfg.ema_alpha, probation_epochs=cfg.probation_epochs, held=held)
     for key, r in sorted(results.items()):
         log.info("  %s epoch_verdict=%s answered=%d/%d identity=%s mean_abs=%.4f score=%.3f%s",
                  key, r.tally.verdict().value, r.answered, r.sent, r.identity_ok, r.tally.mean_abs,
@@ -152,7 +117,8 @@ def main() -> None:
     state = ScoreState.load(state_path)
     wallet = bt.Wallet(name=cfg.wallet_name, hotkey=cfg.hotkey_name)
     st = bt.Subtensor(network=cfg.network)
-    current = CurrentCatalog(cfg, st)
+    current = CatalogFollower(st, cfg.network, cfg.netuid, catalog.CatalogStore(cfg.catalog_dir), cfg.catalog_mirrors,
+                              grace_s=(st.tempo(cfg.netuid) + 1) * BLOCK_S)
     capacity = Capacity.start(network=cfg.network, netuid=cfg.netuid, policy=current.catalog.audit_policy(), st=st,
                               wallet=wallet, state_dir=state_dir)
     is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)
@@ -163,6 +129,8 @@ def main() -> None:
             current.store.put(current.catalog)
         start_service(st=st, wallet=wallet, netuid=cfg.netuid, public_host=cfg.public_host, port=cfg.port,
                       store=current.store if is_owner else None, auditor=capacity.auditor)
+    current.on_change.append(lambda cat: capacity.set_policy(cat.audit_policy()))
+    current.start()
     capacity.start_slot_refresh(cfg.network, cfg.mechid, current.accepted)
 
     done: int | None = None

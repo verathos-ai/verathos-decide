@@ -26,8 +26,7 @@ REPO = Path(__file__).resolve().parents[2]
 AUDITOR_KEY = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
 BLOCK_S = 0.4
 TEST_GPU = core.GpuClass("Test GPU", 8, matrix_dim=8, capacity_passes=2, capacity_rounds=2, capacity_block_size=4,
-                         fp64_matrix_dim=4, fp64_passes=1, fp64_block_size=2, spot_checks=2, deadline_s=0.6,
-                         calibrated=True)
+                         fp64_matrix_dim=4, fp64_passes=1, fp64_block_size=2, spot_checks=2)
 POLICY = core.AuditPolicy(auditor_hotkey="5Auditor", mode="score_gate", windows_per_epoch=360, cohort_fraction=360.0,
                           max_drain_fraction=1.0, group_stress_fraction=0.0, lead_blocks=15,
                           proof_challenge_delay_blocks=4, deadline_s=0.6, transport_grace_s=0.2, payload_deadline_s=4.0,
@@ -37,16 +36,14 @@ BENCH = r'''
 import json, sys, time, pathlib
 sys.path.insert(0, sys.argv[1])
 from tests.capacity.cpu_bench import CpuBench
-_, _, behaviour, out, lease, spec, challenge_file, start_file, ready_file = sys.argv
+_, _, behaviour, out, lease, spec, challenge_file, start_file = sys.argv
 out = pathlib.Path(out)
-pathlib.Path(ready_file).write_text("{}")
 while not pathlib.Path(start_file).exists():
     time.sleep(0.005)
 seed = json.loads(pathlib.Path(start_file).read_text())["seed_hex"]
 bench = CpuBench(json.loads(spec), lease, seed)
 if behaviour == "late":
     time.sleep(1.0)
-(out / f"{lease}_pass0.json").write_text(json.dumps({"root": bench.final_timing["pass0_root"]}))
 (out / f"{lease}_final_timing.json").write_text(json.dumps(bench.final_timing))
 while not pathlib.Path(challenge_file).exists():
     time.sleep(0.005)
@@ -101,9 +98,9 @@ def run(tmp_path_factory: pytest.TempPathFactory):
         kp = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
         url = f"http://{len(miners) + 10}.0.113.5:8091/e/gpu0"
 
-        def bench_command(audit, *, out_dir, challenge_file, ready_file, start_file, behaviour=behaviour, **_):
+        def bench_command(audit, *, out_dir, challenge_file, start_file, behaviour=behaviour, **_):
             return [sys.executable, str(script), str(REPO), behaviour, str(out_dir), audit.lease,
-                    json.dumps(audit.workload_spec), str(challenge_file), str(start_file), str(ready_file)]
+                    json.dumps(audit.workload_spec), str(challenge_file), str(start_file)]
 
         endpoint = AuditEndpoint("gpu0", url, "kev-4b", "Test GPU", 8, 0)
         worker = AuditWorker(netuid=405, keypair=kp, endpoints=[endpoint], policy=POLICY, chain=chain,
@@ -115,6 +112,8 @@ def run(tmp_path_factory: pytest.TempPathFactory):
     holds.update_slots([slot for _, _, slot in miners.values()])
     drained_seen = set()
 
+    # Miners start at this block; skip the start-up replay of earlier blocks, which they never followed.
+    auditor._last_block = holds._last_block = chain.n - 1
     auditor.poll_once()
     holds.poll_once()
     for _, worker, _ in miners.values():
@@ -133,6 +132,9 @@ def run(tmp_path_factory: pytest.TempPathFactory):
         chain.tick()
         auditor.poll_once()
         time.sleep(0.05)
+    while chain.n < 3 * 360 + 1:  # into epoch 3, whose verdicts count the closed epoch 2
+        chain.tick()
+        auditor.poll_once()
     auditor.drained_seen_by_follower = drained_seen
     yield auditor, miners
     auditor.stop()
@@ -147,7 +149,7 @@ def test_honest_miner_passes(run) -> None:
     auditor, miners = run
     kp = miners["honest"][0]
     assert outcomes(auditor, kp.ss58_address) and set(outcomes(auditor, kp.ss58_address)) == {PASSED}
-    assert (kp.ss58_address, "gpu0") not in auditor.gated(2)
+    assert (kp.ss58_address, "gpu0") not in auditor.gated(3)
 
 
 def test_late_final_receipt_is_a_timing_miss(run) -> None:
@@ -161,7 +163,8 @@ def test_forged_proof_is_invalid_and_gated(run) -> None:
     auditor, miners = run
     kp = miners["forge"][0]
     assert INVALID in outcomes(auditor, kp.ss58_address)
-    assert auditor.gated(2)[(kp.ss58_address, "gpu0")] == "invalid_proof"
+    assert auditor.gated(3)[(kp.ss58_address, "gpu0")] == "invalid_proof"
+    assert (kp.ss58_address, "gpu0") not in auditor.gated(2)  # the epoch it happened in is still open there
 
 
 def test_windows_are_confirmed_before_counting(run) -> None:
@@ -174,15 +177,16 @@ def test_ingest_rejects_unknown_and_unsigned_artifacts(run) -> None:
     auditor, miners = run
     kp = miners["honest"][0]
     client = TestClient(create_ingest_app(auditor, AUDITOR_KEY))
-    artifact = {"protocol_version": core.PROTOCOL_VERSION, "artifact_type": "capacity_audit_pass0_receipt",
-                "audit_id": "ff" * 32, "slot_id": "ee" * 32, "hotkey": kp.ss58_address, "pass0_root": "aa" * 32}
+    artifact = {"protocol_version": core.PROTOCOL_VERSION, "artifact_type": "capacity_audit_final_receipt",
+                "audit_id": "ff" * 32, "slot_id": "ee" * 32, "hotkey": kp.ss58_address}
     unsigned = client.post("/capacity/v1/receipt", json=artifact)
     assert unsigned.status_code == 400 and unsigned.json()["error"] == "invalid miner_signature"
     artifact["miner_signature"] = core.sign_artifact(artifact, kp)
     unknown = client.post("/capacity/v1/receipt", json=artifact)
     assert unknown.status_code == 400 and unknown.json()["error"] == "unknown audit slot"
-    wrong_path = client.post("/capacity/v1/proof", json=artifact)
-    assert wrong_path.status_code == 400
+    wrong_path = client.post("/capacity/v1/proof", json=artifact,
+                             headers={core.HDR_AUDIT_ID: "ff" * 32, core.HDR_SLOT_ID: "ee" * 32})
+    assert wrong_path.status_code == 400 and wrong_path.json()["error"] == "unknown audit slot"
 
 
 def test_follower_sees_the_same_holds(run) -> None:
@@ -193,10 +197,11 @@ def test_follower_sees_the_same_holds(run) -> None:
 def test_signed_verdicts_reach_followers(run) -> None:
     auditor, miners = run
     client = TestClient(create_ingest_app(auditor, AUDITOR_KEY))
-    document = client.get("/capacity/v1/verdicts", params={"epoch": 2}).json()
-    gated = accepted_verdicts(document, auditor_hotkey=AUDITOR_KEY.ss58_address, netuid=405, epoch=2)
-    assert gated == auditor.gated(2) and (miners["forge"][0].ss58_address, "gpu0") in gated
+    document = client.get("/capacity/v1/verdicts", params={"epoch": 3}).json()
+    gated = accepted_verdicts(document, auditor_hotkey=AUDITOR_KEY.ss58_address, netuid=405, epoch=3)
+    assert gated == auditor.gated(3) and (miners["forge"][0].ss58_address, "gpu0") in gated
     with pytest.raises(ValueError, match="not signed by the auditor"):
-        accepted_verdicts(document, auditor_hotkey=miners["honest"][0].ss58_address, netuid=405, epoch=2)
+        accepted_verdicts(document, auditor_hotkey=miners["honest"][0].ss58_address, netuid=405, epoch=3)
     with pytest.raises(ValueError, match="another netuid or epoch"):
-        accepted_verdicts(document, auditor_hotkey=AUDITOR_KEY.ss58_address, netuid=405, epoch=3)
+        accepted_verdicts(document, auditor_hotkey=AUDITOR_KEY.ss58_address, netuid=405, epoch=2)
+    assert client.get("/capacity/v1/verdicts", params={"epoch": 4}).status_code == 400  # not started

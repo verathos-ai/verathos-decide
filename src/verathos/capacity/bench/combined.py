@@ -3,9 +3,9 @@
 The miner's audit worker launches one process per drafted endpoint, pinned to that endpoint's GPU through
 ``CUDA_VISIBLE_DEVICES``:
 
-1. allocate and warm up, write the ready file, and wait for the start file carrying the proof seed (hot start);
+1. allocate and warm up, then wait for the start file carrying the proof seed (hot start);
 2. run the timed lanes (capacity, optional capacity tail, optional FP64), each committing a root chain;
-3. write ``<lease>_pass0.json`` and ``<lease>_final_timing.json`` with the combined transcript root;
+3. write ``<lease>_final_timing.json`` with the combined transcript root;
 4. wait for the B_proof challenge seed, build and self-verify the sampled proofs, write ``<lease>_final.json``.
 
 For a local round trip pass ``--seed-hex`` and ``--b-proof-hex`` instead of the start and challenge files.
@@ -334,8 +334,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     seed_hex = args.seed_hex
     if args.start_file:
-        if args.ready_file:
-            _write_json(args.ready_file, {"lease_id": lease, "t": time.time()})
         start = _wait_for(args.start_file, args.start_timeout_s, json.loads)
         seed_hex = str(start["seed_hex"])
     seed_hex = _hex32(seed_hex)
@@ -369,11 +367,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     combined_root = combined_transcript_root(
         capacity_transcript=cap_transcript, capacity_tail_transcript=tail_transcript, fp64_transcript=fp64_transcript,
         capacity_params=capacity, capacity_tail_params=tail, fp64_params=fp64_lane)
-    pass0_root = cap_chain[0]["pass_root"]
     final_timing = {
         "lease_id": lease,
-        "root": combined_root,
-        "pass0_root": pass0_root,
         "transcript_root": combined_root,
         "workload_version": WORKLOAD_VERSION,
         "pass_count": spec["pass_count"],
@@ -391,7 +386,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "fp64_cuda_s": fp64_ms / 1000.0,
         "t": time.time(),
     }
-    _write_json(out_dir / f"{lease}_pass0.json", {"lease_id": lease, "root": pass0_root, "t": time.time()})
     _write_json(out_dir / f"{lease}_final_timing.json", final_timing)
 
     # Post-timing proof.
@@ -456,7 +450,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workload", required=True, help="workload spec JSON (core.gpu_workload_spec)")
     p.add_argument("--out-dir", type=pathlib.Path, required=True)
     p.add_argument("--start-file", type=pathlib.Path, help="hot start: wait for this file to carry seed_hex")
-    p.add_argument("--ready-file", type=pathlib.Path, help="written once warm-up is done")
     p.add_argument("--start-timeout-s", type=float, default=60.0)
     p.add_argument("--seed-hex", default="", help="proof seed when no start file is used")
     p.add_argument("--challenge-file", type=pathlib.Path, help="wait for this file to carry the B_proof seed")

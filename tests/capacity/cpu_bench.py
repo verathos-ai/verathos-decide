@@ -54,8 +54,8 @@ class CpuBench:
             capacity_transcript=self.cap_transcript, capacity_tail_transcript="", fp64_transcript=self.fp64_transcript,
             capacity_params=self.capacity, capacity_tail_params=None, fp64_params=self.fp64_params)
         self.final_timing = {
-            "lease_id": lease_id, "root": self.root, "pass0_root": self.cap_chain[0]["pass_root"],
-            "transcript_root": self.root, "workload_version": WORKLOAD_VERSION, "pass_count": spec["pass_count"],
+            "lease_id": lease_id, "transcript_root": self.root, "workload_version": WORKLOAD_VERSION,
+            "pass_count": spec["pass_count"],
             "combined_transcript_root": self.root, "capacity_transcript_root": self.cap_transcript,
             "capacity_tail_transcript_root": "", "fp64_transcript_root": self.fp64_transcript,
             "capacity_params": self.capacity, "capacity_tail_params": None, "fp64_params": self.fp64_params,

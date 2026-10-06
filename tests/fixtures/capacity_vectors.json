@@ -2929,25 +2929,6 @@
    true
   ]
  ],
- "transcript_root": [
-  [
-   "b8c6f33f1780d30977c5e964f62e7959102a3694f1c28ae0834ab12f98a3dcb0",
-   "89a1a98e709fa672374b463bbd8d5946ff4f530c5e65be07bf17ef8473ec96e9",
-   "2453695514ac2ba4f06e40a20e20cbc76b7a6c6d9a438c4a30e2acea3be39f57",
-   "0a4f88e04b578e42ff125845c9b27ba749498ed4b68a20c94cf0e195aae9cbc4",
-   "51b0b105bb16ebcd60cfee5ea698e21a60300ce6aee537045cb725bbb5b308a1",
-   [
-    1,
-    2,
-    3
-   ],
-   [
-    4,
-    5
-   ]
-  ],
-  "8241e8b275a066b11d3f5d23b89d0dc39240d6850e21cfaf1fc704ff5068e5f0"
- ],
  "workload_specs": {
   "NVIDIA GeForce RTX 4090": [
    24,
@@ -3024,11 +3005,5 @@
     "pass_count": 1649
    }
   ]
- },
- "registered_domain": {
-  "a.b.example.co.uk": "example.co.uk",
-  "miner.example.com": "example.com",
-  "203.0.113.5": "",
-  "localhost": ""
  }
 }

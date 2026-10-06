@@ -93,17 +93,20 @@ Clef models use `verathos-engine` in float32 (see `MINING.md` for the install):
 ```
 
 Per epoch (one subnet tempo) the validator:
-1. resolves the catalog the subnet owner commits (shipped copy, local store, owner's axon, mirrors; any copy is
-   checked against the committed digest) and adopts a newly committed one, including its audit policy;
+1. uses the catalog the subnet owner commits (shipped copy, local store, owner's axon, mirrors; any copy is
+   checked against the committed digest). The validator checks the commitment every minute in the background and
+   applies a new audit policy at once; models and tolerances apply from the next epoch;
 2. reads axons and commitments and accepts each miner's manifest if it is signed by the hotkey, matches the
-   committed digest and was built for the current catalog;
+   committed digest, lists its endpoints on the hotkey's axon and was built for the current catalog (or, for one
+   tempo after a change, the previous one);
 3. challenges each endpoint to sign a nonce with the listing hotkey;
 4. derives the epoch's canaries from its secret, computes the references, sends each endpoint its subset spread over
    the first `audit_fraction` of the epoch, and checks every signed receipt;
 5. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
    probation, and sets weights on `mechid`.
 
-`--once` runs one epoch immediately and exits. Keep `state_dir` across restarts: it holds the canary secret and the
+Nothing a miner returns can stop the epoch: replies are size- and time-bounded and every malformed reply is
+recorded against that endpoint. Chain errors are retried every block. `--once` runs one epoch immediately and exits. Keep `state_dir` across restarts: it holds the canary secret and the
 score history.
 
 ## Capacity audit
@@ -111,14 +114,16 @@ score history.
 Every validator derives the audit windows from chain data, like the miners, and holds its canaries for an
 endpoint while that endpoint is inside an audit hold. In `score_gate` mode it fetches the auditor's verdicts for
 the epoch from the auditor's axon (`GET /capacity/v1/verdicts`), checks they are signed by the auditor hotkey, and
-scores the gated endpoints zero with probation. Without a valid feed it gates nothing that epoch.
+scores the gated endpoints zero with probation. Without a valid feed it gates nothing that epoch. In `score_gate`
+mode every validator also scores zero the open endpoints the audit cannot cover (not CUDA, or a GPU without a
+class in the catalog).
 
 If the validator's hotkey is the auditor, it also:
 - serves the ingest (`/capacity/v1/receipt`, `/capacity/v1/proof`) and the verdicts on `port` and points its
   axon at `public_host:port`, where miners and validators find it;
 - follows every block, drafts audit windows, times receipts and verifies proofs;
-- in `score_gate` mode, scores gated endpoints zero with probation, and open endpoints without a calibrated GPU
-  class zero.
+- in `score_gate` mode, gates endpoints on its own evidence.
 
-The audit database is `state_dir/capacity.sqlite`. Keep the auditor running continuously: windows whose blocks it
-did not observe are void, and an outage voids evidence rather than counting misses.
+The audit database is `state_dir/capacity.sqlite`. Keep the auditor running continuously: windows it did not
+follow are void, and an outage voids evidence rather than counting misses. After a restart it replays the recent
+blocks so the slots of running windows stay busy, as they are on the miners.

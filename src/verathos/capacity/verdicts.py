@@ -15,11 +15,13 @@ import httpx
 from bittensor_wallet import Keypair
 
 from verathos.protocol import signing
+from verathos.protocol.http import request_json
 
 log = logging.getLogger(__name__)
 
 VERDICTS_PATH = "/capacity/v1/verdicts"
 VERDICTS_DOMAIN = "verathos/capacity-verdicts/v1"
+MAX_VERDICTS_BYTES = 1 << 20
 
 
 def signed_verdicts(keypair: Keypair, netuid: int, epoch: int, gated: dict[tuple[str, str], str]) -> dict[str, Any]:
@@ -47,9 +49,9 @@ async def fetch_verdicts(client: httpx.AsyncClient, auditor_url: str | None, *, 
         log.warning("capacity auditor %s has no axon; no capacity verdicts this epoch", auditor_hotkey[:12])
         return {}
     try:
-        r = await client.get(auditor_url.rstrip("/") + VERDICTS_PATH, params={"epoch": epoch}, timeout=15)
-        r.raise_for_status()
-        return accepted_verdicts(r.json(), auditor_hotkey=auditor_hotkey, netuid=netuid, epoch=epoch)
-    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        document = await request_json(client, "GET", auditor_url.rstrip("/") + VERDICTS_PATH,
+                                      params={"epoch": epoch}, limit=MAX_VERDICTS_BYTES, timeout=15)
+        return accepted_verdicts(document, auditor_hotkey=auditor_hotkey, netuid=netuid, epoch=epoch)
+    except (httpx.HTTPError, TimeoutError, ValueError, KeyError, TypeError) as exc:
         log.warning("capacity verdicts unavailable this epoch: %s", exc)
         return {}

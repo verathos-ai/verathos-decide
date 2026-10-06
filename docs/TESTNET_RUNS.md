@@ -53,12 +53,12 @@ temporary host, bittensor SDK 10.3.2, a discovery script since folded into the m
 
 | Case | Result |
 |---|---|
-| Signed manifest (seq 1, 2 endpoints), axon set, digest committed | accepted, both endpoints read, catalog matched |
+| Signed manifest (2 endpoints), axon set, digest committed | accepted, both endpoints read, catalog matched |
 | Catalog digest committed by the owner hotkey | accepted |
-| New validly signed manifest (seq 2) served without committing | rejected: digest differs from commitment |
+| New validly signed manifest served without committing | rejected: digest differs from commitment |
 | Manifest content edited after signing | rejected: signature does not verify |
 | Manifest signed by another hotkey served at the axon | rejected: hotkey mismatch |
-| Seq 2 committed and served | accepted, visible 3 blocks after submission |
+| New manifest committed and served | accepted, visible 3 blocks after submission |
 | Full discovery pass over all 14 UIDs (commitment pre-filter) | 3 s, one manifest fetched |
 
 Commitment space used: 200 of 3,100 bytes (miner, two commits), 100 (owner, one commit).
@@ -72,6 +72,6 @@ test suite 72 passed. Results:
 |---|---|---|---|---|---|
 | Calibrated 5090 row, 337 passes of 8960x8960 int8 (`scripts/capacity_roundtrip.py`) | 20.4 s | 30 s | 0.1 s | 257 KB | ok in 58 ms |
 | Datacenter shape at small pass counts: transition mix 3 / fanout 64, tail lane, FP64 lane | 2.8 s | n/a | 5.6 s | 11.6 MB | ok in 178 ms |
-| Miner hot-start file protocol with the real bench (ready, start seed, final timing, challenge) | 20.5 s | 30 s | | | ok, derived as the auditor does |
+| Miner hot-start file protocol with the real bench (start seed, final timing, challenge) | 20.5 s | 30 s | | | ok, derived as the auditor does |
 
 Peak GPU memory about 0.6 GB, so the bench fits beside a resident model.

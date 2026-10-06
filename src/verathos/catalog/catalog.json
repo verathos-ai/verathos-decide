@@ -34,6 +34,34 @@
     }
   ],
   "capacity_audit": {
-    "mode": "observe"
+    "mode": "observe",
+    "gpu_classes": [
+      {"gpu_name": "NVIDIA GeForce RTX 4090", "vram_gb": 24, "capacity_passes": 222, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA GeForce RTX 3090", "vram_gb": 24, "capacity_passes": 90, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA GeForce RTX 3090 Ti", "vram_gb": 24, "capacity_passes": 115, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA GeForce RTX 5090", "vram_gb": 32, "capacity_passes": 337, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "vram_gb": 96, "capacity_passes": 311, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA RTX 4000 Ada Generation", "vram_gb": 20, "capacity_passes": 62, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA RTX A4500", "vram_gb": 20, "capacity_passes": 53, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA RTX A5000", "vram_gb": 24, "capacity_passes": 69, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA RTX 5000 Ada Generation", "vram_gb": 32, "capacity_passes": 144, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA L4", "vram_gb": 23, "capacity_passes": 45, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA A40", "vram_gb": 46, "capacity_passes": 93, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA RTX A6000", "vram_gb": 49, "capacity_passes": 96, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA L40", "vram_gb": 46, "capacity_passes": 150, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA L40S", "vram_gb": 46, "capacity_passes": 196, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA RTX 6000 Ada Generation", "vram_gb": 49, "capacity_passes": 156, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA RTX PRO 4000 Blackwell", "vram_gb": 24, "capacity_passes": 105, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA RTX PRO 4500 Blackwell", "vram_gb": 32, "capacity_passes": 154, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA RTX PRO 5000 Blackwell", "vram_gb": 48, "capacity_passes": 195, "capacity_rounds": 8},
+      {"gpu_name": "NVIDIA A100-SXM4-40GB", "vram_gb": 40, "capacity_passes": 6, "capacity_tail_passes": 14, "fp64_passes": 654, "transition_mix_rounds": 3, "transition_fanout": 64},
+      {"gpu_name": "NVIDIA A100 80GB PCIe", "vram_gb": 80, "capacity_passes": 9, "capacity_tail_passes": 9, "fp64_passes": 681, "transition_mix_rounds": 3, "transition_fanout": 64},
+      {"gpu_name": "NVIDIA A100-SXM4-80GB", "vram_gb": 80, "capacity_passes": 8, "capacity_tail_passes": 9, "fp64_passes": 645, "transition_mix_rounds": 3, "transition_fanout": 64},
+      {"gpu_name": "NVIDIA H100 80GB HBM3", "vram_gb": 80, "capacity_passes": 16, "capacity_tail_passes": 4, "fp64_passes": 1629, "transition_mix_rounds": 3, "transition_fanout": 64},
+      {"gpu_name": "NVIDIA H100 PCIe", "vram_gb": 80, "capacity_passes": 9, "capacity_tail_passes": 1, "fp64_passes": 1335, "transition_mix_rounds": 3, "transition_fanout": 64},
+      {"gpu_name": "NVIDIA H100 NVL", "vram_gb": 96, "capacity_passes": 14, "capacity_tail_passes": 4, "fp64_passes": 1462, "transition_mix_rounds": 3, "transition_fanout": 64},
+      {"gpu_name": "NVIDIA H200", "vram_gb": 141, "capacity_passes": 20, "capacity_tail_passes": 12, "fp64_passes": 1629, "transition_mix_rounds": 3, "transition_fanout": 64},
+      {"gpu_name": "NVIDIA B200", "vram_gb": 192, "capacity_passes": 43, "capacity_tail_passes": 1, "fp64_passes": 1110, "transition_mix_rounds": 3, "transition_fanout": 64}
+    ]
   }
 }

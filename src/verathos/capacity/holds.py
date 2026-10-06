@@ -24,7 +24,7 @@ class HoldTracker:
                  block_time_s: float = core.DEFAULT_BLOCK_TIME_S) -> None:
         self.netuid, self.policy, self.chain, self.block_time_s = netuid, policy, chain, block_time_s
         self._lock = threading.Lock()
-        self._slots: list[core.Slot] = []
+        self._slots: list[core.Slot] | None = None
         self._drafted_at: dict[str, int] = {}
         self._busy_until: dict[str, int] = {}
         self._last_block = 0
@@ -32,8 +32,9 @@ class HoldTracker:
 
     def set_policy(self, policy: core.AuditPolicy) -> None:
         """Adopt a newly committed policy; windows already drafted keep their scheduled workload."""
-        policy.validate(self.block_time_s)
-        self.policy = policy
+        if policy != self.policy:
+            policy.validate(self.block_time_s)
+            self.policy = policy
 
     def update_slots(self, slots: list[core.Slot]) -> None:
         with self._lock:
@@ -52,25 +53,30 @@ class HoldTracker:
             time.sleep(poll_s)
 
     def poll_once(self) -> None:
+        """Process every block from the last processed one up to the current head. On start-up the recent blocks
+        are replayed, so holds already running are known."""
+        if self._slots is None:
+            return
         head, head_hash = self.chain.head()
         if head <= 0:
             return
         if self._last_block <= 0:
-            self._last_block = head - 1
+            p = self.policy
+            self._last_block = head - (p.lead_blocks + max(1, p.proof_challenge_delay_blocks)
+                                       + core.payload_cooldown_blocks(p, self.block_time_s)) - 1
         for n in range(self._last_block + 1, head + 1):
             h = head_hash if n == head and head_hash else self.chain.block_hash(n)
             if h is None:
                 return
-            self._last_block = n
             window = core.open_window(self.netuid, n, h, self.chain.epoch_blocks(), self.policy)
-            if window is None:
-                continue
-            with self._lock:
-                busy = {s for s, until in self._busy_until.items() if n <= until}
-                cooldown = core.payload_cooldown_blocks(self.policy, self.block_time_s)
-                for slot, _row in core.draft(window, self._slots, self.policy, busy):
-                    self._drafted_at[slot.slot_id] = n
-                    self._busy_until[slot.slot_id] = window.proof_block + cooldown
+            if window is not None:
+                with self._lock:
+                    busy = {s for s, until in self._busy_until.items() if n <= until}
+                    cooldown = core.payload_cooldown_blocks(self.policy, self.block_time_s)
+                    for slot, _row in core.draft(window, self._slots, self.policy, busy):
+                        self._drafted_at[slot.slot_id] = n
+                        self._busy_until[slot.slot_id] = window.proof_block + cooldown
+            self._last_block = n
 
     def drained(self, hotkey: str, endpoint_id: str) -> bool:
         slot_id = core.Slot(self.netuid, hotkey, endpoint_id, "", "").slot_id

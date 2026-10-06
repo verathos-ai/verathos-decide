@@ -60,12 +60,16 @@ class SubtensorChainView:
         self._subtensor = None
 
     def head(self) -> tuple[int, bytes | None]:
-        header = self._rpc("chain_getHeader", [])
+        """The best block's number and hash, both read from the same header (a load-balanced node cannot pair the
+        number of one block with the hash of another)."""
+        block_hash = _hash_bytes(self._rpc("chain_getBlockHash", []))
+        if block_hash is None:
+            return 0, None
+        header = self._rpc("chain_getHeader", ["0x" + block_hash.hex()])
         number = header.get("number") if isinstance(header, dict) else None
         if number is None:
             return 0, None
-        block = int(number, 0) if isinstance(number, str) else int(number)
-        return block, self.block_hash(block)
+        return (int(number, 0) if isinstance(number, str) else int(number)), block_hash
 
     def block_hash(self, block_number: int) -> bytes | None:
         return _hash_bytes(self._rpc("chain_getBlockHash", [int(block_number)]))

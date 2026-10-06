@@ -27,6 +27,7 @@ from verathos.validator import chain as validator_chain
 from verathos.validator.discovery import DiscoveredMiner, discover
 
 log = logging.getLogger(__name__)
+SLOT_REFRESH_S = 120.0
 
 
 def capacity_slots(miners: list[DiscoveredMiner], netuid: int) -> list[Slot]:
@@ -73,7 +74,7 @@ class Capacity:
         (self.auditor or self.holds).set_policy(policy)
 
     def start_slot_refresh(self, network: str, mechid: int, catalog_digests: Callable[[], Collection[str]],
-                           interval_s: float = 600.0) -> None:
+                           interval_s: float = SLOT_REFRESH_S) -> None:
         """Re-discover miners every ``interval_s`` so new or changed endpoints join the audit within minutes rather
         than at the next epoch."""
 
@@ -101,16 +102,18 @@ class Capacity:
         return (self.auditor or self.holds).drained(hotkey, endpoint_id)
 
     def tempo_epoch(self) -> int:
-        return self.chain.head()[0] // self.chain.epoch_blocks()
+        """The audit's epoch number at the current head (the epoch audit windows are filed under)."""
+        head = self.chain.head()[0]
+        if head <= 0:
+            raise RuntimeError("chain head unavailable")
+        return head // self.chain.epoch_blocks()
 
-    async def gated(self, client: httpx.AsyncClient) -> dict[tuple[str, str], str]:
-        """Endpoints gated this epoch: the auditor's own evaluation, or its signed verdicts."""
+    async def gated(self, client: httpx.AsyncClient, epoch: int) -> dict[tuple[str, str], str]:
+        """Endpoints gated in audit epoch ``epoch``: the auditor's own evaluation, or its signed verdicts."""
+        if self.auditor is not None:
+            self.auditor.prune(epoch)
+            return self.auditor.gated(epoch)
         if self.policy.mode != "score_gate":
             return {}
-        epoch = self.tempo_epoch()
-        if self.auditor is not None:
-            gated = self.auditor.gated(epoch)
-            self.auditor.prune(epoch)
-            return gated
         return await fetch_verdicts(client, self.chain.auditor_url(), auditor_hotkey=self.auditor_hotkey,
                                     netuid=self.netuid, epoch=epoch)

@@ -5,13 +5,15 @@ public chain data and this miner's committed manifest, and when one of its endpo
 
 1. drains that endpoint (the miner service answers 503 for it until the audit ends),
 2. prelaunches the bench on that endpoint's GPU so it is hot before B_start,
-3. releases the bench at B_start with proof_seed = H(B_start hash, slot), publishing a pass-0 receipt as soon as the
-   first pass commits and a final receipt when the timed work commits its transcript,
+3. releases the bench at B_start with proof_seed = H(B_start hash, slot) and publishes a final receipt, naming the
+   B_start hash it used, when the timed work commits its transcript,
 4. derives the challenge seed from the B_proof hash once it exists, lets the bench build the sampled proof, and
-5. publishes the proof payload.
+5. publishes the proof payload, naming the B_proof hash it used.
 
 All artifacts are signed by the miner hotkey and sent only to the audit validator (the policy's ``auditor_hotkey``),
-found through its axon. Several endpoints drafted in the same window bench concurrently on their own GPUs.
+found through its axon. Final receipts and proofs travel on separate delivery lanes, so a proof upload never delays
+another endpoint's time-critical receipt. Several endpoints drafted in the same window bench concurrently on their
+own GPUs.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,9 +41,8 @@ from verathos.capacity.proof.combined import COMBINED_PROOF_FORMAT, final_commit
 
 log = logging.getLogger(__name__)
 
-RECEIPT_PATH = "/capacity/v1/receipt"
-PROOF_PATH = "/capacity/v1/proof"
 UNKNOWN_SLOT_ERROR = "unknown audit slot"
+RETRYABLE = (409, 425, 429, 500, 502, 503, 504)
 
 
 class ChainView(Protocol):
@@ -121,93 +123,100 @@ def bench_extension_available() -> tuple[bool, str]:
     return proc.returncode == 0, (proc.stderr or proc.stdout or "")[-500:]
 
 
-def default_bench_command(audit: SelectedAudit, *, out_dir: Path, challenge_file: Path, ready_file: Path,
-                          start_file: Path, start_timeout_s: float, challenge_timeout_s: float) -> list[str]:
+def default_bench_command(audit: SelectedAudit, *, out_dir: Path, challenge_file: Path, start_file: Path,
+                          start_timeout_s: float, challenge_timeout_s: float) -> list[str]:
     return [sys.executable, "-m", "verathos.capacity.bench.combined", "--lease-id", audit.lease,
             "--workload", json.dumps(audit.workload_spec, sort_keys=True), "--out-dir", str(out_dir),
-            "--start-file", str(start_file), "--ready-file", str(ready_file), "--start-timeout-s", str(start_timeout_s),
+            "--start-file", str(start_file), "--start-timeout-s", str(start_timeout_s),
             "--challenge-file", str(challenge_file), "--challenge-timeout-s", str(challenge_timeout_s)]
 
 
-def _root_hex(root_words: Any) -> str:
-    if isinstance(root_words, str):
-        raw = root_words.strip().removeprefix("0x")
-        if len(raw) == 64:
-            try:
-                bytes.fromhex(raw)
-                return raw
-            except ValueError:
-                pass
-    return core.root_words_digest(root_words)
+class _Lane:
+    """One ordered delivery lane to the audit validator. Each artifact is retried until its deadline."""
 
-
-class _Publisher:
-    """Ordered delivery of signed artifacts to the audit validator."""
-
-    def __init__(self, chain: ChainView, client: httpx.Client) -> None:
-        self._chain, self._client = chain, client
-        self._queue: queue.Queue[tuple[str, dict, int, float]] = queue.Queue(maxsize=64)
+    def __init__(self, name: str, chain: ChainView, client: httpx.Client, rejected: set[tuple[str, str]],
+                 lock: threading.Lock) -> None:
+        self._name, self._chain, self._client = name, chain, client
+        self._rejected, self._rejected_lock = rejected, lock
+        self._queue: queue.Queue[tuple[str, dict, float, float]] = queue.Queue(maxsize=64)
         self._stop = threading.Event()
-        self._rejected: set[str] = set()
-        threading.Thread(target=self._run, name="capacity-publisher", daemon=True).start()
+        threading.Thread(target=self._run, name=f"capacity-{name}", daemon=True).start()
 
-    def publish(self, path: str, artifact: dict, *, attempts: int, retry_delay_s: float) -> None:
+    def publish(self, path: str, artifact: dict, *, until: float, retry_delay_s: float) -> None:
         try:
-            self._queue.put_nowait((path, artifact, max(1, attempts), max(0.0, retry_delay_s)))
+            self._queue.put_nowait((path, artifact, until, retry_delay_s))
         except queue.Full:
-            log.warning("capacity publish queue full; dropping %s for %s", artifact.get("artifact_type"),
-                        str(artifact.get("audit_id"))[:12])
+            log.warning("capacity %s queue full; dropping audit %s", self._name, str(artifact.get("audit_id"))[:12])
 
     def stop(self) -> None:
         self._stop.set()
 
-    def wait_idle(self, timeout_s: float) -> bool:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if self._queue.unfinished_tasks == 0:
-                return True
-            time.sleep(0.01)
-        return False
+    def idle(self) -> bool:
+        return self._queue.unfinished_tasks == 0
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                path, artifact, attempts, delay = self._queue.get(timeout=0.1)
+                path, artifact, until, delay = self._queue.get(timeout=0.1)
             except queue.Empty:
                 continue
             try:
-                self._deliver(path, artifact, attempts, delay)
+                self._deliver(path, artifact, until, delay)
             except Exception:
-                log.exception("capacity publish failed")
+                log.exception("capacity %s delivery failed", self._name)
             finally:
                 self._queue.task_done()
 
-    def _deliver(self, path: str, artifact: dict, attempts: int, delay: float) -> None:
-        audit_id = str(artifact.get("audit_id") or "")
-        for attempt in range(1, attempts + 1):
-            if audit_id in self._rejected:
-                return
+    def _deliver(self, path: str, artifact: dict, until: float, delay: float) -> None:
+        key = (str(artifact.get("audit_id") or ""), str(artifact.get("slot_id") or ""))
+        headers = {core.HDR_AUDIT_ID: key[0], core.HDR_SLOT_ID: key[1]}
+        while True:
+            with self._rejected_lock:
+                if key in self._rejected:
+                    return
             base = self._chain.auditor_url()
             if base:
                 try:
-                    r = self._client.post(base.rstrip("/") + path, json=artifact, timeout=10.0)
+                    r = self._client.post(base.rstrip("/") + path, json=artifact, headers=headers, timeout=10.0)
                 except httpx.HTTPError as exc:
-                    log.warning("capacity publish error %s %s: %s", artifact.get("artifact_type"), audit_id[:12], exc)
+                    log.warning("capacity %s error for %s: %s", self._name, key[0][:12], exc)
                 else:
                     if r.status_code < 300:
                         return
                     if r.status_code == 400 and UNKNOWN_SLOT_ERROR in r.text.lower():
-                        self._rejected.add(audit_id)
-                        log.info("auditor does not know audit %s; stopping delivery", audit_id[:12])
+                        with self._rejected_lock:
+                            self._rejected.add(key)
+                        log.info("auditor does not know audit %s for this slot; stopping delivery", key[0][:12])
                         return
-                    log.warning("capacity publish %s %s -> %d %s", artifact.get("artifact_type"), audit_id[:12],
-                                r.status_code, r.text[:200])
-                    if r.status_code not in (409, 425, 429, 500, 502, 503, 504):
+                    log.warning("capacity %s for %s -> %d %s", self._name, key[0][:12], r.status_code, r.text[:200])
+                    if r.status_code not in RETRYABLE:
                         return
             else:
-                log.warning("no auditor endpoint known; retrying %s", artifact.get("artifact_type"))
-            if attempt < attempts and self._stop.wait(max(0.1, delay)):
+                log.warning("no auditor endpoint known; retrying %s", self._name)
+            if time.time() + delay > until or self._stop.wait(delay):
                 return
+
+
+class _Publisher:
+    """Delivery of signed artifacts to the audit validator: final receipts and proofs on separate lanes."""
+
+    def __init__(self, chain: ChainView, client: httpx.Client) -> None:
+        rejected: set[tuple[str, str]] = set()
+        lock = threading.Lock()
+        self.receipts = _Lane("receipts", chain, client, rejected, lock)
+        self.proofs = _Lane("proofs", chain, client, rejected, lock)
+
+    def stop(self) -> None:
+        self.receipts.stop()
+        self.proofs.stop()
+
+    def wait_idle(self, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.receipts.idle() and self.proofs.idle():
+                return True
+            time.sleep(0.01)
+        return False
 
 
 class AuditWorker:
@@ -291,8 +300,8 @@ class AuditWorker:
                 for old in [b for b in self._hashes if b < n - 255]:
                     del self._hashes[old]
                 self._hash_cond.notify_all()
-            self._last_block = n
             self.on_block(n, h)
+            self._last_block = n
 
     def _wait_hash(self, block_number: int, timeout_s: float) -> bytes | None:
         deadline = time.monotonic() + timeout_s
@@ -341,34 +350,34 @@ class AuditWorker:
         artifact = {
             "protocol_version": core.PROTOCOL_VERSION, "audit_id": audit.audit_id, "slot_id": audit.slot.slot_id,
             "netuid": self.netuid, "hotkey": self.keypair.ss58_address, "endpoint_id": audit.endpoint.endpoint_id,
-            "claimed_gpu_class": audit.gpu_class.match_gpu_name, "gpu_index": 0, "B_select": audit.selection_block,
-            "B_start": audit.audit_block, "B_proof": audit.proof_block, "pass_count": audit.passes, **fields,
+            "claimed_gpu_class": audit.gpu_class.gpu_name, "gpu_index": 0, "lease_id": audit.lease,
+            "B_select": audit.selection_block, "B_start": audit.audit_block, "B_proof": audit.proof_block,
+            "pass_count": audit.passes, **fields,
         }
         artifact["miner_signature"] = core.sign_artifact(artifact, self.keypair)
         return artifact
 
     def _run_audit(self, audit: SelectedAudit) -> None:
-        ep_id = audit.endpoint.endpoint_id
+        out_dir = Path(tempfile.mkdtemp(prefix="verathos_capacity_", dir=self.work_dir))
         proc = None
         try:
-            proc = self._execute(audit)
+            proc = self._execute(audit, out_dir)
         except Exception:
             log.exception("capacity audit %s failed", audit.audit_id[:12])
         finally:
             if proc is not None and proc.poll() is None:
                 proc.kill()
-            self.drain.clear(ep_id)
+            self.drain.clear(audit.endpoint.endpoint_id)
+            shutil.rmtree(out_dir, ignore_errors=True)
 
-    def _execute(self, audit: SelectedAudit) -> subprocess.Popen | None:
+    def _execute(self, audit: SelectedAudit, out_dir: Path) -> subprocess.Popen | None:
         p = self.policy
         lead_s = (audit.audit_block - audit.selection_block) * self.block_time_s
         challenge_wait_s = (audit.proof_block - audit.audit_block) * self.block_time_s + p.payload_deadline_s
-        out_dir = Path(tempfile.mkdtemp(prefix="verathos_capacity_", dir=self.work_dir))
         files = {name: out_dir / f"{audit.lease}_{name}" for name in
-                 ("challenge.txt", "start.json", "ready.json", "pass0.json", "final_timing.json", "final.json")}
+                 ("challenge.txt", "start.json", "final_timing.json", "final.json")}
         cmd = self.bench_command(audit, out_dir=out_dir, challenge_file=files["challenge.txt"],
-                                 ready_file=files["ready.json"], start_file=files["start.json"],
-                                 start_timeout_s=max(60.0, lead_s + 60.0),
+                                 start_file=files["start.json"], start_timeout_s=max(60.0, lead_s + 60.0),
                                  challenge_timeout_s=max(30.0, challenge_wait_s))
         env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(audit.endpoint.cuda_device)}
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -380,34 +389,30 @@ class AuditWorker:
         if proc.poll() is not None:
             log.warning("audit %s: bench exited before B_start: %s", audit.audit_id[:12], proc.stderr.read()[-500:])
             return proc
+        started = time.time()
         proof_seed = core.derive_proof_seed(start_hash, audit.slot.slot_id, 0)
         tmp = files["start.json"].with_suffix(".tmp")
         tmp.write_text(json.dumps({"seed_hex": proof_seed, "audit_id": audit.audit_id, "B_start": audit.audit_block,
-                                   "t": time.time()}, sort_keys=True) + "\n")
+                                   "t": started}, sort_keys=True) + "\n")
         os.replace(tmp, files["start.json"])
 
-        pass0_root = final_root = transcript = ""
-        deadline = time.time() + max(120.0, audit.gpu_class.deadline_s + 90.0 + challenge_wait_s)
+        transcript = ""
+        deadline = started + max(120.0, p.deadline_s + 90.0 + challenge_wait_s)
         while time.time() < deadline:
-            if not pass0_root and files["pass0.json"].exists():
-                root = json.loads(files["pass0.json"].read_text()).get("root")
-                if root not in (None, "", []):
-                    pass0_root = _root_hex(root)
-                    self.publisher.publish(RECEIPT_PATH, self._artifact(
-                        audit, artifact_type="capacity_audit_pass0_receipt", pass0_root=pass0_root,
-                        pass0_transcript_commit=pass0_root), attempts=3, retry_delay_s=0.25)
             if files["final_timing.json"].exists():
                 timing = json.loads(files["final_timing.json"].read_text())
-                if not pass0_root and timing.get("pass0_root"):
-                    pass0_root = _root_hex(timing["pass0_root"])
-                    self.publisher.publish(RECEIPT_PATH, self._artifact(
-                        audit, artifact_type="capacity_audit_pass0_receipt", pass0_root=pass0_root,
-                        pass0_transcript_commit=pass0_root), attempts=3, retry_delay_s=0.25)
-                final_root = _root_hex(timing.get("root") or [])
-                transcript = str(timing.get("transcript_root") or "") or core.transcript_root([pass0_root, final_root])
-                final = dict(artifact_type="capacity_audit_final_receipt", pass0_root=pass0_root, final_root=final_root,
-                             final_transcript_commit=transcript, combined=final_commitment(timing))
-                self.publisher.publish(RECEIPT_PATH, self._artifact(audit, **final), attempts=3, retry_delay_s=0.25)
+                transcript = str(timing.get("transcript_root") or "")
+                if not transcript:
+                    log.warning("audit %s: bench reported no transcript root", audit.audit_id[:12])
+                    return proc
+                if self._hashes.get(audit.proof_block) is not None:
+                    log.warning("audit %s: timed work finished after B_proof; no receipt sent", audit.audit_id[:12])
+                    return proc
+                # retried only while the auditor can still time it: a receipt after B_proof would be invalid
+                self.publisher.receipts.publish(core.RECEIPT_PATH, self._artifact(
+                    audit, artifact_type="capacity_audit_final_receipt", final_transcript_commit=transcript,
+                    combined=final_commitment(timing), B_start_hash=start_hash.hex()),
+                    until=started + p.deadline_s + p.transport_grace_s, retry_delay_s=0.25)
                 break
             if proc.poll() is not None:
                 log.warning("audit %s: bench ended without final receipt: %s", audit.audit_id[:12],
@@ -423,6 +428,7 @@ class AuditWorker:
             log.warning("audit %s: B_proof %d not observed in time", audit.audit_id[:12], audit.proof_block)
             return proc
         challenge = core.derive_proof_challenge_seed(transcript, proof_hash, audit.lease, audit.slot.slot_id, 0)
+        proof_seen = time.time()
         tmp = files["challenge.txt"].with_suffix(".tmp")
         tmp.write_text(challenge)
         os.replace(tmp, files["challenge.txt"])
@@ -437,15 +443,8 @@ class AuditWorker:
         if not isinstance(payload, dict) or payload.get("format") != COMBINED_PROOF_FORMAT:
             log.warning("audit %s: bench produced no proof payload", audit.audit_id[:12])
             return proc
-        sampled = (payload.get("capacity_proof") or {}).get("sampled") or {}
-        try:
-            sampled_index = int(sampled.get("pass_index"))
-        except (TypeError, ValueError):
-            sampled_index = 0
-        self.publisher.publish(PROOF_PATH, self._artifact(
-            audit, artifact_type="capacity_audit_proof_payload", sampled_pass_index=sampled_index,
-            sampled_opening={"lease_id": audit.lease, "transcript_root": transcript, "pass0_root": pass0_root,
-                             "final_root": final_root, "pass_index": sampled_index},
-            sampled_pass_proof=payload), attempts=min(12, max(1, int(p.payload_deadline_s // 5))), retry_delay_s=5.0)
+        self.publisher.proofs.publish(core.PROOF_PATH, self._artifact(
+            audit, artifact_type="capacity_audit_proof_payload", sampled_pass_proof=payload,
+            B_proof_hash=proof_hash.hex()), until=proof_seen + p.payload_deadline_s, retry_delay_s=5.0)
         log.info("audit %s: proof published", audit.audit_id[:12])
         return proc

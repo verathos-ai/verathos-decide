@@ -136,7 +136,6 @@ def test_window_catches_subtle_drift_no_single_epoch_shows() -> None:
 
 def test_capacity_gate_and_unauditable_endpoints() -> None:
     """Gated endpoints fail verification (probation); open endpoints without a calibrated GPU class score zero."""
-    from verathos.capacity.core import AuditPolicy
     from verathos.validator.audit import EndpointResult
     from verathos.validator.capacity import capacity_slots, unauditable_endpoints
     from verathos.validator.discovery import DiscoveredEndpoint, DiscoveredMiner
@@ -152,7 +151,7 @@ def test_capacity_gate_and_unauditable_endpoints() -> None:
             netuid=405, mechid=1, hotkey=hotkey, catalog_digest=catalog.load().digest(),
             endpoints=[endpoint])))
     assert [s.hotkey for s in capacity_slots(miners, 405)] == [audited]
-    assert unauditable_endpoints(miners, AuditPolicy()) == {f"{undeclared}/gpu0"}
+    assert unauditable_endpoints(miners, catalog.load().audit_policy()) == {f"{undeclared}/gpu0"}
 
     tol = Tolerance(min_probabilities=1)
     results = {}
@@ -240,3 +239,11 @@ def test_gone_endpoints_are_forgotten() -> None:
     state = ScoreState(ema={"hkA/gpu0": 1e-5}, uid_of={"hkA/gpu0": 1}, window={"hkA/gpu0": [[0.0, 1.0]]})
     update(state, {}, {}, set())
     assert state.ema == {} and state.uid_of == {} and state.window == {}
+
+
+def test_endpoints_the_validator_could_not_audit_keep_their_score() -> None:
+    state = ScoreState(ema={"hkA/gpu0": 0.5}, uid_of={"hkA/gpu0": 1})
+    update(state, {}, {}, set(), held={"hkA/gpu0"})
+    assert state.ema == {"hkA/gpu0": 0.5}
+    update(state, {}, {}, set())
+    assert state.ema["hkA/gpu0"] == pytest.approx(0.4)

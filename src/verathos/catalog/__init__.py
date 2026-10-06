@@ -22,7 +22,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_validator
 
-from verathos.capacity.core import AuditPolicy
+from verathos.capacity.core import AuditPolicy, GpuClass
 from verathos.protocol.canonical import digest
 from verathos.protocol.http import get_json
 from verathos.validator.compare import Tolerance
@@ -58,14 +58,15 @@ class CatalogModel(BaseModel):
     tolerance: Tolerance = Tolerance()
 
 
-_AUDIT_FIELDS = {f.name for f in dataclasses.fields(AuditPolicy)} - {"gpu_classes"}
+_AUDIT_FIELDS = {f.name for f in dataclasses.fields(AuditPolicy)}
 
 
 class Catalog(BaseModel):
     version: Literal[1] = 1
     revision: str
     models: list[CatalogModel]
-    capacity_audit: dict[str, Any] = Field(default_factory=dict, description="Overrides of the capacity-audit policy")
+    capacity_audit: dict[str, Any] = Field(default_factory=dict, description="Capacity-audit policy settings over "
+                                           "the code defaults, including the calibrated GPU classes")
     _document: Any = PrivateAttr(None)
 
     @classmethod
@@ -92,8 +93,12 @@ class Catalog(BaseModel):
         return self
 
     def audit_policy(self) -> AuditPolicy:
-        """The capacity-audit policy: code defaults (live-calibrated values) with this catalog's overrides."""
-        return dataclasses.replace(AuditPolicy(), **self.capacity_audit)
+        """The capacity-audit policy: code defaults with this catalog's settings. GPU classes come only from the
+        catalog; an endpoint whose GPU has no class here cannot be audited."""
+        settings = dict(self.capacity_audit)
+        if "gpu_classes" in settings:
+            settings["gpu_classes"] = tuple(GpuClass.from_dict(row) for row in settings["gpu_classes"])
+        return dataclasses.replace(AuditPolicy(), **settings)
 
     def digest(self) -> str:
         return digest(self.document())

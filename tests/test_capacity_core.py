@@ -3,6 +3,7 @@ derivations (``fixtures/capacity_vectors.json``) that the GPU bench and the veri
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -10,9 +11,11 @@ from pathlib import Path
 import pytest
 from bittensor_wallet import Keypair
 
+from verathos import catalog
 from verathos.capacity import core
 
 VECTORS = json.loads((Path(__file__).parent / "fixtures" / "capacity_vectors.json").read_text())
+POLICY = catalog.load().audit_policy()
 
 
 def h(i: int) -> str:
@@ -28,19 +31,15 @@ def test_proof_derivations_match_reference_vectors() -> None:
         assert core.derive_sampled_pass_index(root, lease, gpu, passes) == expected
     for block, epoch, expected in VECTORS["audit_seed"]:
         assert core.derive_audit_seed(block, epoch) == expected
-    roots, expected = VECTORS["transcript_root"]
-    assert core.transcript_root(roots) == expected
 
 
-def test_beacon_and_gpu_rows_match_reference_vectors() -> None:
-    policy = core.AuditPolicy(windows_per_epoch=5, lead_blocks=5, proof_challenge_delay_blocks=4)
+def test_beacon_and_catalog_gpu_rows_match_reference_vectors() -> None:
+    policy = dataclasses.replace(POLICY, windows_per_epoch=5, lead_blocks=5, proof_challenge_delay_blocks=4)
     for block, block_hash, triggered, fits in VECTORS["window"]:
         assert core.window_triggered(block, block_hash, 360, policy) == triggered
         assert core.window_fits_epoch(block, 360, policy) == fits
     for name, (vram, spec) in VECTORS["workload_specs"].items():
         assert core.gpu_workload_spec(core.match_gpu_class(name, vram, policy)) == spec
-    for host, expected in VECTORS["registered_domain"].items():
-        assert core.registered_domain_from_host(host) == expected
 
 
 def slot(hotkey: str, endpoint_id: str = "gpu0", url: str = "http://203.0.113.5:8091/e/gpu0",
@@ -53,10 +52,18 @@ def test_slot_and_lease_identity() -> None:
     assert a.slot_id != b.slot_id != slot("hkB").slot_id
     assert a.slot_id == slot("hkA").slot_id
     assert core.lease_id(a, 1) != core.lease_id(a, 2)
+    # a refreshed URL or model on one side never changes the work
+    assert core.lease_id(a, 1) == core.lease_id(slot("hkA", url="http://198.51.100.1:9000/e/gpu0", model="x"), 1)
+
+
+def test_grouping_tokens_come_from_hotkey_and_axon_ip() -> None:
+    assert core.group_keys(slot("hkA")) == (
+        "hk:hka", "hk_model:hka::kev-4b", "ip24:203.0.113", "ip24_model:203.0.113::kev-4b", "ip:203.0.113.5",
+        "ip_model:203.0.113.5::kev-4b")
 
 
 def test_selection_is_reproducible_by_each_miner() -> None:
-    policy = core.AuditPolicy(cohort_fraction=0.5, windows_per_epoch=5)
+    policy = dataclasses.replace(POLICY, cohort_fraction=0.5, windows_per_epoch=5)
     slots = [slot(f"hk{i}", url=f"http://198.51.{i // 50}.{i % 50}:8091/e/gpu0") for i in range(200)]
     for i in range(30):
         seed = core.derive_audit_seed(h(i), 1)
@@ -68,7 +75,7 @@ def test_co_hosted_slots_are_drafted_together() -> None:
     """Group stress: endpoints behind one IP share grouping tokens and are selected together about twice as often
     as independent endpoints, on top of the base draw. Over repeated windows this drafts co-hosted slots into the
     same window, which is what lets the sieve catch several endpoints on one machine."""
-    policy = core.AuditPolicy(cohort_fraction=0.5, windows_per_epoch=5)
+    policy = dataclasses.replace(POLICY, cohort_fraction=0.5, windows_per_epoch=5)
     co_a, co_b = slot("hkX", "gpu0", "http://203.0.113.9:8091/e/gpu0"), slot("hkY", "gpu0", "http://203.0.113.9:8092/e/gpu0")
     far_a, far_b = slot("hkP", "gpu0", "http://192.0.2.1:8091/e/gpu0"), slot("hkQ", "gpu0", "http://198.51.100.7:8091/e/gpu0")
     together_co = together_far = 0
@@ -90,8 +97,20 @@ def test_artifact_signing() -> None:
 
 
 def test_policy_validation() -> None:
-    core.AuditPolicy().validate()
+    POLICY.validate()
     with pytest.raises(ValueError):
-        core.AuditPolicy(deadline_s=60).validate()
+        dataclasses.replace(POLICY, deadline_s=60).validate()
     with pytest.raises(ValueError):
-        core.AuditPolicy(group_stress_fraction=0.9).validate()
+        dataclasses.replace(POLICY, group_stress_fraction=0.9).validate()
+    with pytest.raises(ValueError, match="unique"):
+        dataclasses.replace(POLICY, gpu_classes=POLICY.gpu_classes[:1] * 2).validate()
+
+
+def test_catalog_gpu_classes_are_validated() -> None:
+    document = catalog.load().document()
+    bad = {**document, "capacity_audit": {"gpu_classes": [{"gpu_name": "X", "vram_gb": 8, "passes": 3}]}}
+    with pytest.raises(ValueError, match="unknown GPU class settings"):
+        catalog.Catalog.parse(bad)
+    missing = {**document, "capacity_audit": {"gpu_classes": [{"gpu_name": "X", "vram_gb": 8}]}}
+    with pytest.raises(ValueError, match="capacity_passes"):
+        catalog.Catalog.parse(missing)

@@ -12,15 +12,17 @@ capacity audit (see `CAPACITY_AUDIT.md`) checks that every endpoint has the GPU 
 
 - Linux with NVIDIA drivers, CUDA toolkit 12.8 (`nvcc`), Python 3.12, Rust (via rustup), `build-essential`,
   `pkg-config`, `libssl-dev`, `git`.
-- One GPU per endpoint, of a calibrated class:
+- One GPU per endpoint, of a GPU class the catalog lists (shipped catalog):
 
   | | GPU classes |
   |---|---|
   | Consumer and workstation | RTX 3090, 3090 Ti, 4090, 5090; RTX A4500, A5000, A6000; RTX 4000/5000/6000 Ada; RTX PRO 4000/4500/5000 Blackwell; RTX PRO 6000 Blackwell Server Edition; L4, L40, L40S, A40 |
   | Datacenter (adds an FP64 lane) | A100 40/80 GB, H100 (HBM3, PCIe, NVL), H200, B200 |
 
-  Other GPUs cannot be audited; in `score_gate` mode their endpoints score zero.
-- A public IP and one open TCP port for the miner service.
+  Other GPUs cannot be audited; in `score_gate` mode their endpoints score zero. The subnet owner adds classes by
+  publishing a new catalog.
+- A public IP address and one open TCP port for the miner service. Validators reach endpoints only at the axon's
+  IP and port, so the miner service must be reachable there directly (plain HTTP; requests and receipts are signed).
 - A hotkey registered on the subnet; the miner machine needs the hotkey and `coldkeypub.txt`, never the coldkey.
 
 ## 1. Register
@@ -103,8 +105,7 @@ CUDA_VISIBLE_DEVICES=2 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --rev
 | Field | Meaning |
 |---|---|
 | `network` | `finney`, `test`, or a subtensor websocket URL |
-| `public_host`, `port` | where validators reach the miner; the miner listens on `listen_host` (default `0.0.0.0`) at `port` |
-| `scheme` | `http` (default) or `https` if a TLS proxy terminates in front of the miner |
+| `public_host`, `port` | the public IP address and port validators reach the miner at (the axon); the miner listens on `listen_host` (default `0.0.0.0`) at `port` |
 | `endpoint_id` | 1-32 characters of `a-z`, `0-9`, `-`; unique per miner |
 | `model_id` | a catalog model |
 | `engine_url`, `engine_api_key` | the endpoint's engine and its bearer token, if it needs one |
@@ -125,27 +126,32 @@ CUDA_VISIBLE_DEVICES=2 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --rev
 
 On start the miner:
 1. finds the catalog the subnet owner commits on chain (the shipped copy, its local store, the owner's axon or a
-   configured mirror; any copy is checked against the committed digest) and exits if an endpoint's model is not in
-   it;
-2. signs a manifest listing its endpoints, points its axon at `public_host:port` (`serve_axon`) and commits the
-   manifest digest (`set_commitment`); both are free and only sent when they change;
+   configured mirror; any copy is checked against the committed digest); endpoints whose model the catalog does not
+   serve (unknown or `retired`) are left out, and it exits if none remain;
+2. checks the capacity-audit setup (GPU fields, bench extension), then signs a manifest listing its endpoints,
+   points its axon at `public_host:port` (`serve_axon`) and commits the manifest digest (`set_commitment`); both
+   are free and only sent when they change, so a restart with the same configuration writes nothing;
 3. serves the manifest (`GET /v1/manifest`) and the endpoints (`/e/<endpoint_id>/v1/...`) on one port;
 4. follows the chain and runs the capacity audit for its CUDA endpoints;
-5. checks the owner's commitment every 10 minutes; when the owner commits a new catalog it re-signs and
-   re-publishes the manifest by itself.
+5. checks the owner's commitment every minute; when the owner commits a new catalog it re-signs and re-publishes
+   the manifest by itself, withdrawing endpoints whose model was retired, and adopts the new audit policy.
 
 Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted only
-from hotkeys holding a validator permit and from `gateway_hotkeys`, each signed and bound to this miner.
+from hotkeys holding a validator permit and from `gateway_hotkeys`, each signed and bound to this miner; other
+callers are refused before their request body is read, and bodies are capped at 1 MiB.
 
 ## Capacity audit duty
 
 When an endpoint is drafted, the miner answers `503` for that endpoint for a few minutes, runs the calibrated GPU
-workload beside the resident model, and sends signed receipts and a proof to the auditor. Nothing needs to be done
-by hand, but:
+workload beside the resident model, and sends a signed final receipt and a proof to the auditor. Nothing needs to
+be done by hand, but:
 - do not run other GPU work on an endpoint's GPU;
 - declare the GPU each endpoint really has: an endpoint that shares a GPU with another, or claims a faster class,
   misses deadlines and is gated;
-- keep the clock synchronised (NTP) and the machine responsive; a late final receipt is a miss.
+- use a new `endpoint_id` when an endpoint moves to other hardware;
+- use a reliable subtensor node: artifacts name the block hashes the miner used, and work built on a fork the
+  chain did not keep is a miss;
+- keep the machine responsive; a late final receipt is a miss.
 
 ## Updating
 

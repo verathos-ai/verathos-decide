@@ -15,7 +15,7 @@ import uvicorn
 
 from verathos import catalog
 from verathos.capacity.chain import SubtensorChainView
-from verathos.capacity.core import AuditPolicy, gpu_support_status
+from verathos.capacity.core import POLICY_WATCH_S, AuditPolicy, gpu_support_status
 from verathos.capacity.miner import AuditEndpoint, AuditWorker, DrainState, bench_extension_available
 from verathos.miner.app import create_app
 from verathos.miner.chain import PermitAuthorizer, build_manifest, publish
@@ -25,7 +25,6 @@ from verathos.protocol.manifest import SignedManifest
 from verathos.subnet.chain import committed_catalog, current_catalog
 
 log = logging.getLogger("verathos.miner")
-CATALOG_WATCH_S = 120.0
 
 
 def servable(config: MinerConfig, cat: catalog.Catalog) -> list[EndpointConfig]:
@@ -84,7 +83,7 @@ class Publisher:
         listed = {e.endpoint_id for e in self.signed.manifest.endpoints}
         return [e for e in self.config.endpoints if e.endpoint_id in listed]
 
-    def watch(self, interval_s: float = CATALOG_WATCH_S) -> None:
+    def watch(self, interval_s: float = POLICY_WATCH_S) -> None:
         """Follow the owner's catalog commitment; a catalog that cannot be applied yet is retried."""
 
         def run() -> None:

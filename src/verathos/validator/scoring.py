@@ -105,27 +105,31 @@ def epoch_scores(results: dict[str, EndpointResult], model_weight: dict[str, flo
 
 
 def update(state: ScoreState, results: dict[str, EndpointResult], scores: dict[str, float], failed: set[str],
-           *, alpha: float = 0.2, probation_epochs: int = 6) -> None:
-    """Fold one epoch into the state. Endpoints absent this epoch decay toward zero and are forgotten once their EMA
-    is negligible."""
-    held: dict[str, int] = {}
+           *, alpha: float = 0.2, probation_epochs: int = 6, held: Collection[str] = ()) -> None:
+    """Fold one epoch into the state. ``held`` endpoints were discovered but could not be audited this epoch (no
+    usable reference answers); their EMA is kept. Other endpoints absent this epoch decay toward zero and are
+    forgotten once their EMA is negligible."""
+    on_probation: dict[str, int] = {}
     for key, remaining in state.probation.items():
         hotkey = key.split("/", 1)[0]
-        held[hotkey] = max(held.get(hotkey, 0), remaining)
+        on_probation[hotkey] = max(on_probation.get(hotkey, 0), remaining)
     for key, r in results.items():
-        if key not in state.ema and key not in state.probation and held.get(r.endpoint.hotkey):
-            state.probation[key] = held[r.endpoint.hotkey]
+        if key not in state.ema and key not in state.probation and on_probation.get(r.endpoint.hotkey):
+            state.probation[key] = on_probation[r.endpoint.hotkey]
         state.uid_of[key] = r.endpoint.uid
     for key in failed:
         state.probation[key] = probation_epochs
     for key in set(state.ema) | set(scores) | set(state.probation):
+        if key in held and key not in scores and key not in state.probation:
+            continue
         current = scores.get(key, 0.0)
         if state.probation.get(key, 0) > 0:
             current = 0.0
             state.probation[key] -= 1
         state.ema[key] = alpha * current + (1 - alpha) * state.ema.get(key, 0.0)
     state.probation = {k: v for k, v in state.probation.items() if v > 0}
-    for key in [k for k, v in state.ema.items() if v < PRUNE_BELOW and k not in results and k not in state.probation]:
+    for key in [k for k, v in state.ema.items()
+                if v < PRUNE_BELOW and k not in results and k not in state.probation and k not in held]:
         del state.ema[key]
         state.uid_of.pop(key, None)
         state.window.pop(key, None)
