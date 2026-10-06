@@ -1,5 +1,26 @@
 # Testnet runs
 
+## 2026-10-06: first validator epoch on mechanism 1 (testnet 405)
+
+Owner setup with `scripts/testnet_owner_ops.py` (owner coldkey from the OS keyring): `max_allowed_uids` 256 -> 128
+(chain rule: max UIDs x mechanisms <= 256), mechanism count 1 -> 2, emission split 90/10 ([58982, 6553]).
+
+Miner (one RTX 5090, hotkey `test_miner96/rehearsal-aug18`, UID 12): `gpu0` Kev-4B, `gpu1` Kev-0.8B advertised as
+`kev-4b`. Validator `python -m decide.validator --once` as UID 0 (`test_sn96`, validator permit) with a CPU fp32
+Kev-4B reference engine on another machine; 10 canaries per model, 6 per endpoint.
+
+| Endpoint | Answered | Identity | Mean abs diff | Verdict | Score |
+|---|---|---|---|---|---|
+| gpu0 (Kev-4B) | 6/6 | verified | 0.0014 | insufficient (below 100 probabilities) | 1.03 |
+| gpu1 (Kev-0.8B as kev-4b) | 6/6 | verified | 0.1335 | fail_hard | 0, probation |
+
+`set_weights(mechid=1)` succeeded; 405 has commit-reveal on (reveal period 1 epoch), and the commit appeared in
+mechanism 1's timelocked queue, separate from the existing validators' commits on mechanism 0. Epoch wall time
+1 min 45 s, mostly CPU reference computation.
+
+Follow-up: the statistical bound needs more probabilities than one epoch of 6 canaries provides; tallies should
+accumulate over a rolling window of epochs.
+
 ## 2026-10-06: miner smoke test with a disguised model (testnet 405)
 
 Setup:
