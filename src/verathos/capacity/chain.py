@@ -30,7 +30,7 @@ class SubtensorChainView:
         self._lock = threading.Lock()
         self._subtensor: bt.Subtensor | None = None
         self._tempo: tuple[float, int] | None = None
-        self._auditor: tuple[float, str | None] | None = None
+        self._auditor: tuple[float, str] | None = None
 
     def _st(self) -> bt.Subtensor:
         if self._subtensor is None:
@@ -79,9 +79,13 @@ class SubtensorChainView:
         return self._tempo[1]
 
     def auditor_url(self) -> str | None:
+        """The auditor's axon URL, cached once resolved; an unresolved auditor is looked up again on each call."""
         now = time.monotonic()
         if self._auditor is None or now - self._auditor[0] > self._cache_s:
-            self._auditor = (now, self._resolve_auditor_url())
+            url = self._resolve_auditor_url()
+            if url is None:
+                return None
+            self._auditor = (now, url)
         return self._auditor[1]
 
     def _resolve_auditor_url(self) -> str | None:
