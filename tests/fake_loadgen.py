@@ -55,9 +55,10 @@ async def _target(client: httpx.AsyncClient, target: dict[str, Any], plan: dict[
 
     await asyncio.gather(*(send(k) for k in range(count)))
     latencies = sorted(c.pop("latency_ms") for c in completed)
-    return {"id": target["id"], "sent": count, "skipped": 0, "completed": len(completed),
+    in_window = sum(window[0] <= start + k / target["rate_rps"] < window[1] for k in range(count))
+    return {"id": target["id"], "sent": in_window, "skipped": 0, "completed": len(completed),
             "delivered_rps": len(completed) / plan["test_s"],
-            "latency_ms": {"p50": latencies[len(latencies) // 2] if latencies else 0.0,
-                           "p95": latencies[int(len(latencies) * 0.95)] if latencies else 0.0,
-                           "max": latencies[-1] if latencies else 0.0},
+            "latency_ms": {"p50": latencies[len(latencies) // 2] if latencies else None,
+                           "p95": latencies[int(len(latencies) * 0.95)] if latencies else None,
+                           "max": latencies[-1] if latencies else None},
             "errors": errors, "samples": rng.sample(completed, min(target["samples"], len(completed)))}

@@ -3,8 +3,8 @@
 
 It reads one plan as JSON on stdin (targets with their URL, open-loop rate, headers and request mix), sends every
 target its traffic at once, and writes per-target counts, latencies and a random sample of completed requests as JSON
-on stdout. A request counts as delivered when its response (HTTP 200, a JSON object) completes inside the measured
-window.
+on stdout. A request counts as delivered when its response (HTTP 200, a JSON object of at most 1 MiB) completes
+inside the measured window; ``sent`` and ``late_sends`` count the sends scheduled inside it.
 """
 
 from __future__ import annotations
@@ -28,9 +28,11 @@ class LoadgenError(RuntimeError):
 
 
 class Latency(BaseModel):
-    p50: float = 0.0
-    p95: float = 0.0
-    max: float = 0.0
+    """Milliseconds over the requests completed in the window; None when none completed."""
+
+    p50: float | None = None
+    p95: float | None = None
+    max: float | None = None
 
 
 class Sample(BaseModel):

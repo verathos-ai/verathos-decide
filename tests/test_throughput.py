@@ -19,6 +19,7 @@ from verathos.miner.admission import Admission
 from verathos.miner.app import create_app
 from verathos.miner.config import MinerConfig
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest
+from verathos.throughput import loadgen
 from verathos.throughput.auditor import Auditor, Slot, planned_rate
 from verathos.throughput.measure import MeasurementStore, Target, current_measurements, measure_all
 from verathos.throughput.policy import (
@@ -225,9 +226,10 @@ class HostRouter(httpx.AsyncBaseTransport):
         return await self._t[request.url.host].handle_async_request(request)
 
 
-def miner_app(host: str, keypair: Keypair, auditor: Keypair, engines: dict[str, object], declared: float):
+def miner_app(host: str, keypair: Keypair, auditor: Keypair, engines: dict[str, object], declared: float,
+              port: int = 80):
     config = MinerConfig.model_validate({
-        "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": 80,
+        "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": port,
         "endpoints": [{"endpoint_id": e, "model_id": "kev-4b", "engine_url": "http://unused", "max_concurrency": 64}
                       for e in engines]})
     signed = SignedManifest.create(Manifest(
@@ -316,3 +318,48 @@ def test_a_test_whose_selection_block_is_not_final_is_void(tmp_path) -> None:
     chain.head_block = 4 * 180
     auditor.follower.poll()
     assert auditor.verdicts(4).verdicts.credits == []
+
+
+@pytest.mark.skipif(not loadgen.BINARY_PATH.exists(), reason="verathos-build-loadgen has not been run")
+def test_auditor_with_the_load_generator_over_tcp(tmp_path) -> None:
+    """The real load generator against miner services on local ports: the honest endpoint passes, the
+    over-declaring one is credited what it delivers."""
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+
+    from verathos.validator.discovery import DiscoveredMiner
+
+    auditor_kp, servers, miners = kp(), [], []
+    policy = dataclasses.replace(AuditPolicy(), max_latency_s=0.5, warmup_s=1.0, test_s=3.0, samples_per_test=5)
+    for uid, rps in ((1, 80), (2, 20)):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        keypair = kp()
+        engines = {"gpu0": CapacityEngine(MockEngine("kev-4b"), rps=rps)}
+        app, manifest = miner_app("127.0.0.1", keypair, auditor_kp, engines, 40.0, port=port)
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+        threading.Thread(target=server.run, daemon=True).start()
+        servers.append(server)
+        miners.append(DiscoveredMiner(uid, keypair.ss58_address, f"http://127.0.0.1:{port}", manifest))
+    while not all(s.started for s in servers):
+        time.sleep(0.05)
+
+    chain = FakeChain(head=3 * 180 + 40)
+    auditor = Auditor(netuid=405, mechid=1, keypair=auditor_kp, chain=chain, policy=policy, catalog=catalog.load,
+                      references={}, db_path=tmp_path / "throughput.sqlite")
+    auditor.update_slots(slots(miners))
+    selection = chain.head_block - policy.lead_blocks
+    auditor.follower.poll()
+    try:
+        asyncio.run(auditor.run_test(ScheduledTest(3, selection, block_hash(selection).hex(), chain.head_block),
+                                     {"kev-4b": MockEngine("kev-4b")}))
+    finally:
+        for server in servers:
+            server.should_exit = True
+    honest, over = (auditor.store.outcomes(m.hotkey, 0)[0] for m in miners)
+    assert (honest.outcome, honest.credited_rps) == ("passed", 40.0), honest
+    assert over.outcome == "partial" and 14 < over.credited_rps < 26, over

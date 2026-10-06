@@ -325,7 +325,8 @@ class Auditor:
                        references: dict[str, Engine], policy: AuditPolicy) -> Result:
         detail = json.dumps({"sent": r.sent, "completed": r.completed, "skipped": r.skipped, "errors": r.errors,
                              "late_sends": r.late_sends, "samples": len(r.samples)}, sort_keys=True)
-        latency = {"latency_p50_ms": r.latency_ms.p50, "latency_p95_ms": r.latency_ms.p95, "detail": detail}
+        latency = {"latency_p50_ms": r.latency_ms.p50 or 0.0, "latency_p95_ms": r.latency_ms.p95 or 0.0,
+                   "detail": detail}
         if r.late_sends > LATE_SEND_SHARE * max(r.sent, 1):
             return Result(target, "void", "the auditor's load generator fell behind", **latency)
         slot, model = target.slot, self.catalog().get(target.slot.model_id)
