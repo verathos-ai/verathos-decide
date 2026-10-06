@@ -8,10 +8,10 @@ import pytest
 from bittensor_wallet import Keypair
 from fastapi.testclient import TestClient
 
+from tests.mock_engine import MockEngine
 from verathos import catalog
 from verathos.miner.app import IDENTITY_DOMAIN, create_app, identity_payload
 from verathos.miner.config import MinerConfig
-from verathos.miner.engine import MockEngine
 from verathos.protocol import signing
 from verathos.protocol.api import distributions
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, accept, commitment_value

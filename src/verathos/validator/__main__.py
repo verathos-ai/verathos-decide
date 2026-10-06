@@ -26,6 +26,7 @@ from verathos import catalog
 from verathos.capacity.auditor import Auditor
 from verathos.capacity.chain import SubtensorChainView
 from verathos.capacity.ingest import create_ingest_app
+from verathos.chain import serve_axon
 from verathos.miner.engine import HttpEngine
 from verathos.validator import chain
 from verathos.validator.audit import audit_epoch
@@ -61,7 +62,7 @@ def start_auditor(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, sta
     server = uvicorn.Server(uvicorn.Config(create_ingest_app(auditor), host="0.0.0.0", port=cfg.capacity_port,
                                            log_level="warning"))
     threading.Thread(target=server.run, name="capacity-ingest", daemon=True).start()
-    chain.serve_axon(st, wallet, cfg.netuid, cfg.capacity_public_host, cfg.capacity_port)
+    serve_axon(st, wallet, cfg.netuid, cfg.capacity_public_host, cfg.capacity_port)
     log.info("capacity auditor running (%s mode), ingest on port %d", policy.mode, cfg.capacity_port)
     return auditor
 

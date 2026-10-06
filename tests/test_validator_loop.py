@@ -12,10 +12,10 @@ import httpx
 import pytest
 from bittensor_wallet import Keypair
 
+from tests.mock_engine import MockEngine
 from verathos import catalog
 from verathos.miner.app import create_app
 from verathos.miner.config import MinerConfig
-from verathos.miner.engine import MockEngine
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
 from verathos.validator.audit import audit_epoch
 from verathos.validator.canaries import assignment, canary_pool

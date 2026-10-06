@@ -82,9 +82,7 @@ class GpuClass:
     match_gpu_name: str
     vram_gb: int = 0
     workload_version: str = "hot_capacity_combined"
-    arena_mb: int = 500
     matrix_dim: int = 8960
-    rounds_per_pass: int = 8
     passes: int = 0
     capacity_passes: int = 0
     capacity_rounds: int = 1

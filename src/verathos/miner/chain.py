@@ -9,6 +9,7 @@ import time
 
 import bittensor as bt
 
+from verathos.chain import serve_axon
 from verathos.miner.config import MinerConfig
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
 
@@ -29,19 +30,9 @@ def build_manifest(config: MinerConfig, keypair, catalog_digest: str, block: int
 
 def publish(subtensor: bt.Subtensor, wallet: bt.Wallet, config: MinerConfig, signed: SignedManifest) -> None:
     """Point the axon at this service and commit the manifest digest; each call is made only if it changes state."""
-    hotkey = wallet.hotkey.ss58_address
-    neuron = subtensor.get_neuron_for_pubkey_and_subnet(hotkey, config.netuid)
-    if neuron is None or neuron.is_null:
-        raise RuntimeError(f"hotkey {hotkey} is not registered on netuid {config.netuid}")
-    axon = neuron.axon_info
-    if (axon.ip, axon.port) != (config.public_host, config.port):
-        result = subtensor.serve_axon(netuid=config.netuid, axon=bt.Axon(wallet=wallet, port=config.port,
-                                      external_ip=config.public_host, external_port=config.port))
-        if not getattr(result, "success", False):
-            raise RuntimeError(f"serve_axon failed: {getattr(result, 'message', result)}")
-        log.info("serve_axon %s:%d", config.public_host, config.port)
+    uid = serve_axon(subtensor, wallet, config.netuid, config.public_host, config.port)
     value = commitment_value(signed.manifest.digest())
-    if subtensor.get_commitment(config.netuid, neuron.uid) != value:
+    if subtensor.get_commitment(config.netuid, uid) != value:
         result = subtensor.set_commitment(wallet, config.netuid, value)
         if not getattr(result, "success", False):
             raise RuntimeError(f"set_commitment failed: {getattr(result, 'message', result)}")
