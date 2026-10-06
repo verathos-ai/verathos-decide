@@ -47,6 +47,16 @@ def test_resolve_prefers_shipped_then_store_then_verified_download(tmp_path, mon
     assert got.digest() == newer.digest() and store.get(newer.digest()).digest() == newer.digest()
 
 
+def test_the_committed_shipped_catalog_outlives_its_release(tmp_path, monkeypatch) -> None:
+    """A release shipping another catalog still finds the one committed, with every source down."""
+    shipped = catalog.load()
+    store = catalog.CatalogStore(tmp_path)
+    catalog.resolve(shipped.digest(), store=store, sources=[])
+    next_release, load = variant(revision="next-release"), catalog.load
+    monkeypatch.setattr(catalog, "load", lambda path=None: load(path) if path else next_release)
+    assert catalog.resolve(shipped.digest(), store=store, sources=[]).digest() == shipped.digest()
+
+
 def test_changed_copies_are_digested_from_their_fields() -> None:
     c = catalog.load()
     assert c.model_copy(update={"revision": "other"}).digest() != c.digest()

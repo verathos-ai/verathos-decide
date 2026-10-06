@@ -160,10 +160,13 @@ class CatalogStore:
 def resolve(catalog_digest: str, *, store: CatalogStore, sources: list[str]) -> Catalog:
     """The catalog with ``catalog_digest``: shipped copy, local store, then each source URL in order.
 
-    Sources are URL templates containing ``{digest}``. Anything fetched is accepted only if its digest matches.
+    Sources are URL templates containing ``{digest}``. Anything fetched is accepted only if its digest matches. The
+    shipped copy, when committed, is kept in the store too, so a later release still finds it without a source.
     """
     shipped = load()
     if shipped.digest() == catalog_digest:
+        if not store.path(catalog_digest).exists():
+            store.put(shipped)
         return shipped
     stored = store.get(catalog_digest)
     if stored is not None:
