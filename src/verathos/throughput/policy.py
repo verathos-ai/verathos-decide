@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 
 from verathos.protocol import signing
 from verathos.protocol.canonical import canonical_json
-from verathos.protocol.requests import NonceCache, RequestRejected
+from verathos.protocol.requests import MAX_SKEW_MS, NonceCache, RequestRejected
 
 BLOCK_TIME_S = 12.0
 POLICY_WATCH_S = 60.0  # miners and validators check the committed catalog (and so the policy) this often
@@ -48,7 +48,8 @@ class AuditPolicy:
     auditor_hotkey: str = ""  # empty: the subnet owner
     epoch_blocks: int = 180  # the catalog's epoch length
     lead_blocks: int = 5
-    warmup_s: float = 2.0
+    max_latency_s: float = 2.0  # the miner declares capacity only at concurrencies answering within this
+    warmup_s: float = 3.0  # at least max_latency_s, so a test measures in steady state
     test_s: float = 8.0
     request_timeout_s: float = 20.0
     pass_fraction: float = 0.95
@@ -63,8 +64,10 @@ class AuditPolicy:
             raise ValueError("mode must be enforce or observe")
         if not (0 < self.pass_fraction <= 1 and 0 < self.capacity_margin <= 1):
             raise ValueError("pass_fraction and capacity_margin must be in (0, 1]")
-        if self.warmup_s < 0 or self.test_s <= 0 or self.request_timeout_s <= 0:
-            raise ValueError("test durations must be positive")
+        if self.max_latency_s <= 0 or self.test_s <= 0 or self.request_timeout_s <= 0:
+            raise ValueError("max_latency_s, test_s and request_timeout_s must be positive")
+        if self.warmup_s < self.max_latency_s:
+            raise ValueError("warmup_s must be at least max_latency_s")
         if self.session_s > MAX_SESSION_S:
             raise ValueError(f"warmup_s + test_s + request_timeout_s must stay under {MAX_SESSION_S - 5:.0f} s")
         if min(self.lead_blocks, self.samples_per_test, self.qualification_tests, self.credit_ttl_epochs) < 1:
@@ -193,12 +196,13 @@ def read_session(headers: Mapping[str, str]) -> tuple[Session, str] | None:
 
 class SessionGate:
     """A miner's check of test traffic: a session signed by the current auditor for this miner and endpoint, not
-    expired, and a request id not seen before in the session. Each session's signature is verified once."""
+    expired (allowing the same clock skew as signed requests), and a request id not seen before in the session. Each
+    session's signature is verified once."""
 
     def __init__(self, netuid: int, miner_hotkey: str) -> None:
         self.netuid, self.miner_hotkey = netuid, miner_hotkey
         self._verified: dict[str, Session] = {}
-        self._request_ids = NonceCache(window_ms=int(MAX_SESSION_S * 1000))
+        self._request_ids = NonceCache(window_ms=int(MAX_SESSION_S * 1000) + MAX_SKEW_MS)
 
     def check(self, headers: Mapping[str, str], *, auditor: str | None, endpoint_id: str, now_ms: int) -> tuple[
             Session, str]:
@@ -213,12 +217,12 @@ class SessionGate:
         if not (session.auditor == auditor and session.netuid == self.netuid
                 and session.miner_hotkey == self.miner_hotkey and session.endpoint_id == endpoint_id):
             raise RequestRejected("test session is for another auditor, miner or endpoint")
-        if now_ms > session.not_after_ms:
+        if now_ms > session.not_after_ms + MAX_SKEW_MS:
             raise RequestRejected("test session expired")
         if self._verified.get(signature) != session:
             if not signing.verify(session.auditor, SESSION_DOMAIN, session.model_dump(), signature):
                 raise RequestRejected("bad test session signature")
-            self._verified = {s: v for s, v in self._verified.items() if v.not_after_ms >= now_ms}
+            self._verified = {s: v for s, v in self._verified.items() if v.not_after_ms + MAX_SKEW_MS >= now_ms}
             self._verified[signature] = session
         if not self._request_ids.check_and_add(f"{session.test_id}:{request_id}", now_ms):
             raise RequestRejected("replayed request")

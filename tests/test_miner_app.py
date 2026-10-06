@@ -129,7 +129,8 @@ def test_test_traffic_carries_the_auditors_session(setup) -> None:
 def test_test_sessions_are_checked(setup) -> None:
     client, miner, validator, *_ = setup
     assert "another auditor" in session_post(client, miner, auditor=validator).json()["error"]
-    assert "expired" in session_post(client, miner, expires_in_ms=-1).json()["error"]
+    assert session_post(client, miner, expires_in_ms=-30_000).status_code == 200  # within the clock skew
+    assert "expired" in session_post(client, miner, expires_in_ms=-61_000).json()["error"]
     assert session_post(client, miner, request_id="not-hex").json()["error"] == "malformed request id"
     forged = Session(netuid=405, auditor=AUDITOR.ss58_address, miner_hotkey=miner.ss58_address, endpoint_id="gpu0",
                      test_id="t" * 64, not_after_ms=int(time.time() * 1000) + 30_000)

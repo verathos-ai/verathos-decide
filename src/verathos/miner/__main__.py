@@ -62,13 +62,14 @@ async def measure(endpoints: list[EndpointConfig], cat: catalog.Catalog, store: 
                   remeasure: bool = False) -> dict[str, Measurement]:
     engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key) for e in endpoints}
     try:
-        targets = []
+        targets, max_latency_s = [], cat.audit_policy().max_latency_s
         for e in endpoints:
             workload = cat.get(e.model_id).workload
-            config = {"model_id": e.model_id, "engine_url": e.engine_url, "max_concurrency": e.max_concurrency}
+            config = {"model_id": e.model_id, "engine_url": e.engine_url, "max_concurrency": e.max_concurrency,
+                      "max_latency_s": max_latency_s}
             targets.append(Target(e.endpoint_id, e.model_id, engines[e.endpoint_id], workload, e.max_concurrency,
                                   fingerprint(config, await engines[e.endpoint_id].info(), workload)))
-        return await current_measurements(targets, store, remeasure=remeasure)
+        return await current_measurements(targets, store, max_latency_s=max_latency_s, remeasure=remeasure)
     finally:
         for engine in engines.values():
             await engine.close()

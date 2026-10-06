@@ -194,7 +194,8 @@
   "throughput_audit": {
     "mode": "enforce",
     "lead_blocks": 5,
-    "warmup_s": 2.0,
+    "max_latency_s": 2.0,
+    "warmup_s": 3.0,
     "test_s": 8.0,
     "request_timeout_s": 20.0,
     "pass_fraction": 0.95,

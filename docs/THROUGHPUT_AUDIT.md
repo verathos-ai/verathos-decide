@@ -33,16 +33,19 @@ endpoints that share hardware compete as they do in a test:
 
 1. warm-up runs of 8 s at concurrency `min(16, max_concurrency)` until every endpoint's last two runs agree within
    5% (at most 12 runs);
-2. one run per concurrency step (4, 8, 16, ... up to `max_concurrency`); an endpoint stops climbing once its
-   throughput falls below 90% of its best;
-3. five runs at each endpoint's best concurrency.
+2. one run per concurrency step (1, 2, 4, 8, ... up to `max_concurrency`); an endpoint stops climbing once its
+   throughput falls below 90% of its best or its latency (concurrency / throughput) exceeds `max_latency_s`
+   (default 2 s);
+3. five runs at each endpoint's knee: the lowest concurrency within 3% of its best throughput.
 
-The declared `capacity_rps` is `capacity_margin` (default 0.9) times the median of the five runs. A measurement
+The declared `capacity_rps` is `capacity_margin` (default 0.9) times the median of the five runs. Because the
+latency at the declared rate stays within `max_latency_s`, and a test warms up for at least that long, a test
+measures every honest endpoint in steady state. A measurement
 takes a few minutes. It is stored in `state_dir/capacity.json` together with a fingerprint of what it depends on (the
-endpoint's model, engine URL and `max_concurrency`, the engine's `GET /v1/models` document, and the request mix) and
-is reused until one of them changes. `--remeasure` measures again, for example after a hardware change.
+endpoint's model, engine URL and `max_concurrency`, `max_latency_s`, the engine's `GET /v1/models` document, and the
+request mix) and is reused until one of them changes. `--remeasure` measures again, for example after a hardware change.
 
-The miner never sends an engine more requests at once than its best concurrency; further requests wait in the
+The miner never sends an engine more requests at once than its knee concurrency; further requests wait in the
 miner (up to four per engine slot, at most 30 s).
 
 ## Schedule
@@ -55,7 +58,7 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
   epoch's first hit selects the test; the last eligible block always hits, so there is exactly one test per epoch,
   uniformly placed.
 - Traffic starts at `start_block = selection block + lead_blocks` (default 5 blocks, about 60 s) and lasts
-  `warmup_s + test_s` (2 s + 8 s).
+  `warmup_s + test_s` (3 s + 8 s).
 - Validators hold their canaries from `start_block - 1` to `start_block + traffic_blocks + 1`, where
   `traffic_blocks` is the traffic duration in blocks, rounded up.
 
@@ -128,7 +131,8 @@ How credits and wrong answers enter the score is in `SCORING.md`.
 | `mode` | `enforce` | `observe`: validators count declared capacities and apply no evidence; tests still run |
 | `auditor_hotkey` | subnet owner | hotkey that runs the tests and signs the verdicts |
 | `lead_blocks` | 5 | blocks from the selection block to the start of the traffic |
-| `warmup_s`, `test_s` | 2, 8 | unmeasured and measured traffic, seconds |
+| `max_latency_s` | 2 | highest latency at which a miner's measurement counts throughput |
+| `warmup_s`, `test_s` | 3, 8 | unmeasured and measured traffic, seconds; `warmup_s` is at least `max_latency_s` |
 | `request_timeout_s` | 20 | per-request timeout of the load generator |
 | `pass_fraction` | 0.95 | share of the tested rate an endpoint must deliver to be credited the full rate |
 | `samples_per_test` | 10 | responses per endpoint whose receipts and answers are checked |

@@ -172,12 +172,12 @@ def test_measurement_finds_capacity_and_shares_of_one_engine(tmp_path) -> None:
                    Target("a", "kev-4b", shared, KEV.workload, 8, "f2"),
                    Target("b", "kev-4b", shared, KEV.workload, 8, "f3")]
         store = MeasurementStore(tmp_path / "capacity.json")
-        measured = await current_measurements(targets, store, run_s=0.25)
+        measured = await current_measurements(targets, store, max_latency_s=1.0, run_s=0.25)
         calls = alone.calls
-        again = await current_measurements(targets, store, run_s=0.25)
+        again = await current_measurements(targets, store, max_latency_s=1.0, run_s=0.25)
         assert alone.calls == calls and again == measured  # stored measurements are reused
         changed = [dataclasses.replace(targets[0], fingerprint="new")] + targets[1:]
-        assert (await current_measurements(changed, store, run_s=0.25))["alone"].fingerprint == "new"
+        assert (await current_measurements(changed, store, max_latency_s=1.0, run_s=0.25))["alone"].fingerprint == "new"
         return measured
 
     m = asyncio.run(run())
@@ -197,7 +197,22 @@ def test_measurement_waits_for_the_engine_and_fails_without_answers() -> None:
     target = Target("gpu0", "kev-4b", Down(), KEV.workload, 8, "f")
     with pytest.raises(measure.MeasurementFailed, match="engine not answering"):
         asyncio.run(measure.wait_ready(target, timeout_s=0))
-    assert asyncio.run(measure_all([dataclasses.replace(target, engine=MockEngine("kev-4b"))], run_s=0.05))
+    assert asyncio.run(measure_all([dataclasses.replace(target, engine=MockEngine("kev-4b"))], 1.0, run_s=0.05))
+    slow = dataclasses.replace(target, engine=CapacityEngine(MockEngine("kev-4b"), rps=4, concurrency=1))
+    with pytest.raises(measure.MeasurementFailed, match="longer than 0.1 s"):
+        asyncio.run(measure_all([slow], 0.1, run_s=0.3))
+
+
+def test_declared_capacity_stays_within_the_latency_bound() -> None:
+    """Past saturation more concurrency only adds latency: the measurement settles at the knee, well inside the
+    bound."""
+    from verathos.throughput.measure import knee
+
+    target = Target("gpu0", "kev-4b", CapacityEngine(MockEngine("kev-4b"), rps=160, concurrency=8), KEV.workload, 256,
+                    "f")
+    (m,) = asyncio.run(measure_all([target], 0.2, run_s=0.25))
+    assert 8 <= m.concurrency <= 16 and m.measured_rps == pytest.approx(160, rel=0.15)
+    assert knee([(4, 80.0), (8, 158.0), (16, 161.0), (32, 160.0)]) == (8, 158.0)
 
 
 # ---- the auditor end to end ----

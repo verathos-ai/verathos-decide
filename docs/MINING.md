@@ -16,7 +16,7 @@ proves, so hardware pays by its throughput per cost.
   once, split between them.
 - A public IP address and one open TCP port for the miner service. Validators and the auditor reach endpoints only
   at the axon's IP and port, so the miner service must be reachable there directly (plain HTTP; requests and
-  receipts are signed). A test sends every endpoint its declared rate for about 10 s: the connection must carry it.
+  receipts are signed). A test sends every endpoint its declared rate for about 11 s: the connection must carry it.
 - A hotkey registered on the subnet; the miner machine needs the hotkey and `coldkeypub.txt`, never the coldkey.
 
 ## 1. Register
@@ -92,7 +92,7 @@ CUDA_VISIBLE_DEVICES=2 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --rev
 | `endpoint_id` | 1-32 characters of `a-z`, `0-9`, `-`; unique per miner |
 | `model_id` | a catalog model |
 | `engine_url`, `engine_api_key` | the endpoint's engine and its bearer token, if it needs one |
-| `max_concurrency` | highest concurrency the capacity measurement tries (default 256) |
+| `max_concurrency` | highest concurrency the capacity measurement tries (default 256); the engine never gets more requests at once than the concurrency the measurement settles on |
 | `gateway_hotkeys` | callers allowed in addition to validators with a permit |
 | `catalog_mirrors` | extra catalog sources, URL templates with `{digest}`, tried after the owner's axon |
 | `catalog_dir` | local catalog store (default `~/.verathos/catalog`) |
@@ -159,7 +159,7 @@ validator's epoch 45352:
 
 ## Throughput tests
 
-Once per epoch, at a block nobody knows in advance, every endpoint gets its declared rate for about 10 s. Nothing
+Once per epoch, at a block nobody knows in advance, every endpoint gets its declared rate for about 11 s. Nothing
 needs to be done by hand, but:
 - keep the engines warm and their GPUs free of other work: a test delivers what the hardware has at that moment;
 - run `--remeasure` after changing an endpoint's hardware; the miner measures again by itself when the engine,

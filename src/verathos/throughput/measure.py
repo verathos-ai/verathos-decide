@@ -1,10 +1,10 @@
 """A miner measures the capacity it declares.
 
-For each endpoint: warm the engine with the model's standard request mix until two runs agree, find the
-concurrency with the highest throughput, measure several runs there, and declare ``capacity_margin`` times the
-median. All endpoints of a miner are measured in the same rounds, so endpoints sharing hardware each measure their
-real share, as a network-wide test sees them. Results are stored with a fingerprint of what they depend on and reused
-until that changes.
+For each endpoint: warm the engine with the model's standard request mix until two runs agree, find the lowest
+concurrency that reaches nearly the highest throughput with latency within the policy's ``max_latency_s``, measure
+several runs there, and declare ``capacity_margin`` times the median. All endpoints of a miner are measured in the
+same rounds, so endpoints sharing hardware each measure their real share, as a network-wide test sees them. Results
+are stored with a fingerprint of what they depend on and reused until that changes.
 """
 
 from __future__ import annotations
@@ -31,8 +31,9 @@ RUN_START_SHARE = 0.125  # every run first sends this share of its duration unco
 STABLE_TOLERANCE = 0.05
 MAX_WARMUP_RUNS = 12
 FINAL_RUNS = 5
-CONCURRENCY_LADDER = (4, 8, 16, 32, 64, 128, 256)
+CONCURRENCY_LADDER = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 READY_TIMEOUT_S = 900.0
+KNEE_SHARE = 0.97
 
 
 class MeasurementFailed(RuntimeError):
@@ -104,16 +105,25 @@ async def wait_ready(target: Target, timeout_s: float = READY_TIMEOUT_S) -> None
             await asyncio.sleep(5)
 
 
+def knee(steps: list[tuple[int, float]]) -> tuple[int, float]:
+    """The lowest concurrency within ``KNEE_SHARE`` of the highest throughput: nearly all the capacity at the
+    lowest latency."""
+    top = max(rps for _, rps in steps)
+    return min((c, rps) for c, rps in steps if rps >= KNEE_SHARE * top)
+
+
 def _ladder(target: Target) -> list[int]:
     return [c for c in CONCURRENCY_LADDER if c <= target.max_concurrency] or [target.max_concurrency]
 
 
-async def measure_all(targets: Sequence[Target], run_s: float = RUN_S) -> list[Measurement]:
+async def measure_all(targets: Sequence[Target], max_latency_s: float, run_s: float = RUN_S) -> list[Measurement]:
     """Measure every endpoint in the same rounds, so endpoints sharing an engine or a GPU always compete as they do in
     a test: warm up together until every endpoint's last two runs agree, step up the concurrency ladder together
-    (an endpoint past its best stays at its best), then run the final rounds together at each one's best.
+    (an endpoint past its best, or whose latency exceeds ``max_latency_s``, stays at its knee), then run the final
+    rounds together at each one's knee. In a closed loop the latency is concurrency / throughput.
 
-    Raises MeasurementFailed if an engine never answers or answers nothing under load."""
+    Raises MeasurementFailed if an engine never answers, answers nothing under load, or takes longer than
+    ``max_latency_s`` for a single request."""
     await asyncio.gather(*(wait_ready(t) for t in targets))
 
     async def round_(concurrency: list[int]) -> list[float]:
@@ -128,20 +138,28 @@ async def measure_all(targets: Sequence[Target], run_s: float = RUN_S) -> list[M
         previous = current
         if stable:
             break
-    best = [(ladder[0], 0.0) for ladder in ladders]
+    steps: list[list[tuple[int, float]]] = [[] for _ in targets]  # (concurrency, requests/s) within the bound
     climbing = [True] * len(targets)
     for step in range(max(len(ladder) for ladder in ladders)):
         climbing = [up and step < len(ladder) for up, ladder in zip(climbing, ladders)]
         if not any(climbing):
             break
-        rates = await round_([ladder[step] if up else b[0] for up, ladder, b in zip(climbing, ladders, best)])
+        held = [knee(s)[0] if s else ladder[0] for s, ladder in zip(steps, ladders)]
+        rates = await round_([ladder[step] if up else h for up, ladder, h in zip(climbing, ladders, held)])
         for i, rps in enumerate(rates):
             if not climbing[i]:
                 continue
-            if rps > best[i][1]:
-                best[i] = (ladders[i][step], rps)
-            elif rps < 0.9 * best[i][1]:
+            c = ladders[i][step]
+            if rps <= 0 or c / rps > max_latency_s:
+                climbing[i] = False  # answers too slowly at this concurrency
+                continue
+            steps[i].append((c, rps))
+            if rps < 0.9 * max(r for _, r in steps[i]):
                 climbing[i] = False  # past the engine's best operating point
+    for t, s in zip(targets, steps):
+        if not s:
+            raise MeasurementFailed(f"endpoint {t.endpoint_id}: one request takes longer than {max_latency_s} s")
+    best = [knee(s) for s in steps]
     finals = [await round_([b[0] for b in best]) for _ in range(FINAL_RUNS)]
     out = []
     for i, t in enumerate(targets):
@@ -171,8 +189,8 @@ class MeasurementStore:
         tmp.replace(self.path)
 
 
-async def current_measurements(targets: Sequence[Target], store: MeasurementStore, *, remeasure: bool = False,
-                               run_s: float = RUN_S) -> dict[str, Measurement]:
+async def current_measurements(targets: Sequence[Target], store: MeasurementStore, *, max_latency_s: float,
+                               remeasure: bool = False, run_s: float = RUN_S) -> dict[str, Measurement]:
     """Stored measurements whose fingerprint still matches; all endpoints are measured again (together) if any is
     new or changed, or when ``remeasure`` is set."""
     stored = store.load()
@@ -182,6 +200,6 @@ async def current_measurements(targets: Sequence[Target], store: MeasurementStor
     runs = MAX_WARMUP_RUNS / 3 + len(CONCURRENCY_LADDER) + FINAL_RUNS
     log.info("measuring the capacity of %d endpoints (about %d minutes)", len(targets),
              max(1, round(runs * run_s * (1 + RUN_START_SHARE) / 60)))
-    fresh = {m.endpoint_id: m for m in await measure_all(targets, run_s)}
+    fresh = {m.endpoint_id: m for m in await measure_all(targets, max_latency_s, run_s)}
     store.save(fresh)
     return fresh
