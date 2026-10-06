@@ -30,6 +30,7 @@ class CatalogModel(BaseModel):
     base_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     license: str
     max_state_tokens: int = Field(ge=1)
+    score_weight: float = Field(1.0, gt=0, description="Relative reward per verified answer")
     tolerance: Tolerance = Tolerance()
 
 
