@@ -170,16 +170,27 @@ def test_credited_capacity() -> None:
     from verathos.validator.discovery import DiscoveredEndpoint
 
     endpoints = [DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=e, url=f"http://x/e/{e}",
-                                    model_id="kev-4b", capacity_rps=rps)) for e, rps in (("a", 30.0), ("b", 50.0),
-                                                                                         ("c", 50.0))]
+                                    model_id=model, capacity_rps=rps))
+                 for e, model, rps in (("a", "kev-4b", 30.0), ("b", "kev-4b", 50.0), ("c", "kev-4b", 50.0),
+                                       ("d", "kev-9b", 50.0))]
+
+    def credit(hotkey: str, endpoint_id: str, qualified: bool = True, model_id: str = "kev-4b") -> Credit:
+        return Credit(hotkey=hotkey, endpoint_id=endpoint_id, model_id=model_id, credited_rps=45.0, test_epoch=8,
+                      qualified=qualified)
+
     verdicts = Verdicts(netuid=405, auditor="aud", epoch=9, invalid=[], credits=[
-        Credit(hotkey="hkA", endpoint_id="a", credited_rps=45.0, test_epoch=8, qualified=True),
-        Credit(hotkey="hkA", endpoint_id="b", credited_rps=45.0, test_epoch=8, qualified=False),
-        Credit(hotkey="hkB", endpoint_id="a", credited_rps=45.0, test_epoch=8, qualified=True)])
-    # capped at today's declaration; unqualified and untested endpoints have no credit
+        credit("hkA", "a"), credit("hkA", "b", qualified=False), credit("hkB", "a"), credit("hkA", "d")])
+    # capped at today's declaration; unqualified, untested and re-modelled endpoints have no credit
     assert credited_capacity(endpoints, verdicts, "enforce") == {"hkA/a": 30.0}
     assert credited_capacity(endpoints, None, "enforce") == {}
-    assert credited_capacity(endpoints, None, "observe") == {"hkA/a": 30.0, "hkA/b": 50.0, "hkA/c": 50.0}
+    assert credited_capacity(endpoints, None, "observe") == {"hkA/a": 30.0, "hkA/b": 50.0, "hkA/c": 50.0,
+                                                             "hkA/d": 50.0}
+
+
+def test_a_restarted_validator_does_not_score_the_same_epoch_twice(tmp_path) -> None:
+    state = ScoreState(last_epoch=41)
+    state.save(tmp_path / "scores.json")
+    assert ScoreState.load(tmp_path / "scores.json").last_epoch == 41
 
 
 def test_hostile_replies_fail_the_endpoint_without_aborting_the_epoch() -> None:

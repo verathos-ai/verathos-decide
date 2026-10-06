@@ -37,12 +37,14 @@ struct LatencyReport {
     max: Option<f64>,
 }
 
+/// The response is reported as a string: whatever JSON a target sends, the result stays readable by
+/// any parser.
 #[derive(Serialize)]
 struct SampleReport<'a> {
     request: &'a RawValue,
     request_id: &'a str,
     status: u16,
-    response: &'a RawValue,
+    response: &'a str,
     sent_at_ms: u64,
     completed_at_ms: u64,
 }
@@ -99,15 +101,13 @@ fn target_report<'a>(
 }
 
 fn sample_report<'a>(sample: &'a Sample, outcome: &Outcome) -> Result<SampleReport<'a>, String> {
-    let raw = |body: &'a [u8]| {
-        serde_json::from_slice::<&RawValue>(body)
-            .map_err(|error| format!("a kept body is not JSON: {error}"))
-    };
     Ok(SampleReport {
-        request: raw(&sample.request)?,
+        request: serde_json::from_slice::<&RawValue>(&sample.request)
+            .map_err(|error| format!("a generated request is not JSON: {error}"))?,
         request_id: &sample.request_id,
         status: 200,
-        response: raw(&sample.response)?,
+        response: std::str::from_utf8(&sample.response)
+            .map_err(|error| format!("a kept response is not UTF-8: {error}"))?,
         sent_at_ms: outcome.clock.unix_ms(sample.sent_at),
         completed_at_ms: outcome.clock.unix_ms(sample.completed_at),
     })

@@ -16,7 +16,7 @@ proves, so hardware pays by its throughput per cost.
   once, split between them.
 - A public IP address and one open TCP port for the miner service. Validators and the auditor reach endpoints only
   at the axon's IP and port, so the miner service must be reachable there directly (plain HTTP; requests and
-  receipts are signed). A test sends every endpoint its declared rate for about 11 s: the connection must carry it.
+  receipts are signed). A test sends every endpoint its declared rate for about 20 s: the connection must carry it.
 - A hotkey registered on the subnet; the miner machine needs the hotkey and `coldkeypub.txt`, never the coldkey.
 
 ## 1. Register
@@ -108,15 +108,17 @@ On start the miner:
 1. finds the catalog the subnet owner commits on chain (the shipped copy, its local store, the owner's axon or a
    configured mirror; any copy is checked against the committed digest); endpoints whose model the catalog does not
    serve (unknown or `retired`) are left out, and it exits if none remain;
-2. waits until every engine answers, then measures the endpoints' capacity, all at once (a few minutes; see
-   `THROUGHPUT_AUDIT.md`), or reuses the stored measurements if nothing they depend on changed;
-3. signs a manifest listing its endpoints and their declared capacity, points its axon at `public_host:port`
+2. starts its service: the manifest (`GET /v1/manifest`) and the endpoints (`/e/<endpoint_id>/v1/...`) on one port;
+3. waits until every engine answers, then measures the endpoints' capacity through its own service, all at once (a
+   few minutes; see `THROUGHPUT_AUDIT.md`), or reuses the stored measurements if nothing they depend on changed.
+   An endpoint that cannot be measured is withdrawn, and the miner stops only if none is left;
+4. signs a manifest listing its endpoints and their declared capacity, points its axon at `public_host:port`
    (`serve_axon`) and commits the manifest digest (`set_commitment`); both are free and only sent when they change,
    so a restart with the same configuration and measurements writes nothing;
-4. serves the manifest (`GET /v1/manifest`) and the endpoints (`/e/<endpoint_id>/v1/...`) on one port;
 5. checks the owner's commitment every minute; when the owner commits a new catalog it re-signs and re-publishes
-   the manifest by itself, withdrawing endpoints whose model was retired and measuring again if a model's request
-   mix changed.
+   the manifest by itself, withdrawing endpoints whose model was retired and measuring again if the catalog changed
+   what a measurement depends on (a model's request mix or `max_latency_s`). A failed measurement then keeps the
+   current manifest.
 
 Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted from
 hotkeys holding a validator permit, from `gateway_hotkeys`, and as test traffic under a session the auditor signed;
@@ -130,14 +132,14 @@ once per epoch, plus every throughput test of the hotkey once it is final:
 
 ```
 measuring the capacity of 1 endpoints (about 3 minutes)
-endpoint gpu0 (kev-4b): 54.3 requests/s at concurrency 32 (runs 54.1, 54.3, 53.8, 54.6, 54.4), declares 48.9
+endpoint gpu0 (kev-4b): 19.9 requests/s at concurrency 32 (runs 19.2, 22.9, 19.1, 20.1, 19.9), declares 18.9
 manifest committed on chain (2968f3219dc7)
 serving 1 endpoints on port 8091; throughput tests are accepted from 5F...; status is logged once per epoch
 validator's epoch 45351:
   gpu0 (kev-4b): qualifying, checked but not scored until it passes a throughput test; answers pass 10/10, mean diff 0.0014
-throughput test of epoch 45351 (block 8163045), gpu0: passed, delivered 49.6 of 48.9 requests/s, p95 latency 830 ms; credited 48.9
+throughput test of epoch 45351 (block 8163045), gpu0: passed, delivered 18.9 of 18.9 requests/s, p95 latency 1630 ms; credited 18.9
 validator's epoch 45352:
-  gpu0 (kev-4b): scored 48.41 this epoch, average 9.68; proven 48.9 of 48.9 requests/s declared; answers pass 10/10, mean diff 0.0014
+  gpu0 (kev-4b): scored 18.71 this epoch, average 3.74; proven 18.9 of 18.9 requests/s declared; answers pass 10/10, mean diff 0.0014
 ```
 
 | Endpoint state | Meaning |
@@ -152,18 +154,19 @@ validator's epoch 45352:
 
 | Test outcome | Meaning |
 |---|---|
-| `passed` | delivered at least 95% of the tested rate; credited the tested rate |
-| `BELOW the tested rate` | credited what it delivered; the reason names the shortfall |
+| `passed` | delivered at least 95% of the tested rate; credited what it delivered |
+| `BELOW the tested rate` | delivered less than 95% of it; credited delivered x delivered / tested; the reason names the shortfall |
 | `INVALID` | a sampled answer was wrong |
 | `not counted` | the test or this endpoint's result was void (the reason says why); earlier credit still counts |
 
 ## Throughput tests
 
-Once per epoch, at a block nobody knows in advance, every endpoint gets its declared rate for about 11 s. Nothing
-needs to be done by hand, but:
+Once per epoch, at a block nobody knows in advance, every endpoint gets its declared rate for about 20 s; a
+request counts if it is answered within 2 s of the end of the measured window. Nothing needs to be done by hand,
+but:
 - keep the engines warm and their GPUs free of other work: a test delivers what the hardware has at that moment;
-- run `--remeasure` after changing an endpoint's hardware; the miner measures again by itself when the engine,
-  its configuration or the request mix changes;
+- run `--remeasure` after changing an endpoint's hardware; the miner measures again by itself when the engine's
+  identity, the endpoint's configuration, the request mix or `max_latency_s` changes;
 - an engine that just restarted runs slow for its first minutes, and a test then credits less;
 - requests from validators and gateways are always served before test requests, so a busy endpoint delivers less
   of the test rate.

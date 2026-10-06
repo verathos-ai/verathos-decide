@@ -156,7 +156,7 @@ class Throughput:
     async def proven_invalid(self, evidence: list[feed.Evidence], references: dict[str, Engine],
                              cat: catalog.Catalog) -> list[feed.Evidence]:
         """The evidence this validator accepts: the miner's receipt binds the request and the answers, and the
-        validator's own reference (if it has one for the model) also proves the answers wrong."""
+        validator's own reference (if it has one for the model and it answers) also proves the answers wrong."""
         accepted = []
         for e in evidence:
             model = cat.get(e.model_id)
@@ -167,10 +167,16 @@ class Throughput:
                 log.warning("evidence against %s/%s rejected: %s", e.hotkey, e.endpoint_id,
                             "unknown model" if model is None else "the receipt does not bind it")
                 continue
-            if (self.auditor is None and e.model_id in references
-                    and await feed.answer_fault(e.request, answers, references[e.model_id], model.tolerance) is None):
-                log.warning("evidence against %s/%s rejected: this validator's reference accepts the answers",
-                            e.hotkey, e.endpoint_id)
-                continue
+            if self.auditor is None and e.model_id in references:
+                try:
+                    fault = await feed.answer_fault(e.request, answers, references[e.model_id], model.tolerance)
+                except feed.ReferenceUnavailable as exc:
+                    log.warning("evidence against %s/%s not rechecked, reference unavailable (%s); applying the "
+                                "auditor's verdict", e.hotkey, e.endpoint_id, exc)
+                    fault = e.reason
+                if fault is None:
+                    log.warning("evidence against %s/%s rejected: this validator's reference accepts the answers",
+                                e.hotkey, e.endpoint_id)
+                    continue
             accepted.append(e)
         return accepted

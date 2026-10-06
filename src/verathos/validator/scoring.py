@@ -39,6 +39,7 @@ class ScoreState:
     uid_of: dict[str, int] = field(default_factory=dict)
     window: dict[str, list[list[float]]] = field(default_factory=dict)  # key -> [[sum_abs, count], ...] newest last
     evidence_seen: dict[str, int] = field(default_factory=dict)  # evidence id -> epoch it was applied
+    last_epoch: int | None = None  # the last epoch scored, so a restart does not score it again
 
     @classmethod
     def load(cls, path: Path) -> ScoreState:

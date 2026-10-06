@@ -26,11 +26,13 @@ class Engine(Protocol):
 class HttpEngine:
     """A local engine process speaking ``POST /v1/systemone``."""
 
-    def __init__(self, base_url: str, api_key: str | None = None, timeout_s: float = 120.0) -> None:
+    def __init__(self, base_url: str, api_key: str | None = None, timeout_s: float = 120.0,
+                 max_connections: int = 256) -> None:
         self._base = base_url.rstrip("/")
         self._url = self._base + "/v1/systemone"
         self._headers = {"Authorization": f"Bearer {api_key or 'local'}"}
-        self._client = httpx.AsyncClient(timeout=timeout_s)
+        limits = httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections)
+        self._client = httpx.AsyncClient(timeout=timeout_s, limits=limits)
 
     async def info(self) -> Any:
         """The engine's ``GET /v1/models`` document, or None if it serves none."""

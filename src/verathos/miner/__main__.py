@@ -1,14 +1,16 @@
 """Run a miner: ``verathos-miner --config miner.json``.
 
-On start the miner measures the capacity of its endpoints with each model's standard request mix (all endpoints at
-once), declares it in its manifest, publishes, and serves. Measurements are stored and reused until an endpoint's
-engine, configuration or request mix changes, or ``--remeasure`` is given.
+The miner starts its service, measures the capacity of its endpoints through it with each model's standard request
+mix (all endpoints at once), declares it in its manifest, and publishes. Measurements are stored and reused until an
+endpoint's engine, configuration or request mix changes, or ``--remeasure`` is given. An endpoint that cannot be
+measured is withdrawn; the others are served.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import logging
 import os
 import threading
@@ -17,6 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import bittensor as bt
+import httpx
 import uvicorn
 
 from verathos import catalog
@@ -26,20 +29,24 @@ from verathos.miner.chain import PermitAuthorizer, build_manifest, publish
 from verathos.miner.config import EndpointConfig, MinerConfig
 from verathos.miner.engine import HttpEngine
 from verathos.miner.status import StatusWatcher
-from verathos.protocol.manifest import SignedManifest
+from verathos.protocol.manifest import axon_base
 from verathos.subnet.chain import committed_catalog, current_catalog
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.measure import (
     Measurement,
     MeasurementFailed,
     MeasurementStore,
+    ServicePath,
     Target,
-    current_measurements,
     fingerprint,
+    measure_and_store,
+    stored,
+    wait_ready,
 )
 from verathos.throughput.policy import POLICY_WATCH_S
 
 log = logging.getLogger("verathos.miner")
+LOCAL_HOSTS = {"0.0.0.0": "127.0.0.1", "": "127.0.0.1", "::": "::1"}
 
 
 def servable(config: MinerConfig, cat: catalog.Catalog) -> list[EndpointConfig]:
@@ -58,63 +65,112 @@ def servable(config: MinerConfig, cat: catalog.Catalog) -> list[EndpointConfig]:
     return out
 
 
-async def measure(endpoints: list[EndpointConfig], cat: catalog.Catalog, store: MeasurementStore, *,
-                  remeasure: bool = False) -> dict[str, Measurement]:
-    engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key) for e in endpoints}
+async def engine_fingerprint(e: EndpointConfig, cat: catalog.Catalog) -> str:
+    engine = HttpEngine(e.engine_url, e.engine_api_key)
     try:
-        targets, max_latency_s = [], cat.audit_policy().max_latency_s
-        for e in endpoints:
-            workload = cat.get(e.model_id).workload
-            config = {"model_id": e.model_id, "engine_url": e.engine_url, "max_concurrency": e.max_concurrency,
-                      "max_latency_s": max_latency_s}
-            targets.append(Target(e.endpoint_id, e.model_id, engines[e.endpoint_id], workload, e.max_concurrency,
-                                  fingerprint(config, await engines[e.endpoint_id].info(), workload)))
-        return await current_measurements(targets, store, max_latency_s=max_latency_s, remeasure=remeasure)
+        info = await engine.info()
     finally:
-        for engine in engines.values():
-            await engine.close()
+        await engine.close()
+    config = {"model_id": e.model_id, "engine_url": e.engine_url, "max_concurrency": e.max_concurrency,
+              "max_latency_s": cat.audit_policy().max_latency_s}
+    return fingerprint(config, info, cat.get(e.model_id).workload)
 
 
 class Publisher:
-    """The current signed manifest, rebuilt and re-published when the subnet owner commits a new catalog (measuring
-    again first if the catalog changed an endpoint's request mix)."""
+    """The current signed manifest: the endpoints whose capacity is measured, rebuilt when the subnet owner commits a
+    new catalog, and published on chain."""
 
     def __init__(self, config: MinerConfig, wallet: bt.Wallet, cat: catalog.Catalog, *, publish_on_chain: bool,
-                 subtensor: bt.Subtensor, remeasure: bool) -> None:
+                 subtensor: bt.Subtensor) -> None:
         self.config, self.wallet, self.publish_on_chain = config, wallet, publish_on_chain
         self.store = MeasurementStore(config.state_dir / "capacity.json")
         self.admissions = {e.endpoint_id: Admission(e.max_concurrency) for e in config.endpoints}
-        self.catalog, self.signed = cat, self._sign(cat, remeasure=remeasure)
-        self.auditor = self._auditor(subtensor)
-        if publish_on_chain:
-            publish(subtensor, self.wallet, self.config, self.signed)
-        self._published = True
-        self.on_catalog: list[Callable[[catalog.Catalog], None]] = []
-
-    def _sign(self, cat: catalog.Catalog, *, remeasure: bool = False) -> SignedManifest:
-        endpoints = servable(self.config, cat)
+        endpoints = servable(config, cat)
         if not endpoints:
             raise SystemExit(f"no configured endpoint serves a model of catalog {cat.digest()[:12]}")
-        try:
-            measured = asyncio.run(measure(endpoints, cat, self.store, remeasure=remeasure))
-        except MeasurementFailed as exc:
-            raise SystemExit(str(exc)) from None
-        margin = cat.audit_policy().capacity_margin
+        # Until the first measurement: an unpublished manifest, so the service can be measured through.
+        self.catalog = cat
+        self.signed = build_manifest(config, endpoints, dict.fromkeys((e.endpoint_id for e in endpoints), 0.0),
+                                     wallet.hotkey, cat.digest())
+        self.serving = {e.endpoint_id for e in endpoints}
+        self.auditor = self._auditor(subtensor)
+        self._published = False
+        self.on_catalog: list[Callable[[catalog.Catalog], None]] = []
+
+    def _auditor(self, st: bt.Subtensor) -> str:
+        return self.catalog.audit_policy().auditor_hotkey or st.get_subnet_owner_hotkey(self.config.netuid)
+
+    def _local_url(self, endpoint_id: str) -> str:
+        host = LOCAL_HOSTS.get(self.config.listen_host, self.config.listen_host)
+        return f"{axon_base(host, self.config.port)}/e/{endpoint_id}/v1/systemone"
+
+    async def _measure(self, endpoints: list[EndpointConfig], cat: catalog.Catalog,
+                       remeasure: bool) -> tuple[dict[str, Measurement], dict[str, str]]:
+        limits = httpx.Limits(max_connections=None, max_keepalive_connections=1024)
+        async with httpx.AsyncClient(timeout=120.0, limits=limits) as client:
+            targets = [Target(e.endpoint_id, e.model_id,
+                              ServicePath(client, self._local_url(e.endpoint_id), self.wallet.hotkey,
+                                          self.config.netuid, e.endpoint_id),
+                              cat.get(e.model_id).workload, e.max_concurrency, "") for e in endpoints]
+            failures = {}
+            for t, outcome in zip(targets, await asyncio.gather(*(wait_ready(t) for t in targets),
+                                                                return_exceptions=True)):
+                if isinstance(outcome, MeasurementFailed):
+                    failures[t.endpoint_id] = str(outcome)
+                elif isinstance(outcome, BaseException):
+                    raise outcome
+            by_id = {e.endpoint_id: e for e in endpoints}
+            targets = [dataclasses.replace(t, fingerprint=await engine_fingerprint(by_id[t.endpoint_id], cat))
+                       for t in targets if t.endpoint_id not in failures]
+            if not targets:
+                return {}, failures
+            reuse = None if remeasure else stored(targets, self.store)
+            if reuse is not None:
+                return reuse, failures
+            measured, failed = await measure_and_store(targets, self.store,
+                                                       max_latency_s=cat.audit_policy().max_latency_s)
+            return measured, failures | failed
+
+    def adopt(self, cat: catalog.Catalog, *, remeasure: bool = False) -> bool:
+        """Measure the endpoints ``cat`` serves (or reuse their stored measurements) through the running service and
+        sign a manifest of those measured. False if none could be measured; the current manifest stays."""
+        endpoints = servable(self.config, cat)
+        if not endpoints:
+            log.error("no configured endpoint serves a model of catalog %s", cat.digest()[:12])
+            return False
+        previous = set(self.serving)
+        self.serving = previous | {e.endpoint_id for e in endpoints}
         for e in endpoints:
+            self.admissions[e.endpoint_id].limit = e.max_concurrency
+        measured, failures = asyncio.run(self._measure(endpoints, cat, remeasure))
+        for endpoint_id, reason in sorted(failures.items()):
+            log.error("endpoint %s withdrawn: %s", endpoint_id, reason)
+        listed = [e for e in endpoints if e.endpoint_id in measured]
+        if not listed:
+            self.serving = previous
+            return False
+        margin = cat.audit_policy().capacity_margin
+        for e in listed:
             m = measured[e.endpoint_id]
             self.admissions[e.endpoint_id].limit = m.concurrency
             log.info("endpoint %s (%s): %.1f requests/s at concurrency %d (runs %s), declares %.1f", e.endpoint_id,
                      e.model_id, m.measured_rps, m.concurrency, ", ".join(f"{r:.1f}" for r in m.runs),
                      m.declared(margin))
-        return build_manifest(self.config, endpoints, {k: m.declared(margin) for k, m in measured.items()},
-                              self.wallet.hotkey, cat.digest())
+        self.catalog = cat
+        self.signed = build_manifest(self.config, listed, {e.endpoint_id: measured[e.endpoint_id].declared(margin)
+                                                           for e in listed}, self.wallet.hotkey, cat.digest())
+        self.serving = {e.endpoint_id for e in listed}
+        self._published = False
+        return True
 
-    def _auditor(self, st: bt.Subtensor) -> str:
-        return self.catalog.audit_policy().auditor_hotkey or st.get_subnet_owner_hotkey(self.config.netuid)
+    def publish(self, st: bt.Subtensor) -> None:
+        if self.publish_on_chain and not self._published:
+            publish(st, self.wallet, self.config, self.signed)
+        self._published = True
 
     def watch(self, interval_s: float = POLICY_WATCH_S) -> None:
-        """Follow the owner's catalog commitment. A new catalog is adopted (manifest, audit policy) at once; its
-        on-chain publication is retried until it succeeds."""
+        """Follow the owner's catalog commitment. A new catalog is adopted at once (measuring again if it changed what
+        a measurement depends on); its on-chain publication is retried until it succeeds."""
 
         def run() -> None:
             st = bt.Subtensor(network=self.config.network)
@@ -124,18 +180,17 @@ class Publisher:
                 try:
                     if committed_catalog(st, self.config.netuid) != self.catalog.digest():
                         cat = current_catalog(st, self.config.netuid, store, self.config.catalog_mirrors)
-                        self.catalog, self.signed, self._published = cat, self._sign(cat), False
-                        log.info("catalog %s committed; manifest rebuilt", cat.digest()[:12])
-                        for callback in self.on_catalog:
-                            callback(cat)
+                        if self.adopt(cat):
+                            log.info("catalog %s committed; manifest rebuilt", cat.digest()[:12])
+                            for callback in self.on_catalog:
+                                callback(cat)
+                        else:
+                            log.error("catalog %s committed but no endpoint could be measured; keeping the "
+                                      "current manifest", cat.digest()[:12])
                     self.auditor = self._auditor(st)
-                    if self.publish_on_chain and not self._published:
-                        publish(st, self.wallet, self.config, self.signed)
-                        self._published = True
+                    if not self._published:
+                        self.publish(st)
                         log.info("manifest published")
-                except SystemExit as exc:
-                    log.critical("%s; stopping", exc)
-                    os._exit(1)
                 except Exception:
                     log.exception("catalog follow failed; retrying")
 
@@ -167,22 +222,36 @@ def main() -> None:
     wallet = bt.Wallet(name=config.wallet_name, hotkey=config.hotkey_name)
     subtensor = bt.Subtensor(network=config.network)
     cat = catalog.load() if args.no_publish else resolve_catalog(subtensor, config)
-    publisher = Publisher(config, wallet, cat, publish_on_chain=not args.no_publish, subtensor=subtensor,
-                          remeasure=args.remeasure)
+    publisher = Publisher(config, wallet, cat, publish_on_chain=not args.no_publish, subtensor=subtensor)
+
+    authorizer = PermitAuthorizer(subtensor, config.netuid, config.gateway_hotkeys)
+    engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key, max_connections=e.max_concurrency)
+               for e in config.endpoints}
+    app = create_app(config=config, keypair=wallet.hotkey, manifest=lambda: publisher.signed, engines=engines,
+                     authorized=authorizer, auditor=lambda: publisher.auditor, admissions=publisher.admissions,
+                     serving=lambda: publisher.serving)
+    server = uvicorn.Server(uvicorn.Config(app, host=config.listen_host, port=config.port, log_level="warning",
+                                           access_log=False))
+    service = threading.Thread(target=server.run, name="service", daemon=True)
+    service.start()
+    while not server.started:
+        if not service.is_alive():
+            raise SystemExit(f"the service could not start on port {config.port}")
+        time.sleep(0.1)
+
+    if not publisher.adopt(cat, remeasure=args.remeasure):
+        raise SystemExit("no endpoint could be measured")
+    publisher.publish(subtensor)
     if not args.no_publish:
         publisher.watch()
         chain = SubtensorChainView(config.network, config.netuid, cat.audit_policy().auditor_hotkey)
         publisher.on_catalog.append(lambda c: chain.set_auditor_hotkey(c.audit_policy().auditor_hotkey))
         StatusWatcher(hotkey=wallet.hotkey.ss58_address, auditor_url=chain.auditor_url,
                       listed=lambda: [e.endpoint_id for e in publisher.signed.manifest.endpoints]).start()
-
-    authorizer = PermitAuthorizer(subtensor, config.netuid, config.gateway_hotkeys)
-    engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key) for e in config.endpoints}
-    app = create_app(config=config, keypair=wallet.hotkey, manifest=lambda: publisher.signed, engines=engines,
-                     authorized=authorizer, auditor=lambda: publisher.auditor, admissions=publisher.admissions)
     log.info("serving %d endpoints on port %d; throughput tests are accepted from %s; status is logged once per "
              "epoch", len(publisher.signed.manifest.endpoints), config.port, publisher.auditor)
-    uvicorn.run(app, host=config.listen_host, port=config.port, log_level="warning", access_log=False)
+    service.join()
+    os._exit(1)  # the service stopped
 
 
 if __name__ == "__main__":

@@ -14,7 +14,8 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
+from dataclasses import dataclass
 from typing import Any
 
 from bittensor_wallet import Keypair
@@ -30,12 +31,19 @@ from verathos.protocol.api import SystemOneRequest
 from verathos.protocol.canonical import digest
 from verathos.protocol.manifest import SignedManifest
 from verathos.protocol.receipts import Receipt, SignedReceipt
-from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, VerifiedCaller, verify_request
+from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, verify_request
 from verathos.throughput.policy import HDR_SESSION, SessionGate
 
 log = logging.getLogger(__name__)
 IDENTITY_DOMAIN = "verathos/identity/v1"
 MAX_REQUEST_BYTES = 1 << 20
+
+
+@dataclass(frozen=True)
+class TestCaller:
+    hotkey: str  # the auditor, or this miner for its own measurement
+    nonce: str  # the request id
+    not_after_ms: int
 
 
 class IdentityChallenge(BaseModel):
@@ -55,9 +63,11 @@ def create_app(
     authorized: Callable[[str], bool],
     auditor: Callable[[], str | None],
     admissions: dict[str, Admission] | None = None,
+    serving: Callable[[], Collection[str]] | None = None,
 ) -> FastAPI:
-    """``auditor`` gives the hotkey whose test sessions are accepted; ``admissions`` the engine admission per
-    endpoint (default: ``max_concurrency`` slots)."""
+    """``auditor`` gives the hotkey whose test sessions are accepted (besides the miner's own, for its measurement);
+    ``admissions`` the engine admission per endpoint (default: ``max_concurrency`` slots); ``serving`` the endpoints
+    answered (default: those the manifest lists)."""
     app = FastAPI(title="Verathos miner")
     nonces = NonceCache()
     endpoints = {e.endpoint_id: e for e in config.endpoints}
@@ -95,8 +105,8 @@ def create_app(
         return caller, body, None
 
     async def authenticate_test(request: Request, endpoint_id: str):
-        """-> (auditor as caller with the request id as nonce, body, None) or (None, None, error response). The
-        session is checked before the body is read."""
+        """-> (the session's signer as caller, with the request id as nonce, body, None) or (None, None, error
+        response). The session is checked before the body is read."""
         try:
             session, request_id = sessions.check(request.headers, auditor=auditor(), endpoint_id=endpoint_id,
                                                  now_ms=int(time.time() * 1000))
@@ -105,10 +115,12 @@ def create_app(
         body = await read_body(request)
         if body is None:
             return None, None, error(413, "request too large")
-        return VerifiedCaller(session.auditor, request_id), body, None
+        return TestCaller(session.auditor, request_id, session.not_after_ms), body, None
 
     def listed(endpoint_id: str) -> bool:
-        """Whether the current manifest lists the endpoint (a catalog change can withdraw one)."""
+        """Whether the endpoint is served (a catalog change or a failed measurement can withdraw one)."""
+        if serving is not None:
+            return endpoint_id in serving()
         return any(e.endpoint_id == endpoint_id for e in manifest().manifest.endpoints)
 
     @app.get("/health")
@@ -151,9 +163,13 @@ def create_app(
         if parsed.model != endpoint.model_id:
             return error(422, f"endpoint serves {endpoint.model_id}, not {parsed.model}")
         admission = admissions[endpoint_id]
-        if not await admission.acquire(test=test):
+        # A test request is useful only until its session ends.
+        wait_s = (caller.not_after_ms - time.time() * 1000) / 1000 if test else None
+        if not await admission.acquire(test=test, wait_s=wait_s):
             return error(503, "endpoint at capacity")
         try:
+            if await request.is_disconnected():
+                return error(499, "caller gone")
             response = await engines[endpoint_id].answer(raw)
         except EngineError as e:
             log.warning("engine %s failed: %s", endpoint_id, e)

@@ -227,6 +227,8 @@ fn target(id: &str, address: SocketAddr, rate_rps: f64, samples: usize) -> Value
     })
 }
 
+const GRACE_S: f64 = 0.5;
+
 fn plan(
     start_at_ms: i64,
     warmup_s: f64,
@@ -238,6 +240,7 @@ fn plan(
         "start_at_ms": start_at_ms,
         "warmup_s": warmup_s,
         "test_s": test_s,
+        "grace_s": GRACE_S,
         "timeout_s": timeout_s,
         "words": ["invoice", "refund", "late", "card", "password", "shipment"],
         "seed": "8f1e4c0b9a7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f",
@@ -302,9 +305,12 @@ async fn delivered_rate_tracks_the_offered_rate_up_to_capacity() {
         .map(|target| target["id"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(ids, ["fast", "queued", "rejecting"]);
-    for (target, rate, capacity) in [
-        (&targets[0], 120.0, 1e9),
-        (&targets[1], 300.0, 150.0),
+    // A server that queues what it cannot serve answers the warmup backlog first: of the window's
+    // requests it answers capacity x (warmup + test + grace) - rate x warmup by the deadline.
+    let queued_delivered = (150.0 * (warmup_s + test_s + GRACE_S) - 300.0 * warmup_s) / test_s;
+    for (target, rate, expected) in [
+        (&targets[0], 120.0, 120.0),
+        (&targets[1], 300.0, queued_delivered),
         (&targets[2], 200.0, 100.0),
     ] {
         let id = target["id"].as_str().unwrap();
@@ -318,16 +324,16 @@ async fn delivered_rate_tracks_the_offered_rate_up_to_capacity() {
         assert_eq!(target["late_sends"], 0, "{id}: {target}");
         assert!(target["max_send_lag_ms"].as_f64().unwrap() < 50.0, "{id}");
         let delivered = target["delivered_rps"].as_f64().unwrap();
-        assert_near(
-            delivered,
-            f64::min(rate, capacity),
-            0.10,
-            &format!("{id} delivered_rps"),
-        );
+        assert_near(delivered, expected, 0.10, &format!("{id} delivered_rps"));
         assert_eq!(delivered, target["completed"].as_f64().unwrap() / test_s);
     }
     assert_eq!(targets[0]["errors"], json!({}));
-    assert_eq!(targets[1]["errors"], json!({}));
+    // Replies still in flight at the deadline are not recorded at all.
+    assert!(targets[1]["errors"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .all(|kind| kind == "late"));
     let rejected = targets[2]["errors"]["http_429"].as_f64().unwrap();
     assert_near(
         rejected,
@@ -355,6 +361,7 @@ async fn delivered_rate_tracks_the_offered_rate_up_to_capacity() {
     let samples = targets[0]["samples"].as_array().unwrap();
     assert_eq!(samples.len(), 5);
     let window_ms = (start_at_ms + 1_000, start_at_ms + 3_500);
+    let deadline_ms = window_ms.1 + 500;
     let mut request_ids = std::collections::HashSet::new();
     for sample in samples {
         let request_id = sample["request_id"].as_str().unwrap();
@@ -366,7 +373,7 @@ async fn delivered_rate_tracks_the_offered_rate_up_to_capacity() {
         assert_eq!(request["model"], "kev-4b");
         assert_eq!(request["questions"], questions());
         assert!(request["state"].as_str().unwrap().starts_with("Ticket "));
-        let response = &sample["response"];
+        let response: Value = serde_json::from_str(sample["response"].as_str().unwrap()).unwrap();
         assert_eq!(response["request_id"], request_id);
         assert_eq!(response["state"], request["state"]);
         assert_eq!(response["session"], SESSION);
@@ -377,8 +384,12 @@ async fn delivered_rate_tracks_the_offered_rate_up_to_capacity() {
         );
         assert!(completed - sent >= 19, "{sample}");
         assert!(
-            window_ms.0 <= completed && completed <= window_ms.1,
-            "{completed} outside {window_ms:?}"
+            window_ms.0 <= sent && sent <= window_ms.1 + 50,
+            "sent at {sent}, outside {window_ms:?}"
+        );
+        assert!(
+            completed <= deadline_ms,
+            "{completed} after the deadline {deadline_ms}"
         );
     }
 }

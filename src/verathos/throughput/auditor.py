@@ -4,15 +4,21 @@ Per test:
 
 1. At the selection block the auditor fixes the targets: every listed open endpoint with a declared capacity, each at
    its declared rate, but at most ``rate_growth`` times what it delivered in its last test (at most the model's
-   ``first_test_rps`` before its first). An endpoint cannot make the auditor send more than it has shown it serves.
-2. When the start block appears, the load generator drives all targets at once for ``warmup_s + test_s``. Endpoints
-   sharing hardware, or a pool behind several endpoints, must deliver the sum of their rates at the same time.
-3. Per endpoint: delivered = requests completed in the measured window / ``test_s``, scaled by the share of sampled
-   responses whose receipt is valid. Credit = the tested rate if delivered reaches ``pass_fraction`` of it, else the
-   delivered rate. A sampled answer the miner signed and the reference proves wrong makes the result invalid; the
-   evidence is kept for the verdicts.
-4. Once the selection block is final with the same hash, the test is confirmed; otherwise void. A test is also void
-   when the load generator fails or falls behind its schedule (for one endpoint: that endpoint's result).
+   ``first_test_rps`` before its first, and never less than ``min_test_share`` of that). An endpoint cannot make the
+   auditor send much more than it has shown it serves.
+2. When the start block appears, the load generator drives all targets at once: ``warmup_s`` unmeasured, then
+   ``test_s`` measured. Endpoints sharing hardware, or a pool behind several endpoints, must deliver the sum of their
+   rates at the same time.
+3. Per endpoint: delivered = requests sent in the measured window and answered by its end plus ``max_latency_s``,
+   per second, scaled by the share of sampled responses whose receipt is valid. Credit = delivered (up to the tested
+   rate); below ``pass_fraction`` of the tested rate it is scaled by delivered / tested once more, so declaring more
+   than an endpoint serves costs credit. A sampled answer the miner signed and the reference proves wrong makes the
+   result invalid; the evidence is kept for the verdicts.
+4. Once the selection block is final with the hash it was selected by, the test is confirmed; otherwise void. A test
+   is also void when the load generator fails or falls behind its schedule (for one endpoint: that endpoint's
+   result).
+
+An endpoint is credited from the latest confirmed test only: one that was not among its targets has no credit.
 """
 
 from __future__ import annotations
@@ -37,7 +43,16 @@ from verathos.miner.engine import Engine, HttpEngine
 from verathos.protocol.status import ThroughputOutcome
 from verathos.throughput import loadgen
 from verathos.throughput.chain import SubtensorChainView
-from verathos.throughput.feed import Credit, Evidence, SignedVerdicts, Verdicts, answer_fault, signed_answers
+from verathos.throughput.feed import (
+    MAX_EVIDENCE_BYTES,
+    Credit,
+    Evidence,
+    ReferenceUnavailable,
+    SignedVerdicts,
+    Verdicts,
+    answer_fault,
+    signed_answers,
+)
 from verathos.throughput.follow import POLL_S, ScheduleFollower
 from verathos.throughput.policy import AuditPolicy, ScheduledTest, Session, session_headers
 from verathos.throughput.workload import WORDS
@@ -162,26 +177,35 @@ class Store:
                                 "('running', 'unconfirmed')", (first_epoch, last_epoch)))
 
     def credits(self, first_epoch: int, last_epoch: int, qualification_tests: int) -> list[Credit]:
-        """Per endpoint, the credit of its latest counted result in confirmed tests of the epoch range."""
-        rows = self._query(
-            "SELECT r.hotkey, r.endpoint_id, r.credited_rps, t.epoch FROM results r JOIN tests t USING (test_id) "
-            "WHERE t.state = 'confirmed' AND r.outcome != 'void' AND t.epoch BETWEEN ? AND ? ORDER BY t.epoch",
-            (first_epoch, last_epoch))
-        latest = {(hk, ep): (rps, epoch) for hk, ep, rps, epoch in rows}
+        """The endpoints of the latest confirmed test in the epoch range, with their credit; an endpoint whose result
+        there is void keeps its latest counted result from the range."""
+        latest = self._query("SELECT test_id FROM tests WHERE state = 'confirmed' AND epoch BETWEEN ? AND ? "
+                             "ORDER BY epoch DESC, start_block DESC LIMIT 1", (first_epoch, last_epoch))
+        if not latest:
+            return []
+        targeted = self._query("SELECT hotkey, endpoint_id FROM results WHERE test_id = ?", (latest[0][0],))
+        counted = {(hk, ep): (model, rps, epoch) for hk, ep, model, rps, epoch in self._query(
+            "SELECT r.hotkey, r.endpoint_id, r.model_id, r.credited_rps, t.epoch FROM results r "
+            "JOIN tests t USING (test_id) WHERE t.state = 'confirmed' AND r.outcome != 'void' "
+            "AND t.epoch BETWEEN ? AND ? ORDER BY t.epoch, t.start_block", (first_epoch, last_epoch))}
         passed = {(hk, ep): n for hk, ep, n in self._query(
             "SELECT r.hotkey, r.endpoint_id, COUNT(*) FROM results r JOIN tests t USING (test_id) "
             "WHERE t.state = 'confirmed' AND r.credited_rps > 0 AND t.epoch <= ? GROUP BY r.hotkey, r.endpoint_id",
             (last_epoch,))}
-        return [Credit(hotkey=hk, endpoint_id=ep, credited_rps=rps, test_epoch=epoch,
-                       qualified=passed.get((hk, ep), 0) >= qualification_tests)
-                for (hk, ep), (rps, epoch) in sorted(latest.items())]
+        return [Credit(hotkey=hk, endpoint_id=ep, model_id=counted[hk, ep][0], credited_rps=counted[hk, ep][1],
+                       test_epoch=counted[hk, ep][2], qualified=passed.get((hk, ep), 0) >= qualification_tests)
+                for hk, ep in sorted(targeted) if (hk, ep) in counted]
 
     def evidence(self, first_epoch: int, last_epoch: int) -> list[Evidence]:
+        """The first wrong answer proven against each hotkey in the confirmed tests of the epoch range."""
         rows = self._query(
-            "SELECT r.evidence FROM results r JOIN tests t USING (test_id) WHERE t.state = 'confirmed' "
+            "SELECT r.hotkey, r.evidence FROM results r JOIN tests t USING (test_id) WHERE t.state = 'confirmed' "
             "AND r.evidence IS NOT NULL AND t.epoch BETWEEN ? AND ? ORDER BY t.epoch, r.hotkey, r.endpoint_id",
             (first_epoch, last_epoch))
-        return [Evidence.model_validate_json(e) for (e,) in rows]
+        first: dict[str, str] = {}
+        for hotkey, evidence in rows:
+            first.setdefault(hotkey, evidence)
+        return [Evidence.model_validate_json(e) for e in first.values()]
 
     def outcomes(self, hotkey: str, since_epoch: int) -> list[ThroughputOutcome]:
         rows = self._query(
@@ -203,12 +227,31 @@ class Store:
 
 def planned_rate(slot: Slot, first_test_rps: float, last_delivered: float | None, policy: AuditPolicy) -> float:
     """The rate an endpoint is tested at."""
-    ceiling = first_test_rps if last_delivered is None else max(first_test_rps, policy.rate_growth * last_delivered)
+    if last_delivered is None:
+        ceiling = first_test_rps
+    else:
+        ceiling = max(policy.min_test_share * first_test_rps, policy.rate_growth * last_delivered)
     return round(min(slot.declared_rps, ceiling), 2)
 
 
 def credit(tested_rps: float, delivered_rps: float, policy: AuditPolicy) -> float:
-    return tested_rps if delivered_rps >= policy.pass_fraction * tested_rps else round(delivered_rps, 2)
+    """What was delivered, up to the tested rate; below ``pass_fraction`` of the tested rate, scaled by delivered /
+    tested once more."""
+    delivered = min(delivered_rps, tested_rps)
+    if delivered >= policy.pass_fraction * tested_rps:
+        return round(delivered, 2)
+    return round(delivered * delivered / tested_rps, 2)
+
+
+def parse_response(text: str) -> dict[str, Any] | None:
+    """A sampled response body as a JSON object, or None if it is not one (or too large to be an answer)."""
+    if len(text) > MAX_EVIDENCE_BYTES:
+        return None
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 class Auditor:
@@ -283,13 +326,22 @@ class Auditor:
                 "samples": policy.samples_per_test,
             })
         return {"start_at_ms": start_ms, "warmup_s": policy.warmup_s, "test_s": policy.test_s,
-                "timeout_s": policy.request_timeout_s, "words": list(WORDS), "seed": secrets.token_hex(16),
-                "targets": planned}
+                "grace_s": policy.max_latency_s, "timeout_s": policy.request_timeout_s, "words": list(WORDS),
+                "seed": secrets.token_hex(16), "targets": planned}
 
     async def run_test(self, test: ScheduledTest, references: dict[str, Engine]) -> None:
-        policy = self.policy
+        """Run one test; any failure of the auditor itself voids it."""
         if self.store.known(test.test_id) or self.follower.head > test.start_block:
             return  # already run, or selected before this auditor was following
+        try:
+            await self._run_test(test, references)
+        except Exception as exc:
+            log.exception("throughput test of epoch %d failed", test.epoch)
+            if self.store.known(test.test_id):
+                self.store.set_state(test.test_id, "void", f"the auditor failed: {type(exc).__name__}")
+
+    async def _run_test(self, test: ScheduledTest, references: dict[str, Engine]) -> None:
+        policy = self.policy
         targets = self.targets(policy)
         if not targets:
             log.info("throughput test of epoch %d: no endpoints to test", test.epoch)
@@ -332,28 +384,37 @@ class Auditor:
         slot, model = target.slot, self.catalog().get(target.slot.model_id)
         valid, evidence = 0, None
         for sample in r.samples:
-            answers = signed_answers(sample.response, sample.request, request_id=sample.request_id,
-                                     hotkey=slot.hotkey, endpoint_id=slot.endpoint_id, model_id=slot.model_id,
-                                     auditor=self.hotkey, netuid=self.netuid, mechid=self.mechid)
+            response = parse_response(sample.response)
+            answers = None if response is None else signed_answers(
+                response, sample.request, request_id=sample.request_id, hotkey=slot.hotkey,
+                endpoint_id=slot.endpoint_id, model_id=slot.model_id, auditor=self.hotkey, netuid=self.netuid,
+                mechid=self.mechid)
             if answers is None:
                 continue
             valid += 1
             if evidence is None and model is not None:
-                fault = await answer_fault(sample.request, answers, references.get(slot.model_id), model.tolerance)
+                try:
+                    fault = await answer_fault(sample.request, answers, references.get(slot.model_id),
+                                               model.tolerance)
+                except ReferenceUnavailable as exc:
+                    log.warning("reference for %s unavailable, a sample of %s is unchecked: %s", slot.model_id,
+                                slot.key, exc)
+                    fault = None
                 if fault:
                     evidence = Evidence(hotkey=slot.hotkey, endpoint_id=slot.endpoint_id, model_id=slot.model_id,
                                         test_id=test.test_id, reason=fault, request_id=sample.request_id,
-                                        request=sample.request, response=sample.response)
-        delivered = r.completed / policy.test_s * (valid / len(r.samples) if r.samples else 1.0)
+                                        request=sample.request,
+                                        response={"answers": answers, "receipt": response["receipt"]})
+        delivered = round(r.completed / policy.test_s * (valid / len(r.samples) if r.samples else 1.0), 2)
         if evidence is not None:
-            return Result(target, "invalid", evidence.reason, round(delivered, 2), 0.0, evidence=evidence, **latency)
+            return Result(target, "invalid", evidence.reason, delivered, 0.0, evidence=evidence, **latency)
         credited = credit(target.tested_rps, delivered, policy)
-        if credited >= target.tested_rps:
-            return Result(target, "passed", "", round(delivered, 2), credited, **latency)
+        if delivered >= policy.pass_fraction * target.tested_rps:
+            return Result(target, "passed", "", delivered, credited, **latency)
         reason = f"delivered {delivered:.1f} of {target.tested_rps:.1f} requests/s"
         if valid < len(r.samples):
-            reason += f", {len(r.samples) - valid} of {len(r.samples)} sampled receipts invalid"
-        return Result(target, "partial", reason, round(delivered, 2), credited, **latency)
+            reason += f", {len(r.samples) - valid} of {len(r.samples)} sampled responses without a valid receipt"
+        return Result(target, "partial", reason, delivered, credited, **latency)
 
     def settle(self) -> None:
         """Confirm tests whose selection block is final with the hash they were selected by; void the others."""
@@ -379,13 +440,14 @@ class Auditor:
     # ---- outputs ----
 
     def verdicts(self, epoch: int) -> SignedVerdicts | None:
-        """The signed verdicts for scoring epoch ``epoch``; None for an epoch that has not started or whose tests are
-        no longer kept, or while a test they cover is not settled."""
-        if epoch in self._verdicts:
-            return self._verdicts[epoch]
+        """The signed verdicts for scoring epoch ``epoch`` (the current one or the two before); None otherwise, or
+        while a test they cover is not settled."""
+        cached = self._verdicts.get(epoch)
+        if cached is not None:
+            return cached
         policy = self.policy
         current, first = self.follower.head // policy.epoch_blocks, epoch - policy.credit_ttl_epochs
-        if not current - KEEP_EPOCHS < epoch <= current or self.store.pending(first, epoch - 1):
+        if not current - 2 <= epoch <= current or self.store.pending(first, epoch - 1):
             return None
         verdicts = Verdicts(netuid=self.netuid, auditor=self.hotkey, epoch=epoch,
                             credits=self.store.credits(first, epoch - 1, policy.qualification_tests),

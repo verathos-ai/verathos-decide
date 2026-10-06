@@ -21,7 +21,7 @@ from verathos.miner.config import MinerConfig
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest
 from verathos.throughput import loadgen
 from verathos.throughput.auditor import Auditor, Slot, planned_rate
-from verathos.throughput.measure import MeasurementStore, Target, current_measurements, measure_all
+from verathos.throughput.measure import MeasurementStore, Target, measure_all, measure_and_store, stored
 from verathos.throughput.policy import (
     AuditPolicy,
     Schedule,
@@ -95,6 +95,17 @@ def test_validators_hold_canaries_around_the_test() -> None:
     assert held == list(range(test.start_block - 1, test.start_block + policy.traffic_blocks + 2))
 
 
+def test_a_policy_change_never_selects_a_second_test_in_an_epoch() -> None:
+    chain = FakeChain(head=180 + 170)
+    from verathos.throughput.follow import ScheduleFollower
+
+    follower = ScheduleFollower(chain, AuditPolicy())
+    (test,) = follower.poll()
+    follower.set_policy(dataclasses.replace(AuditPolicy(), lead_blocks=2))
+    chain.head_block += 5
+    assert follower.poll() == [] and follower.schedule.held(test.start_block)
+
+
 def test_policy_comes_from_the_catalog_and_is_checked() -> None:
     assert policy_from({"pass_fraction": 0.9, "samples_per_test": 20}, 360).samples_per_test == 20
     for bad in ({"unknown": 1}, {"epoch_blocks": 100}, {"pass_fraction": 1.5}, {"rate_growth": 0.5},
@@ -121,8 +132,22 @@ def test_tested_rate_grows_from_what_was_delivered() -> None:
     policy = AuditPolicy()
     assert planned_rate(slot, 50.0, None, policy) == 50.0
     assert planned_rate(slot, 50.0, 90.0, policy) == 180.0
-    assert planned_rate(slot, 50.0, 5.0, policy) == 50.0
+    assert planned_rate(slot, 50.0, 5.0, policy) == 10.0
+    assert planned_rate(slot, 50.0, 0.0, policy) == 6.25  # an endpoint that delivered nothing is probed
     assert planned_rate(dataclasses.replace(slot, declared_rps=30.0), 50.0, 90.0, policy) == 30.0
+
+
+def test_credit_is_what_was_delivered_and_over_declaring_costs() -> None:
+    from verathos.throughput.auditor import credit
+
+    policy = AuditPolicy()
+    assert credit(40.0, 40.0, policy) == 40.0
+    assert credit(40.0, 38.5, policy) == 38.5  # inside the pass band: what was delivered
+    assert credit(40.0, 41.0, policy) == 40.0
+    assert credit(40.0, 20.0, policy) == 10.0  # declared twice what it serves: credited a quarter of the declaration
+    # declaring more than an endpoint serves never pays
+    serves = 20.0
+    assert max((credit(d, min(d, serves), policy), d) for d in (15.0, 20.0, 21.0, 25.0, 40.0))[1] in (20.0, 21.0)
 
 
 # ---- the miner ----
@@ -173,18 +198,16 @@ def test_measurement_finds_capacity_and_shares_of_one_engine(tmp_path) -> None:
                    Target("a", "kev-4b", shared, KEV.workload, 8, "f2"),
                    Target("b", "kev-4b", shared, KEV.workload, 8, "f3")]
         store = MeasurementStore(tmp_path / "capacity.json")
-        measured = await current_measurements(targets, store, max_latency_s=1.0, run_s=0.25)
-        calls = alone.calls
-        again = await current_measurements(targets, store, max_latency_s=1.0, run_s=0.25)
-        assert alone.calls == calls and again == measured  # stored measurements are reused
+        measured, failures = await measure_and_store(targets, store, max_latency_s=1.0, run_s=0.25)
+        assert failures == {} and stored(targets, store) == measured
         changed = [dataclasses.replace(targets[0], fingerprint="new")] + targets[1:]
-        assert (await current_measurements(changed, store, max_latency_s=1.0, run_s=0.25))["alone"].fingerprint == "new"
+        assert stored(changed, store) is None
         return measured
 
     m = asyncio.run(run())
     assert m["alone"].measured_rps == pytest.approx(200, rel=0.2)
     assert m["a"].measured_rps + m["b"].measured_rps == pytest.approx(200, rel=0.2)
-    assert m["alone"].declared(0.9) == round(m["alone"].measured_rps * 0.9, 2)
+    assert m["alone"].declared(0.95) == round(m["alone"].measured_rps * 0.95, 2)
 
 
 def test_fingerprint_ignores_engine_counters() -> None:
@@ -200,7 +223,7 @@ def test_fingerprint_ignores_engine_counters() -> None:
     assert fingerprint(config, None, KEV.workload) == fingerprint(config, "not a document", KEV.workload)
 
 
-def test_measurement_waits_for_the_engine_and_fails_without_answers() -> None:
+def test_an_endpoint_that_cannot_be_measured_is_left_out() -> None:
     from verathos.miner.engine import EngineError
     from verathos.throughput import measure
 
@@ -208,13 +231,15 @@ def test_measurement_waits_for_the_engine_and_fails_without_answers() -> None:
         async def answer(self, request):
             raise EngineError("connection refused")
 
-    target = Target("gpu0", "kev-4b", Down(), KEV.workload, 8, "f")
-    with pytest.raises(measure.MeasurementFailed, match="engine not answering"):
-        asyncio.run(measure.wait_ready(target, timeout_s=0))
-    assert asyncio.run(measure_all([dataclasses.replace(target, engine=MockEngine("kev-4b"))], 1.0, run_s=0.05))
-    slow = dataclasses.replace(target, engine=CapacityEngine(MockEngine("kev-4b"), rps=4, concurrency=1))
-    with pytest.raises(measure.MeasurementFailed, match="longer than 0.1 s"):
-        asyncio.run(measure_all([slow], 0.1, run_s=0.3))
+    down = Target("down", "kev-4b", Down(), KEV.workload, 8, "f")
+    with pytest.raises(measure.MeasurementFailed, match="not answering"):
+        asyncio.run(measure.wait_ready(down, timeout_s=0))
+    up = dataclasses.replace(down, endpoint_id="up", engine=MockEngine("kev-4b"))
+    slow = dataclasses.replace(down, endpoint_id="slow",
+                               engine=CapacityEngine(MockEngine("kev-4b"), rps=4, concurrency=1))
+    measured, failures = asyncio.run(measure_all([down, up, slow], 0.1, run_s=0.2, ready_timeout_s=0))
+    assert set(measured) == {"up"}
+    assert failures["down"].startswith("not answering") and failures["slow"] == "one request takes longer than 0.1 s"
 
 
 def test_declared_capacity_stays_within_the_latency_bound() -> None:
@@ -224,7 +249,8 @@ def test_declared_capacity_stays_within_the_latency_bound() -> None:
 
     target = Target("gpu0", "kev-4b", CapacityEngine(MockEngine("kev-4b"), rps=160, concurrency=8), KEV.workload, 256,
                     "f")
-    (m,) = asyncio.run(measure_all([target], 0.2, run_s=0.25))
+    measured, _ = asyncio.run(measure_all([target], 0.2, run_s=0.25))
+    m = measured["gpu0"]
     assert 8 <= m.concurrency <= 16 and m.measured_rps == pytest.approx(160, rel=0.15)
     assert knee([(4, 80.0), (8, 158.0), (16, 161.0), (32, 160.0)]) == (8, 158.0)
 
@@ -260,7 +286,7 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
     auditor_kp = kp()
     keys = {name: kp() for name in ("honest", "over", "shared", "wrong")}
     hosts = {name: f"10.0.0.{i}" for i, name in enumerate(keys, start=1)}
-    policy = dataclasses.replace(AuditPolicy(), warmup_s=0.3, test_s=1.5, samples_per_test=5)
+    policy = dataclasses.replace(AuditPolicy(), max_latency_s=0.5, warmup_s=0.5, test_s=2.0, samples_per_test=5)
     chain = FakeChain(head=3 * 180 + 40)
 
     async def run():
@@ -302,10 +328,11 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
     credits = {f"{c.hotkey[:6]}/{c.endpoint_id}": c for c in verdicts.credits}
     by_name = {name: k.ss58_address[:6] for name, k in keys.items()}
     honest = credits[f"{by_name['honest']}/gpu0"]
-    assert honest.credited_rps == 40.0 and honest.qualified and honest.test_epoch == 3
-    assert 10 < credits[f"{by_name['over']}/gpu0"].credited_rps < 30
+    assert honest.credited_rps == pytest.approx(40.0, rel=0.05) and honest.qualified and honest.test_epoch == 3
+    # delivers about half its declaration, so it is credited about a quarter of it
+    assert 5 < credits[f"{by_name['over']}/gpu0"].credited_rps < 15
     shares = [credits[f"{by_name['shared']}/{e}"].credited_rps for e in ("gpu0", "gpu1")]
-    assert all(10 < s < 30 for s in shares) and sum(shares) < 50  # one engine cannot pass for two
+    assert sum(shares) < 30  # one engine cannot pass for two
     wrong = credits[f"{by_name['wrong']}/gpu0"]
     assert wrong.credited_rps == 0.0 and not wrong.qualified
     assert [(e.hotkey, e.endpoint_id) for e in verdicts.invalid] == [(keys["wrong"].ss58_address, "gpu0")]
@@ -336,7 +363,7 @@ def test_a_test_whose_selection_block_is_not_final_is_void(tmp_path) -> None:
 @pytest.mark.skipif(not loadgen.BINARY_PATH.exists(), reason="verathos-build-loadgen has not been run")
 def test_auditor_with_the_load_generator_over_tcp(tmp_path) -> None:
     """The real load generator against miner services on local ports: the honest endpoint passes, the
-    over-declaring one is credited what it delivers."""
+    over-declaring one is credited less than it serves."""
     import socket
     import threading
     import time
@@ -374,5 +401,6 @@ def test_auditor_with_the_load_generator_over_tcp(tmp_path) -> None:
         for server in servers:
             server.should_exit = True
     honest, over = (auditor.store.outcomes(m.hotkey, 0)[0] for m in miners)
-    assert (honest.outcome, honest.credited_rps) == ("passed", 40.0), honest
-    assert over.outcome == "partial" and 14 < over.credited_rps < 26, over
+    assert honest.outcome == "passed" and honest.credited_rps == pytest.approx(40.0, rel=0.05), honest
+    # delivers what is left after the warmup backlog, about 17 of 40, and is credited 17 x 17 / 40
+    assert over.outcome == "partial" and 3 < over.credited_rps < 12, over

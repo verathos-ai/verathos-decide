@@ -107,15 +107,15 @@ Per epoch (`epoch_blocks` from the catalog, default 180 blocks) the validator:
 
 Nothing a miner returns can stop the epoch: replies are size- and time-bounded and every malformed reply is
 recorded against that endpoint. Chain errors are retried every block. `--once` runs one epoch immediately and exits. Keep `state_dir` across restarts: it holds the canary secret and the
-score history.
+score history, including the last epoch scored, so a restart does not score an epoch twice.
 
 ## Throughput audit
 
 Every validator follows the test schedule from chain data and holds its canaries while a test's traffic runs. It
 fetches the auditor's verdicts for the epoch from the auditor's axon (`GET /v1/throughput/<epoch>`), checks they are
-signed by the auditor hotkey, and scores each endpoint by the capacity credited there. It applies a proven wrong
-answer only after checking the miner's receipt in the evidence and, if it runs a reference engine for the model,
-recomputing the answer. If the verdicts stay unavailable it uses the last ones it holds while they still cover a
+signed by the auditor hotkey, and scores each endpoint by the capacity credited there for the model it serves now.
+It applies a proven wrong answer only after checking the miner's receipt in the evidence and, if it runs a reference
+engine for the model, recomputing the answer (if that engine does not answer, it applies the auditor's verdict). If the verdicts stay unavailable it uses the last ones it holds while they still cover a
 recent test; without any, no endpoint has proven capacity that epoch. In `observe` mode it counts declared
 capacities and fetches nothing.
 

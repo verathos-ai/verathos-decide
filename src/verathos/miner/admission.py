@@ -26,9 +26,9 @@ class Admission:
     def _waiting(self) -> int:
         return len(self._regular) + len(self._test)
 
-    async def acquire(self, *, test: bool) -> bool:
-        """Wait for an engine slot; False if the queue is full or the wait times out. Call ``release`` after a
-        True."""
+    async def acquire(self, *, test: bool, wait_s: float | None = None) -> bool:
+        """Wait for an engine slot, at most ``wait_s`` (default ``self.wait_s``); False if the queue is full or the
+        wait times out. Call ``release`` after a True."""
         if self.inflight < self.limit and not self._regular and not (test and self._test):
             self.inflight += 1
             return True
@@ -40,7 +40,7 @@ class Admission:
         waiter = asyncio.get_running_loop().create_future()
         queue.append(waiter)
         try:
-            return await asyncio.wait_for(asyncio.shield(waiter), self.wait_s)
+            return await asyncio.wait_for(asyncio.shield(waiter), self.wait_s if wait_s is None else wait_s)
         except TimeoutError:
             return self._withdraw(waiter, queue)
         except asyncio.CancelledError:

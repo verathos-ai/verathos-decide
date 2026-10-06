@@ -37,6 +37,8 @@ HDR_SESSION = "X-Verathos-Session"
 HDR_SESSION_SIGNATURE = "X-Verathos-Session-Signature"
 HDR_REQUEST_ID = "X-Verathos-Request-Id"
 _REQUEST_ID = re.compile(r"[0-9a-f]{32}")
+_SIGNATURE = re.compile(r"[0-9a-f]{128}")
+MAX_SESSIONS = 1024  # verified sessions a miner keeps
 MAX_SESSION_S = 300.0
 
 
@@ -50,14 +52,15 @@ class AuditPolicy:
     lead_blocks: int = 5
     max_latency_s: float = 2.0  # the miner declares capacity only at concurrencies answering within this
     warmup_s: float = 3.0  # at least max_latency_s, so a test measures in steady state
-    test_s: float = 8.0
+    test_s: float = 16.0
     request_timeout_s: float = 20.0
     pass_fraction: float = 0.95
     samples_per_test: int = 10
-    capacity_margin: float = 0.9
+    capacity_margin: float = 0.95
     qualification_tests: int = 1
     credit_ttl_epochs: int = 2
     rate_growth: float = 2.0  # an endpoint is tested at no more than this times what it last delivered
+    min_test_share: float = 0.125  # ... but at least this share of the model's first_test_rps
 
     def validate(self) -> None:
         if self.mode not in ("enforce", "observe"):
@@ -75,6 +78,8 @@ class AuditPolicy:
                              "least 1")
         if self.rate_growth < 1:
             raise ValueError("rate_growth must be at least 1")
+        if not 0 < self.min_test_share <= 1:
+            raise ValueError("min_test_share must be in (0, 1]")
         if eligible_range(0, self)[1] < eligible_range(0, self)[0]:
             raise ValueError("the epoch is too short for a test")
 
@@ -85,8 +90,8 @@ class AuditPolicy:
 
     @property
     def traffic_blocks(self) -> int:
-        """Blocks the test traffic spans, rounded up."""
-        return math.ceil((self.warmup_s + self.test_s) / BLOCK_TIME_S)
+        """Blocks the test traffic spans until its last answers are due, rounded up."""
+        return math.ceil((self.warmup_s + self.test_s + self.max_latency_s) / BLOCK_TIME_S)
 
 
 def policy_from(settings: Mapping[str, Any], epoch_blocks: int) -> AuditPolicy:
@@ -137,7 +142,8 @@ class ScheduledTest:
 
 class Schedule:
     """Follows blocks in order and reports each epoch's test when its selection block appears. A node that starts
-    mid-epoch feeds the epoch from its first block (``eligible_range``) before following the head."""
+    mid-epoch feeds the epoch from its first block (``eligible_range``) before following the head. A new policy
+    applies from the next block observed."""
 
     def __init__(self, policy: AuditPolicy) -> None:
         self.policy = policy
@@ -154,8 +160,12 @@ class Schedule:
             del self._tests[old]
         return test
 
-    def test(self, epoch: int) -> ScheduledTest | None:
-        return self._tests.get(epoch)
+    def adopt(self, policy: AuditPolicy) -> None:
+        """Continue under a new policy; tests already selected stay, so an epoch never gets a second one (a new epoch
+        length forgets them)."""
+        if policy.epoch_blocks != self.policy.epoch_blocks:
+            self._tests = {}
+        self.policy = policy
 
     def held(self, block: int) -> bool:
         """Whether ``block`` is inside a test's traffic (validators hold canaries)."""
@@ -195,9 +205,9 @@ def read_session(headers: Mapping[str, str]) -> tuple[Session, str] | None:
 
 
 class SessionGate:
-    """A miner's check of test traffic: a session signed by the current auditor for this miner and endpoint, not
-    expired (allowing the same clock skew as signed requests), and a request id not seen before in the session. Each
-    session's signature is verified once."""
+    """A miner's check of test traffic: a session signed by the current auditor (or by the miner itself, for its own
+    measurement) for this miner and endpoint, not expired (allowing the same clock skew as signed requests), and a
+    request id not seen before in the session. Each session's signature is verified once."""
 
     def __init__(self, netuid: int, miner_hotkey: str) -> None:
         self.netuid, self.miner_hotkey = netuid, miner_hotkey
@@ -214,16 +224,17 @@ class SessionGate:
         request_id = {k.lower(): v for k, v in headers.items()}.get(HDR_REQUEST_ID.lower(), "")
         if not _REQUEST_ID.fullmatch(request_id):
             raise RequestRejected("malformed request id")
-        if not (session.auditor == auditor and session.netuid == self.netuid
+        if not (session.auditor in (auditor, self.miner_hotkey) and session.netuid == self.netuid
                 and session.miner_hotkey == self.miner_hotkey and session.endpoint_id == endpoint_id):
             raise RequestRejected("test session is for another auditor, miner or endpoint")
         if now_ms > session.not_after_ms + MAX_SKEW_MS:
             raise RequestRejected("test session expired")
         if self._verified.get(signature) != session:
-            if not signing.verify(session.auditor, SESSION_DOMAIN, session.model_dump(), signature):
+            if not (_SIGNATURE.fullmatch(signature)
+                    and signing.verify(session.auditor, SESSION_DOMAIN, session.model_dump(), signature)):
                 raise RequestRejected("bad test session signature")
-            self._verified = {s: v for s, v in self._verified.items() if v.not_after_ms + MAX_SKEW_MS >= now_ms}
-            self._verified[signature] = session
+            live = {s: v for s, v in self._verified.items() if v.not_after_ms + MAX_SKEW_MS >= now_ms}
+            self._verified = dict(list(live.items())[-(MAX_SESSIONS - 1):]) | {signature: session}
         if not self._request_ids.check_and_add(f"{session.test_id}:{request_id}", now_ms):
             raise RequestRejected("replayed request")
         return session, request_id

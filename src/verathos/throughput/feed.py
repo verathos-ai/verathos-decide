@@ -1,9 +1,9 @@
 """The auditor's signed verdicts, one document per scoring epoch: ``GET /v1/throughput/{epoch}``.
 
-For scoring epoch ``E`` the verdicts list every endpoint's credited capacity from its latest confirmed test in epochs
-``E - credit_ttl_epochs .. E - 1``, whether the endpoint has qualified, and the evidence of every answer the auditor
-proved wrong in those tests. Each piece of evidence is the request, the miner's response and its signed receipt, so
-any validator can check it against its own reference.
+For scoring epoch ``E`` the verdicts list the credited capacity of every endpoint in the latest confirmed test of
+epochs ``E - credit_ttl_epochs .. E - 1``, whether it has qualified, and the evidence of a wrong answer for every
+hotkey the auditor proved one against in those tests. Each piece of evidence is the request, the miner's answers and
+its signed receipt, so any validator can check it against its own reference.
 """
 
 from __future__ import annotations
@@ -23,12 +23,14 @@ from verathos.validator.compare import Tolerance, compare_request
 
 VERDICTS_PATH = "/v1/throughput/{epoch}"
 VERDICTS_DOMAIN = "verathos/throughput-verdicts/v1"
-MAX_VERDICTS_BYTES = 16 << 20
+MAX_EVIDENCE_BYTES = 64 << 10  # a response larger than this is not a valid answer
+MAX_VERDICTS_BYTES = 32 << 20  # at most one piece of evidence per hotkey
 
 
 class Credit(BaseModel):
     hotkey: str
     endpoint_id: str
+    model_id: str
     credited_rps: float = Field(ge=0)
     test_epoch: int
     qualified: bool
@@ -42,7 +44,7 @@ class Evidence(BaseModel):
     reason: str
     request_id: str
     request: dict[str, Any]
-    response: dict[str, Any]  # as the miner returned it: answers and the signed receipt
+    response: dict[str, Any]  # the answers and the signed receipt, as the miner returned them
 
 
 class Verdicts(BaseModel):
@@ -65,6 +67,10 @@ class SignedVerdicts(BaseModel):
 
 class VerdictsUnavailable(Exception):
     pass
+
+
+class ReferenceUnavailable(Exception):
+    """The reference engine could not answer, so an answer could not be checked."""
 
 
 async def fetch(client: httpx.AsyncClient, auditor_url: str | None, *, auditor_hotkey: str, netuid: int,
@@ -106,7 +112,7 @@ def signed_answers(response: Any, request: dict[str, Any], *, request_id: str, h
 async def answer_fault(request: dict[str, Any], answers: Any, reference: Engine | None,
                        tolerance: Tolerance) -> str | None:
     """Why ``answers`` are wrong for ``request``: unreadable, or (with a reference engine) outside the model's hard
-    tolerance. None if they pass or cannot be checked."""
+    tolerance. None if they pass, or if there is no reference engine. Raises ReferenceUnavailable."""
     try:
         got = distributions(answers)
     except Exception:  # whatever the miner signed, unreadable answers are wrong answers
@@ -115,8 +121,8 @@ async def answer_fault(request: dict[str, Any], answers: Any, reference: Engine 
         return None
     try:
         expected = distributions((await reference.answer(request))["answers"])
-    except (EngineError, KeyError, ValueError):
-        return None
+    except (EngineError, KeyError, ValueError) as exc:
+        raise ReferenceUnavailable(str(exc)) from None
     c = compare_request(expected, got, tolerance)
     if not c.hard_fail(tolerance):
         return None

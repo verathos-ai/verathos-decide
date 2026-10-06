@@ -137,3 +137,14 @@ def test_test_sessions_are_checked(setup) -> None:
     headers = {**session_headers(forged, validator), HDR_REQUEST_ID: secrets.token_hex(16)}
     r = client.post("/e/gpu0/v1/systemone", json=REQUEST, headers=headers)
     assert (r.status_code, r.json()["error"]) == (401, "bad test session signature")
+
+
+def test_the_miner_measures_itself_through_its_own_sessions(setup) -> None:
+    client, miner, validator, *_ = setup
+    assert session_post(client, miner, auditor=miner).status_code == 200
+    session = Session(netuid=405, auditor=AUDITOR.ss58_address, miner_hotkey=miner.ss58_address, endpoint_id="gpu0",
+                      test_id="t" * 64, not_after_ms=int(time.time() * 1000) + 30_000)
+    headers = session_headers(session, AUDITOR)
+    headers["X-Verathos-Session-Signature"] = headers["X-Verathos-Session-Signature"].upper()
+    r = client.post("/e/gpu0/v1/systemone", json=REQUEST, headers={**headers, HDR_REQUEST_ID: secrets.token_hex(16)})
+    assert (r.status_code, r.json()["error"]) == (401, "bad test session signature")

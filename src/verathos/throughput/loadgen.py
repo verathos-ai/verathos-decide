@@ -3,8 +3,9 @@
 
 It reads one plan as JSON on stdin (targets with their URL, open-loop rate, headers and request mix), sends every
 target its traffic at once, and writes per-target counts, latencies and a random sample of completed requests as JSON
-on stdout. A request counts as delivered when its response (HTTP 200, a JSON object of at most 1 MiB) completes
-inside the measured window; ``sent`` and ``late_sends`` count the sends scheduled inside it.
+on stdout. A request counts as delivered when it was sent inside the measured window and its response (HTTP 200, a
+JSON object of at most 1 MiB) arrives by the window's end plus ``grace_s``; ``sent`` and ``late_sends`` count the
+sends scheduled inside the window.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ class LoadgenError(RuntimeError):
 
 
 class Latency(BaseModel):
-    """Milliseconds over the requests completed in the window; None when none completed."""
+    """Milliseconds over the requests that count; None when none did."""
 
     p50: float | None = None
     p95: float | None = None
@@ -38,10 +39,7 @@ class Latency(BaseModel):
 class Sample(BaseModel):
     request: dict[str, Any]
     request_id: str
-    status: int
-    response: Any
-    sent_at_ms: int
-    completed_at_ms: int
+    response: str  # the body as received; a miner's JSON is parsed only when its sample is checked
 
 
 class TargetResult(BaseModel):
@@ -49,10 +47,8 @@ class TargetResult(BaseModel):
     sent: int = Field(ge=0)
     skipped: int = Field(ge=0)
     completed: int = Field(ge=0)
-    delivered_rps: float = Field(ge=0)
     latency_ms: Latency = Latency()
     errors: dict[str, int] = {}
-    max_send_lag_ms: float = 0.0
     late_sends: int = Field(0, ge=0)
     samples: list[Sample] = []
 

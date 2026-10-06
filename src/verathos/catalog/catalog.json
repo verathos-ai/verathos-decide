@@ -196,14 +196,15 @@
     "lead_blocks": 5,
     "max_latency_s": 2.0,
     "warmup_s": 3.0,
-    "test_s": 8.0,
+    "test_s": 16.0,
     "request_timeout_s": 20.0,
     "pass_fraction": 0.95,
     "samples_per_test": 10,
-    "capacity_margin": 0.9,
+    "capacity_margin": 0.95,
     "qualification_tests": 1,
     "credit_ttl_epochs": 2,
-    "rate_growth": 2.0
+    "rate_growth": 2.0,
+    "min_test_share": 0.125
   },
   "scoring": {
     "canary_pool_size": 16,

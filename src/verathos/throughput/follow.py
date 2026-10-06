@@ -18,19 +18,18 @@ class ScheduleFollower:
     a test's traffic is running at the head."""
 
     def __init__(self, chain: SubtensorChainView, policy: AuditPolicy) -> None:
-        self.chain = chain
+        self.chain, self.policy, self.schedule = chain, policy, Schedule(policy)
         self.head = 0
+        self._next: int | None = None
         self._lock = threading.Lock()
-        self._reset(policy)
-
-    def _reset(self, policy: AuditPolicy) -> None:
-        self.policy, self.schedule, self._next = policy, Schedule(policy), None
 
     def set_policy(self, policy: AuditPolicy) -> None:
-        """Adopt a new policy; the current epoch is replayed under it."""
+        """Adopt a new policy from the next block; a new epoch length replays the current epoch under it."""
         with self._lock:
-            if policy != self.policy:
-                self._reset(policy)
+            if policy.epoch_blocks != self.policy.epoch_blocks:
+                self._next = None
+            self.schedule.adopt(policy)
+            self.policy = policy
 
     def poll(self) -> list[ScheduledTest]:
         """Read the head and feed the blocks up to it; returns the tests they select."""

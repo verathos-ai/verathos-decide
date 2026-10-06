@@ -55,14 +55,14 @@ def load_secret(state_dir: Path) -> bytes:
 
 
 def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | None, mode: str) -> dict[str, float]:
-    """Proven capacity per endpoint key, at most what the endpoint declares now. In observe mode the declarations
-    count as proven."""
-    declared = {e.key: e.endpoint.capacity_rps for e in endpoints}
+    """Proven capacity per endpoint key, for the model the endpoint serves now and at most what it declares now. In
+    observe mode the declarations count as proven."""
     if mode == "observe":
-        return declared
-    credits = {f"{c.hotkey}/{c.endpoint_id}": c.credited_rps for c in (verdicts.credits if verdicts else [])
+        return {e.key: e.endpoint.capacity_rps for e in endpoints}
+    credits = {(c.hotkey, c.endpoint_id, c.model_id): c.credited_rps for c in (verdicts.credits if verdicts else [])
                if c.qualified}
-    return {key: min(credits[key], rps) for key, rps in declared.items() if key in credits}
+    return {e.key: min(credits[e.hotkey, e.endpoint.endpoint_id, e.endpoint.model_id], e.endpoint.capacity_rps)
+            for e in endpoints if (e.hotkey, e.endpoint.endpoint_id, e.endpoint.model_id) in credits}
 
 
 async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, secret: bytes, state: ScoreState,
@@ -173,7 +173,7 @@ def main() -> None:
     current.start()
     throughput.start_slot_refresh(cfg.network, current.accepted)
 
-    done: int | None = None
+    done = state.last_epoch
     while True:
         try:
             block = st.get_current_block()
@@ -184,8 +184,8 @@ def main() -> None:
                 blocks_left = max(next_start - block, 1)
                 asyncio.run(run_epoch(cfg, st, wallet, secret, state, epoch, 1 if args.once else blocks_left,
                                       throughput, current, board))
+                done = state.last_epoch = epoch
                 state.save(state_path)
-                done = epoch
                 if args.once:
                     break
             time.sleep(max((next_start - st.get_current_block()) * BLOCK_TIME_S, 0) + BLOCK_TIME_S)
