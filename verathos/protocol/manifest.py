@@ -30,6 +30,8 @@ _ENDPOINT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 class Hardware(BaseModel):
     kind: Literal["cuda", "apple"]
     device_id: str = Field(min_length=1, max_length=128)
+    gpu_name: str | None = Field(None, max_length=128, description="Claimed GPU class; selects the capacity-audit workload")
+    vram_gb: int | None = Field(None, ge=1, le=4096)
 
 
 class Endpoint(BaseModel):

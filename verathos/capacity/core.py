@@ -1,0 +1,476 @@
+"""Capacity audit: deterministic protocol core.
+
+The audit is non-interactive once current-head chain data is available. The owner validator and every miner
+independently derive audit windows, cohorts, seeds and proof challenges from public chain data plus the endpoints
+listed in committed miner manifests.
+
+Security model (unchanged from the original design): an elimination sieve over repeated windows. Random beacon
+windows draft cohorts of endpoint slots that must each run a calibrated GPU workload simultaneously, beside their
+resident model, inside a timing window, followed by a sampled proof of the work. Slots sharing hardware cannot pass
+together; their misses accumulate to the gate and probation removes them from routing and reward. Probation in this
+lane is the sieve's removal step and is never cleared by re-registration.
+
+A slot is one endpoint of one hotkey: slot_id = H(netuid, hotkey, endpoint_id). Artifacts are signed with the
+hotkey (sr25519). Proof-related derivations (proof seed, challenge seed, transcript root, sampled pass) are
+byte-identical to the original protocol so the existing CUDA bench and verifier remain valid.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import ipaddress
+import json
+import math
+import re
+import struct
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urlparse
+
+from bittensor_wallet import Keypair
+
+from verathos.protocol import signing
+
+PROTOCOL_VERSION = "verathos-capacity-audit-v2"
+DEFAULT_MAX_PROOF_PAYLOAD_BYTES = 32 * 1024 * 1024
+DEFAULT_BLOCK_TIME_S = 12.0
+SELECTION_COOLDOWN_MARGIN_BLOCKS = 2
+ACTIVE_STATE_MARGIN_S = 30.0
+
+# Identity derivations (new: hotkey and endpoint based)
+SLOT_PREFIX = b"VERATHOS_CAPACITY_SLOT_V2"
+LEASE_PREFIX = b"VERATHOS_CAPACITY_LEASE_V2"
+AUDIT_ID_PREFIX = b"VERATHOS_CAPACITY_AUDIT_ID_V2"
+ARTIFACT_DOMAIN = "verathos/capacity-artifact/v1"
+# Beacon and proof derivations (unchanged)
+AUDIT_PREFIX = b"VERATHOS_AUDIT_V1"
+WINDOW_TRIGGER_PREFIX = b"VERATHOS_CAPACITY_WINDOW_TRIGGER_V1"
+PROOF_SEED_PREFIX = b"VERATHOS_HOT_CAPACITY_SEED_V1"
+TRANSCRIPT_PREFIX = b"VERATHOS_HOT_CAPACITY_TRANSCRIPT_V1"
+PROOF_PASS_PREFIX = b"VERATHOS_HOT_CAPACITY_PROOF_PASS_V1"
+PROOF_CHALLENGE_PREFIX = b"VERATHOS_HOT_CAPACITY_CHALLENGE_V1"
+SELECTION_SCORE_PREFIX = b"VERATHOS_CAPACITY_SELECTION_SCORE_V1"
+
+# Deterministic fallback for common multi-label public suffixes. No runtime public-suffix data: miners and the
+# validator must derive identical cohorts from the same manifest data.
+_MULTI_LABEL_PUBLIC_SUFFIXES = {
+    "ac.jp", "ac.uk", "co.jp", "co.kr", "co.nz", "co.uk", "com.ar", "com.au", "com.br", "com.cn", "com.hk",
+    "com.mx", "com.sg", "com.tr", "com.tw", "gov.uk", "ne.jp", "net.au", "net.cn", "net.nz", "net.uk", "org.au",
+    "org.cn", "org.nz", "org.uk",
+}
+_PUBLIC_GROUP_PREFIXES = ("hk:", "host:", "ip:", "ip24:", "regdom:", "hk_model:", "host_model:", "ip_model:",
+                          "ip24_model:", "regdom_model:")
+
+MARKETED_VRAM_SIZES_GB = (12, 16, 20, 24, 32, 40, 48, 80, 96, 128, 141, 192, 288)
+
+
+def normalize_vram_gb(raw_gb: float) -> int:
+    """Map a usable or provider-reported VRAM value to its marketed memory class."""
+    value = float(raw_gb)
+    if value <= 0:
+        return round(value)
+    for marketed in MARKETED_VRAM_SIZES_GB:
+        if value * 0.95 <= marketed <= value * 1.25:
+            return marketed
+    return round(value)
+
+
+@dataclass(frozen=True)
+class GpuClass:
+    """Calibrated workload row for one GPU class."""
+
+    match_gpu_name: str
+    vram_gb: int = 0
+    workload_version: str = "hot_capacity_combined"
+    arena_mb: int = 500
+    matrix_dim: int = 8960
+    rounds_per_pass: int = 8
+    passes: int = 0
+    capacity_passes: int = 0
+    capacity_rounds: int = 1
+    capacity_warmup_passes: int = 1
+    capacity_block_size: int = 64
+    transition_mix_rounds: int = 0
+    transition_fanout: int = 1
+    capacity_tail_passes: int = 0
+    capacity_tail_rounds: int = 1
+    capacity_tail_warmup_passes: int = 1
+    capacity_tail_transition_mix_rounds: int = 1
+    capacity_tail_transition_fanout: int = 8
+    fp64_matrix_dim: int = 4096
+    fp64_passes: int = 0
+    fp64_rounds: int = 1
+    fp64_warmup_passes: int = 1
+    fp64_block_size: int = 64
+    spot_checks: int = 1
+    deadline_s: float = 30.0
+    calibrated: bool = False
+
+
+def _consumer(name: str, vram: int, passes: int, calibrated: bool = True) -> GpuClass:
+    return GpuClass(name, vram, passes=passes, capacity_passes=passes, capacity_rounds=8, calibrated=calibrated)
+
+
+def _datacenter(name: str, vram: int, passes: int, capacity: int, tail: int, fp64: int) -> GpuClass:
+    return GpuClass(name, vram, passes=passes, capacity_passes=capacity, capacity_tail_passes=tail,
+                    transition_mix_rounds=3, transition_fanout=64, fp64_passes=fp64, calibrated=True)
+
+
+# Calibrated rows carried over unchanged from the original protocol.
+DEFAULT_GPU_CLASSES: tuple[GpuClass, ...] = (
+    _consumer("NVIDIA GeForce RTX 4090", 24, 222),
+    _consumer("NVIDIA GeForce RTX 3090", 24, 90),
+    _consumer("NVIDIA GeForce RTX 3090 Ti", 24, 115),
+    _consumer("NVIDIA GeForce RTX 5090", 32, 337),
+    _consumer("NVIDIA RTX PRO 6000 Blackwell Server Edition", 96, 311),
+    _consumer("NVIDIA RTX 4000 Ada Generation", 20, 62),
+    _consumer("NVIDIA RTX A4500", 20, 53),
+    _consumer("NVIDIA RTX A5000", 24, 69),
+    _consumer("NVIDIA RTX 5000 Ada Generation", 32, 144),
+    _consumer("NVIDIA L4", 23, 45),
+    _consumer("NVIDIA A40", 46, 93),
+    _consumer("NVIDIA RTX A6000", 49, 96),
+    _datacenter("NVIDIA A100-SXM4-40GB", 40, 674, 6, 14, 654),
+    _datacenter("NVIDIA A100 80GB PCIe", 80, 699, 9, 9, 681),
+    _datacenter("NVIDIA A100-SXM4-80GB", 80, 662, 8, 9, 645),
+    _consumer("NVIDIA L40", 46, 150),
+    _consumer("NVIDIA L40S", 46, 196),
+    _consumer("NVIDIA RTX 6000 Ada Generation", 49, 156),
+    _consumer("NVIDIA RTX PRO 4000 Blackwell", 24, 105),
+    _consumer("NVIDIA RTX PRO 4500 Blackwell", 32, 154),
+    _consumer("NVIDIA RTX PRO 5000 Blackwell", 48, 195),
+    _datacenter("NVIDIA H100 80GB HBM3", 80, 1649, 16, 4, 1629),
+    _datacenter("NVIDIA H100 PCIe", 80, 1345, 9, 1, 1335),
+    _datacenter("NVIDIA H100 NVL", 96, 1480, 14, 4, 1462),
+    _datacenter("NVIDIA H200", 141, 1661, 20, 12, 1629),
+    _consumer("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 98, 393, calibrated=False),
+    _datacenter("NVIDIA B200", 192, 1154, 43, 1, 1110),
+)
+
+
+@dataclass(frozen=True)
+class AuditPolicy:
+    """Published audit policy. Only ``auditor_hotkey`` (the owner validator) runs and evaluates audits."""
+
+    auditor_hotkey: str = ""
+    mode: str = "observe"  # observe | score_gate
+    cohort_fraction: float = 0.2
+    windows_per_epoch: int = 5
+    max_drain_fraction: float = 0.1
+    group_stress_fraction: float = 0.35
+    lead_blocks: int = 5
+    proof_challenge_delay_blocks: int = 4
+    drain_seconds: float = 30.0
+    deadline_s: float = 30.0
+    transport_grace_s: float = 3.0
+    payload_deadline_s: float = 90.0
+    max_proof_payload_bytes: int = DEFAULT_MAX_PROOF_PAYLOAD_BYTES
+    repeat_window_epochs: int = 10
+    timing_misses_for_zero_score: int = 3
+    hard_proof_misses_for_zero_score: int = 2
+    invalid_proof_misses_for_zero_score: int = 1
+    gpu_classes: tuple[GpuClass, ...] = DEFAULT_GPU_CLASSES
+
+    def validate(self, block_time_s: float = DEFAULT_BLOCK_TIME_S) -> None:
+        if not 0.0 <= self.group_stress_fraction <= 0.5:
+            raise ValueError("group_stress_fraction must be between 0.0 and 0.5")
+        proof_delay_s = max(1, self.proof_challenge_delay_blocks) * block_time_s
+        if self.deadline_s + self.transport_grace_s >= proof_delay_s:
+            raise ValueError("deadline_s + transport_grace_s must be smaller than proof_challenge_delay_blocks * block_time")
+        if self.max_proof_payload_bytes <= 0:
+            raise ValueError("max_proof_payload_bytes must be positive")
+        if self.mode not in ("observe", "score_gate"):
+            raise ValueError("mode must be observe or score_gate")
+
+
+def active_hold_seconds(policy: AuditPolicy, block_time_s: float = DEFAULT_BLOCK_TIME_S) -> float:
+    """The miner's complete busy hold from B_select."""
+    pre_challenge_blocks = max(0, policy.lead_blocks) + max(1, policy.proof_challenge_delay_blocks)
+    evidence_s = policy.deadline_s + policy.transport_grace_s + policy.payload_deadline_s + ACTIVE_STATE_MARGIN_S
+    return max(policy.drain_seconds, pre_challenge_blocks * block_time_s + evidence_s, 60.0)
+
+
+def payload_cooldown_blocks(policy: AuditPolicy, block_time_s: float = DEFAULT_BLOCK_TIME_S) -> int:
+    """Post-B_proof cooldown before a slot may be selected again."""
+    pre_challenge_blocks = max(0, policy.lead_blocks) + max(1, policy.proof_challenge_delay_blocks)
+    post_s = max(0.0, active_hold_seconds(policy, block_time_s) - pre_challenge_blocks * block_time_s)
+    return int(math.ceil(post_s / block_time_s)) + SELECTION_COOLDOWN_MARGIN_BLOCKS
+
+
+@dataclass(frozen=True)
+class Slot:
+    """One endpoint of one hotkey, as listed in its committed manifest."""
+
+    netuid: int
+    hotkey: str
+    endpoint_id: str
+    endpoint_url: str
+    model_id: str
+    gpu_name: str = ""
+    vram_gb: int = 0
+
+    @property
+    def slot_id(self) -> str:
+        return _hash_hex(SLOT_PREFIX, _u64(self.netuid), self.hotkey.encode(), b"\0", self.endpoint_id.encode())
+
+
+def _bytes_from_hash(value: bytes | str) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    raw = str(value).strip()
+    if raw.startswith("0x"):
+        raw = raw[2:]
+    try:
+        return bytes.fromhex(raw)
+    except ValueError:
+        return raw.encode("utf-8")
+
+
+def _hash_hex(*parts: bytes) -> str:
+    h = hashlib.sha256()
+    for part in parts:
+        h.update(part)
+    return h.hexdigest()
+
+
+def _u64(value: int) -> bytes:
+    return struct.pack(">Q", int(value))
+
+
+def lease_id(slot: Slot, audit_epoch: int) -> str:
+    return _hash_hex(LEASE_PREFIX, _u64(slot.netuid), slot.hotkey.encode(), b"\0", slot.endpoint_id.encode(), b"\0",
+                     slot.endpoint_url.encode(), b"\0", slot.model_id.encode(), _u64(audit_epoch))
+
+
+def derive_audit_seed(selection_block_hash: bytes | str, subnet_epoch: int) -> str:
+    return _hash_hex(AUDIT_PREFIX, _bytes_from_hash(selection_block_hash), _u64(subnet_epoch))
+
+
+def derive_audit_id(*, netuid: int, epoch_number: int, selection_block: int, audit_block: int, cohort_seed: str) -> str:
+    return _hash_hex(AUDIT_ID_PREFIX, _u64(netuid), _u64(epoch_number), _u64(selection_block), _u64(audit_block),
+                     _bytes_from_hash(cohort_seed))
+
+
+def derive_proof_seed(audit_block_hash: bytes | str, slot_identifier: str, gpu_index: int) -> str:
+    return _hash_hex(PROOF_SEED_PREFIX, _bytes_from_hash(audit_block_hash), _bytes_from_hash(slot_identifier),
+                     _u64(gpu_index))
+
+
+def derive_proof_challenge_seed(transcript_root_hex: bytes | str, challenge_block_hash: bytes | str,
+                                lease_identifier: str, slot_identifier: str, gpu_index: int) -> str:
+    """Public post-commit challenge seed: the timed final receipt commits the transcript root before the challenge
+    block hash exists, and the proof sample is drawn from this seed."""
+    return _hash_hex(PROOF_CHALLENGE_PREFIX, _bytes_from_hash(transcript_root_hex), _bytes_from_hash(challenge_block_hash),
+                     lease_identifier.encode("utf-8"), _bytes_from_hash(slot_identifier), _u64(gpu_index))
+
+
+def transcript_root(pass_roots: Sequence[Any]) -> str:
+    h = hashlib.sha256()
+    h.update(TRANSCRIPT_PREFIX)
+    for idx, root in enumerate(pass_roots):
+        h.update(_u64(idx))
+        if isinstance(root, (list, tuple)):
+            h.update(json.dumps({"root": list(root)}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode())
+        else:
+            h.update(str(root).encode("utf-8"))
+    return h.hexdigest()
+
+
+def derive_sampled_pass_index(root_hex: str, lease_identifier: str, gpu_index: int, passes: int) -> int:
+    if passes <= 0:
+        return 0
+    digest = hashlib.sha256(PROOF_PASS_PREFIX + _bytes_from_hash(root_hex) + lease_identifier.encode("utf-8")
+                            + _u64(gpu_index)).digest()
+    return int.from_bytes(digest[:8], "big") % passes
+
+
+def window_triggered(block_number: int, block_hash: bytes | str, epoch_blocks: int, policy: AuditPolicy) -> bool:
+    """Whether this current-head block opens a surprise audit window (rate windows_per_epoch / epoch_blocks)."""
+    epoch_blocks = max(1, int(epoch_blocks))
+    windows = max(0, policy.windows_per_epoch)
+    if windows <= 0:
+        return False
+    if windows >= epoch_blocks:
+        return True
+    digest = hashlib.sha256(WINDOW_TRIGGER_PREFIX + _bytes_from_hash(block_hash) + _u64(block_number)
+                            + _u64(epoch_blocks) + _u64(windows)).digest()
+    return int.from_bytes(digest[:16], "big") < ((1 << 128) * windows) // epoch_blocks
+
+
+def window_fits_epoch(selection_block: int, epoch_blocks: int, policy: AuditPolicy) -> bool:
+    """All audit blocks must stay in one tempo; late selections are dropped, never carried into the next epoch."""
+    epoch_blocks = max(1, int(epoch_blocks))
+    epoch_end_exclusive = ((selection_block // epoch_blocks) + 1) * epoch_blocks
+    audit_block = selection_block + policy.lead_blocks
+    proof_block = audit_block + max(1, policy.proof_challenge_delay_blocks)
+    return audit_block < epoch_end_exclusive and proof_block < epoch_end_exclusive
+
+
+def registered_domain_from_host(host: str) -> str:
+    """Deterministic registered-domain grouping token (no live DNS, no runtime public-suffix data)."""
+    normalized = (host or "").strip().lower().rstrip(".")
+    if not normalized or "." not in normalized:
+        return ""
+    try:
+        ipaddress.ip_address(normalized)
+        return ""
+    except ValueError:
+        pass
+    try:
+        ascii_host = normalized.encode("idna").decode("ascii")
+    except UnicodeError:
+        ascii_host = normalized
+    labels = [label for label in ascii_host.split(".") if label]
+    if len(labels) < 2 or any(label.startswith("-") or label.endswith("-") for label in labels):
+        return ""
+    suffix2 = ".".join(labels[-2:])
+    if suffix2 in _MULTI_LABEL_PUBLIC_SUFFIXES and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return suffix2
+
+
+def _token(value: str) -> str:
+    return str(value or "").strip().lower().replace("|", "%7c")
+
+
+def group_keys(slot: Slot) -> tuple[str, ...]:
+    """Public grouping tokens from committed manifest data only (hotkey, endpoint URL, model)."""
+    host = (urlparse(slot.endpoint_url).hostname or "").lower()
+    ip_literal = ip24 = ""
+    if host:
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.version == 4:
+                ip_literal = str(ip)
+                ip24 = ".".join(ip_literal.split(".")[:3])
+        except ValueError:
+            pass
+    regdom = registered_domain_from_host(host)
+    hk, model, h = _token(slot.hotkey), _token(slot.model_id), _token(host)
+    tokens = [
+        f"hk:{hk}" if hk else "", f"host:{h}" if h else "", f"ip:{ip_literal}" if ip_literal else "",
+        f"ip24:{ip24}" if ip24 else "", f"regdom:{_token(regdom)}" if regdom else "",
+        f"hk_model:{hk}::{model}" if hk and model else "", f"host_model:{h}::{model}" if h and model else "",
+        f"ip_model:{ip_literal}::{model}" if ip_literal and model else "",
+        f"ip24_model:{ip24}::{model}" if ip24 and model else "",
+        f"regdom_model:{_token(regdom)}::{model}" if regdom and model else "",
+    ]
+    return tuple(sorted(t for t in tokens if t and t.startswith(_PUBLIC_GROUP_PREFIXES)))
+
+
+def _selection_probability(policy: AuditPolicy) -> float:
+    target = max(0.0, policy.cohort_fraction) / max(1, policy.windows_per_epoch)
+    if policy.max_drain_fraction > 0:
+        target = min(target, policy.max_drain_fraction)
+    return min(1.0, max(0.0, target))
+
+
+def _selection_hit(audit_seed_hex: str, namespace: str, key: str, probability: float) -> bool:
+    p = min(1.0, max(0.0, probability))
+    if p <= 0.0:
+        return False
+    if p >= 1.0:
+        return True
+    h = hashlib.sha256()
+    h.update(SELECTION_SCORE_PREFIX)
+    for part in (audit_seed_hex, namespace, key):
+        h.update(str(part).encode("utf-8"))
+        h.update(b"\0")
+    return int(h.hexdigest(), 16) < int(p * (1 << 256))
+
+
+def slot_selected(slot: Slot, audit_seed_hex: str, policy: AuditPolicy) -> bool:
+    """Per-slot public predicate: base draw on the slot id, plus group-stress draws on its grouping tokens."""
+    target = _selection_probability(policy)
+    if target <= 0.0:
+        return False
+    group_fraction = min(1.0, max(0.0, policy.group_stress_fraction))
+    if _selection_hit(audit_seed_hex, "base", slot.slot_id, target * (1.0 - group_fraction)):
+        return True
+    keys = group_keys(slot)
+    if not keys or group_fraction <= 0.0:
+        return False
+    per_key = min(1.0, target * group_fraction)
+    return any(_selection_hit(audit_seed_hex, "group", k, per_key) for k in keys)
+
+
+def select_slots(slots: Iterable[Slot], audit_seed_hex: str, policy: AuditPolicy) -> list[Slot]:
+    """Deterministic cohort from the public seed and committed manifests; needs no global miner state."""
+    unique = {s.slot_id: s for s in slots}
+    return sorted((s for s in unique.values() if slot_selected(s, audit_seed_hex, policy)),
+                  key=lambda s: (s.hotkey, s.endpoint_id))
+
+
+def _canonical_gpu_name(gpu_name: str) -> str:
+    normalized = " ".join(str(gpu_name or "").strip().lower().split())
+    normalized = normalized.replace("pci-e", "pcie").replace("pci e", "pcie")
+    return re.sub(r"\b(\d{2,3})\s*g(?:b)?\b", r"\1gb", normalized)
+
+
+def match_gpu_class(gpu_name: str, vram_gb: int, policy: AuditPolicy) -> GpuClass | None:
+    normalized = _canonical_gpu_name(gpu_name)
+    for row in policy.gpu_classes:
+        if _canonical_gpu_name(row.match_gpu_name) != normalized:
+            continue
+        if row.vram_gb and vram_gb:
+            if abs(vram_gb - row.vram_gb) > 2 and abs(normalize_vram_gb(vram_gb) - normalize_vram_gb(row.vram_gb)) > 2:
+                continue
+        return row
+    return None
+
+
+def gpu_support_status(gpu_name: str, vram_gb: int, policy: AuditPolicy) -> tuple[bool, str, GpuClass | None]:
+    row = match_gpu_class(gpu_name, vram_gb, policy)
+    if row is None:
+        return False, "unsupported_gpu_class", None
+    if not row.calibrated:
+        return False, "uncalibrated_gpu_class", row
+    return True, "supported", row
+
+
+def gpu_pass_count(row: GpuClass) -> int:
+    if row.workload_version == "hot_capacity_combined":
+        total = row.capacity_passes + row.capacity_tail_passes + row.fp64_passes
+        if total > 0:
+            return total
+    return row.passes
+
+
+def gpu_workload_spec(row: GpuClass) -> dict[str, Any]:
+    """Workload spec handed to the bench for a calibrated GPU row."""
+    return {
+        "workload_version": row.workload_version or "hot_capacity_combined",
+        "capacity_matrix_dim": row.matrix_dim or 8960,
+        "capacity_passes": row.capacity_passes or row.passes,
+        "capacity_rounds": row.capacity_rounds or 1,
+        "capacity_warmup_passes": row.capacity_warmup_passes,
+        "capacity_block_size": row.capacity_block_size or 64,
+        "transition_mix_rounds": row.transition_mix_rounds,
+        "transition_fanout": row.transition_fanout or 1,
+        "capacity_tail_passes": row.capacity_tail_passes,
+        "capacity_tail_rounds": row.capacity_tail_rounds or 1,
+        "capacity_tail_warmup_passes": row.capacity_tail_warmup_passes,
+        "capacity_tail_transition_mix_rounds": row.capacity_tail_transition_mix_rounds or 1,
+        "capacity_tail_transition_fanout": row.capacity_tail_transition_fanout or 1,
+        "fp64_matrix_dim": row.fp64_matrix_dim or 4096,
+        "fp64_passes": row.fp64_passes,
+        "fp64_rounds": row.fp64_rounds or 1,
+        "fp64_warmup_passes": row.fp64_warmup_passes,
+        "fp64_block_size": row.fp64_block_size or 64,
+        "spot_checks": row.spot_checks or 1,
+        "pass_count": gpu_pass_count(row),
+    }
+
+
+def _unsigned(data: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in data.items() if k != "miner_signature"}
+
+
+def sign_artifact(data: Mapping[str, Any], keypair: Keypair) -> str:
+    """sr25519 signature of an audit artifact by the slot's hotkey."""
+    return signing.sign(keypair, ARTIFACT_DOMAIN, _unsigned(data))
+
+
+def verify_artifact_signature(data: Mapping[str, Any], expected_hotkey: str) -> bool:
+    sig = str(data.get("miner_signature") or "")
+    return bool(sig) and signing.verify(expected_hotkey, ARTIFACT_DOMAIN, _unsigned(data), sig)
