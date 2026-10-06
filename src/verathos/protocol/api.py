@@ -14,11 +14,11 @@ compares those distributions, so the derived fields (choice, score, confidence) 
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-JSONContent = Union[str, dict, list, int, float, bool, None]
+JSONContent = str | dict | list | int | float | bool | None
 MAX_OPTIONS = 255
 
 
@@ -46,7 +46,7 @@ class Score(BaseModel):
     criteria: list[JSONContent] = Field(min_length=1, max_length=MAX_OPTIONS)
 
 
-Question = Annotated[Union[Noul, Choice, Score], Field(discriminator="type")]
+Question = Annotated[Noul | Choice | Score, Field(discriminator="type")]
 
 
 class SystemOneRequest(BaseModel):

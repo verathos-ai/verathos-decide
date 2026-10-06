@@ -64,7 +64,7 @@ def epoch_scores(results: dict[str, EndpointResult], model_weight: dict[str, flo
                  state: ScoreState) -> tuple[dict[str, float], set[str]]:
     """-> (score per endpoint key, keys that failed verification this epoch). Call after ``record_window``."""
     medians_by_model: dict[str, list[float]] = {}
-    for key, r in results.items():
+    for r in results.values():
         if r.latencies_ms:
             medians_by_model.setdefault(r.endpoint.endpoint.model_id, []).append(statistics.median(r.latencies_ms))
     model_median = {m: statistics.median(v) for m, v in medians_by_model.items()}

@@ -56,13 +56,18 @@ class MockEngine:
         answers = {}
         for qid, q in req.questions.items():
             keys = question_keys(q)
-            raw = [int.from_bytes(hashlib.sha256(f"{self.salt}|{req.state}|{qid}|{k}".encode()).digest()[:4], "big") + 1
-                   for k in keys]
+            raw = [
+                int.from_bytes(hashlib.sha256(f"{self.salt}|{req.state}|{qid}|{k}".encode()).digest()[:4], "big") + 1
+                for k in keys
+            ]
             probs = [round(x / sum(raw), 4) for x in raw]
             if isinstance(q, Noul):
                 answers[qid] = {"type": "noul", "noul": probs[1]}
             elif isinstance(q, Choice):
-                answers[qid] = {"type": "choice", "choice": keys[probs.index(max(probs))], "probabilities": dict(zip(keys, probs))}
+                answers[qid] = {"type": "choice", "choice": keys[probs.index(max(probs))],
+                                "probabilities": dict(zip(keys, probs))}
             elif isinstance(q, Score):
-                answers[qid] = {"type": "score", "score": sum(i * p for i, p in enumerate(probs)), "probabilities": dict(zip(keys, probs))}
-        return {"model": self.model, "answers": answers, "usage": {"input_tokens": len(str(req.state)) // 4, "output_tokens": 0}}
+                answers[qid] = {"type": "score", "score": sum(i * p for i, p in enumerate(probs)),
+                                "probabilities": dict(zip(keys, probs))}
+        return {"model": self.model, "answers": answers,
+                "usage": {"input_tokens": len(str(req.state)) // 4, "output_tokens": 0}}

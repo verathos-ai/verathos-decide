@@ -19,9 +19,9 @@ from verathos.miner.engine import MockEngine
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
 from verathos.validator.audit import audit_epoch
 from verathos.validator.canaries import assignment, canary_pool
+from verathos.validator.compare import Tolerance, Verdict
 from verathos.validator.discovery import Neuron, discover
 from verathos.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
-from verathos.validator.compare import Tolerance, Verdict
 
 
 class HostRouter(httpx.AsyncBaseTransport):
@@ -115,8 +115,8 @@ def test_weights_ignore_reassigned_uids() -> None:
 def test_window_catches_subtle_drift_no_single_epoch_shows() -> None:
     """Each epoch alone has too few probabilities for the statistical bound; three epochs together fail it."""
     from verathos.validator.audit import EndpointResult
-    from verathos.validator.discovery import DiscoveredEndpoint
     from verathos.validator.compare import RequestComparison
+    from verathos.validator.discovery import DiscoveredEndpoint
 
     tol = Tolerance(min_probabilities=100, mean_abs=0.005)
     ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id="gpu0", url="http://x/e/gpu0", model_id="kev-4b",
@@ -125,7 +125,8 @@ def test_window_catches_subtle_drift_no_single_epoch_shows() -> None:
     verdicts = []
     for _ in range(3):
         r = EndpointResult(ep, tol, identity_ok=True, sent=10, answered=10, latencies_ms=[40.0] * 10)
-        r.tally.add(RequestComparison(max_abs=0.03, sum_abs=0.6, count=60, confident_flips=0))  # mean 0.01, no hard fail
+        # mean 0.01, no hard fail
+        r.tally.add(RequestComparison(max_abs=0.03, sum_abs=0.6, count=60, confident_flips=0))
         record_window(state, {"hkA/gpu0": r}, 3)
         scores, failed = epoch_scores({"hkA/gpu0": r}, {"kev-4b": 1.0}, state)
         verdicts.append(bool(failed))

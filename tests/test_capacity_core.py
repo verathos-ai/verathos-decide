@@ -43,7 +43,8 @@ def test_beacon_and_gpu_rows_match_reference_vectors() -> None:
         assert core.registered_domain_from_host(host) == expected
 
 
-def slot(hotkey: str, endpoint_id: str = "gpu0", url: str = "http://203.0.113.5:8091/e/gpu0", model: str = "kev-4b") -> core.Slot:
+def slot(hotkey: str, endpoint_id: str = "gpu0", url: str = "http://203.0.113.5:8091/e/gpu0",
+         model: str = "kev-4b") -> core.Slot:
     return core.Slot(405, hotkey, endpoint_id, url, model, "NVIDIA GeForce RTX 5090", 32)
 
 

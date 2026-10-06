@@ -4,7 +4,7 @@ into one transcript and opened with one post-timing sample seed.
 The timed work commits every lane's root chain into ``combined_transcript_root`` before B_proof exists. The
 validator derives ``b_proof_seed`` from finalized chain data, the sample seed is ``H(b_proof_seed, transcript)``, and
 the same seed selects the opening in every lane. Each capacity lane carries a sumcheck block proof over its sampled
-Q block and a polynomial-commitment GEMM proof (``proof.gemm_v2``) over the same block.
+Q block and a polynomial-commitment GEMM proof (``proof.gemm``) over the same block.
 """
 
 from __future__ import annotations
@@ -12,13 +12,14 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from verathos.capacity.proof import fp64
-from verathos.capacity.proof.gemm_v2 import (
-    CapacityGemmV2FormatError,
-    capacity_gemm_v2_context_from_workspace_proof,
-    verify_capacity_gemm_v2,
+from verathos.capacity.proof.gemm import (
+    CapacityGemmFormatError,
+    capacity_gemm_context_from_workspace_proof,
+    verify_capacity_gemm,
 )
 from verathos.capacity.proof.workspace import verify_workspace_proof_payload
 
@@ -120,25 +121,26 @@ def _verify_capacity_lane(*, proof: Mapping[str, Any], params: Mapping[str, Any]
     )
     if not ok:
         return False, reason
-    state_openings = proof.get("gemm_v2_state_openings")
+    state_openings = proof.get("gemm_band_openings")
     block_proof = proof.get("block_proof")
-    if "gemm_v2" not in proof or not isinstance(state_openings, list) or not isinstance(block_proof, Mapping) \
+    if "gemm_proof" not in proof or not isinstance(state_openings, list) or not isinstance(block_proof, Mapping) \
             or not isinstance(block_proof.get("merkle_path"), Mapping):
         return False, "missing_gemm_proof"
     try:
-        context = capacity_gemm_v2_context_from_workspace_proof(
+        context = capacity_gemm_context_from_workspace_proof(
             proof=proof, capacity_params=params, lease_id=lease_id, gpu_index=gpu_index,
             proof_seed_hex=proof_seed_hex, challenge_seed_hex=sample_seed_hex, transcript_root_hex=combined_root)
-    except CapacityGemmV2FormatError as exc:
+    except CapacityGemmFormatError as exc:
         return False, f"invalid_gemm_context:{exc}"
-    ok, reason = verify_capacity_gemm_v2(context=context, payload=proof.get("gemm_v2"),
+    ok, reason = verify_capacity_gemm(context=context, payload=proof.get("gemm_proof"),
                                          q_block_i32=block_proof.get("q_block_i32"),
                                          q_merkle_path=block_proof.get("merkle_path"), state_openings=state_openings)
     return (True, "ok") if ok else (False, f"gemm_invalid:{reason}")
 
 
-def verify_combined_proof(*, proof: Mapping[str, Any], final_commit: Mapping[str, Any], workload_spec: Mapping[str, Any],
-                          lease_id: str, gpu_index: int, proof_seed_hex: str, b_proof_seed_hex: str) -> tuple[bool, str]:
+def verify_combined_proof(*, proof: Mapping[str, Any], final_commit: Mapping[str, Any],
+                          workload_spec: Mapping[str, Any], lease_id: str, gpu_index: int,
+                          proof_seed_hex: str, b_proof_seed_hex: str) -> tuple[bool, str]:
     """Verify a combined proof against the signed final commitment and the validator's own workload spec.
 
     ``b_proof_seed_hex`` is the challenge seed the validator derives from the finalized B_proof block.

@@ -33,7 +33,8 @@ class MinerConfig(BaseModel):
     port: int = Field(ge=1, le=65535)
     scheme: Literal["http", "https"] = "http"
     listen_host: str = "0.0.0.0"
-    gateway_hotkeys: list[str] = Field(default_factory=list, description="Extra caller hotkeys allowed besides permitted validators")
+    gateway_hotkeys: list[str] = Field(default_factory=list,
+                                       description="Extra caller hotkeys allowed besides permitted validators")
     endpoints: list[EndpointConfig] = Field(min_length=1)
 
     @model_validator(mode="after")

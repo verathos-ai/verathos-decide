@@ -1,5 +1,5 @@
 """Combined capacity proof end to end on the CPU: a reference implementation of the bench's lanes builds a complete
-proof (capacity lane with sumcheck block proof and PCS GEMM proof, plus an FP64 lane), and the validator-side
+proof (capacity lane with its Q block sumcheck and Pallas-field GEMM proof, plus an FP64 lane), and the validator-side
 verifier accepts it and rejects tampering."""
 
 from __future__ import annotations
@@ -25,17 +25,16 @@ from verathos.capacity.proof.combined import (
 from verathos.capacity.proof.workspace import (
     WORKSPACE_PROOF_FORMAT,
     WorkspaceMerkleTree,
+    block_transcript,
     derive_challenge_block_index,
     derive_sampled_round_index,
     pass_root_from_round_roots,
     serialize_gemm_block_proof,
     workspace_i8_values,
     workspace_seed_for,
-    workspace_transcript_root_v2,
+    workspace_transcript_root,
 )
-from verathos.capacity.zk.config import Config
-from verathos.capacity.zk.crypto.transcript import Transcript
-from verathos.capacity.zk.prover.gemm_fast import GEMMProverFast
+from verathos.capacity.zk.block_prover import prove_block
 
 LEASE = "lease-combined"
 PROOF_SEED = "21" * 32
@@ -67,7 +66,7 @@ def _capacity_lane(params: dict) -> tuple[str, callable]:
         roots = [WorkspaceMerkleTree.from_matrix_i32(_workspace(seed, p, r, n)[2].tolist(), bs).root.hex()
                  for r in range(rounds)]
         chain.append({"pass_index": p, "pass_root": pass_root_from_round_roots(p, roots), "round_roots": roots})
-    transcript = workspace_transcript_root_v2(chain, [])
+    transcript = workspace_transcript_root(chain, [])
 
     def build(sample_hex: str, combined_root: str) -> dict:
         p = derive_sampled_pass_index(sample_hex, LEASE, 0, passes)
@@ -78,12 +77,8 @@ def _capacity_lane(params: dict) -> tuple[str, callable]:
                                                    pass_index=p, round_index=r, blocks_per_row=n // bs,
                                                    challenge_seed_hex=sample_hex)
         bi, bj = divmod(block_index, n // bs)
-        transcript_fs = Transcript(b"verathos-hot-capacity-workspace-gemm-v1")
-        transcript_fs.absorb(b"pass_index", p)
-        transcript_fs.absorb(b"round_index", r)
-        transcript_fs.absorb_bytes(b"round_root", tree.root)
-        block = GEMMProverFast(Config(block_size=bs, spot_checks=SPEC["spot_checks"]))._prove_block_fast(
-            X=a, W=b, Y=q, Y_merkle=tree, bi=bi, bj=bj, transcript=transcript_fs)
+        block = prove_block(x=a, w=b, y=q, q_tree=tree, bi=bi, bj=bj, block_size=bs, spot_checks=SPEC["spot_checks"],
+                            transcript=block_transcript(p, r, tree.root))
         q_block = q[bi * bs:(bi + 1) * bs, bj * bs:(bj + 1) * bs].tolist()
         proof = {
             "format": WORKSPACE_PROOF_FORMAT, "workload_version": "fixed_workspace_merkle_gemm_v1",
@@ -203,9 +198,10 @@ def _flip_last_byte(hex_text: str) -> str:
 
 @pytest.mark.parametrize("mutate, reason", [
     (lambda p: p["capacity_proof"]["block_proof"]["q_block_i32"][0].__setitem__(0, 7), "capacity_"),
-    (lambda p: p["capacity_proof"]["gemm_v2"].__setitem__("payload", _flip_last_byte(p["capacity_proof"]["gemm_v2"]
-                                                                                      ["payload"])), "capacity_gemm"),
-    (lambda p: p["capacity_proof"].pop("gemm_v2_state_openings"), "capacity_missing_gemm_proof"),
+    (lambda p: p["capacity_proof"]["gemm_proof"].__setitem__(
+        "payload", _flip_last_byte(p["capacity_proof"]["gemm_proof"]["payload"])
+     ), "capacity_gemm"),
+    (lambda p: p["capacity_proof"].pop("gemm_band_openings"), "capacity_missing_gemm_proof"),
     (lambda p: p["fp64_proof"]["spots"][0].__setitem__("value", p["fp64_proof"]["spots"][0]["value"] + 2), "fp64_"),
     (lambda p: p["fp64_proof"].__setitem__("seed", p["fp64_proof"]["seed"] + 1), "fp64_seed"),
     (lambda p: p.__setitem__("sample_seed", "00" * 32), "sample_seed_mismatch"),

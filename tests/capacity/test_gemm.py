@@ -1,4 +1,4 @@
-"""Protocol-v2 hot-capacity arithmetic adapter tests."""
+"""Capacity GEMM proof: native prover, Python verifier, and the workspace bands it binds to."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ import numpy as np
 import pytest
 
 from verathos.capacity.core import derive_sampled_pass_index
-from verathos.capacity.proof.gemm_v2 import (
-    CAPACITY_GEMM_V2_FORMAT,
-    CapacityGemmV2Context,
-    CapacityGemmV2FormatError,
-    CapacityGemmV2Payload,
-    prove_capacity_gemm_v2,
+from verathos.capacity.proof.gemm import (
+    CAPACITY_GEMM_FORMAT,
+    CapacityGemmContext,
+    CapacityGemmFormatError,
+    CapacityGemmPayload,
+    prove_capacity_gemm,
     required_transition_state_blocks,
-    verify_capacity_gemm_v2,
+    verify_capacity_gemm,
 )
 from verathos.capacity.proof.workspace import (
     WORKSPACE_PROOF_FORMAT,
@@ -25,17 +25,17 @@ from verathos.capacity.proof.workspace import (
     derive_challenge_block_index,
     derive_sampled_round_index,
     serialize_merkle_path,
+    verify_workspace_gemm_block_proof,
+    verify_workspace_proof_payload,
     workspace_i8_value,
     workspace_i8_values,
     workspace_q_block_hash_i32,
     workspace_seed_for,
     workspace_state_block_hash_i8,
-    verify_workspace_gemm_block_proof,
-    verify_workspace_proof_payload,
-    workspace_transcript_root_v2,
+    workspace_transcript_root,
 )
-from verathos.capacity.zk.crypto.gemm_v2_batch import GemmV2BatchProof, GemmV2BatchStatement
-from verathos.capacity.zk.crypto.pcs_v2 import PCSNativeError
+from verathos.capacity.zk.gemm_native import NativeError
+from verathos.capacity.zk.gemm_sumcheck import GemmBatchProof, GemmBatchStatement
 
 
 @pytest.mark.parametrize("matrix_id", [0, 1])
@@ -65,7 +65,7 @@ def _deterministic_fixture(
     false_output: bool = False,
     matrix_dim: int = 4,
 ):
-    lease_id = "capacity-lease-v2"
+    lease_id = "capacity-lease"
     proof_seed = bytes.fromhex("12" * 32)
     challenge_seed = bytes.fromhex("34" * 32)
     transcript_root = bytes.fromhex("56" * 32)
@@ -129,8 +129,8 @@ def _deterministic_fixture(
         challenge_seed_hex=challenge_seed.hex(),
     )
     row_block, column_block = divmod(block_index, blocks_per_row)
-    context = CapacityGemmV2Context(
-        workload_version="fixed_workspace_merkle_gemm_v2",
+    context = CapacityGemmContext(
+        workload_version="fixed_workspace_merkle_gemm_v1",
         lease_id=lease_id,
         gpu_index=gpu_index,
         proof_seed=proof_seed,
@@ -196,7 +196,7 @@ def test_workspace_state_block_hash_accepts_int8_arrays():
 
 
 def _transition_fixture():
-    lease_id = "capacity-transition-v2"
+    lease_id = "capacity-transition"
     proof_seed = bytes.fromhex("9a" * 32)
     challenge_seed = bytes.fromhex("bc" * 32)
     transcript_root = bytes.fromhex("de" * 32)
@@ -242,8 +242,8 @@ def _transition_fixture():
         challenge_seed_hex=challenge_seed.hex(),
     )
     row_block, column_block = divmod(block_index, blocks_per_row)
-    context = CapacityGemmV2Context(
-        workload_version="fixed_workspace_transition_merkle_gemm_v2",
+    context = CapacityGemmContext(
+        workload_version="fixed_workspace_transition_fanout_v1",
         lease_id=lease_id,
         gpu_index=gpu_index,
         proof_seed=proof_seed,
@@ -277,13 +277,13 @@ def _transition_fixture():
 
 def test_deterministic_workspace_roundtrip():
     context, q_block, q_path = _deterministic_fixture()
-    payload = prove_capacity_gemm_v2(
+    payload = prove_capacity_gemm(
         context=context,
         q_block_i32=q_block,
         q_merkle_path=q_path,
     )
-    decoded = CapacityGemmV2Payload.from_mapping(payload.to_mapping())
-    ok, reason = verify_capacity_gemm_v2(
+    decoded = CapacityGemmPayload.from_mapping(payload.to_mapping())
+    ok, reason = verify_capacity_gemm(
         context=context,
         payload=decoded,
         q_block_i32=q_block,
@@ -294,12 +294,12 @@ def test_deterministic_workspace_roundtrip():
 
 def test_non_power_of_two_inner_dimension_is_zero_padded_soundly():
     context, q_block, q_path = _deterministic_fixture(matrix_dim=6)
-    payload = prove_capacity_gemm_v2(
+    payload = prove_capacity_gemm(
         context=context,
         q_block_i32=q_block,
         q_merkle_path=q_path,
     )
-    assert verify_capacity_gemm_v2(
+    assert verify_capacity_gemm(
         context=context,
         payload=payload,
         q_block_i32=q_block,
@@ -309,13 +309,13 @@ def test_non_power_of_two_inner_dimension_is_zero_padded_soundly():
 
 def test_transition_workspace_uses_exact_authenticated_band_openings():
     context, q_block, q_path, openings = _transition_fixture()
-    payload = prove_capacity_gemm_v2(
+    payload = prove_capacity_gemm(
         context=context,
         q_block_i32=q_block,
         q_merkle_path=q_path,
         state_openings=openings,
     )
-    assert verify_capacity_gemm_v2(
+    assert verify_capacity_gemm(
         context=context,
         payload=payload,
         q_block_i32=q_block,
@@ -323,7 +323,7 @@ def test_transition_workspace_uses_exact_authenticated_band_openings():
         state_openings=openings,
     ) == (True, "ok")
 
-    ok, reason = verify_capacity_gemm_v2(
+    ok, reason = verify_capacity_gemm(
         context=context,
         payload=payload,
         q_block_i32=q_block,
@@ -334,7 +334,7 @@ def test_transition_workspace_uses_exact_authenticated_band_openings():
     assert "exact required block set" in reason
 
 
-def test_v2_workspace_transcript_commits_every_transition_state_root():
+def test_workspace_transcript_commits_every_transition_state_root():
     q_roots = [
         {
             "pass_index": 0,
@@ -348,20 +348,20 @@ def test_v2_workspace_transcript_commits_every_transition_state_root():
             "round_state_roots": [["33" * 32, "44" * 32]],
         }
     ]
-    committed = workspace_transcript_root_v2(q_roots, state_roots)
+    committed = workspace_transcript_root(q_roots, state_roots)
     changed = [
         {
             "pass_index": 0,
             "round_state_roots": [["33" * 32, "45" * 32]],
         }
     ]
-    assert workspace_transcript_root_v2(q_roots, changed) != committed
+    assert workspace_transcript_root(q_roots, changed) != committed
 
 
 def test_valid_output_commitment_with_false_gemm_is_rejected():
     context, q_block, q_path = _deterministic_fixture(false_output=True)
-    with pytest.raises(PCSNativeError, match="does not satisfy"):
-        prove_capacity_gemm_v2(
+    with pytest.raises(NativeError, match="does not satisfy"):
+        prove_capacity_gemm(
             context=context,
             q_block_i32=q_block,
             q_merkle_path=q_path,
@@ -370,12 +370,12 @@ def test_valid_output_commitment_with_false_gemm_is_rejected():
 
 def test_prover_supplied_terminal_values_cannot_replace_openings():
     context, q_block, q_path = _deterministic_fixture()
-    payload = prove_capacity_gemm_v2(
+    payload = prove_capacity_gemm(
         context=context,
         q_block_i32=q_block,
         q_merkle_path=q_path,
     )
-    proof = GemmV2BatchProof.from_canonical_bytes(
+    proof = GemmBatchProof.from_canonical_bytes(
         payload.arithmetic_proof,
         expected_blocks=1,
         expected_rounds=context.arithmetic_rounds,
@@ -384,10 +384,10 @@ def test_prover_supplied_terminal_values_cannot_replace_openings():
         proof,
         final_x_evals=((proof.final_x_evals[0] + 1) % (1 << 200),),
     )
-    forged_payload = CapacityGemmV2Payload(
+    forged_payload = CapacityGemmPayload(
         payload.statement_digest, forged.canonical_bytes()
     )
-    ok, _reason = verify_capacity_gemm_v2(
+    ok, _reason = verify_capacity_gemm(
         context=context,
         payload=forged_payload,
         q_block_i32=q_block,
@@ -399,17 +399,17 @@ def test_prover_supplied_terminal_values_cannot_replace_openings():
 def test_empty_sumcheck_rounds_are_rejected():
     context, q_block, q_path = _deterministic_fixture()
     statement = context.statement(workspace_q_block_hash_i32(q_block))
-    empty = GemmV2BatchProof(
+    empty = GemmBatchProof(
         claimed_y_evals=(0,),
         rounds=(),
         final_x_evals=(0,),
         final_w_evals=(0,),
     )
-    payload = CapacityGemmV2Payload(
-        GemmV2BatchStatement((statement,)).digest(),
+    payload = CapacityGemmPayload(
+        GemmBatchStatement((statement,)).digest(),
         empty.canonical_bytes(),
     )
-    ok, reason = verify_capacity_gemm_v2(
+    ok, reason = verify_capacity_gemm(
         context=context,
         payload=payload,
         q_block_i32=q_block,
@@ -421,34 +421,34 @@ def test_empty_sumcheck_rounds_are_rejected():
 
 def test_context_requires_fixed_nonzero_challenge_set_and_derived_coordinates():
     context, _q_block, _q_path = _deterministic_fixture()
-    with pytest.raises(CapacityGemmV2FormatError, match="challenge_count"):
+    with pytest.raises(CapacityGemmFormatError, match="challenge_count"):
         replace(context, challenge_count=0)
-    with pytest.raises(CapacityGemmV2FormatError, match="block coordinates"):
+    with pytest.raises(CapacityGemmFormatError, match="block coordinates"):
         replace(
             context,
             column_block=(context.column_block + 1)
             % (context.matrix_dim // context.block_size),
         )
-    with pytest.raises(CapacityGemmV2FormatError, match="rounds_per_pass"):
+    with pytest.raises(CapacityGemmFormatError, match="rounds_per_pass"):
         replace(context, rounds_per_pass=0)
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("workload_version", "different_workspace_v2"),
+        ("workload_version", "different_workspace_v1"),
         ("transcript_root", bytes.fromhex("aa" * 32)),
     ],
 )
 def test_statement_context_is_not_replayable(field, value):
     context, q_block, q_path = _deterministic_fixture()
-    payload = prove_capacity_gemm_v2(
+    payload = prove_capacity_gemm(
         context=context,
         q_block_i32=q_block,
         q_merkle_path=q_path,
     )
     changed = replace(context, **{field: value})
-    ok, reason = verify_capacity_gemm_v2(
+    ok, reason = verify_capacity_gemm(
         context=changed,
         payload=payload,
         q_block_i32=q_block,
@@ -458,29 +458,16 @@ def test_statement_context_is_not_replayable(field, value):
     assert "statement digest" in reason
 
 
-def test_legacy_or_ambiguous_mapping_is_not_protocol_v2():
-    with pytest.raises(CapacityGemmV2FormatError):
-        CapacityGemmV2Payload.from_mapping(
-            {
-                "format": "fixed_workspace_merkle_gemm_v1",
-                "protocol_version": 1,
-                "payload": "00",
-            }
-        )
-    with pytest.raises(CapacityGemmV2FormatError):
-        CapacityGemmV2Payload.from_mapping(
-            {
-                "format": CAPACITY_GEMM_V2_FORMAT,
-                "protocol_version": 2,
-                "payload": "00",
-                "rounds": 0,
-            }
-        )
+def test_payload_mapping_must_be_canonical():
+    with pytest.raises(CapacityGemmFormatError):
+        CapacityGemmPayload.from_mapping({"format": "fixed_workspace_merkle_gemm_v1", "payload": "00"})
+    with pytest.raises(CapacityGemmFormatError):
+        CapacityGemmPayload.from_mapping({"format": CAPACITY_GEMM_FORMAT, "payload": "00", "rounds": 0})
 
 
 def test_q_opening_and_parser_fail_closed():
     context, q_block, q_path = _deterministic_fixture()
-    payload = prove_capacity_gemm_v2(
+    payload = prove_capacity_gemm(
         context=context,
         q_block_i32=q_block,
         q_merkle_path=q_path,
@@ -490,7 +477,7 @@ def test_q_opening_and_parser_fail_closed():
         "siblings": [list(item) for item in q_path["siblings"]],
     }
     bad_path["siblings"][0][1] = not bad_path["siblings"][0][1]
-    ok, reason = verify_capacity_gemm_v2(
+    ok, reason = verify_capacity_gemm(
         context=context,
         payload=payload,
         q_block_i32=q_block,
@@ -500,12 +487,12 @@ def test_q_opening_and_parser_fail_closed():
     assert "direction" in reason
 
     encoded = payload.canonical_bytes()
-    with pytest.raises(CapacityGemmV2FormatError):
-        CapacityGemmV2Payload.from_canonical_bytes(encoded + b"\x00")
+    with pytest.raises(CapacityGemmFormatError):
+        CapacityGemmPayload.from_canonical_bytes(encoded + b"\x00")
 
 
 def test_reachable_workspace_parser_rejects_zero_spots_and_malformed_data():
-    lease_id = "legacy-parser-check"
+    lease_id = "parser-check"
     proof_seed = "42" * 32
     workspace_seed = workspace_seed_for(lease_id, 0, proof_seed)
     base = {

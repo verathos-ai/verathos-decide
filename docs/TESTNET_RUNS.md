@@ -52,10 +52,10 @@ See `DISCOVERY.md`.
 
 ## 2026-10-06: capacity audit proof stack round trip (RTX 5090)
 
-Native parts built from source on the box: Rust PCS library (cargo 1.99), zk CUDA extension, bench kernel.
+Native parts built from source on the box: Rust GEMM library (cargo 1.99), zk extension, bench kernel.
 Full test suite with native builds: 151 passed, 2 skipped (golden vectors need verathos-core next to the repo).
 `scripts/capacity_roundtrip.py "NVIDIA GeForce RTX 5090" 32` with the calibrated 5090 row (337 passes of
-8960x8960 int8, proof protocol v2):
+8960x8960 int8):
 
 | Timed GPU work | Deadline | Proof build | Payload | Verification |
 |---|---|---|---|---|

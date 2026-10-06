@@ -45,7 +45,8 @@ class SignedReceipt(BaseModel):
         return cls(receipt=receipt, signature=signing.sign(keypair, RECEIPT_DOMAIN, receipt.model_dump(mode="json")))
 
     def signature_valid(self) -> bool:
-        return signing.verify(self.receipt.miner_hotkey, RECEIPT_DOMAIN, self.receipt.model_dump(mode="json"), self.signature)
+        return signing.verify(self.receipt.miner_hotkey, RECEIPT_DOMAIN, self.receipt.model_dump(mode="json"),
+                              self.signature)
 
     def binds(self, request: dict[str, Any], answers: dict[str, Any]) -> bool:
         """Whether this receipt commits to exactly this request and these answers."""

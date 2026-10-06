@@ -1,10 +1,10 @@
+// Capacity workspace (int8 GEMM with A/B transition mixing) and FP64 identity
+// workloads, with SHA-256 Merkle commitments over square blocks.
 #include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cublas_v2.h>
-#include <cublasLt.h>
-#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <cstring>
 #include <tuple>
-#include <vector>
 
 #define CUDA_OK(expr) do { \
     cudaError_t _e = (expr); \
@@ -39,42 +38,12 @@ static inline cublasHandle_t get_handle(int device_index) {
     return handles[device_index];
 }
 
-static inline cublasLtHandle_t get_lt_handle(int device_index) {
-    static std::array<cublasLtHandle_t, 32> handles{};
-    static std::array<bool, 32> initialized{};
-    TORCH_CHECK(device_index >= 0 && device_index < (int)handles.size(), "unsupported device index");
-    if (!initialized[device_index]) {
-        c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-        CUBLAS_OK(cublasLtCreate(&handles[device_index]));
-        initialized[device_index] = true;
-    }
-    return handles[device_index];
-}
 
 __device__ __forceinline__ uint64_t splitmix64(uint64_t x) {
     x += 0x9E3779B97F4A7C15ULL;
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
     x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
     return x ^ (x >> 31);
-}
-
-__global__ void fill_i8_kernel(
-    int8_t* __restrict__ out,
-    int64_t total,
-    uint64_t seed,
-    int64_t pass_index,
-    int round_index,
-    int matrix_id
-) {
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    uint64_t x = seed;
-    x ^= (uint64_t)pass_index * 0xD1B54A32D192ED03ULL;
-    x ^= (uint64_t)round_index * 0xABC98388FB8FAC03ULL;
-    x ^= (uint64_t)matrix_id * 0x8CB92BA72F3D8DD7ULL;
-    x ^= (uint64_t)idx;
-    uint64_t r = splitmix64(x);
-    out[idx] = (int8_t)((int)(r & 0xFFU) - 128);
 }
 
 __global__ void fill_i8_pair_kernel(
@@ -95,29 +64,6 @@ __global__ void fill_i8_pair_kernel(
     uint64_t rb = splitmix64(x ^ 0x195D7C4F8E2D2D13ULL);
     a[idx] = (int8_t)((int)(ra & 0xFFU) - 128);
     b[idx] = (int8_t)((int)(rb & 0xFFU) - 128);
-}
-
-__global__ void mix_i8_pair_stream_kernel(
-    int8_t* __restrict__ a,
-    int8_t* __restrict__ b,
-    int64_t total,
-    uint64_t seed,
-    int64_t pass_index,
-    int round_index,
-    int mix_index
-) {
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    uint64_t basis = seed;
-    basis ^= (uint64_t)pass_index * 0xD1B54A32D192ED03ULL;
-    basis ^= (uint64_t)round_index * 0xABC98388FB8FAC03ULL;
-    basis ^= (uint64_t)mix_index * 0x9E3779B97F4A7C15ULL;
-    uint8_t ai = (uint8_t)a[idx];
-    uint8_t bi = (uint8_t)b[idx];
-    uint64_t ra = splitmix64(basis ^ ((uint64_t)idx << 1) ^ 0xA5A5A5A5A5A5A5A5ULL);
-    uint64_t rb = splitmix64(basis ^ ((uint64_t)idx << 2) ^ 0x5A5A5A5A5A5A5A5AULL);
-    a[idx] = (int8_t)(ai ^ (uint8_t)ra);
-    b[idx] = (int8_t)(bi ^ (uint8_t)rb);
 }
 
 __global__ void mix_i8_pair_transition_kernel(
@@ -170,40 +116,6 @@ __global__ void copy_i8_pair_kernel(
     if (idx >= total) return;
     dst_a[idx] = src_a[idx];
     dst_b[idx] = src_b[idx];
-}
-
-__global__ void reduce_i8_pair_kernel(
-    const int8_t* __restrict__ a,
-    const int8_t* __restrict__ b,
-    int64_t total,
-    uint64_t* __restrict__ partial,
-    uint64_t seed,
-    int64_t pass_index,
-    int round_index,
-    int mix_index
-) {
-    extern __shared__ uint64_t smem[];
-    uint64_t acc = seed;
-    acc ^= ((uint64_t)pass_index << 32);
-    acc ^= ((uint64_t)round_index << 16);
-    acc ^= (uint64_t)mix_index;
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = (int64_t)gridDim.x * blockDim.x;
-    while (idx < total) {
-        uint64_t av = (uint64_t)(uint8_t)a[idx];
-        uint64_t bv = (uint64_t)(uint8_t)b[idx];
-        acc ^= splitmix64(av | (bv << 8) | ((uint64_t)idx << 16));
-        idx += stride;
-    }
-    smem[threadIdx.x] = acc;
-    __syncthreads();
-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-        if (threadIdx.x < offset) {
-            smem[threadIdx.x] ^= splitmix64(smem[threadIdx.x + offset] + (uint64_t)offset);
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) partial[blockIdx.x] = smem[0];
 }
 
 __global__ void reduce_q_kernel(
@@ -280,16 +192,6 @@ __global__ void reduce_partial_kernel(
     }
 }
 
-__global__ void store_root_kernel(
-    const int64_t* __restrict__ root,
-    int64_t* __restrict__ roots,
-    int64_t root_index
-) {
-    if (threadIdx.x < 4) {
-        roots[root_index * 4 + threadIdx.x] = root[threadIdx.x];
-    }
-}
-
 __device__ __forceinline__ uint32_t rotr32(uint32_t x, uint32_t n) {
     return (x >> n) | (x << (32 - n));
 }
@@ -337,6 +239,8 @@ __constant__ uint32_t K256[64] = {
     0x90befffaU,0xa4506cebU,0xbef9a3f7U,0xc67178f2U
 };
 
+// Domain tags, zero-padded to 32 bytes. Q tags hash their string length;
+// state and FP64 tags hash all 32 bytes.
 __constant__ uint8_t D_Q_BLOCK_TAG_GPU[32];
 __constant__ uint8_t D_Q_LEAF_TAG_GPU[32];
 __constant__ uint8_t D_Q_NODE_TAG_GPU[32];
@@ -660,116 +564,6 @@ static inline size_t merkle_total_nodes(size_t leaves) {
     return total;
 }
 
-static void upload_q_merkle_tags(cudaStream_t stream);
-
-static void state_i8_pair_merkle_root_scratch(
-    const int8_t* a,
-    const int8_t* b,
-    int64_t n64,
-    int64_t block_size,
-    cudaStream_t stream,
-    at::Tensor flat_gpu,
-    at::Tensor block_hashes
-);
-
-std::vector<double> profile_workspace_pass_algo(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    int device_index,
-    int gemm_algo_code
-);
-
-std::vector<double> profile_workspace_pass_lt(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    int device_index,
-    int heuristic_index
-);
-
-std::vector<double> profile_workspace_pass_reduce_blocks(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    int device_index,
-    int requested_reduce_blocks
-);
-
-static void run_round_kernels(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    cublasHandle_t handle,
-    cudaStream_t stream,
-    uint64_t seed,
-    int64_t pass_index,
-    int round_index,
-    cublasGemmAlgo_t gemm_algo
-) {
-    int64_t n = a.size(0);
-    int64_t total = n * n;
-    int threads = 256;
-    int blocks_fill = (int)((total + threads - 1) / threads);
-    int blocks_reduce = std::min<int64_t>(partial.numel(), kReduceBlockCap);
-    const int32_t alpha = 1;
-    const int32_t beta = 0;
-
-    fill_i8_pair_kernel<<<blocks_fill, threads, 0, stream>>>(
-        a.data_ptr<int8_t>(), b.data_ptr<int8_t>(), total, seed, pass_index, round_index);
-    CUDA_OK(cudaGetLastError());
-
-    // Row-major trick: cublas column-major computes Q^T = B^T * A^T.
-    CUBLAS_OK(cublasGemmEx(
-        handle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        (int)n, (int)n, (int)n,
-        &alpha,
-        b.data_ptr<int8_t>(), CUDA_R_8I, (int)n,
-        a.data_ptr<int8_t>(), CUDA_R_8I, (int)n,
-        &beta,
-        q.data_ptr<int32_t>(), CUDA_R_32I, (int)n,
-        CUBLAS_COMPUTE_32I,
-        gemm_algo
-    ));
-
-    reduce_q_kernel<<<blocks_reduce, threads, threads * sizeof(uint64_t), stream>>>(
-        q.data_ptr<int32_t>(),
-        total,
-        reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-        seed,
-        pass_index,
-        round_index
-    );
-    CUDA_OK(cudaGetLastError());
-    reduce_partial_kernel<<<1, threads, 4 * threads * sizeof(uint64_t), stream>>>(
-        reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-        blocks_reduce,
-        root.data_ptr<int64_t>(),
-        seed,
-        pass_index,
-        round_index
-    );
-    CUDA_OK(cudaGetLastError());
-}
-
 static void run_round_gemm_only(
     at::Tensor a,
     at::Tensor b,
@@ -792,49 +586,7 @@ static void run_round_gemm_only(
         a.data_ptr<int8_t>(), b.data_ptr<int8_t>(), total, seed, pass_index, round_index);
     CUDA_OK(cudaGetLastError());
 
-    CUBLAS_OK(cublasGemmEx(
-        handle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        (int)n, (int)n, (int)n,
-        &alpha,
-        b.data_ptr<int8_t>(), CUDA_R_8I, (int)n,
-        a.data_ptr<int8_t>(), CUDA_R_8I, (int)n,
-        &beta,
-        q.data_ptr<int32_t>(), CUDA_R_32I, (int)n,
-        CUBLAS_COMPUTE_32I,
-        gemm_algo
-    ));
-}
-
-static void run_round_gemm_only_mixed(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    cublasHandle_t handle,
-    cudaStream_t stream,
-    uint64_t seed,
-    int64_t pass_index,
-    int round_index,
-    cublasGemmAlgo_t gemm_algo,
-    int memory_mix_rounds
-) {
-    int64_t n = a.size(0);
-    int64_t total = n * n;
-    int threads = 256;
-    int blocks_fill = (int)((total + threads - 1) / threads);
-    const int32_t alpha = 1;
-    const int32_t beta = 0;
-
-    fill_i8_pair_kernel<<<blocks_fill, threads, 0, stream>>>(
-        a.data_ptr<int8_t>(), b.data_ptr<int8_t>(), total, seed, pass_index, round_index);
-    CUDA_OK(cudaGetLastError());
-
-    for (int m = 0; m < memory_mix_rounds; ++m) {
-        mix_i8_pair_stream_kernel<<<blocks_fill, threads, 0, stream>>>(
-            a.data_ptr<int8_t>(), b.data_ptr<int8_t>(), total, seed, pass_index, round_index, m);
-        CUDA_OK(cudaGetLastError());
-    }
-
+    // Row-major trick: cuBLAS column-major B*A stores row-major A*B in q.
     CUBLAS_OK(cublasGemmEx(
         handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
@@ -881,86 +633,6 @@ static void run_fp64_identity_round_only(
         &beta,
         c.data_ptr<double>(), (int)n
     ));
-}
-
-static void run_pass_kernels(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    cublasHandle_t handle,
-    cudaStream_t stream,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    cublasGemmAlgo_t gemm_algo
-) {
-    for (int r = 0; r < rounds; ++r) {
-        run_round_kernels(
-            a, b, q, partial, root, handle, stream, seed, pass_index, r,
-            gemm_algo);
-    }
-}
-
-static float elapsed_and_reset(cudaEvent_t start, cudaEvent_t stop, cudaStream_t stream) {
-    CUDA_OK(cudaEventRecord(stop, stream));
-    CUDA_OK(cudaEventSynchronize(stop));
-    float ms = 0.0f;
-    CUDA_OK(cudaEventElapsedTime(&ms, start, stop));
-    CUDA_OK(cudaEventRecord(start, stream));
-    return ms;
-}
-
-double run_workspace_pass(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    int device_index
-) {
-    TORCH_CHECK(rounds > 0, "rounds must be > 0");
-    TORCH_CHECK(a.is_cuda() && b.is_cuda() && q.is_cuda() && partial.is_cuda() && root.is_cuda(),
-                "all tensors must be CUDA tensors");
-    TORCH_CHECK(a.dtype() == torch::kInt8 && b.dtype() == torch::kInt8, "a/b must be int8");
-    TORCH_CHECK(q.dtype() == torch::kInt32, "q must be int32");
-    TORCH_CHECK(partial.dtype() == torch::kInt64, "partial must be int64");
-    TORCH_CHECK(root.dtype() == torch::kInt64, "root must be int64");
-    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && q.dim() == 2, "a/b/q must be matrices");
-    TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && q.is_contiguous(), "a/b/q must be contiguous");
-    TORCH_CHECK(partial.is_contiguous() && root.is_contiguous(), "partial/root must be contiguous");
-    int64_t n = a.size(0);
-    TORCH_CHECK(a.size(1) == n && b.size(0) == n && b.size(1) == n, "a/b must be NxN");
-    TORCH_CHECK(q.size(0) == n && q.size(1) == n, "q must be NxN");
-    TORCH_CHECK(root.numel() >= 4, "root must have at least 4 int64 words");
-
-    c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    cublasHandle_t handle = get_handle(device_index);
-    CUBLAS_OK(cublasSetStream(handle, stream));
-
-    TORCH_CHECK(partial.numel() > 0, "partial tensor must not be empty");
-
-    cudaEvent_t ev_start, ev_stop;
-    CUDA_OK(cudaEventCreate(&ev_start));
-    CUDA_OK(cudaEventCreate(&ev_stop));
-    CUDA_OK(cudaEventRecord(ev_start, stream));
-
-    run_pass_kernels(
-        a, b, q, partial, root, handle, stream, seed, pass_index, rounds,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-
-    CUDA_OK(cudaEventRecord(ev_stop, stream));
-    CUDA_OK(cudaEventSynchronize(ev_stop));
-    float ms = 0.0f;
-    CUDA_OK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-    CUDA_OK(cudaEventDestroy(ev_start));
-    CUDA_OK(cudaEventDestroy(ev_stop));
-    return (double)ms;
 }
 
 double run_workspace_round(
@@ -1051,548 +723,7 @@ double run_workspace_round(
     return (double)ms;
 }
 
-double run_workspace_round_mixed(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    uint64_t seed,
-    int64_t pass_index,
-    int round_index,
-    int memory_mix_rounds,
-    int device_index
-) {
-    TORCH_CHECK(memory_mix_rounds >= 0, "memory_mix_rounds must be >= 0");
-    TORCH_CHECK(a.is_cuda() && b.is_cuda() && q.is_cuda() && partial.is_cuda() && root.is_cuda(),
-                "all tensors must be CUDA tensors");
-    TORCH_CHECK(a.dtype() == torch::kInt8 && b.dtype() == torch::kInt8, "a/b must be int8");
-    TORCH_CHECK(q.dtype() == torch::kInt32, "q must be int32");
-    TORCH_CHECK(partial.dtype() == torch::kInt64, "partial must be int64");
-    TORCH_CHECK(root.dtype() == torch::kInt64, "root must be int64");
-    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && q.dim() == 2, "a/b/q must be matrices");
-    TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && q.is_contiguous(), "a/b/q must be contiguous");
-    TORCH_CHECK(partial.is_contiguous() && root.is_contiguous(), "partial/root must be contiguous");
-    int64_t n = a.size(0);
-    TORCH_CHECK(a.size(1) == n && b.size(0) == n && b.size(1) == n, "a/b must be NxN");
-    TORCH_CHECK(q.size(0) == n && q.size(1) == n, "q must be NxN");
-    TORCH_CHECK(root.numel() >= 4, "root must have at least 4 int64 words");
-    TORCH_CHECK(partial.numel() > 0, "partial tensor must not be empty");
-
-    c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    cublasHandle_t handle = get_handle(device_index);
-    CUBLAS_OK(cublasSetStream(handle, stream));
-
-    cudaEvent_t ev_start, ev_stop;
-    CUDA_OK(cudaEventCreate(&ev_start));
-    CUDA_OK(cudaEventCreate(&ev_stop));
-    CUDA_OK(cudaEventRecord(ev_start, stream));
-
-    run_round_gemm_only_mixed(
-        a, b, q, handle, stream, seed, pass_index, round_index,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP, memory_mix_rounds);
-
-    int64_t total = n * n;
-    int threads = 256;
-    int blocks_reduce = std::min<int64_t>(partial.numel(), kReduceBlockCap);
-    reduce_q_kernel<<<blocks_reduce, threads, threads * sizeof(uint64_t), stream>>>(
-        q.data_ptr<int32_t>(),
-        total,
-        reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-        seed,
-        pass_index,
-        round_index
-    );
-    CUDA_OK(cudaGetLastError());
-    reduce_partial_kernel<<<1, threads, 4 * threads * sizeof(uint64_t), stream>>>(
-        reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-        blocks_reduce,
-        root.data_ptr<int64_t>(),
-        seed,
-        pass_index,
-        round_index
-    );
-    CUDA_OK(cudaGetLastError());
-
-    CUDA_OK(cudaEventRecord(ev_stop, stream));
-    CUDA_OK(cudaEventSynchronize(ev_stop));
-    float ms = 0.0f;
-    CUDA_OK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-    CUDA_OK(cudaEventDestroy(ev_start));
-    CUDA_OK(cudaEventDestroy(ev_stop));
-    return (double)ms;
-}
-
-std::vector<double> profile_workspace_pass(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    int device_index
-) {
-    return profile_workspace_pass_algo(
-        a, b, q, partial, root, seed, pass_index, rounds, device_index,
-        (int)CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-}
-
-std::vector<double> profile_workspace_pass_transition_mix(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    int device_index,
-    int transition_mix_rounds,
-    bool commit_transitions
-) {
-    TORCH_CHECK(rounds > 0, "rounds must be > 0");
-    TORCH_CHECK(transition_mix_rounds >= 0, "transition_mix_rounds must be >= 0");
-    TORCH_CHECK(a.is_cuda() && b.is_cuda() && q.is_cuda() && partial.is_cuda() && root.is_cuda(),
-                "all tensors must be CUDA tensors");
-    TORCH_CHECK(a.dtype() == torch::kInt8 && b.dtype() == torch::kInt8, "a/b must be int8");
-    TORCH_CHECK(q.dtype() == torch::kInt32, "q must be int32");
-    TORCH_CHECK(partial.dtype() == torch::kInt64, "partial must be int64");
-    TORCH_CHECK(root.dtype() == torch::kInt64, "root must be int64");
-    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && q.dim() == 2, "a/b/q must be matrices");
-    TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && q.is_contiguous(), "a/b/q must be contiguous");
-
-    c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    cublasHandle_t handle = get_handle(device_index);
-    CUBLAS_OK(cublasSetStream(handle, stream));
-    upload_q_merkle_tags(stream);
-
-    int64_t n = a.size(0);
-    int64_t total = n * n;
-    int64_t state_block_size = 64;
-    TORCH_CHECK(n % state_block_size == 0,
-                "transition state profiling currently requires n divisible by 64");
-    TORCH_CHECK(q.numel() * (int64_t)sizeof(int32_t) >= total * 2,
-                "q scratch is too small for transition ping-pong buffers");
-    int threads = 256;
-    int blocks_fill = (int)((total + threads - 1) / threads);
-    int blocks_reduce = std::min<int64_t>(partial.numel(), kReduceBlockCap);
-    int8_t* scratch = reinterpret_cast<int8_t*>(q.data_ptr<int32_t>());
-    int8_t* scratch_a = scratch;
-    int8_t* scratch_b = scratch + total;
-    const int32_t alpha = 1;
-    const int32_t beta = 0;
-
-    cudaEvent_t ev, mark;
-    CUDA_OK(cudaEventCreate(&ev));
-    CUDA_OK(cudaEventCreate(&mark));
-    CUDA_OK(cudaEventRecord(ev, stream));
-    double fill_ms = 0.0;
-    double mix_ms = 0.0;
-    double state_reduce_ms = 0.0;
-    double gemm_ms = 0.0;
-    double q_reduce_ms = 0.0;
-    at::Tensor state_merkle_flat;
-    at::Tensor state_merkle_block_hashes;
-    if (commit_transitions) {
-        int64_t blocks_per_row = n / state_block_size;
-        int64_t total_blocks = blocks_per_row * blocks_per_row;
-        size_t total_nodes = merkle_total_nodes((size_t)total_blocks);
-        auto dev_cuda = torch::Device(torch::kCUDA, device_index);
-        state_merkle_flat = torch::empty(
-            {(long)(total_nodes * 32)}, torch::dtype(torch::kUInt8).device(dev_cuda));
-        state_merkle_block_hashes = torch::empty(
-            {total_blocks, 32}, torch::dtype(torch::kUInt8).device(dev_cuda));
-    }
-
-    for (int r = 0; r < rounds; ++r) {
-        fill_i8_pair_kernel<<<blocks_fill, threads, 0, stream>>>(
-            a.data_ptr<int8_t>(), b.data_ptr<int8_t>(), total, seed, pass_index, r);
-        CUDA_OK(cudaGetLastError());
-        fill_ms += elapsed_and_reset(ev, mark, stream);
-
-        const int8_t* cur_a = a.data_ptr<int8_t>();
-        const int8_t* cur_b = b.data_ptr<int8_t>();
-        bool cur_is_scratch = false;
-        for (int m = 0; m < transition_mix_rounds; ++m) {
-            int8_t* dst_a = cur_is_scratch ? a.data_ptr<int8_t>() : scratch_a;
-            int8_t* dst_b = cur_is_scratch ? b.data_ptr<int8_t>() : scratch_b;
-            mix_i8_pair_transition_kernel<<<blocks_fill, threads, 0, stream>>>(
-                cur_a, cur_b, dst_a, dst_b, total, seed, pass_index, r, m, 1);
-            CUDA_OK(cudaGetLastError());
-            mix_ms += elapsed_and_reset(ev, mark, stream);
-            cur_a = dst_a;
-            cur_b = dst_b;
-            cur_is_scratch = !cur_is_scratch;
-
-            if (commit_transitions) {
-                state_i8_pair_merkle_root_scratch(
-                    cur_a,
-                    cur_b,
-                    n,
-                    state_block_size,
-                    stream,
-                    state_merkle_flat,
-                    state_merkle_block_hashes);
-                state_reduce_ms += elapsed_and_reset(ev, mark, stream);
-            }
-        }
-        if (cur_is_scratch) {
-            copy_i8_pair_kernel<<<blocks_fill, threads, 0, stream>>>(
-                cur_a, cur_b, a.data_ptr<int8_t>(), b.data_ptr<int8_t>(), total);
-            CUDA_OK(cudaGetLastError());
-            mix_ms += elapsed_and_reset(ev, mark, stream);
-            cur_a = a.data_ptr<int8_t>();
-            cur_b = b.data_ptr<int8_t>();
-        }
-
-        CUBLAS_OK(cublasGemmEx(
-            handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            (int)n, (int)n, (int)n,
-            &alpha,
-            cur_b, CUDA_R_8I, (int)n,
-            cur_a, CUDA_R_8I, (int)n,
-            &beta,
-            q.data_ptr<int32_t>(), CUDA_R_32I, (int)n,
-            CUBLAS_COMPUTE_32I,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP
-        ));
-        gemm_ms += elapsed_and_reset(ev, mark, stream);
-
-        reduce_q_kernel<<<blocks_reduce, threads, threads * sizeof(uint64_t), stream>>>(
-            q.data_ptr<int32_t>(),
-            total,
-            reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-            seed,
-            pass_index,
-            r
-        );
-        CUDA_OK(cudaGetLastError());
-        reduce_partial_kernel<<<1, threads, 4 * threads * sizeof(uint64_t), stream>>>(
-            reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-            blocks_reduce,
-            root.data_ptr<int64_t>(),
-            seed,
-            pass_index,
-            r
-        );
-        CUDA_OK(cudaGetLastError());
-        q_reduce_ms += elapsed_and_reset(ev, mark, stream);
-    }
-    CUDA_OK(cudaEventDestroy(ev));
-    CUDA_OK(cudaEventDestroy(mark));
-    return {
-        fill_ms,
-        mix_ms,
-        state_reduce_ms,
-        gemm_ms,
-        q_reduce_ms,
-        fill_ms + mix_ms + state_reduce_ms + gemm_ms + q_reduce_ms,
-    };
-}
-
-std::vector<double> profile_workspace_pass_algo(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    int device_index,
-    int gemm_algo_code
-) {
-    TORCH_CHECK(rounds > 0, "rounds must be > 0");
-    c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    cublasHandle_t handle = get_handle(device_index);
-    CUBLAS_OK(cublasSetStream(handle, stream));
-
-    int64_t n = a.size(0);
-    int64_t total = n * n;
-    int threads = 256;
-    int blocks_fill = (int)((total + threads - 1) / threads);
-    int blocks_reduce = std::min<int64_t>(partial.numel(), kReduceBlockCap);
-    const int32_t alpha = 1;
-    const int32_t beta = 0;
-
-    cudaEvent_t ev, mark;
-    CUDA_OK(cudaEventCreate(&ev));
-    CUDA_OK(cudaEventCreate(&mark));
-    CUDA_OK(cudaEventRecord(ev, stream));
-    double fill_ms = 0.0;
-    double gemm_ms = 0.0;
-    double reduce_ms = 0.0;
-
-    for (int r = 0; r < rounds; ++r) {
-        fill_i8_pair_kernel<<<blocks_fill, threads, 0, stream>>>(
-            a.data_ptr<int8_t>(), b.data_ptr<int8_t>(), total, seed, pass_index, r);
-        CUDA_OK(cudaGetLastError());
-        fill_ms += elapsed_and_reset(ev, mark, stream);
-
-        CUBLAS_OK(cublasGemmEx(
-            handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            (int)n, (int)n, (int)n,
-            &alpha,
-            b.data_ptr<int8_t>(), CUDA_R_8I, (int)n,
-            a.data_ptr<int8_t>(), CUDA_R_8I, (int)n,
-            &beta,
-            q.data_ptr<int32_t>(), CUDA_R_32I, (int)n,
-            CUBLAS_COMPUTE_32I,
-            (cublasGemmAlgo_t)gemm_algo_code
-        ));
-        gemm_ms += elapsed_and_reset(ev, mark, stream);
-
-        reduce_q_kernel<<<blocks_reduce, threads, threads * sizeof(uint64_t), stream>>>(
-            q.data_ptr<int32_t>(),
-            total,
-            reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-            seed,
-            pass_index,
-            r
-        );
-        CUDA_OK(cudaGetLastError());
-        reduce_partial_kernel<<<1, threads, 4 * threads * sizeof(uint64_t), stream>>>(
-            reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-            blocks_reduce,
-            root.data_ptr<int64_t>(),
-            seed,
-            pass_index,
-            r
-        );
-        CUDA_OK(cudaGetLastError());
-        reduce_ms += elapsed_and_reset(ev, mark, stream);
-    }
-    CUDA_OK(cudaEventDestroy(ev));
-    CUDA_OK(cudaEventDestroy(mark));
-    return {fill_ms, gemm_ms, reduce_ms, fill_ms + gemm_ms + reduce_ms};
-}
-
-std::vector<double> profile_workspace_pass_lt(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    int device_index,
-    int heuristic_index
-) {
-    TORCH_CHECK(rounds > 0, "rounds must be > 0");
-    c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    cublasLtHandle_t lt_handle = get_lt_handle(device_index);
-
-    int64_t n64 = a.size(0);
-    TORCH_CHECK(n64 <= INT32_MAX, "matrix too large for cuBLASLt int dims");
-    int n = (int)n64;
-    int64_t total = n64 * n64;
-    int threads = 256;
-    int blocks_fill = (int)((total + threads - 1) / threads);
-    int blocks_reduce = std::min<int64_t>(partial.numel(), kReduceBlockCap);
-    const int32_t alpha = 1;
-    const int32_t beta = 0;
-
-    cublasLtMatmulDesc_t op_desc = nullptr;
-    cublasLtMatrixLayout_t a_desc = nullptr;
-    cublasLtMatrixLayout_t b_desc = nullptr;
-    cublasLtMatrixLayout_t c_desc = nullptr;
-    cublasLtMatrixLayout_t d_desc = nullptr;
-    cublasLtMatmulPreference_t pref = nullptr;
-
-    CUBLAS_OK(cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
-    CUBLAS_OK(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_8I, n, n, n));
-    CUBLAS_OK(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_8I, n, n, n));
-    CUBLAS_OK(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32I, n, n, n));
-    CUBLAS_OK(cublasLtMatrixLayoutCreate(&d_desc, CUDA_R_32I, n, n, n));
-    CUBLAS_OK(cublasLtMatmulPreferenceCreate(&pref));
-    size_t max_workspace = 0;
-    CUBLAS_OK(cublasLtMatmulPreferenceSetAttribute(
-        pref,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-        &max_workspace,
-        sizeof(max_workspace)
-    ));
-
-    constexpr int kMaxHeuristics = 32;
-    cublasLtMatmulHeuristicResult_t heuristics[kMaxHeuristics];
-    int returned = 0;
-    CUBLAS_OK(cublasLtMatmulAlgoGetHeuristic(
-        lt_handle,
-        op_desc,
-        a_desc,
-        b_desc,
-        c_desc,
-        d_desc,
-        pref,
-        kMaxHeuristics,
-        heuristics,
-        &returned
-    ));
-    TORCH_CHECK(returned > 0, "cuBLASLt returned no heuristics");
-    TORCH_CHECK(heuristic_index >= 0 && heuristic_index < returned,
-                "heuristic index out of range; returned ", returned);
-    TORCH_CHECK(heuristics[heuristic_index].state == CUBLAS_STATUS_SUCCESS,
-                "selected cuBLASLt heuristic is not runnable: ", (int)heuristics[heuristic_index].state);
-    TORCH_CHECK(heuristics[heuristic_index].workspaceSize == 0,
-                "selected cuBLASLt heuristic requires workspace: ", heuristics[heuristic_index].workspaceSize);
-
-    cudaEvent_t ev, mark;
-    CUDA_OK(cudaEventCreate(&ev));
-    CUDA_OK(cudaEventCreate(&mark));
-    CUDA_OK(cudaEventRecord(ev, stream));
-    double fill_ms = 0.0;
-    double gemm_ms = 0.0;
-    double reduce_ms = 0.0;
-
-    for (int r = 0; r < rounds; ++r) {
-        fill_i8_pair_kernel<<<blocks_fill, threads, 0, stream>>>(
-            a.data_ptr<int8_t>(), b.data_ptr<int8_t>(), total, seed, pass_index, r);
-        CUDA_OK(cudaGetLastError());
-        fill_ms += elapsed_and_reset(ev, mark, stream);
-
-        CUBLAS_OK(cublasLtMatmul(
-            lt_handle,
-            op_desc,
-            &alpha,
-            b.data_ptr<int8_t>(),
-            a_desc,
-            a.data_ptr<int8_t>(),
-            b_desc,
-            &beta,
-            q.data_ptr<int32_t>(),
-            c_desc,
-            q.data_ptr<int32_t>(),
-            d_desc,
-            &heuristics[heuristic_index].algo,
-            nullptr,
-            0,
-            stream
-        ));
-        gemm_ms += elapsed_and_reset(ev, mark, stream);
-
-        reduce_q_kernel<<<blocks_reduce, threads, threads * sizeof(uint64_t), stream>>>(
-            q.data_ptr<int32_t>(),
-            total,
-            reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-            seed,
-            pass_index,
-            r
-        );
-        CUDA_OK(cudaGetLastError());
-        reduce_partial_kernel<<<1, threads, 4 * threads * sizeof(uint64_t), stream>>>(
-            reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-            blocks_reduce,
-            root.data_ptr<int64_t>(),
-            seed,
-            pass_index,
-            r
-        );
-        CUDA_OK(cudaGetLastError());
-        reduce_ms += elapsed_and_reset(ev, mark, stream);
-    }
-
-    CUDA_OK(cudaEventDestroy(ev));
-    CUDA_OK(cudaEventDestroy(mark));
-    CUBLAS_OK(cublasLtMatmulPreferenceDestroy(pref));
-    CUBLAS_OK(cublasLtMatrixLayoutDestroy(d_desc));
-    CUBLAS_OK(cublasLtMatrixLayoutDestroy(c_desc));
-    CUBLAS_OK(cublasLtMatrixLayoutDestroy(b_desc));
-    CUBLAS_OK(cublasLtMatrixLayoutDestroy(a_desc));
-    CUBLAS_OK(cublasLtMatmulDescDestroy(op_desc));
-    return {fill_ms, gemm_ms, reduce_ms, fill_ms + gemm_ms + reduce_ms};
-}
-
-std::vector<double> profile_workspace_pass_reduce_blocks(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    int device_index,
-    int requested_reduce_blocks
-) {
-    TORCH_CHECK(rounds > 0, "rounds must be > 0");
-    TORCH_CHECK(requested_reduce_blocks > 0, "requested_reduce_blocks must be > 0");
-    c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    cublasHandle_t handle = get_handle(device_index);
-    CUBLAS_OK(cublasSetStream(handle, stream));
-
-    int64_t n = a.size(0);
-    int64_t total = n * n;
-    int threads = 256;
-    int blocks_fill = (int)((total + threads - 1) / threads);
-    int blocks_reduce = std::min<int64_t>(partial.numel(), requested_reduce_blocks);
-    const int32_t alpha = 1;
-    const int32_t beta = 0;
-
-    cudaEvent_t ev, mark;
-    CUDA_OK(cudaEventCreate(&ev));
-    CUDA_OK(cudaEventCreate(&mark));
-    CUDA_OK(cudaEventRecord(ev, stream));
-    double fill_ms = 0.0;
-    double gemm_ms = 0.0;
-    double reduce_ms = 0.0;
-
-    for (int r = 0; r < rounds; ++r) {
-        fill_i8_pair_kernel<<<blocks_fill, threads, 0, stream>>>(
-            a.data_ptr<int8_t>(), b.data_ptr<int8_t>(), total, seed, pass_index, r);
-        CUDA_OK(cudaGetLastError());
-        fill_ms += elapsed_and_reset(ev, mark, stream);
-
-        CUBLAS_OK(cublasGemmEx(
-            handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            (int)n, (int)n, (int)n,
-            &alpha,
-            b.data_ptr<int8_t>(), CUDA_R_8I, (int)n,
-            a.data_ptr<int8_t>(), CUDA_R_8I, (int)n,
-            &beta,
-            q.data_ptr<int32_t>(), CUDA_R_32I, (int)n,
-            CUBLAS_COMPUTE_32I,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP
-        ));
-        gemm_ms += elapsed_and_reset(ev, mark, stream);
-
-        reduce_q_kernel<<<blocks_reduce, threads, threads * sizeof(uint64_t), stream>>>(
-            q.data_ptr<int32_t>(),
-            total,
-            reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-            seed,
-            pass_index,
-            r
-        );
-        CUDA_OK(cudaGetLastError());
-        reduce_partial_kernel<<<1, threads, 4 * threads * sizeof(uint64_t), stream>>>(
-            reinterpret_cast<uint64_t*>(partial.data_ptr<int64_t>()),
-            blocks_reduce,
-            root.data_ptr<int64_t>(),
-            seed,
-            pass_index,
-            r
-        );
-        CUDA_OK(cudaGetLastError());
-        reduce_ms += elapsed_and_reset(ev, mark, stream);
-    }
-
-    CUDA_OK(cudaEventDestroy(ev));
-    CUDA_OK(cudaEventDestroy(mark));
-    return {fill_ms, gemm_ms, reduce_ms, fill_ms + gemm_ms + reduce_ms};
-}
-
-static void upload_q_merkle_tags(cudaStream_t stream) {
+static void upload_merkle_tags(cudaStream_t stream) {
     uint8_t block_tag[32] = {0};
     uint8_t leaf_tag[32] = {0};
     uint8_t node_tag[32] = {0};
@@ -1640,11 +771,10 @@ static void upload_q_merkle_tags(cudaStream_t stream) {
         D_FP64_C_NODE_TAG_GPU, fp64_node_tag, sizeof(fp64_node_tag), 0, cudaMemcpyHostToDevice, stream));
 }
 
-static std::tuple<at::Tensor, at::Tensor> q_merkle_commit_impl(
+std::tuple<at::Tensor, at::Tensor> q_merkle_commit_i32(
     at::Tensor q,
     int64_t block_size,
-    int device_index,
-    bool copy_full_tree
+    int device_index
 ) {
     TORCH_CHECK(q.dim() == 2, "q must be 2D");
     TORCH_CHECK(q.dtype() == torch::kInt32, "q must be int32");
@@ -1664,7 +794,7 @@ static std::tuple<at::Tensor, at::Tensor> q_merkle_commit_impl(
 
     c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    upload_q_merkle_tags(stream);
+    upload_merkle_tags(stream);
 
     auto dev_cuda = torch::Device(torch::kCUDA, device_index);
     auto dev_cpu = torch::Device(torch::kCPU);
@@ -1710,12 +840,6 @@ static std::tuple<at::Tensor, at::Tensor> q_merkle_commit_impl(
         32,
         cudaMemcpyDeviceToHost,
         stream));
-    if (!copy_full_tree) {
-        CUDA_OK(cudaStreamSynchronize(stream));
-        at::Tensor empty_tree = torch::empty({0}, torch::dtype(torch::kUInt8).device(dev_cpu));
-        return {root_cpu, empty_tree};
-    }
-
     at::Tensor flat_cpu = torch::empty(
         {(long)(total_nodes * 32)}, torch::dtype(torch::kUInt8).device(dev_cpu));
     CUDA_OK(cudaMemcpyAsync(
@@ -1728,23 +852,10 @@ static std::tuple<at::Tensor, at::Tensor> q_merkle_commit_impl(
     return {root_cpu, flat_cpu};
 }
 
-at::Tensor q_merkle_root_i32(at::Tensor q, int64_t block_size, int device_index) {
-    return std::get<0>(q_merkle_commit_impl(q, block_size, device_index, false));
-}
-
-std::tuple<at::Tensor, at::Tensor> q_merkle_commit_i32(
-    at::Tensor q,
-    int64_t block_size,
-    int device_index
-) {
-    return q_merkle_commit_impl(q, block_size, device_index, true);
-}
-
-static std::tuple<at::Tensor, at::Tensor> fp64_c_merkle_commit_impl(
+std::tuple<at::Tensor, at::Tensor> fp64_c_merkle_commit_f64(
     at::Tensor c,
     int64_t block_size,
-    int device_index,
-    bool copy_full_tree
+    int device_index
 ) {
     TORCH_CHECK(c.dim() == 2, "c must be 2D");
     TORCH_CHECK(c.dtype() == torch::kFloat64, "c must be float64");
@@ -1764,7 +875,7 @@ static std::tuple<at::Tensor, at::Tensor> fp64_c_merkle_commit_impl(
 
     c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    upload_q_merkle_tags(stream);
+    upload_merkle_tags(stream);
 
     auto dev_cuda = torch::Device(torch::kCUDA, device_index);
     auto dev_cpu = torch::Device(torch::kCPU);
@@ -1810,12 +921,6 @@ static std::tuple<at::Tensor, at::Tensor> fp64_c_merkle_commit_impl(
         32,
         cudaMemcpyDeviceToHost,
         stream));
-    if (!copy_full_tree) {
-        CUDA_OK(cudaStreamSynchronize(stream));
-        at::Tensor empty_tree = torch::empty({0}, torch::dtype(torch::kUInt8).device(dev_cpu));
-        return {root_cpu, empty_tree};
-    }
-
     at::Tensor flat_cpu = torch::empty(
         {(long)(total_nodes * 32)}, torch::dtype(torch::kUInt8).device(dev_cpu));
     CUDA_OK(cudaMemcpyAsync(
@@ -1828,24 +933,11 @@ static std::tuple<at::Tensor, at::Tensor> fp64_c_merkle_commit_impl(
     return {root_cpu, flat_cpu};
 }
 
-at::Tensor fp64_c_merkle_root_f64(at::Tensor c, int64_t block_size, int device_index) {
-    return std::get<0>(fp64_c_merkle_commit_impl(c, block_size, device_index, false));
-}
-
-std::tuple<at::Tensor, at::Tensor> fp64_c_merkle_commit_f64(
-    at::Tensor c,
-    int64_t block_size,
-    int device_index
-) {
-    return fp64_c_merkle_commit_impl(c, block_size, device_index, true);
-}
-
 static void fp64_c_merkle_root_store_scratch(
     at::Tensor c,
     int64_t block_size,
     at::Tensor out_roots,
     int64_t root_index,
-    int device_index,
     cudaStream_t stream,
     at::Tensor flat_gpu,
     at::Tensor block_hashes
@@ -1923,7 +1015,6 @@ static void q_merkle_root_i32_store_scratch(
     int64_t block_size,
     at::Tensor out_roots,
     int64_t root_index,
-    int device_index,
     cudaStream_t stream,
     at::Tensor flat_gpu,
     at::Tensor block_hashes
@@ -2108,7 +1199,7 @@ std::tuple<at::Tensor, at::Tensor> state_merkle_commit_i8(
 
     c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    upload_q_merkle_tags(stream);
+    upload_merkle_tags(stream);
 
     auto dev_cuda = torch::Device(torch::kCUDA, device_index);
     auto dev_cpu = torch::Device(torch::kCPU);
@@ -2175,7 +1266,7 @@ double run_workspace_pass_committed(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
     cublasHandle_t handle = get_handle(device_index);
     CUBLAS_OK(cublasSetStream(handle, stream));
-    upload_q_merkle_tags(stream);
+    upload_merkle_tags(stream);
 
     int64_t n64 = q.size(0);
     int64_t blocks_per_row = n64 / block_size;
@@ -2197,141 +1288,7 @@ double run_workspace_pass_committed(
             a, b, q, handle, stream, seed, pass_index, r,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         q_merkle_root_i32_store_scratch(
-            q, block_size, round_roots, pass_index * rounds + r, device_index, stream,
-            merkle_flat, merkle_block_hashes);
-    }
-
-    CUDA_OK(cudaEventRecord(ev_stop, stream));
-    CUDA_OK(cudaEventSynchronize(ev_stop));
-    float ms = 0.0f;
-    CUDA_OK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-    CUDA_OK(cudaEventDestroy(ev_start));
-    CUDA_OK(cudaEventDestroy(ev_stop));
-    return (double)ms;
-}
-
-double run_workspace_chain_committed(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    at::Tensor roots,
-    at::Tensor round_roots,
-    uint64_t seed,
-    int64_t start_pass,
-    int64_t passes,
-    int rounds,
-    int64_t block_size,
-    int device_index
-) {
-    TORCH_CHECK(passes >= 0, "passes must be >= 0");
-    TORCH_CHECK(rounds > 0, "rounds must be > 0");
-    TORCH_CHECK(a.is_cuda() && b.is_cuda() && q.is_cuda() && partial.is_cuda() && root.is_cuda() && roots.is_cuda(),
-                "all tensors must be CUDA tensors");
-    TORCH_CHECK(roots.dim() == 2 && roots.size(1) >= 4, "roots must be [passes, >=4]");
-    TORCH_CHECK(start_pass + passes <= roots.size(0), "roots tensor too small for requested chain");
-    TORCH_CHECK((start_pass + passes) * rounds <= round_roots.size(0),
-                "round_roots tensor too small for requested chain");
-
-    c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    cublasHandle_t handle = get_handle(device_index);
-    CUBLAS_OK(cublasSetStream(handle, stream));
-    upload_q_merkle_tags(stream);
-
-    int64_t n64 = q.size(0);
-    int64_t blocks_per_row = n64 / block_size;
-    int64_t total_blocks = blocks_per_row * blocks_per_row;
-    size_t total_nodes = merkle_total_nodes((size_t)total_blocks);
-    auto dev_cuda = torch::Device(torch::kCUDA, device_index);
-    at::Tensor merkle_flat = torch::empty(
-        {(long)(total_nodes * 32)}, torch::dtype(torch::kUInt8).device(dev_cuda));
-    at::Tensor merkle_block_hashes = torch::empty(
-        {total_blocks, 32}, torch::dtype(torch::kUInt8).device(dev_cuda));
-
-    cudaEvent_t ev_start, ev_stop;
-    CUDA_OK(cudaEventCreate(&ev_start));
-    CUDA_OK(cudaEventCreate(&ev_stop));
-    CUDA_OK(cudaEventRecord(ev_start, stream));
-
-    for (int64_t p = 0; p < passes; ++p) {
-        int64_t pass_index = start_pass + p;
-        for (int r = 0; r < rounds; ++r) {
-            run_round_gemm_only(
-                a, b, q, handle, stream, seed, pass_index, r,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            q_merkle_root_i32_store_scratch(
-                q, block_size, round_roots, pass_index * rounds + r, device_index, stream,
-                merkle_flat, merkle_block_hashes);
-        }
-    }
-
-    CUDA_OK(cudaEventRecord(ev_stop, stream));
-    CUDA_OK(cudaEventSynchronize(ev_stop));
-    float ms = 0.0f;
-    CUDA_OK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-    CUDA_OK(cudaEventDestroy(ev_start));
-    CUDA_OK(cudaEventDestroy(ev_stop));
-    return (double)ms;
-}
-
-double run_workspace_pass_committed_mixed(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    at::Tensor round_roots,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    int64_t block_size,
-    int memory_mix_rounds,
-    int device_index
-) {
-    TORCH_CHECK(memory_mix_rounds >= 0, "memory_mix_rounds must be >= 0");
-    TORCH_CHECK(rounds > 0, "rounds must be > 0");
-    TORCH_CHECK(a.is_cuda() && b.is_cuda() && q.is_cuda() && partial.is_cuda() && root.is_cuda(),
-                "all tensors must be CUDA tensors");
-    TORCH_CHECK(a.dtype() == torch::kInt8 && b.dtype() == torch::kInt8, "a/b must be int8");
-    TORCH_CHECK(q.dtype() == torch::kInt32, "q must be int32");
-    TORCH_CHECK(partial.dtype() == torch::kInt64, "partial must be int64");
-    TORCH_CHECK(root.dtype() == torch::kInt64, "root must be int64");
-    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && q.dim() == 2, "a/b/q must be matrices");
-    TORCH_CHECK(root.numel() >= 4, "root must have at least 4 int64 words");
-    TORCH_CHECK(partial.numel() > 0, "partial tensor must not be empty");
-    TORCH_CHECK(pass_index >= 0, "pass_index must be non-negative");
-    TORCH_CHECK(pass_index * rounds + rounds <= round_roots.size(0),
-                "round_roots tensor too small for requested pass");
-
-    c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    cublasHandle_t handle = get_handle(device_index);
-    CUBLAS_OK(cublasSetStream(handle, stream));
-    upload_q_merkle_tags(stream);
-
-    int64_t n64 = q.size(0);
-    int64_t blocks_per_row = n64 / block_size;
-    int64_t total_blocks = blocks_per_row * blocks_per_row;
-    size_t total_nodes = merkle_total_nodes((size_t)total_blocks);
-    auto dev_cuda = torch::Device(torch::kCUDA, device_index);
-    at::Tensor merkle_flat = torch::empty(
-        {(long)(total_nodes * 32)}, torch::dtype(torch::kUInt8).device(dev_cuda));
-    at::Tensor merkle_block_hashes = torch::empty(
-        {total_blocks, 32}, torch::dtype(torch::kUInt8).device(dev_cuda));
-
-    cudaEvent_t ev_start, ev_stop;
-    CUDA_OK(cudaEventCreate(&ev_start));
-    CUDA_OK(cudaEventCreate(&ev_stop));
-    CUDA_OK(cudaEventRecord(ev_start, stream));
-
-    for (int r = 0; r < rounds; ++r) {
-        run_round_gemm_only_mixed(
-            a, b, q, handle, stream, seed, pass_index, r,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP, memory_mix_rounds);
-        q_merkle_root_i32_store_scratch(
-            q, block_size, round_roots, pass_index * rounds + r, device_index, stream,
+            q, block_size, round_roots, pass_index * rounds + r, stream,
             merkle_flat, merkle_block_hashes);
     }
 
@@ -2385,7 +1342,7 @@ double run_workspace_pass_transition_committed(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
     cublasHandle_t handle = get_handle(device_index);
     CUBLAS_OK(cublasSetStream(handle, stream));
-    upload_q_merkle_tags(stream);
+    upload_merkle_tags(stream);
 
     int64_t n64 = a.size(0);
     TORCH_CHECK(a.size(1) == n64 && b.size(0) == n64 && b.size(1) == n64,
@@ -2482,7 +1439,7 @@ double run_workspace_pass_transition_committed(
             CUBLAS_GEMM_DEFAULT_TENSOR_OP
         ));
         q_merkle_root_i32_store_scratch(
-            q, block_size, round_roots, pass_index * rounds + r, device_index, stream,
+            q, block_size, round_roots, pass_index * rounds + r, stream,
             q_merkle_flat, q_merkle_block_hashes);
     }
 
@@ -2536,7 +1493,7 @@ double run_workspace_round_transition_committed(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
     cublasHandle_t handle = get_handle(device_index);
     CUBLAS_OK(cublasSetStream(handle, stream));
-    upload_q_merkle_tags(stream);
+    upload_merkle_tags(stream);
 
     int64_t n64 = a.size(0);
     TORCH_CHECK(a.size(1) == n64 && b.size(0) == n64 && b.size(1) == n64,
@@ -2631,7 +1588,7 @@ double run_workspace_round_transition_committed(
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
     ));
     q_merkle_root_i32_store_scratch(
-        q, block_size, round_roots, 0, device_index, stream,
+        q, block_size, round_roots, 0, stream,
         q_merkle_flat, q_merkle_block_hashes);
 
     CUDA_OK(cudaEventRecord(ev_stop, stream));
@@ -2720,74 +1677,6 @@ double run_workspace_round_transition_state(
     return (double)ms;
 }
 
-double run_workspace_chain_committed_mixed(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    at::Tensor roots,
-    at::Tensor round_roots,
-    uint64_t seed,
-    int64_t start_pass,
-    int64_t passes,
-    int rounds,
-    int64_t block_size,
-    int memory_mix_rounds,
-    int device_index
-) {
-    TORCH_CHECK(memory_mix_rounds >= 0, "memory_mix_rounds must be >= 0");
-    TORCH_CHECK(passes >= 0, "passes must be >= 0");
-    TORCH_CHECK(rounds > 0, "rounds must be > 0");
-    TORCH_CHECK(a.is_cuda() && b.is_cuda() && q.is_cuda() && partial.is_cuda() && root.is_cuda() && roots.is_cuda(),
-                "all tensors must be CUDA tensors");
-    TORCH_CHECK(roots.dim() == 2 && roots.size(1) >= 4, "roots must be [passes, >=4]");
-    TORCH_CHECK(start_pass + passes <= roots.size(0), "roots tensor too small for requested chain");
-    TORCH_CHECK((start_pass + passes) * rounds <= round_roots.size(0),
-                "round_roots tensor too small for requested chain");
-
-    c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    cublasHandle_t handle = get_handle(device_index);
-    CUBLAS_OK(cublasSetStream(handle, stream));
-    upload_q_merkle_tags(stream);
-
-    int64_t n64 = q.size(0);
-    int64_t blocks_per_row = n64 / block_size;
-    int64_t total_blocks = blocks_per_row * blocks_per_row;
-    size_t total_nodes = merkle_total_nodes((size_t)total_blocks);
-    auto dev_cuda = torch::Device(torch::kCUDA, device_index);
-    at::Tensor merkle_flat = torch::empty(
-        {(long)(total_nodes * 32)}, torch::dtype(torch::kUInt8).device(dev_cuda));
-    at::Tensor merkle_block_hashes = torch::empty(
-        {total_blocks, 32}, torch::dtype(torch::kUInt8).device(dev_cuda));
-
-    cudaEvent_t ev_start, ev_stop;
-    CUDA_OK(cudaEventCreate(&ev_start));
-    CUDA_OK(cudaEventCreate(&ev_stop));
-    CUDA_OK(cudaEventRecord(ev_start, stream));
-
-    for (int64_t p = 0; p < passes; ++p) {
-        int64_t pass_index = start_pass + p;
-        for (int r = 0; r < rounds; ++r) {
-            run_round_gemm_only_mixed(
-                a, b, q, handle, stream, seed, pass_index, r,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP, memory_mix_rounds);
-            q_merkle_root_i32_store_scratch(
-                q, block_size, round_roots, pass_index * rounds + r, device_index, stream,
-                merkle_flat, merkle_block_hashes);
-        }
-    }
-
-    CUDA_OK(cudaEventRecord(ev_stop, stream));
-    CUDA_OK(cudaEventSynchronize(ev_stop));
-    float ms = 0.0f;
-    CUDA_OK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-    CUDA_OK(cudaEventDestroy(ev_start));
-    CUDA_OK(cudaEventDestroy(ev_stop));
-    return (double)ms;
-}
-
 double run_fp64_identity_round_committed(
     at::Tensor a,
     at::Tensor b,
@@ -2819,7 +1708,7 @@ double run_fp64_identity_round_committed(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
     cublasHandle_t handle = get_handle(device_index);
     CUBLAS_OK(cublasSetStream(handle, stream));
-    upload_q_merkle_tags(stream);
+    upload_merkle_tags(stream);
 
     int64_t blocks_per_row = n64 / block_size;
     int64_t total_blocks = blocks_per_row * blocks_per_row;
@@ -2837,72 +1726,8 @@ double run_fp64_identity_round_committed(
 
     run_fp64_identity_round_only(a, b, c, handle, stream, seed, pass_index, round_index);
     fp64_c_merkle_root_store_scratch(
-        c, block_size, round_roots, 0, device_index, stream,
+        c, block_size, round_roots, 0, stream,
         merkle_flat, merkle_block_hashes);
-
-    CUDA_OK(cudaEventRecord(ev_stop, stream));
-    CUDA_OK(cudaEventSynchronize(ev_stop));
-    float ms = 0.0f;
-    CUDA_OK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-    CUDA_OK(cudaEventDestroy(ev_start));
-    CUDA_OK(cudaEventDestroy(ev_stop));
-    return (double)ms;
-}
-
-double run_fp64_identity_pass_committed(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor c,
-    at::Tensor round_roots,
-    uint64_t seed,
-    int64_t pass_index,
-    int rounds,
-    int64_t block_size,
-    int device_index
-) {
-    TORCH_CHECK(rounds > 0, "rounds must be > 0");
-    TORCH_CHECK(a.is_cuda() && b.is_cuda() && c.is_cuda() && round_roots.is_cuda(),
-                "all tensors must be CUDA tensors");
-    TORCH_CHECK(a.dtype() == torch::kFloat64 && b.dtype() == torch::kFloat64 && c.dtype() == torch::kFloat64,
-                "a/b/c must be float64");
-    TORCH_CHECK(round_roots.dtype() == torch::kUInt8, "round_roots must be uint8");
-    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && c.dim() == 2, "a/b/c must be matrices");
-    TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && c.is_contiguous(), "a/b/c must be contiguous");
-    TORCH_CHECK(pass_index >= 0, "pass_index must be non-negative");
-    TORCH_CHECK(pass_index * rounds + rounds <= round_roots.size(0),
-                "round_roots tensor too small for requested pass");
-    int64_t n64 = a.size(0);
-    TORCH_CHECK(a.size(1) == n64 && b.size(0) == n64 && b.size(1) == n64,
-                "a/b must be NxN");
-    TORCH_CHECK(c.size(0) == n64 && c.size(1) == n64, "c must be NxN");
-    TORCH_CHECK(n64 % block_size == 0, "matrix dimension must be divisible by block_size");
-
-    c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    cublasHandle_t handle = get_handle(device_index);
-    CUBLAS_OK(cublasSetStream(handle, stream));
-    upload_q_merkle_tags(stream);
-
-    int64_t blocks_per_row = n64 / block_size;
-    int64_t total_blocks = blocks_per_row * blocks_per_row;
-    size_t total_nodes = merkle_total_nodes((size_t)total_blocks);
-    auto dev_cuda = torch::Device(torch::kCUDA, device_index);
-    at::Tensor merkle_flat = torch::empty(
-        {(long)(total_nodes * 32)}, torch::dtype(torch::kUInt8).device(dev_cuda));
-    at::Tensor merkle_block_hashes = torch::empty(
-        {total_blocks, 32}, torch::dtype(torch::kUInt8).device(dev_cuda));
-
-    cudaEvent_t ev_start, ev_stop;
-    CUDA_OK(cudaEventCreate(&ev_start));
-    CUDA_OK(cudaEventCreate(&ev_stop));
-    CUDA_OK(cudaEventRecord(ev_start, stream));
-
-    for (int r = 0; r < rounds; ++r) {
-        run_fp64_identity_round_only(a, b, c, handle, stream, seed, pass_index, r);
-        fp64_c_merkle_root_store_scratch(
-            c, block_size, round_roots, pass_index * rounds + r, device_index, stream,
-            merkle_flat, merkle_block_hashes);
-    }
 
     CUDA_OK(cudaEventRecord(ev_stop, stream));
     CUDA_OK(cudaEventSynchronize(ev_stop));
@@ -2946,7 +1771,7 @@ double run_fp64_identity_chain_committed(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
     cublasHandle_t handle = get_handle(device_index);
     CUBLAS_OK(cublasSetStream(handle, stream));
-    upload_q_merkle_tags(stream);
+    upload_merkle_tags(stream);
 
     int64_t blocks_per_row = n64 / block_size;
     int64_t total_blocks = blocks_per_row * blocks_per_row;
@@ -2967,62 +1792,9 @@ double run_fp64_identity_chain_committed(
         for (int r = 0; r < rounds; ++r) {
             run_fp64_identity_round_only(a, b, c, handle, stream, seed, pass_index, r);
             fp64_c_merkle_root_store_scratch(
-                c, block_size, round_roots, pass_index * rounds + r, device_index, stream,
+                c, block_size, round_roots, pass_index * rounds + r, stream,
                 merkle_flat, merkle_block_hashes);
         }
-    }
-
-    CUDA_OK(cudaEventRecord(ev_stop, stream));
-    CUDA_OK(cudaEventSynchronize(ev_stop));
-    float ms = 0.0f;
-    CUDA_OK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-    CUDA_OK(cudaEventDestroy(ev_start));
-    CUDA_OK(cudaEventDestroy(ev_stop));
-    return (double)ms;
-}
-
-double run_workspace_chain(
-    at::Tensor a,
-    at::Tensor b,
-    at::Tensor q,
-    at::Tensor partial,
-    at::Tensor root,
-    at::Tensor roots,
-    uint64_t seed,
-    int64_t start_pass,
-    int64_t passes,
-    int rounds,
-    int device_index
-) {
-    TORCH_CHECK(passes >= 0, "passes must be >= 0");
-    TORCH_CHECK(rounds > 0, "rounds must be > 0");
-    TORCH_CHECK(a.is_cuda() && b.is_cuda() && q.is_cuda() && partial.is_cuda() && root.is_cuda() && roots.is_cuda(),
-                "all tensors must be CUDA tensors");
-    TORCH_CHECK(a.dtype() == torch::kInt8 && b.dtype() == torch::kInt8, "a/b must be int8");
-    TORCH_CHECK(q.dtype() == torch::kInt32, "q must be int32");
-    TORCH_CHECK(partial.dtype() == torch::kInt64, "partial must be int64");
-    TORCH_CHECK(root.dtype() == torch::kInt64 && roots.dtype() == torch::kInt64, "root/roots must be int64");
-    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && q.dim() == 2, "a/b/q must be matrices");
-    TORCH_CHECK(roots.dim() == 2 && roots.size(1) >= 4, "roots must be [passes, >=4]");
-    TORCH_CHECK(start_pass + passes <= roots.size(0), "roots tensor too small for requested chain");
-
-    c10::cuda::CUDAGuard guard{static_cast<c10::DeviceIndex>(device_index)};
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    cublasHandle_t handle = get_handle(device_index);
-    CUBLAS_OK(cublasSetStream(handle, stream));
-
-    cudaEvent_t ev_start, ev_stop;
-    CUDA_OK(cudaEventCreate(&ev_start));
-    CUDA_OK(cudaEventCreate(&ev_stop));
-    CUDA_OK(cudaEventRecord(ev_start, stream));
-
-    for (int64_t p = 0; p < passes; ++p) {
-        int64_t pass_index = start_pass + p;
-        run_pass_kernels(
-            a, b, q, partial, root, handle, stream, seed, pass_index, rounds,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        store_root_kernel<<<1, 4, 0, stream>>>(root.data_ptr<int64_t>(), roots.data_ptr<int64_t>(), pass_index);
-        CUDA_OK(cudaGetLastError());
     }
 
     CUDA_OK(cudaEventRecord(ev_stop, stream));

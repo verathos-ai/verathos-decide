@@ -58,8 +58,9 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     scores, failed = epoch_scores(results, {m.model_id: m.score_weight for m in cat.models}, state)
     update(state, results, scores, failed, alpha=cfg.ema_alpha, probation_epochs=cfg.probation_epochs)
     for key, r in sorted(results.items()):
-        log.info("  %s epoch_verdict=%s answered=%d/%d identity=%s mean_abs=%.4f score=%.3f", key, r.tally.verdict().value,
-                 r.answered, r.sent, r.identity_ok, r.tally.mean_abs, scores.get(key, 0.0))
+        log.info("  %s epoch_verdict=%s answered=%d/%d identity=%s mean_abs=%.4f score=%.3f",
+                 key, r.tally.verdict().value, r.answered, r.sent, r.identity_ok, r.tally.mean_abs,
+                 scores.get(key, 0.0))
     w = weights(state, hotkey_of_uid)
     if not w:
         owner = chain.owner_uid(st, cfg.netuid, hotkey_of_uid)

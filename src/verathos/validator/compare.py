@@ -18,7 +18,7 @@ Bounds are per model and are set in the catalog.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
@@ -78,7 +78,7 @@ def compare_request(
     return RequestComparison(max_abs, sum_abs, count, flips)
 
 
-class Verdict(str, Enum):
+class Verdict(StrEnum):
     PASS = "pass"
     INSUFFICIENT = "insufficient"
     FAIL_HARD = "fail_hard"

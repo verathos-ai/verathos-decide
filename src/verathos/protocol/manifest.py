@@ -30,7 +30,8 @@ _ENDPOINT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 class Hardware(BaseModel):
     kind: Literal["cuda", "apple"]
     device_id: str = Field(min_length=1, max_length=128)
-    gpu_name: str | None = Field(None, max_length=128, description="Claimed GPU class; selects the capacity-audit workload")
+    gpu_name: str | None = Field(None, max_length=128,
+                                 description="Claimed GPU class; selects the capacity-audit workload")
     vram_gb: int | None = Field(None, ge=1, le=4096)
 
 
@@ -89,10 +90,12 @@ class SignedManifest(BaseModel):
     def create(cls, manifest: Manifest, keypair: Keypair) -> SignedManifest:
         if keypair.ss58_address != manifest.hotkey:
             raise ValueError("keypair does not match manifest.hotkey")
-        return cls(manifest=manifest, signature=signing.sign(keypair, MANIFEST_DOMAIN, manifest.model_dump(mode="json")))
+        return cls(manifest=manifest,
+                   signature=signing.sign(keypair, MANIFEST_DOMAIN, manifest.model_dump(mode="json")))
 
     def signature_valid(self) -> bool:
-        return signing.verify(self.manifest.hotkey, MANIFEST_DOMAIN, self.manifest.model_dump(mode="json"), self.signature)
+        return signing.verify(self.manifest.hotkey, MANIFEST_DOMAIN, self.manifest.model_dump(mode="json"),
+                              self.signature)
 
 
 def commitment_value(manifest_digest: str) -> str:

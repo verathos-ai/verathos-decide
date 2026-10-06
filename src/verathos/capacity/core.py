@@ -4,15 +4,14 @@ The audit is non-interactive once current-head chain data is available. The owne
 independently derive audit windows, cohorts, seeds and proof challenges from public chain data plus the endpoints
 listed in committed miner manifests.
 
-Security model (unchanged from the original design): an elimination sieve over repeated windows. Random beacon
+Security model: an elimination sieve over repeated windows. Random beacon
 windows draft cohorts of endpoint slots that must each run a calibrated GPU workload simultaneously, beside their
 resident model, inside a timing window, followed by a sampled proof of the work. Slots sharing hardware cannot pass
 together; their misses accumulate to the gate and probation removes them from routing and reward. Probation in this
 lane is the sieve's removal step and is never cleared by re-registration.
 
 A slot is one endpoint of one hotkey: slot_id = H(netuid, hotkey, endpoint_id). Artifacts are signed with the
-hotkey (sr25519). Proof-related derivations (proof seed, challenge seed, transcript root, sampled pass) are
-byte-identical to the original protocol so the existing CUDA bench and verifier remain valid.
+hotkey (sr25519).
 """
 
 from __future__ import annotations
@@ -23,26 +22,27 @@ import json
 import math
 import re
 import struct
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 from urllib.parse import urlparse
 
 from bittensor_wallet import Keypair
 
 from verathos.protocol import signing
 
-PROTOCOL_VERSION = "verathos-capacity-audit-v2"
+PROTOCOL_VERSION = "verathos-capacity-audit-v1"
 DEFAULT_MAX_PROOF_PAYLOAD_BYTES = 32 * 1024 * 1024
 DEFAULT_BLOCK_TIME_S = 12.0
 SELECTION_COOLDOWN_MARGIN_BLOCKS = 2
 ACTIVE_STATE_MARGIN_S = 30.0
 
-# Identity derivations (new: hotkey and endpoint based)
-SLOT_PREFIX = b"VERATHOS_CAPACITY_SLOT_V2"
-LEASE_PREFIX = b"VERATHOS_CAPACITY_LEASE_V2"
-AUDIT_ID_PREFIX = b"VERATHOS_CAPACITY_AUDIT_ID_V2"
+# Slot, lease and audit identity
+SLOT_PREFIX = b"VERATHOS_CAPACITY_SLOT_V1"
+LEASE_PREFIX = b"VERATHOS_CAPACITY_LEASE_V1"
+AUDIT_ID_PREFIX = b"VERATHOS_CAPACITY_AUDIT_ID_V1"
 ARTIFACT_DOMAIN = "verathos/capacity-artifact/v1"
-# Beacon and proof derivations (unchanged)
+# Beacon and proof derivations
 AUDIT_PREFIX = b"VERATHOS_AUDIT_V1"
 WINDOW_TRIGGER_PREFIX = b"VERATHOS_CAPACITY_WINDOW_TRIGGER_V1"
 PROOF_SEED_PREFIX = b"VERATHOS_HOT_CAPACITY_SEED_V1"
@@ -116,7 +116,7 @@ def _datacenter(name: str, vram: int, passes: int, capacity: int, tail: int, fp6
                     transition_mix_rounds=3, transition_fanout=64, fp64_passes=fp64, calibrated=True)
 
 
-# Calibrated rows carried over unchanged from the original protocol.
+# Calibrated workload rows: pass counts per GPU class, measured against the audit deadline.
 DEFAULT_GPU_CLASSES: tuple[GpuClass, ...] = (
     _consumer("NVIDIA GeForce RTX 4090", 24, 222),
     _consumer("NVIDIA GeForce RTX 3090", 24, 90),
@@ -177,7 +177,9 @@ class AuditPolicy:
             raise ValueError("group_stress_fraction must be between 0.0 and 0.5")
         proof_delay_s = max(1, self.proof_challenge_delay_blocks) * block_time_s
         if self.deadline_s + self.transport_grace_s >= proof_delay_s:
-            raise ValueError("deadline_s + transport_grace_s must be smaller than proof_challenge_delay_blocks * block_time")
+            raise ValueError(
+                "deadline_s + transport_grace_s must be smaller than proof_challenge_delay_blocks * block_time"
+            )
         if self.max_proof_payload_bytes <= 0:
             raise ValueError("max_proof_payload_bytes must be positive")
         if self.mode not in ("observe", "score_gate"):
@@ -261,8 +263,9 @@ def derive_proof_challenge_seed(transcript_root_hex: bytes | str, challenge_bloc
                                 lease_identifier: str, slot_identifier: str, gpu_index: int) -> str:
     """Public post-commit challenge seed: the timed final receipt commits the transcript root before the challenge
     block hash exists, and the proof sample is drawn from this seed."""
-    return _hash_hex(PROOF_CHALLENGE_PREFIX, _bytes_from_hash(transcript_root_hex), _bytes_from_hash(challenge_block_hash),
-                     lease_identifier.encode("utf-8"), _bytes_from_hash(slot_identifier), _u64(gpu_index))
+    return _hash_hex(PROOF_CHALLENGE_PREFIX, _bytes_from_hash(transcript_root_hex),
+                     _bytes_from_hash(challenge_block_hash), lease_identifier.encode("utf-8"),
+                     _bytes_from_hash(slot_identifier), _u64(gpu_index))
 
 
 def transcript_root(pass_roots: Sequence[Any]) -> str:
@@ -271,14 +274,16 @@ def transcript_root(pass_roots: Sequence[Any]) -> str:
     for idx, root in enumerate(pass_roots):
         h.update(_u64(idx))
         if isinstance(root, (list, tuple)):
-            h.update(json.dumps({"root": list(root)}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode())
+            h.update(
+                json.dumps({"root": list(root)}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+            )
         else:
             h.update(str(root).encode("utf-8"))
     return h.hexdigest()
 
 
 def canonical_json(data: Mapping[str, Any], *, exclude_signature: bool = False) -> str:
-    """Canonical JSON used inside proof transcripts (ASCII, sorted keys); byte-identical to the original protocol."""
+    """Canonical JSON used inside proof transcripts (ASCII, sorted keys)."""
     payload = dict(data)
     if exclude_signature:
         payload.pop("miner_signature", None)
@@ -288,7 +293,9 @@ def canonical_json(data: Mapping[str, Any], *, exclude_signature: bool = False) 
 
 def root_words_digest(root_words: Any) -> str:
     """Digest of one compact CUDA root vector exactly as miner artifacts encode it."""
-    return hashlib.sha256(json.dumps(root_words, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(root_words, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    ).hexdigest()
 
 
 def derive_sampled_pass_index(root_hex: str, lease_identifier: str, gpu_index: int, passes: int) -> int:

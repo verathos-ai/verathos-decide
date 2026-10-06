@@ -23,8 +23,8 @@ from verathos.protocol.api import distributions
 from verathos.protocol.receipts import SignedReceipt
 from verathos.protocol.requests import sign_request
 from verathos.validator.canaries import assignment, canary_pool
-from verathos.validator.discovery import DiscoveredEndpoint, verify_identity
 from verathos.validator.compare import EndpointTally, Tolerance, compare_request
+from verathos.validator.discovery import DiscoveredEndpoint, verify_identity
 
 log = logging.getLogger(__name__)
 

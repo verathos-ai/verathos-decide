@@ -15,7 +15,8 @@ def snapshot(subtensor: bt.Subtensor, netuid: int) -> tuple[list[Neuron], dict[i
     """Neurons with axon and current commitment, plus hotkey per UID."""
     mg = subtensor.metagraph(netuid, lite=True)
     commitments = subtensor.get_all_commitments(netuid)
-    neurons = [Neuron(uid, hk, ax.ip, ax.port, commitments.get(hk)) for uid, (hk, ax) in enumerate(zip(mg.hotkeys, mg.axons))]
+    neurons = [Neuron(uid, hk, ax.ip, ax.port, commitments.get(hk))
+               for uid, (hk, ax) in enumerate(zip(mg.hotkeys, mg.axons))]
     return neurons, dict(enumerate(mg.hotkeys))
 
 
@@ -28,7 +29,8 @@ def mechanism_ready(subtensor: bt.Subtensor, netuid: int, mechid: int) -> bool:
     return subtensor.get_mechanism_count(netuid) > mechid
 
 
-def submit_weights(subtensor: bt.Subtensor, wallet: bt.Wallet, netuid: int, mechid: int, weights: dict[int, float]) -> bool:
+def submit_weights(subtensor: bt.Subtensor, wallet: bt.Wallet, netuid: int, mechid: int,
+                   weights: dict[int, float]) -> bool:
     """Set weights on ``mechid`` with the subnet's weights version key as the floor."""
     version_key = int(subtensor.substrate.query("SubtensorModule", "WeightsVersionKey", [netuid]).value or 0)
     uids = sorted(weights)

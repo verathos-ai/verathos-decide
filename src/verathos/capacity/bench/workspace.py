@@ -10,13 +10,13 @@ import torch
 from verathos.capacity.proof.workspace import (
     WorkspaceMerkleTree,
     WorkspaceStateMerkleTree,
+    block_transcript,
     derive_challenge_block_index,
     serialize_gemm_block_proof,
     serialize_merkle_path,
     state_block_index_for_element,
 )
-
-BLOCK_TRANSCRIPT_LABEL = b"verathos-hot-capacity-workspace-gemm-v1"
+from verathos.capacity.zk.block_prover import prove_block
 
 
 def load_extension() -> Any:
@@ -95,14 +95,9 @@ def challenged_block_proof(*, ext: Any, ws: Workspace, round_root: str, pass_ind
     ``ws.q`` must hold the round whose committed root is ``round_root``; the Q tree is rebuilt on the GPU and
     checked against it before proving.
     """
-    from verathos.capacity.zk.config import Config
-    from verathos.capacity.zk.crypto.transcript import Transcript
-    from verathos.capacity.zk.prover.gemm_fast import GEMMProverFast
-
     root_tensor, flat_tree_tensor = ext.q_merkle_commit_i32(ws.q, block_size, 0)
-    merkle_root = tensor_hex(root_tensor)
-    if merkle_root != round_root:
-        raise RuntimeError(f"resident Q root mismatch: {merkle_root} != {round_root}")
+    if tensor_hex(root_tensor) != round_root:
+        raise RuntimeError("resident Q block does not reproduce its committed round root")
     blocks_per_row = matrix_dim // block_size
     block_index = derive_challenge_block_index(
         round_root_hex=round_root,
@@ -115,14 +110,9 @@ def challenged_block_proof(*, ext: Any, ws: Workspace, round_root: str, pass_ind
     )
     bi, bj = divmod(block_index, blocks_per_row)
     tree = WorkspaceMerkleTree.from_flat_tree(tensor_bytes(flat_tree_tensor), blocks_per_row * blocks_per_row)
-
-    transcript = Transcript(BLOCK_TRANSCRIPT_LABEL)
-    transcript.absorb(b"pass_index", pass_index)
-    transcript.absorb(b"round_index", round_index)
-    transcript.absorb_bytes(b"round_root", bytes.fromhex(round_root))
-    prover = GEMMProverFast(Config(block_size=block_size, spot_checks=spot_checks))
-    block_proof = prover._prove_block_fast(X=ws.a, W=ws.b, Y=ws.q, Y_merkle=tree, bi=bi, bj=bj,
-                                           transcript=transcript)
+    transcript = block_transcript(pass_index, round_index, bytes.fromhex(round_root))
+    block_proof = prove_block(x=ws.a, w=ws.b, y=ws.q, q_tree=tree, bi=bi, bj=bj, block_size=block_size,
+                              spot_checks=spot_checks, transcript=transcript)
     return {
         "block_index": block_index,
         "block_proof": serialize_gemm_block_proof(block_proof, q_block_i32=_block_rows(ws.q, bi, bj, block_size)),

@@ -13,7 +13,7 @@ src/verathos/
   miner/       miner service: manifest and endpoints behind one public port
   validator/   discovery, canaries, answer comparison, scoring, weights
   capacity/    capacity audit: protocol core, proofs, GPU bench, zk primitives
-native/pcs/    Rust PCS library used by the capacity proofs
+native/gemm/   Rust GEMM sumcheck prover used by the capacity proofs
 scripts/       operator and test tools
 docs/          design notes and testnet results
 ```
@@ -28,9 +28,9 @@ verathos-validator --config validator.json
 Capacity-audit native code is built from source on the machine that runs it:
 
 ```bash
-(cd native/pcs && cargo build --release)                                   # Rust >= 1.85
-(cd src/verathos/capacity/zk/cuda && python build.py build_ext --inplace)   # needs libssl-dev
-(cd src/verathos/capacity/bench && python build.py build_ext --inplace)
+VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[capacity]"
+verathos-build-native               # miners: CUDA toolkit, Rust (rustup), libssl-dev
+verathos-build-native --validator   # audit validator: Rust, libssl-dev
 ```
 
 Docs: `docs/DISCOVERY.md` (chain-native discovery), `docs/TESTNET_RUNS.md` (testnet results).

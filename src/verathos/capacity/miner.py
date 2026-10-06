@@ -25,9 +25,10 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 import httpx
 from bittensor_wallet import Keypair
@@ -112,7 +113,7 @@ class DrainState:
 def bench_extension_available() -> tuple[bool, str]:
     """Whether the bench and its native extensions import in a fresh interpreter."""
     code = ("import verathos.capacity.bench.combined as c; c.load_extension(); "
-            "from verathos.capacity.zk.cuda import native; assert native is not None, 'zk native extension missing'")
+            "from verathos.capacity.zk.block_prover import load_extension; load_extension()")
     try:
         proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     except Exception as exc:
@@ -371,7 +372,8 @@ class AuditWorker:
                  ("challenge.txt", "start.json", "ready.json", "pass0.json", "final_timing.json", "final.json")}
         cmd = self.bench_command(audit, out_dir=out_dir, challenge_file=files["challenge.txt"],
                                  ready_file=files["ready.json"], start_file=files["start.json"],
-                                 start_timeout_s=max(60.0, lead_s + 60.0), challenge_timeout_s=max(30.0, challenge_wait_s))
+                                 start_timeout_s=max(60.0, lead_s + 60.0),
+                                 challenge_timeout_s=max(30.0, challenge_wait_s))
         env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(audit.endpoint.cuda_device)}
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 

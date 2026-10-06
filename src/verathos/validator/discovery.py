@@ -67,7 +67,8 @@ async def discover(neurons: list[Neuron], netuid: int, client: httpx.AsyncClient
         try:
             r = await client.get(base + "/v1/manifest", timeout=10)
             r.raise_for_status()
-            manifest = accept(SignedManifest.model_validate_json(r.content), hotkey=n.hotkey, netuid=netuid, commitment=n.commitment)
+            manifest = accept(SignedManifest.model_validate_json(r.content), hotkey=n.hotkey, netuid=netuid,
+                              commitment=n.commitment)
         except (httpx.HTTPError, ManifestRejected, ValueError) as e:
             log.info("uid %d manifest not accepted: %s", n.uid, e)
             continue
@@ -79,7 +80,7 @@ async def verify_identity(endpoint: DiscoveredEndpoint, keypair: Keypair, client
     """The endpoint must sign a fresh challenge with the hotkey that lists it."""
     challenge = secrets.token_hex(16)
     path = endpoint.path_prefix + "/v1/identity"
-    body = ('{"challenge":"%s"}' % challenge).encode()
+    body = (f'{{"challenge":"{challenge}"}}').encode()
     headers = {"Content-Type": "application/json", **sign_request(keypair, "POST", path, body, endpoint.hotkey)}
     try:
         r = await client.post(endpoint.base_url + path, content=body, headers=headers, timeout=10)

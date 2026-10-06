@@ -45,9 +45,9 @@ from verathos.capacity.proof.combined import (
     sample_seed,
     verify_combined_proof,
 )
-from verathos.capacity.proof.gemm_v2 import (
-    capacity_gemm_v2_context_from_workspace_proof,
-    prove_capacity_gemm_v2,
+from verathos.capacity.proof.gemm import (
+    capacity_gemm_context_from_workspace_proof,
+    prove_capacity_gemm,
     required_transition_state_blocks,
 )
 from verathos.capacity.proof.workspace import (
@@ -62,7 +62,7 @@ from verathos.capacity.proof.workspace import (
     state_block_index_for_element,
     transition_source_indices,
     workspace_seed_for,
-    workspace_transcript_root_v2,
+    workspace_transcript_root,
 )
 
 GPU_INDEX = 0
@@ -174,7 +174,7 @@ def _band_state_openings(ws: Workspace, tree: Any, block_indices: tuple[int, ...
 
 def _attach_gemm_proof(proof: dict[str, Any], *, params: dict[str, int], lease_id: str, proof_seed_hex: str,
                        sample_seed_hex: str, combined_root: str, ws: Workspace | None = None, tree: Any = None) -> None:
-    context = capacity_gemm_v2_context_from_workspace_proof(
+    context = capacity_gemm_context_from_workspace_proof(
         proof=proof, capacity_params=params, lease_id=lease_id, gpu_index=GPU_INDEX, proof_seed_hex=proof_seed_hex,
         challenge_seed_hex=sample_seed_hex, transcript_root_hex=combined_root)
     state_openings = []
@@ -182,10 +182,10 @@ def _attach_gemm_proof(proof: dict[str, Any], *, params: dict[str, int], lease_i
         state_openings = _band_state_openings(ws, tree, required_transition_state_blocks(context), params["matrix_dim"],
                                               params["block_size"], context.row_block, context.column_block)
     block_proof = proof["block_proof"]
-    payload = prove_capacity_gemm_v2(context=context, q_block_i32=block_proof["q_block_i32"],
+    payload = prove_capacity_gemm(context=context, q_block_i32=block_proof["q_block_i32"],
                                      q_merkle_path=block_proof["merkle_path"], state_openings=state_openings)
-    proof["gemm_v2"] = payload.to_mapping()
-    proof["gemm_v2_state_openings"] = state_openings
+    proof["gemm_proof"] = payload.to_mapping()
+    proof["gemm_band_openings"] = state_openings
 
 
 def build_capacity_proof(*, ext: Any, ws: Workspace, seed: int, params: dict[str, int], root_chain: list,
@@ -246,7 +246,7 @@ def build_capacity_proof(*, ext: Any, ws: Workspace, seed: int, params: dict[str
         raise RuntimeError("final transition state does not match its committed root")
     proof.update(
         format=WORKSPACE_TRANSITION_PROOF_FORMAT,
-        workload_version="fixed_workspace_transition_fanout_v3" if fanout > 1 else "fixed_workspace_transition_mix_v3",
+        workload_version="fixed_workspace_transition_fanout_v1" if fanout > 1 else "fixed_workspace_transition_mix_v1",
         state_root_chain=state_chain,
         sampled={"pass_index": sampled_pass, "round_index": sampled_round, "round_root": round_root,
                  "block_index": block["block_index"]},
@@ -346,12 +346,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     cap_ms = _run_capacity(ext, ws, state_roots, cap_seed, capacity, capacity["passes"])
     cap_chain, cap_state_chain = _root_chains(ws, state_roots, capacity)
-    cap_transcript = workspace_transcript_root_v2(cap_chain, cap_state_chain)
+    cap_transcript = workspace_transcript_root(cap_chain, cap_state_chain)
     tail_ms, tail_chain, tail_state_chain, tail_transcript = 0.0, [], [], ""
     if tail:
         tail_ms = _run_capacity(ext, ws, tail_state_roots, cap_seed, tail, tail_passes)
         tail_chain, tail_state_chain = _root_chains(ws, tail_state_roots, tail)
-        tail_transcript = workspace_transcript_root_v2(tail_chain, tail_state_chain)
+        tail_transcript = workspace_transcript_root(tail_chain, tail_state_chain)
     capacity_wall_s = time.perf_counter() - started
     fp64_ms, fp64_chain, fp64_transcript, fp64_wall_s = 0.0, [], "", 0.0
     if fp64_buffers is not None:
@@ -409,7 +409,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                       **lane_args) if tail else None
     fp64_proof = fp64_bench.build_fp64_proof(
         ext=ext, a=fp64_buffers[0], b=fp64_buffers[1], c=fp64_buffers[2], seed=fp64_seed,
-        matrix_dim=fp64_lane["matrix_dim"], block_size=fp64_lane["block_size"], passes=fp64_lane["passes"], rounds=fp64_lane["rounds"],
+        matrix_dim=fp64_lane["matrix_dim"], block_size=fp64_lane["block_size"],
+        passes=fp64_lane["passes"], rounds=fp64_lane["rounds"],
         root_chain=fp64_chain, challenge_hex=seed, transcript_hex=fp64_transcript,
         spot_checks=spot_checks) if fp64_buffers is not None else {}
     proof_s = time.perf_counter() - proof_started

@@ -12,7 +12,8 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from bittensor_wallet import Keypair
 from fastapi import FastAPI, Request

@@ -8,4 +8,4 @@ dist/
 *.so
 *.so.*
 *.dylib
-native/pcs/target/
+native/gemm/target/

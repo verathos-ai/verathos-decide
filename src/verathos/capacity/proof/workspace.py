@@ -5,21 +5,24 @@ from __future__ import annotations
 import hashlib
 import math
 import struct
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
-from verathos.capacity.core import (
-    derive_sampled_pass_index,
-)
-
+from verathos.capacity.core import derive_sampled_pass_index
+from verathos.capacity.zk.field import mod_p
+from verathos.capacity.zk.mle import build_mle_from_matrix
+from verathos.capacity.zk.sumcheck import sumcheck_verify
+from verathos.capacity.zk.transcript import Transcript
+from verathos.capacity.zk.types import GEMMBlockProof, MerklePath, SpotCheck, SumcheckProof, SumcheckRound
 
 WORKSPACE_PROOF_FORMAT = "fixed_workspace_merkle_gemm_v1"
-WORKSPACE_TRANSITION_PROOF_FORMAT = "fixed_workspace_transition_merkle_gemm_v3"
+WORKSPACE_TRANSITION_PROOF_FORMAT = "fixed_workspace_transition_merkle_gemm_v1"
 WORKSPACE_SEED_PREFIX = b"VERATHOS_FIXED_WORKSPACE_V1"
 WORKSPACE_PASS_ROOT_PREFIX = b"VERATHOS_FIXED_WORKSPACE_PASS_ROOT_V1"
-WORKSPACE_TRANSCRIPT_V2_PREFIX = b"VERATHOS_FIXED_WORKSPACE_TRANSCRIPT_V2"
+WORKSPACE_TRANSCRIPT_PREFIX = b"VERATHOS_FIXED_WORKSPACE_TRANSCRIPT_V1"
 WORKSPACE_PROOF_ROUND_PREFIX = b"VERATHOS_FIXED_WORKSPACE_PROOF_ROUND_V1"
 WORKSPACE_PROOF_BLOCK_PREFIX = b"VERATHOS_FIXED_WORKSPACE_PROOF_BLOCK_V1"
 WORKSPACE_Q_BLOCK_TAG = b"VERATHOS_Q_BLOCK_V1"
@@ -29,6 +32,7 @@ WORKSPACE_STATE_BLOCK_TAG = b"VERATHOS_AB_STATE_BLOCK_V1"
 WORKSPACE_STATE_LEAF_TAG = b"VERATHOS_AB_STATE_LEAF_V1"
 WORKSPACE_STATE_NODE_TAG = b"VERATHOS_AB_STATE_NODE_V1"
 WORKSPACE_TRANSITION_PROOF_TAG = b"VERATHOS_AB_TRANSITION_PROOF_V1"
+BLOCK_TRANSCRIPT_LABEL = b"verathos-hot-capacity-workspace-gemm-v1"
 
 _PASS_MIX = 0xD1B54A32D192ED03
 _ROUND_MIX = 0xABC98388FB8FAC03
@@ -262,14 +266,14 @@ def pass_root_from_round_roots(pass_index: int, round_roots: Sequence[str]) -> s
     return h.hexdigest()
 
 
-def workspace_transcript_root_v2(
+def workspace_transcript_root(
     pass_entries: Sequence[Mapping[str, Any]],
     state_pass_entries: Sequence[Mapping[str, Any]],
 ) -> str:
     """Commit every Q root and transition-state root before the B challenge."""
 
     h = hashlib.sha256()
-    h.update(WORKSPACE_TRANSCRIPT_V2_PREFIX)
+    h.update(WORKSPACE_TRANSCRIPT_PREFIX)
     h.update(_u64(len(pass_entries)))
     for entry in pass_entries:
         pass_index = int(entry.get("pass_index", 0))
@@ -402,7 +406,6 @@ def _state_block_arrays_i8(
     a_block_rows: Sequence[Sequence[int]],
     b_block_rows: Sequence[Sequence[int]],
 ) -> tuple[Any, Any]:
-    import numpy as np
 
     a_arr = np.asarray(a_block_rows, dtype=np.int16)
     b_arr = np.asarray(b_block_rows, dtype=np.int16)
@@ -420,41 +423,18 @@ def workspace_state_block_hash_i8(
     """Hash an A/B int8 state block exactly like the CUDA state-root path."""
     h = hashlib.sha256()
     h.update(_fixed_tag(WORKSPACE_STATE_BLOCK_TAG))
-    try:
-        import numpy as np
-
-        if isinstance(a_block_rows, np.ndarray) and isinstance(
-            b_block_rows, np.ndarray
-        ):
-            a_arr = a_block_rows
-            b_arr = b_block_rows
-            if a_arr.ndim != 2 or b_arr.ndim != 2 or a_arr.shape != b_arr.shape:
-                raise ValueError("invalid state block shape")
-            if a_arr.shape[0] <= 0 or a_arr.shape[1] <= 0:
-                raise ValueError("state block must not be empty")
-        else:
-            a_arr, b_arr = _state_block_arrays_i8(a_block_rows, b_block_rows)
-        packed = np.empty((a_arr.shape[0] * 2, a_arr.shape[1]), dtype=np.uint8)
-        packed[0::2, :] = a_arr.astype(np.uint8, copy=False)
-        packed[1::2, :] = b_arr.astype(np.uint8, copy=False)
-        h.update(packed.tobytes(order="C"))
-    except ImportError:
-        if len(a_block_rows) != len(b_block_rows):
-            raise ValueError("A/B block row count mismatch")
-        if not a_block_rows:
+    if isinstance(a_block_rows, np.ndarray) and isinstance(b_block_rows, np.ndarray):
+        a_arr, b_arr = a_block_rows, b_block_rows
+        if a_arr.ndim != 2 or b_arr.ndim != 2 or a_arr.shape != b_arr.shape:
+            raise ValueError("invalid state block shape")
+        if a_arr.shape[0] <= 0 or a_arr.shape[1] <= 0:
             raise ValueError("state block must not be empty")
-        width = len(a_block_rows[0])
-        if width <= 0:
-            raise ValueError("state block must not be empty")
-        if any(len(row) != width for row in a_block_rows):
-            raise ValueError("invalid A block shape")
-        if any(len(row) != width for row in b_block_rows):
-            raise ValueError("invalid B block shape")
-        payload = bytearray()
-        for a_row, b_row in zip(a_block_rows, b_block_rows):
-            payload.extend(int(v) & 0xFF for v in a_row)
-            payload.extend(int(v) & 0xFF for v in b_row)
-        h.update(payload)
+    else:
+        a_arr, b_arr = _state_block_arrays_i8(a_block_rows, b_block_rows)
+    packed = np.empty((a_arr.shape[0] * 2, a_arr.shape[1]), dtype=np.uint8)
+    packed[0::2, :] = a_arr.astype(np.uint8, copy=False)
+    packed[1::2, :] = b_arr.astype(np.uint8, copy=False)
+    h.update(packed.tobytes(order="C"))
     block_hash = h.digest()
     return hashlib.sha256(_fixed_tag(WORKSPACE_STATE_LEAF_TAG) + block_hash).digest()
 
@@ -468,7 +448,7 @@ def workspace_state_merkle_parent(left: bytes, right: bytes) -> bytes:
 
 
 class WorkspaceMerkleTree:
-    """Small CPU tree used by tests and post-timing sampled proof assembly."""
+    """Q-block Merkle tree, rebuilt from the flat tree the GPU commits (or from a matrix for reference checks)."""
 
     def __init__(self, leaf_hashes: Sequence[bytes]):
         if not leaf_hashes:
@@ -491,7 +471,7 @@ class WorkspaceMerkleTree:
         self._offsets.append(len(self._nodes))
 
     @classmethod
-    def from_flat_tree(cls, flat_tree: bytes, num_leaves: int) -> "WorkspaceMerkleTree":
+    def from_flat_tree(cls, flat_tree: bytes, num_leaves: int) -> WorkspaceMerkleTree:
         node_count = len(flat_tree) // 32
         expected = sum(_level_sizes(num_leaves))
         if len(flat_tree) % 32 != 0 or node_count != expected:
@@ -506,7 +486,7 @@ class WorkspaceMerkleTree:
     @classmethod
     def from_matrix_i32(
         cls, matrix: Sequence[Sequence[int]], block_size: int
-    ) -> "WorkspaceMerkleTree":
+    ) -> WorkspaceMerkleTree:
         n = len(matrix)
         if n <= 0 or any(len(row) != n for row in matrix):
             raise ValueError("matrix must be non-empty and square")
@@ -532,7 +512,6 @@ class WorkspaceMerkleTree:
         return self._nodes[int(bi) * bpr + int(bj)]
 
     def get_path(self, bi: int, bj: int, blocks_per_row: int | None = None):
-        from verathos.capacity.zk.types import MerklePath
 
         bpr = int(blocks_per_row or math.isqrt(self.num_leaves))
         leaf_index = int(bi) * bpr + int(bj)
@@ -580,7 +559,7 @@ class WorkspaceStateMerkleTree:
     @classmethod
     def from_flat_tree(
         cls, flat_tree: bytes, num_leaves: int
-    ) -> "WorkspaceStateMerkleTree":
+    ) -> WorkspaceStateMerkleTree:
         node_count = len(flat_tree) // 32
         expected = sum(_level_sizes(num_leaves))
         if len(flat_tree) % 32 != 0 or node_count != expected:
@@ -598,7 +577,7 @@ class WorkspaceStateMerkleTree:
         a_matrix: Sequence[Sequence[int]],
         b_matrix: Sequence[Sequence[int]],
         block_size: int,
-    ) -> "WorkspaceStateMerkleTree":
+    ) -> WorkspaceStateMerkleTree:
         n = len(a_matrix)
         if n <= 0 or len(b_matrix) != n:
             raise ValueError("state matrices must be non-empty and same-sized")
@@ -628,7 +607,6 @@ class WorkspaceStateMerkleTree:
         return self._nodes[-1]
 
     def get_path(self, block_index: int):
-        from verathos.capacity.zk.types import MerklePath
 
         if int(block_index) < 0 or int(block_index) >= self.num_leaves:
             raise ValueError("block_index out of range")
@@ -690,7 +668,6 @@ def serialize_merkle_path(path: Any) -> dict[str, Any]:
 
 
 def deserialize_merkle_path(data: Mapping[str, Any]):
-    from verathos.capacity.zk.types import MerklePath
 
     return MerklePath(
         leaf_index=int(data.get("leaf_index", 0)),
@@ -726,7 +703,6 @@ def serialize_gemm_block_proof(
 
 
 def deserialize_gemm_block_proof(data: Mapping[str, Any]):
-    from verathos.capacity.zk.types import GEMMBlockProof, SpotCheck, SumcheckProof, SumcheckRound
 
     proof_data = data.get("sumcheck_proof") or {}
     return GEMMBlockProof(
@@ -768,7 +744,6 @@ def deserialize_gemm_block_proof(data: Mapping[str, Any]):
 def _field_matrix_from_i32_block(
     block: Sequence[Sequence[int]], padded_rows: int, padded_cols: int
 ) -> list[list[int]]:
-    from verathos.capacity.zk.crypto.field import mod_p
 
     rows = len(block)
     cols = len(block[0]) if rows else 0
@@ -784,34 +759,21 @@ def _field_matrix_from_i32_block(
 def _evaluate_q_block_claim(
     block: Sequence[Sequence[int]], r_i: Sequence[int], r_j: Sequence[int]
 ) -> int:
-    try:
-        import numpy as np
-        from verathos.capacity.zk.crypto.field import P
-        from verathos.capacity.zk.crypto.field_fast import (
-            build_eq_table_vec,
-            mersenne_sum_axis0_fast,
-            mersenne_vec_sum,
-            mul_f_vec_mersenne,
-        )
+    rows = len(block)
+    cols = len(block[0]) if rows else 0
+    m_bits = max(1, (rows - 1).bit_length())
+    n_bits = max(1, (cols - 1).bit_length())
+    field = _field_matrix_from_i32_block(block, 1 << m_bits, 1 << n_bits)
+    return int(build_mle_from_matrix(field).evaluate(list(r_i) + list(r_j)))
 
-        matrix = np.asarray(block, dtype=np.int64)
-        matrix = np.mod(matrix, P).astype(np.uint64, copy=False)
-        rows, cols = matrix.shape
-        eq_row = build_eq_table_vec(list(r_i))[:rows]
-        eq_col = build_eq_table_vec(list(r_j))[:cols]
-        tmp = mersenne_sum_axis0_fast(
-            mul_f_vec_mersenne(matrix, eq_row[:, np.newaxis])
-        )[:cols]
-        return int(mersenne_vec_sum(mul_f_vec_mersenne(tmp, eq_col)))
-    except Exception:
-        from verathos.capacity.zk.crypto.mle import build_mle_from_matrix
 
-        rows = len(block)
-        cols = len(block[0]) if rows else 0
-        m_bits = max(1, (rows - 1).bit_length())
-        n_bits = max(1, (cols - 1).bit_length())
-        field = _field_matrix_from_i32_block(block, 1 << m_bits, 1 << n_bits)
-        return int(build_mle_from_matrix(field).evaluate(list(r_i) + list(r_j)))
+def block_transcript(pass_index: int, round_index: int, round_root: bytes) -> Transcript:
+    """Fiat-Shamir transcript of a Q block proof, seeded with the round it belongs to."""
+    transcript = Transcript(BLOCK_TRANSCRIPT_LABEL)
+    transcript.absorb(b"pass_index", pass_index)
+    transcript.absorb(b"round_index", round_index)
+    transcript.absorb_bytes(b"round_root", round_root)
+    return transcript
 
 
 def verify_workspace_gemm_block_proof(
@@ -829,9 +791,6 @@ def verify_workspace_gemm_block_proof(
     expected_block_index: int | None = None,
 ) -> tuple[bool, str]:
     """Verify the sampled block proof against the committed workspace round root."""
-    from verathos.capacity.zk.crypto.field import mod_p
-    from verathos.capacity.zk.crypto.sumcheck import sumcheck_verify
-    from verathos.capacity.zk.crypto.transcript import Transcript
 
     if (
         int(matrix_dim) <= 1
@@ -897,10 +856,7 @@ def verify_workspace_gemm_block_proof(
     if not verify_workspace_merkle_path(round_root, leaf_hash, block_proof.merkle_path):
         return False, "q_block_merkle_path_invalid"
 
-    transcript = Transcript(b"verathos-hot-capacity-workspace-gemm-v1")
-    transcript.absorb(b"pass_index", int(pass_index))
-    transcript.absorb(b"round_index", int(round_index))
-    transcript.absorb_bytes(b"round_root", round_root)
+    transcript = block_transcript(int(pass_index), int(round_index), round_root)
     transcript.absorb(b"bi", int(block_proof.bi))
     transcript.absorb(b"bj", int(block_proof.bj))
     transcript.absorb_bytes(b"leaf_hash", leaf_hash)
@@ -1086,12 +1042,8 @@ def verify_workspace_transition_opening(
     challenge_seed_hex: str = "",
     transition_fanout: int = 1,
 ) -> tuple[bool, str]:
-    """Verify one Fiat-Shamir sampled A/B transition opening.
-
-    This verifies the memory-transition part of the v2 candidate relation. It
-    intentionally samples one element and its required source blocks; production
-    payload wiring decides how many such openings to request.
-    """
+    """Verify one Fiat-Shamir sampled A/B transition opening: one element of the after-state and the source
+    blocks it was mixed from."""
     if (
         int(matrix_dim) <= 0
         or int(block_size) <= 0
@@ -1389,7 +1341,7 @@ def _verify_workspace_proof_payload_strict(
     elif state_root_chain not in (None, []):
         return False, "unexpected_state_root_chain"
     committed_state_roots = state_root_chain if isinstance(state_root_chain, list) else []
-    if workspace_transcript_root_v2(root_chain, committed_state_roots) != str(expected_transcript_root):
+    if workspace_transcript_root(root_chain, committed_state_roots) != str(expected_transcript_root):
         return False, "transcript_root_mismatch"
     blocks_per_row = matrix_dim // block_size
     expected_block = derive_challenge_block_index(

@@ -1,10 +1,11 @@
 """Build the native code of the capacity audit in place: ``verathos-build-native``.
 
 - ``verathos/capacity/bench/_workspace_cuda``: capacity and FP64 workload kernels (CUDA; miners).
-- ``verathos/capacity/zk/cuda/_native``: field arithmetic, sumcheck and BLAKE3 Merkle kernels (CUDA when a toolkit
-  is present, CPU otherwise; miners, optional speed-up for the validator).
-- ``verathos/capacity/zk/libverathos_pcs_v2.so``: polynomial-commitment GEMM prover and verifier (Rust; miners
-  and the audit validator), built from ``native/pcs`` of a source checkout.
+- ``verathos/capacity/zk/native/_block_prover``: Q-block sumcheck prover (C++, CPU; miners).
+- ``verathos/capacity/zk/libverathos_gemm.so``: GEMM sumcheck prover and int8 MLE evaluator (Rust; miners, and the
+  audit validator for fast verification), built from ``native/gemm``.
+
+Builds run from a source checkout (``pip install -e``).
 
 CUDA targets the GPUs visible at build time unless ``TORCH_CUDA_ARCH_LIST`` is set.
 """
@@ -18,11 +19,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from verathos.capacity.zk.crypto.pcs_v2 import LIBRARY_PATH
+from verathos.capacity.zk.gemm_native import LIBRARY_PATH
 
 PACKAGE = Path(__file__).resolve().parent
 SRC_ROOT = PACKAGE.parents[1]
-PCS_CRATE = SRC_ROOT.parent / "native" / "pcs"
+GEMM_CRATE = SRC_ROOT.parent / "native" / "gemm"
 BUILD_DIR = SRC_ROOT.parent / "build" / "native"
 
 _SETUP = """
@@ -56,41 +57,31 @@ def build_workspace() -> None:
     bench = PACKAGE / "bench"
     _build_extension("cuda", "verathos.capacity.bench._workspace_cuda",
                      [bench / "binding.cpp", bench / "workspace_kernel.cu"], ["-O3", "-std=c++17"],
-                     ["-O3", "-Xcompiler", "-fPIC", "--expt-relaxed-constexpr"], ["-lcublas", "-lcublasLt"])
+                     ["-O3", "-Xcompiler", "-fPIC", "--expt-relaxed-constexpr"], ["-lcublas"])
 
 
-def build_zk(cuda: bool) -> None:
-    zk = PACKAGE / "zk" / "cuda"
-    if cuda:
-        _build_extension("cuda", "verathos.capacity.zk.cuda._native",
-                         [zk / "binding.cpp", zk / "sumcheck_kernels.cu", zk / "blake3_merkle.cu"],
-                         ["-O3", "-std=c++17", "-DWITH_CUDA", "-fopenmp"],
-                         ["-O3", "-Xcompiler", "-fPIC", "-Xcompiler", "-fopenmp", "--expt-relaxed-constexpr",
-                          "-DWITH_CUDA"], ["-fopenmp", "-lcrypto"])
-    else:
-        _build_extension("cpu", "verathos.capacity.zk.cuda._native", [zk / "binding.cpp"],
-                         ["-O3", "-std=c++17", "-fopenmp"], [], ["-fopenmp", "-lcrypto"])
+def build_block_prover() -> None:
+    _build_extension("cpu", "verathos.capacity.zk.native._block_prover", [PACKAGE / "zk" / "native" / "binding.cpp"],
+                     ["-O3", "-std=c++17"], [], ["-lcrypto"])
 
 
-def build_pcs() -> None:
-    if not (PCS_CRATE / "Cargo.toml").exists():
-        raise SystemExit(f"{PCS_CRATE} not found; the PCS library builds from a source checkout")
-    print("building libverathos_pcs (cargo)", flush=True)
-    subprocess.run(["cargo", "build", "--release", "--locked"], cwd=PCS_CRATE, check=True)
-    shutil.copy2(PCS_CRATE / "target" / "release" / LIBRARY_PATH.name, LIBRARY_PATH)
+def build_gemm() -> None:
+    if not (GEMM_CRATE / "Cargo.toml").exists():
+        raise SystemExit(f"{GEMM_CRATE} not found; the GEMM library builds from a source checkout")
+    print("building libverathos_gemm (cargo)", flush=True)
+    subprocess.run(["cargo", "build", "--release", "--locked"], cwd=GEMM_CRATE, check=True)
+    shutil.copy2(GEMM_CRATE / "target" / "release" / LIBRARY_PATH.name, LIBRARY_PATH)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--validator", action="store_true",
-                        help="build only what the audit validator needs (PCS library and CPU zk kernels)")
+    parser.add_argument("--validator", action="store_true", help="build only the GEMM library (audit validator)")
     args = parser.parse_args()
-    cuda = not args.validator and _cuda_toolkit()
-    if not args.validator and not cuda:
+    if not args.validator and not _cuda_toolkit():
         raise SystemExit("no CUDA toolkit found (CUDA_HOME); miners need it, validators pass --validator")
-    build_pcs()
-    build_zk(cuda)
-    if cuda:
+    build_gemm()
+    if not args.validator:
+        build_block_prover()
         build_workspace()
 
 

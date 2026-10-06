@@ -93,7 +93,9 @@ def verify_request(headers: dict[str, str], method: str, path: str, body: bytes,
         raise RequestRejected("timestamp outside the allowed window")
     try:
         sig = bytes.fromhex(signature)
-        ok = len(sig) == 64 and Keypair(ss58_address=hotkey).verify(signing_message(method, path, body, ts, nonce, receiver), sig)
+        ok = len(sig) == 64 and Keypair(ss58_address=hotkey).verify(
+            signing_message(method, path, body, ts, nonce, receiver), sig
+        )
     except Exception:
         ok = False
     if not ok:

@@ -1,4 +1,11 @@
-"""Strict arithmetic adapter for protocol-v2 hot-capacity proofs."""
+"""GEMM proof for one challenged capacity block: binds the Pallas-field GEMM sumcheck (``zk.gemm_sumcheck``) to the
+workspace lane it proves.
+
+The verifier rebuilds the statement context from the lane's committed roots and its own challenge seed, checks the
+Q block against its Merkle opening, and checks the sumcheck's terminal X/W claims against operand bands it
+recomputes itself: deterministic workspaces from the workspace seed, transition workspaces from Merkle-opened state
+blocks.
+"""
 
 from __future__ import annotations
 
@@ -7,9 +14,10 @@ import binascii
 import hashlib
 import re
 import struct
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -18,40 +26,32 @@ from verathos.capacity.proof.workspace import (
     WORKSPACE_TRANSITION_PROOF_FORMAT,
     derive_challenge_block_index,
     derive_sampled_round_index,
+    verify_workspace_merkle_path,
+    verify_workspace_state_merkle_path,
     workspace_i8_values,
     workspace_q_block_hash_i32,
     workspace_seed_for,
-    verify_workspace_merkle_path,
-    verify_workspace_state_merkle_path,
     workspace_state_block_hash_i8,
 )
-from verathos.capacity.zk.crypto.gemm_v2_batch import (
-    GemmV2BatchProof,
-    GemmV2BatchStatement,
-    verify_gemm_v2_batch_sumcheck,
-)
-from verathos.capacity.zk.crypto.gemm_v2_reference import (
-    GemmV2FormatError,
-    GemmV2Statement,
-    GemmV2VerificationError,
+from verathos.capacity.zk.gemm_native import NativeUnavailableError, evaluate_i8_matrix, prove_gemm_batch_i8
+from verathos.capacity.zk.gemm_sumcheck import (
     PALLAS_SCALAR_MODULUS,
-)
-from verathos.capacity.zk.crypto.pcs_v2 import (
-    PCSUnavailableError,
-    evaluate_i8_matrix,
-    prove_gemm_batch_sumcheck_i8,
-    scalar_to_int as pcs_scalar_to_int,
+    GemmBatchProof,
+    GemmBatchStatement,
+    GemmFormatError,
+    GemmStatement,
+    GemmVerificationError,
+    verify_gemm_batch_sumcheck,
 )
 from verathos.capacity.zk.types import MerklePath
 
+CAPACITY_GEMM_FORMAT = "capacity_gemm_pallas_v1"
+CAPACITY_GEMM_VERSION = 1
+CAPACITY_GEMM_CHALLENGE_COUNT = 1
 
-CAPACITY_GEMM_V2_FORMAT = "hot_capacity_gemm_pallas_v2"
-CAPACITY_GEMM_V2_PROTOCOL_VERSION = 2
-CAPACITY_GEMM_V2_CHALLENGE_COUNT = 1
-
-_CONTEXT_DOMAIN = b"VERATHOS/HOT_CAPACITY/GEMM_V2/CONTEXT/SHA256"
-_SOURCE_DOMAIN = b"VERATHOS/HOT_CAPACITY/GEMM_V2/SOURCE/SHA256"
-_PROOF_MAGIC = b"HCG2"
+_CONTEXT_DOMAIN = b"VERATHOS/CAPACITY/GEMM/CONTEXT/SHA256"
+_SOURCE_DOMAIN = b"VERATHOS/CAPACITY/GEMM/SOURCE/SHA256"
+_PROOF_MAGIC = b"VCG1"
 _PROOF_HEADER = struct.Struct("<4sHH32sI")
 _MAX_ARITHMETIC_PROOF_BYTES = 16 * 1024
 _MAX_MATRIX_DIM = 1 << 17
@@ -59,21 +59,21 @@ _MAX_TEXT_BYTES = 512
 _IDENTIFIER_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}")
 
 
-class CapacityGemmV2FormatError(ValueError):
-    """A protocol-v2 capacity statement or proof is malformed."""
+class CapacityGemmFormatError(ValueError):
+    """A capacity GEMM statement or proof is malformed."""
 
 
-class CapacityGemmV2VerificationError(ValueError):
-    """A well-formed protocol-v2 capacity proof did not verify."""
+class CapacityGemmVerificationError(ValueError):
+    """A well-formed capacity GEMM proof did not verify."""
 
 
 def _record(fields: Sequence[tuple[bytes, bytes]]) -> bytes:
     encoded = bytearray()
     for label, value in fields:
         if not isinstance(label, bytes) or not label:
-            raise CapacityGemmV2FormatError("record label must be non-empty bytes")
+            raise CapacityGemmFormatError("record label must be non-empty bytes")
         if not isinstance(value, bytes):
-            raise CapacityGemmV2FormatError("record value must be bytes")
+            raise CapacityGemmFormatError("record value must be bytes")
         encoded.extend(struct.pack("<I", len(label)))
         encoded.extend(label)
         encoded.extend(struct.pack("<Q", len(value)))
@@ -83,28 +83,28 @@ def _record(fields: Sequence[tuple[bytes, bytes]]) -> bytes:
 
 def _fixed_bytes(value: bytes, size: int, field_name: str) -> bytes:
     if not isinstance(value, bytes) or len(value) != size:
-        raise CapacityGemmV2FormatError(f"{field_name} must be exactly {size} bytes")
+        raise CapacityGemmFormatError(f"{field_name} must be exactly {size} bytes")
     return value
 
 
 def _integer(value: int, field_name: str, *, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
-        raise CapacityGemmV2FormatError(f"{field_name} must be an integer")
+        raise CapacityGemmFormatError(f"{field_name} must be an integer")
     integer = int(value)
     if integer < minimum or integer > maximum:
-        raise CapacityGemmV2FormatError(f"{field_name} is outside the allowed range")
+        raise CapacityGemmFormatError(f"{field_name} is outside the allowed range")
     return integer
 
 
 def _text(value: str, field_name: str) -> str:
     if not isinstance(value, str) or not value:
-        raise CapacityGemmV2FormatError(f"{field_name} must be non-empty text")
+        raise CapacityGemmFormatError(f"{field_name} must be non-empty text")
     try:
         encoded = value.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise CapacityGemmV2FormatError(f"{field_name} is not valid UTF-8") from exc
+        raise CapacityGemmFormatError(f"{field_name} is not valid UTF-8") from exc
     if len(encoded) > _MAX_TEXT_BYTES:
-        raise CapacityGemmV2FormatError(f"{field_name} is too long")
+        raise CapacityGemmFormatError(f"{field_name} is too long")
     return value
 
 
@@ -114,33 +114,33 @@ def _next_power_of_two(value: int) -> int:
 
 def _hex32(value: Any, field_name: str) -> bytes:
     if not isinstance(value, str):
-        raise CapacityGemmV2FormatError(f"{field_name} must be hex text")
+        raise CapacityGemmFormatError(f"{field_name} must be hex text")
     raw = value.removeprefix("0x")
     if len(raw) != 64:
-        raise CapacityGemmV2FormatError(f"{field_name} must be exactly 32 bytes")
+        raise CapacityGemmFormatError(f"{field_name} must be exactly 32 bytes")
     try:
         decoded = bytes.fromhex(raw)
     except ValueError as exc:
-        raise CapacityGemmV2FormatError(f"{field_name} is not valid hex") from exc
+        raise CapacityGemmFormatError(f"{field_name} is not valid hex") from exc
     if raw.lower() != decoded.hex():
-        raise CapacityGemmV2FormatError(f"{field_name} hex is not canonical")
+        raise CapacityGemmFormatError(f"{field_name} hex is not canonical")
     return decoded
 
 
 def _mapping(value: Any, field_name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
-        raise CapacityGemmV2FormatError(f"{field_name} must be a mapping")
+        raise CapacityGemmFormatError(f"{field_name} must be a mapping")
     return value
 
 
 def _sequence(value: Any, field_name: str) -> Sequence[Any]:
     if not isinstance(value, Sequence) or isinstance(value, (bytes, bytearray, str)):
-        raise CapacityGemmV2FormatError(f"{field_name} must be a sequence")
+        raise CapacityGemmFormatError(f"{field_name} must be a sequence")
     return value
 
 
 @dataclass(frozen=True, slots=True)
-class CapacityGemmV2Context:
+class CapacityGemmContext:
     """Verifier-owned context for exactly one sampled workspace GEMM block."""
 
     workload_version: str
@@ -162,13 +162,13 @@ class CapacityGemmV2Context:
     transition_mix_rounds: int = 0
     transition_fanout: int = 1
     state_root: bytes = b""
-    challenge_count: int = CAPACITY_GEMM_V2_CHALLENGE_COUNT
+    challenge_count: int = CAPACITY_GEMM_CHALLENGE_COUNT
     challenge_ordinal: int = 0
 
     def __post_init__(self) -> None:
         workload = _text(self.workload_version, "workload_version")
         if not _IDENTIFIER_RE.fullmatch(workload):
-            raise CapacityGemmV2FormatError("workload_version is not canonical")
+            raise CapacityGemmFormatError("workload_version is not canonical")
         lease_id = _text(self.lease_id, "lease_id")
         gpu_index = _integer(
             self.gpu_index, "gpu_index", minimum=0, maximum=(1 << 32) - 1
@@ -205,9 +205,9 @@ class CapacityGemmV2Context:
             self.block_size, "block_size", minimum=2, maximum=matrix_dim
         )
         if block_size & (block_size - 1):
-            raise CapacityGemmV2FormatError("block_size must be a power of two")
+            raise CapacityGemmFormatError("block_size must be a power of two")
         if matrix_dim % block_size:
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 "matrix_dim must be divisible by block_size"
             )
         blocks_per_row = matrix_dim // block_size
@@ -235,21 +235,21 @@ class CapacityGemmV2Context:
         if transition_mix_rounds:
             _fixed_bytes(self.state_root, 32, "state_root")
         elif self.state_root:
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 "state_root is only valid for transition workspaces"
             )
         if not transition_mix_rounds and transition_fanout != 1:
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 "transition_fanout must be one without transition mixing"
             )
-        if self.challenge_count != CAPACITY_GEMM_V2_CHALLENGE_COUNT:
-            raise CapacityGemmV2FormatError("challenge_count is not the fixed v2 count")
+        if self.challenge_count != CAPACITY_GEMM_CHALLENGE_COUNT:
+            raise CapacityGemmFormatError("challenge_count is not the fixed count")
         if self.challenge_ordinal != 0:
-            raise CapacityGemmV2FormatError("challenge_ordinal is not canonical")
+            raise CapacityGemmFormatError("challenge_ordinal is not canonical")
 
         expected_seed = workspace_seed_for(lease_id, gpu_index, proof_seed.hex())
         if workspace_seed != expected_seed:
-            raise CapacityGemmV2FormatError("workspace_seed does not match the context")
+            raise CapacityGemmFormatError("workspace_seed does not match the context")
 
         # These are verifier-derived indices. Keeping the checks in the context
         # constructor makes an incorrectly assembled statement fail closed.
@@ -263,7 +263,7 @@ class CapacityGemmV2Context:
             pass_count,
         )
         if pass_index != expected_pass:
-            raise CapacityGemmV2FormatError("pass_index is not the derived challenge")
+            raise CapacityGemmFormatError("pass_index is not the derived challenge")
         expected_round = derive_sampled_round_index(
             challenge_hex,
             lease_id,
@@ -272,7 +272,7 @@ class CapacityGemmV2Context:
             rounds,
         )
         if round_index != expected_round:
-            raise CapacityGemmV2FormatError("round_index is not the derived challenge")
+            raise CapacityGemmFormatError("round_index is not the derived challenge")
         expected_block = derive_challenge_block_index(
             round_root_hex=self.round_root.hex(),
             lease_id=lease_id,
@@ -283,7 +283,7 @@ class CapacityGemmV2Context:
             challenge_seed_hex=challenge_hex,
         )
         if row_block * blocks_per_row + column_block != expected_block:
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 "block coordinates are not the derived challenge"
             )
 
@@ -303,11 +303,7 @@ class CapacityGemmV2Context:
         state_root = self.state_root if self.state_root else b"\x00" * 32
         return _record(
             (
-                (
-                    b"protocol_version",
-                    struct.pack("<H", CAPACITY_GEMM_V2_PROTOCOL_VERSION),
-                ),
-                (b"format", CAPACITY_GEMM_V2_FORMAT.encode()),
+                (b"format", CAPACITY_GEMM_FORMAT.encode()),
                 (b"workload_version", self.workload_version.encode()),
                 (b"lease_id", self.lease_id.encode()),
                 (b"gpu_index", struct.pack("<I", self.gpu_index)),
@@ -345,7 +341,7 @@ class CapacityGemmV2Context:
             _SOURCE_DOMAIN + self.digest() + struct.pack("<B", matrix_id) + mode
         ).digest()
 
-    def statement(self, y_leaf_hash: bytes) -> GemmV2Statement:
+    def statement(self, y_leaf_hash: bytes) -> GemmStatement:
         y_leaf_hash = _fixed_bytes(y_leaf_hash, 32, "y_leaf_hash")
         operation_identity = _record(
             (
@@ -354,7 +350,7 @@ class CapacityGemmV2Context:
                 (b"context_digest", self.digest()),
             )
         )
-        return GemmV2Statement(
+        return GemmStatement(
             outer_digest=self.digest(),
             operation_identity=operation_identity,
             row_block=self.row_block,
@@ -363,13 +359,13 @@ class CapacityGemmV2Context:
             inner=self.padded_inner,
             valid_inner=self.matrix_dim,
             columns=self.block_size,
-            x_commitment=self.source_binding(0),
-            w_commitment=self.source_binding(1),
-            y_commitment=y_leaf_hash,
+            x_binding=self.source_binding(0),
+            w_binding=self.source_binding(1),
+            y_binding=y_leaf_hash,
         )
 
 
-def capacity_gemm_v2_context_from_workspace_proof(
+def capacity_gemm_context_from_workspace_proof(
     *,
     proof: Mapping[str, Any],
     capacity_params: Mapping[str, Any],
@@ -378,8 +374,8 @@ def capacity_gemm_v2_context_from_workspace_proof(
     proof_seed_hex: str,
     challenge_seed_hex: str,
     transcript_root_hex: str,
-) -> CapacityGemmV2Context:
-    """Reconstruct the verifier-owned v2 statement from one workspace lane.
+) -> CapacityGemmContext:
+    """Reconstruct the verifier-owned statement context from one workspace lane.
 
     The combined envelope commits ``capacity_params`` before the post-timing
     challenge exists.  The duplicated lane fields must match those parameters
@@ -398,7 +394,7 @@ def capacity_gemm_v2_context_from_workspace_proof(
         "transition_fanout",
     }
     if set(capacity_params) != expected_param_fields:
-        raise CapacityGemmV2FormatError("capacity_params fields are not canonical")
+        raise CapacityGemmFormatError("capacity_params fields are not canonical")
 
     matrix_dim = _integer(
         capacity_params.get("matrix_dim"),
@@ -453,7 +449,7 @@ def capacity_gemm_v2_context_from_workspace_proof(
             maximum=(1 << 32) - 1,
         )
         if actual != expected:
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 f"workspace {field_name} does not match capacity_params"
             )
 
@@ -461,21 +457,21 @@ def capacity_gemm_v2_context_from_workspace_proof(
     if proof_format == WORKSPACE_PROOF_FORMAT:
         expected_workload = "fixed_workspace_merkle_gemm_v1"
         if transition_mix_rounds or transition_fanout != 1:
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 "deterministic workspace mode is inconsistent"
             )
     elif proof_format == WORKSPACE_TRANSITION_PROOF_FORMAT:
         expected_workload = (
-            "fixed_workspace_transition_fanout_v3"
+            "fixed_workspace_transition_fanout_v1"
             if transition_fanout > 1
-            else "fixed_workspace_transition_mix_v3"
+            else "fixed_workspace_transition_mix_v1"
         )
         if not transition_mix_rounds:
-            raise CapacityGemmV2FormatError("transition workspace mode is inconsistent")
+            raise CapacityGemmFormatError("transition workspace mode is inconsistent")
     else:
-        raise CapacityGemmV2FormatError("workspace proof format is not supported by v2")
+        raise CapacityGemmFormatError("workspace proof format is not supported")
     if proof.get("workload_version") != expected_workload:
-        raise CapacityGemmV2FormatError(
+        raise CapacityGemmFormatError(
             "workspace workload_version does not match its format"
         )
 
@@ -507,14 +503,14 @@ def capacity_gemm_v2_context_from_workspace_proof(
 
     root_chain = _sequence(proof.get("root_chain"), "workspace root_chain")
     if len(root_chain) != pass_count:
-        raise CapacityGemmV2FormatError("workspace root_chain length does not match")
+        raise CapacityGemmFormatError("workspace root_chain length does not match")
     pass_entry = _mapping(root_chain[pass_index], "sampled pass root entry")
     round_roots = _sequence(pass_entry.get("round_roots"), "sampled pass round roots")
     if len(round_roots) != rounds:
-        raise CapacityGemmV2FormatError("round root count does not match")
+        raise CapacityGemmFormatError("round root count does not match")
     round_root = _hex32(round_roots[round_index], "sampled round_root")
     if sampled.get("round_root") != round_root.hex():
-        raise CapacityGemmV2FormatError("sampled round_root does not match root_chain")
+        raise CapacityGemmFormatError("sampled round_root does not match root_chain")
 
     block_proof = _mapping(proof.get("block_proof"), "workspace block_proof")
     blocks_per_row = matrix_dim // block_size
@@ -531,7 +527,7 @@ def capacity_gemm_v2_context_from_workspace_proof(
         maximum=blocks_per_row - 1,
     )
     if row_block * blocks_per_row + column_block != block_index:
-        raise CapacityGemmV2FormatError("workspace block coordinates do not match")
+        raise CapacityGemmFormatError("workspace block coordinates do not match")
 
     state_root = b""
     if proof_format == WORKSPACE_TRANSITION_PROOF_FORMAT:
@@ -539,21 +535,21 @@ def capacity_gemm_v2_context_from_workspace_proof(
             proof.get("state_root_chain"), "workspace state_root_chain"
         )
         if len(state_root_chain) != pass_count:
-            raise CapacityGemmV2FormatError("state_root_chain length does not match")
+            raise CapacityGemmFormatError("state_root_chain length does not match")
         state_pass = _mapping(state_root_chain[pass_index], "sampled state pass entry")
         state_rounds = _sequence(
             state_pass.get("round_state_roots"), "sampled state round roots"
         )
         if len(state_rounds) != rounds:
-            raise CapacityGemmV2FormatError("state round root count does not match")
+            raise CapacityGemmFormatError("state round root count does not match")
         state_mix_roots = _sequence(
             state_rounds[round_index], "sampled state mix roots"
         )
         if len(state_mix_roots) != transition_mix_rounds + 1:
-            raise CapacityGemmV2FormatError("state mix root count does not match")
+            raise CapacityGemmFormatError("state mix root count does not match")
         state_root = _hex32(state_mix_roots[-1], "sampled final state_root")
 
-    return CapacityGemmV2Context(
+    return CapacityGemmContext(
         workload_version=expected_workload,
         lease_id=_text(lease_id, "lease_id"),
         gpu_index=_integer(gpu_index, "gpu_index", minimum=0, maximum=(1 << 32) - 1),
@@ -577,8 +573,8 @@ def capacity_gemm_v2_context_from_workspace_proof(
 
 
 @dataclass(frozen=True, slots=True)
-class CapacityGemmV2Payload:
-    """Canonical v2 arithmetic payload with no prover-controlled dimensions."""
+class CapacityGemmPayload:
+    """Canonical arithmetic payload with no prover-controlled dimensions."""
 
     statement_digest: bytes
     arithmetic_proof: bytes
@@ -586,15 +582,15 @@ class CapacityGemmV2Payload:
     def __post_init__(self) -> None:
         _fixed_bytes(self.statement_digest, 32, "statement_digest")
         if not isinstance(self.arithmetic_proof, bytes) or not self.arithmetic_proof:
-            raise CapacityGemmV2FormatError("arithmetic_proof must be non-empty bytes")
+            raise CapacityGemmFormatError("arithmetic_proof must be non-empty bytes")
         if len(self.arithmetic_proof) > _MAX_ARITHMETIC_PROOF_BYTES:
-            raise CapacityGemmV2FormatError("arithmetic_proof is too large")
+            raise CapacityGemmFormatError("arithmetic_proof is too large")
 
     def canonical_bytes(self) -> bytes:
         return (
             _PROOF_HEADER.pack(
                 _PROOF_MAGIC,
-                CAPACITY_GEMM_V2_PROTOCOL_VERSION,
+                CAPACITY_GEMM_VERSION,
                 0,
                 self.statement_digest,
                 len(self.arithmetic_proof),
@@ -603,11 +599,11 @@ class CapacityGemmV2Payload:
         )
 
     @classmethod
-    def from_canonical_bytes(cls, encoded: bytes) -> "CapacityGemmV2Payload":
+    def from_canonical_bytes(cls, encoded: bytes) -> CapacityGemmPayload:
         if not isinstance(encoded, bytes):
-            raise CapacityGemmV2FormatError("capacity proof encoding must be bytes")
+            raise CapacityGemmFormatError("capacity proof encoding must be bytes")
         if len(encoded) < _PROOF_HEADER.size:
-            raise CapacityGemmV2FormatError("capacity proof encoding is truncated")
+            raise CapacityGemmFormatError("capacity proof encoding is truncated")
         (
             magic,
             version,
@@ -616,56 +612,47 @@ class CapacityGemmV2Payload:
             proof_length,
         ) = _PROOF_HEADER.unpack_from(encoded)
         if magic != _PROOF_MAGIC:
-            raise CapacityGemmV2FormatError("capacity proof magic is not recognized")
-        if version != CAPACITY_GEMM_V2_PROTOCOL_VERSION:
-            raise CapacityGemmV2FormatError("capacity proof version is not supported")
+            raise CapacityGemmFormatError("capacity proof magic is not recognized")
+        if version != CAPACITY_GEMM_VERSION:
+            raise CapacityGemmFormatError("capacity proof version is not supported")
         if flags != 0:
-            raise CapacityGemmV2FormatError("capacity proof flags are not canonical")
+            raise CapacityGemmFormatError("capacity proof flags are not canonical")
         if proof_length == 0 or proof_length > _MAX_ARITHMETIC_PROOF_BYTES:
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 "capacity arithmetic proof length is invalid"
             )
         if len(encoded) != _PROOF_HEADER.size + proof_length:
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 "capacity proof encoding has an invalid length"
             )
         return cls(statement_digest, encoded[_PROOF_HEADER.size :])
 
     def to_mapping(self) -> dict[str, Any]:
-        return {
-            "format": CAPACITY_GEMM_V2_FORMAT,
-            "protocol_version": CAPACITY_GEMM_V2_PROTOCOL_VERSION,
-            "payload": self.canonical_bytes().hex(),
-        }
+        return {"format": CAPACITY_GEMM_FORMAT, "payload": self.canonical_bytes().hex()}
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "CapacityGemmV2Payload":
+    def from_mapping(cls, value: Mapping[str, Any]) -> CapacityGemmPayload:
         if not isinstance(value, Mapping):
-            raise CapacityGemmV2FormatError("capacity proof must be a mapping")
-        if set(value) != {"format", "protocol_version", "payload"}:
-            raise CapacityGemmV2FormatError("capacity proof fields are not canonical")
-        if value.get("format") != CAPACITY_GEMM_V2_FORMAT:
-            raise CapacityGemmV2FormatError("capacity proof format is not supported")
-        version = value.get("protocol_version")
-        if isinstance(version, bool) or version != CAPACITY_GEMM_V2_PROTOCOL_VERSION:
-            raise CapacityGemmV2FormatError(
-                "capacity proof protocol version is not supported"
-            )
+            raise CapacityGemmFormatError("capacity proof must be a mapping")
+        if set(value) != {"format", "payload"}:
+            raise CapacityGemmFormatError("capacity proof fields are not canonical")
+        if value.get("format") != CAPACITY_GEMM_FORMAT:
+            raise CapacityGemmFormatError("capacity proof format is not supported")
         payload_hex = value.get("payload")
         if not isinstance(payload_hex, str) or not payload_hex:
-            raise CapacityGemmV2FormatError("capacity proof payload must be hex text")
+            raise CapacityGemmFormatError("capacity proof payload must be hex text")
         if payload_hex.startswith("0x") or len(payload_hex) % 2:
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 "capacity proof payload hex is not canonical"
             )
         try:
             encoded = bytes.fromhex(payload_hex)
         except ValueError as exc:
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 "capacity proof payload is not valid hex"
             ) from exc
         if payload_hex != encoded.hex():
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 "capacity proof payload hex is not canonical"
             )
         return cls.from_canonical_bytes(encoded)
@@ -675,13 +662,13 @@ def _strict_i32_block(
     q_block_i32: Sequence[Sequence[int]], block_size: int
 ) -> tuple[tuple[int, ...], ...]:
     if isinstance(q_block_i32, (bytes, bytearray, str)):
-        raise CapacityGemmV2FormatError("Q block must be a matrix")
+        raise CapacityGemmFormatError("Q block must be a matrix")
     try:
         rows = tuple(tuple(row) for row in q_block_i32)
     except TypeError as exc:
-        raise CapacityGemmV2FormatError("Q block must be a matrix") from exc
+        raise CapacityGemmFormatError("Q block must be a matrix") from exc
     if len(rows) != block_size or any(len(row) != block_size for row in rows):
-        raise CapacityGemmV2FormatError("Q block shape does not match block_size")
+        raise CapacityGemmFormatError("Q block shape does not match block_size")
     normalized = []
     for row in rows:
         normalized_row = []
@@ -711,35 +698,35 @@ def _strict_merkle_path(
         "leaf_index",
         "siblings",
     }:
-        raise CapacityGemmV2FormatError("Merkle path fields are not canonical")
+        raise CapacityGemmFormatError("Merkle path fields are not canonical")
     leaf_index = path_data.get("leaf_index")
     if isinstance(leaf_index, bool) or leaf_index != expected_leaf:
-        raise CapacityGemmV2FormatError("Merkle path leaf index does not match")
+        raise CapacityGemmFormatError("Merkle path leaf index does not match")
     siblings_data = path_data.get("siblings")
     if not isinstance(siblings_data, list) or len(siblings_data) != _tree_height(
         num_leaves
     ):
-        raise CapacityGemmV2FormatError("Merkle path length does not match the tree")
+        raise CapacityGemmFormatError("Merkle path length does not match the tree")
     siblings = []
     node_index = expected_leaf
     level_size = num_leaves
     for item in siblings_data:
         if not isinstance(item, list) or len(item) != 2:
-            raise CapacityGemmV2FormatError("Merkle sibling entry is malformed")
+            raise CapacityGemmFormatError("Merkle sibling entry is malformed")
         digest_hex, is_left = item
         if not isinstance(digest_hex, str) or len(digest_hex) != 64:
-            raise CapacityGemmV2FormatError("Merkle sibling digest is malformed")
+            raise CapacityGemmFormatError("Merkle sibling digest is malformed")
         if not isinstance(is_left, bool):
-            raise CapacityGemmV2FormatError("Merkle sibling direction is malformed")
+            raise CapacityGemmFormatError("Merkle sibling direction is malformed")
         try:
             digest = bytes.fromhex(digest_hex)
         except ValueError as exc:
-            raise CapacityGemmV2FormatError(
+            raise CapacityGemmFormatError(
                 "Merkle sibling digest is malformed"
             ) from exc
         expected_left = bool(node_index & 1)
         if is_left != expected_left:
-            raise CapacityGemmV2FormatError("Merkle sibling direction does not match")
+            raise CapacityGemmFormatError("Merkle sibling direction does not match")
         siblings.append((digest, is_left))
         node_index //= 2
         level_size = (level_size + 1) // 2
@@ -747,7 +734,7 @@ def _strict_merkle_path(
 
 
 def _verify_q_opening(
-    context: CapacityGemmV2Context,
+    context: CapacityGemmContext,
     q_block_i32: Sequence[Sequence[int]],
     q_merkle_path: Mapping[str, Any],
 ) -> tuple[tuple[tuple[int, ...], ...], bytes]:
@@ -760,7 +747,7 @@ def _verify_q_opening(
     )
     leaf_hash = workspace_q_block_hash_i32(q_block)
     if not verify_workspace_merkle_path(context.round_root, leaf_hash, path):
-        raise CapacityGemmV2VerificationError("Q block Merkle path did not verify")
+        raise CapacityGemmVerificationError("Q block Merkle path did not verify")
     return q_block, leaf_hash
 
 
@@ -769,30 +756,30 @@ def _packed_state_block_i8(
     block_size: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     if not isinstance(value, str) or not value.startswith("base64:"):
-        raise CapacityGemmV2FormatError(
+        raise CapacityGemmFormatError(
             "packed state block must use canonical base64"
         )
     encoded = value.removeprefix("base64:")
     try:
         raw = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise CapacityGemmV2FormatError("packed state block is invalid") from exc
+        raise CapacityGemmFormatError("packed state block is invalid") from exc
     if base64.b64encode(raw).decode("ascii") != encoded:
-        raise CapacityGemmV2FormatError("packed state block is noncanonical")
+        raise CapacityGemmFormatError("packed state block is noncanonical")
     expected_length = 2 * block_size * block_size
     if len(raw) != expected_length:
-        raise CapacityGemmV2FormatError("packed state block has the wrong length")
+        raise CapacityGemmFormatError("packed state block has the wrong length")
     packed = np.frombuffer(raw, dtype=np.uint8).reshape(block_size * 2, block_size)
     a_block = np.ascontiguousarray(packed[0::2, :]).view(np.int8)
     b_block = np.ascontiguousarray(packed[1::2, :]).view(np.int8)
     return a_block, b_block
 
 
-def required_transition_state_blocks(context: CapacityGemmV2Context) -> tuple[int, ...]:
+def required_transition_state_blocks(context: CapacityGemmContext) -> tuple[int, ...]:
     """Return the exact state-block set needed for the selected A and B bands."""
 
-    if not isinstance(context, CapacityGemmV2Context):
-        raise CapacityGemmV2FormatError("context has an unexpected type")
+    if not isinstance(context, CapacityGemmContext):
+        raise CapacityGemmFormatError("context has an unexpected type")
     if not context.transition_mix_rounds:
         return ()
     blocks_per_row = context.matrix_dim // context.block_size
@@ -806,17 +793,17 @@ def required_transition_state_blocks(context: CapacityGemmV2Context) -> tuple[in
 
 
 def _transition_bands(
-    context: CapacityGemmV2Context,
+    context: CapacityGemmContext,
     state_openings: Sequence[Mapping[str, Any]],
 ) -> tuple[np.ndarray, np.ndarray]:
     expected_indices = required_transition_state_blocks(context)
     if not isinstance(state_openings, Sequence) or isinstance(
         state_openings, (bytes, bytearray, str)
     ):
-        raise CapacityGemmV2FormatError("state openings must be a sequence")
+        raise CapacityGemmFormatError("state openings must be a sequence")
     openings = tuple(state_openings)
     if len(openings) != len(expected_indices):
-        raise CapacityGemmV2VerificationError(
+        raise CapacityGemmVerificationError(
             "state openings do not match the exact required block set"
         )
     blocks_per_row = context.matrix_dim // context.block_size
@@ -828,13 +815,13 @@ def _transition_bands(
             "state_block_i8",
             "merkle_path",
         }:
-            raise CapacityGemmV2FormatError("state opening fields are not canonical")
+            raise CapacityGemmFormatError("state opening fields are not canonical")
         block_index = opening.get("block_index")
         if isinstance(block_index, bool) or not isinstance(block_index, Integral):
-            raise CapacityGemmV2FormatError("state block index must be an integer")
+            raise CapacityGemmFormatError("state block index must be an integer")
         block_index = int(block_index)
         if block_index != expected_index:
-            raise CapacityGemmV2VerificationError(
+            raise CapacityGemmVerificationError(
                 "state openings do not match the exact required block set"
             )
         a_block, b_block = _packed_state_block_i8(
@@ -852,7 +839,7 @@ def _transition_bands(
             leaf_hash,
             path,
         ):
-            raise CapacityGemmV2VerificationError(
+            raise CapacityGemmVerificationError(
                 "state Merkle path did not verify"
             )
         opened[block_index] = (a_block, b_block)
@@ -873,7 +860,7 @@ def _transition_bands(
 
 
 def _deterministic_bands(
-    context: CapacityGemmV2Context,
+    context: CapacityGemmContext,
 ) -> tuple[np.ndarray, np.ndarray]:
     row_start = context.row_block * context.block_size
     column_start = context.column_block * context.block_size
@@ -908,20 +895,20 @@ def _deterministic_bands(
 
 
 def _workspace_bands(
-    context: CapacityGemmV2Context,
+    context: CapacityGemmContext,
     state_openings: Sequence[Mapping[str, Any]],
 ) -> tuple[list[list[int]], list[list[int]]]:
     if context.transition_mix_rounds:
         return _transition_bands(context, state_openings)
     if state_openings:
-        raise CapacityGemmV2FormatError(
+        raise CapacityGemmFormatError(
             "state openings are not valid for a deterministic workspace"
         )
     return _deterministic_bands(context)
 
 
 def _pad_inner_bands(
-    context: CapacityGemmV2Context,
+    context: CapacityGemmContext,
     x_band: Sequence[Sequence[int]],
     w_band: Sequence[Sequence[int]],
 ) -> tuple[Sequence[Sequence[int]], Sequence[Sequence[int]]]:
@@ -940,7 +927,7 @@ def _pad_inner_bands(
 def _mle_evaluate(values: Sequence[int], point: Sequence[int]) -> int:
     table = [int(value) % PALLAS_SCALAR_MODULUS for value in values]
     if len(table) != 1 << len(point):
-        raise CapacityGemmV2FormatError("MLE table size does not match its point")
+        raise CapacityGemmFormatError("MLE table size does not match its point")
     modulus = PALLAS_SCALAR_MODULUS
     for coordinate in point:
         coordinate = _integer(
@@ -968,14 +955,14 @@ def _matrix_i8_mle_evaluate_native(
 
     values = np.asarray(matrix)
     if values.ndim != 2 or not values.shape[0] or not values.shape[1]:
-        raise CapacityGemmV2FormatError("MLE matrix must be non-empty and rectangular")
+        raise CapacityGemmFormatError("MLE matrix must be non-empty and rectangular")
     rows, columns = (int(values.shape[0]), int(values.shape[1]))
     if rows & (rows - 1) or columns & (columns - 1):
-        raise CapacityGemmV2FormatError("MLE matrix dimensions must be powers of two")
+        raise CapacityGemmFormatError("MLE matrix dimensions must be powers of two")
     row_bits = rows.bit_length() - 1
     column_bits = columns.bit_length() - 1
     if len(point) != row_bits + column_bits:
-        raise CapacityGemmV2FormatError("MLE table size does not match its point")
+        raise CapacityGemmFormatError("MLE table size does not match its point")
 
     normalized_point = tuple(
         _integer(
@@ -993,38 +980,32 @@ def _matrix_i8_mle_evaluate_native(
         row_point, column_point = column_point, row_point
 
     if np.any(values < -128) or np.any(values > 127):
-        raise CapacityGemmV2FormatError("MLE int8 matrix value is outside range")
+        raise CapacityGemmFormatError("MLE int8 matrix value is outside range")
     values = np.ascontiguousarray(values, dtype=np.int8)
-    return pcs_scalar_to_int(
-        evaluate_i8_matrix(
-            values.tobytes(),
-            rows=int(values.shape[0]),
-            columns=int(values.shape[1]),
-            point=row_point + column_point,
-        )
-    )
+    return evaluate_i8_matrix(values.tobytes(), rows=int(values.shape[0]), columns=int(values.shape[1]),
+                              point=row_point + column_point)
 
 
-def prove_capacity_gemm_v2(
+def prove_capacity_gemm(
     *,
-    context: CapacityGemmV2Context,
+    context: CapacityGemmContext,
     q_block_i32: Sequence[Sequence[int]],
     q_merkle_path: Mapping[str, Any],
     state_openings: Sequence[Mapping[str, Any]] = (),
-) -> CapacityGemmV2Payload:
+) -> CapacityGemmPayload:
     """Build one canonical arithmetic proof from authenticated workspace data."""
 
-    if not isinstance(context, CapacityGemmV2Context):
-        raise CapacityGemmV2FormatError("context has an unexpected type")
+    if not isinstance(context, CapacityGemmContext):
+        raise CapacityGemmFormatError("context has an unexpected type")
     q_block, leaf_hash = _verify_q_opening(context, q_block_i32, q_merkle_path)
     x_band, w_band = _workspace_bands(context, state_openings)
     x_padded, w_padded = _pad_inner_bands(context, x_band, w_band)
     statement = context.statement(leaf_hash)
-    batch_statement = GemmV2BatchStatement((statement,))
+    batch_statement = GemmBatchStatement((statement,))
     x_values = np.ascontiguousarray(x_padded, dtype=np.int8)
     w_values = np.ascontiguousarray(w_padded, dtype=np.int8)
     y_values = np.ascontiguousarray(q_block, dtype="<i8")
-    proof = prove_gemm_batch_sumcheck_i8(
+    proof = prove_gemm_batch_i8(
         batch_digest=batch_statement.digest(),
         x_values=x_values.tobytes(),
         w_values=w_values.tobytes(),
@@ -1035,39 +1016,39 @@ def prove_capacity_gemm_v2(
         inner=context.padded_inner,
         columns=context.block_size,
     )
-    return CapacityGemmV2Payload(batch_statement.digest(), proof)
+    return CapacityGemmPayload(batch_statement.digest(), proof)
 
 
-def verify_capacity_gemm_v2_strict(
+def verify_capacity_gemm_strict(
     *,
-    context: CapacityGemmV2Context,
-    payload: CapacityGemmV2Payload,
+    context: CapacityGemmContext,
+    payload: CapacityGemmPayload,
     q_block_i32: Sequence[Sequence[int]],
     q_merkle_path: Mapping[str, Any],
     state_openings: Sequence[Mapping[str, Any]] = (),
 ) -> None:
-    """Verify one v2 proof, raising on every malformed or invalid input."""
+    """Verify one proof, raising on every malformed or invalid input."""
 
-    if not isinstance(context, CapacityGemmV2Context):
-        raise CapacityGemmV2FormatError("context has an unexpected type")
-    if not isinstance(payload, CapacityGemmV2Payload):
-        raise CapacityGemmV2FormatError("payload has an unexpected type")
+    if not isinstance(context, CapacityGemmContext):
+        raise CapacityGemmFormatError("context has an unexpected type")
+    if not isinstance(payload, CapacityGemmPayload):
+        raise CapacityGemmFormatError("payload has an unexpected type")
     q_block, leaf_hash = _verify_q_opening(context, q_block_i32, q_merkle_path)
     statement = context.statement(leaf_hash)
-    batch_statement = GemmV2BatchStatement((statement,))
+    batch_statement = GemmBatchStatement((statement,))
     if payload.statement_digest != batch_statement.digest():
-        raise CapacityGemmV2VerificationError("statement digest does not match")
+        raise CapacityGemmVerificationError("statement digest does not match")
     try:
-        arithmetic_proof = GemmV2BatchProof.from_canonical_bytes(
+        arithmetic_proof = GemmBatchProof.from_canonical_bytes(
             payload.arithmetic_proof,
             expected_blocks=1,
             expected_rounds=context.arithmetic_rounds,
         )
-        claims = verify_gemm_v2_batch_sumcheck(batch_statement, arithmetic_proof)
-    except GemmV2FormatError as exc:
-        raise CapacityGemmV2FormatError(str(exc)) from exc
-    except GemmV2VerificationError as exc:
-        raise CapacityGemmV2VerificationError(str(exc)) from exc
+        claims = verify_gemm_batch_sumcheck(batch_statement, arithmetic_proof)
+    except GemmFormatError as exc:
+        raise CapacityGemmFormatError(str(exc)) from exc
+    except GemmVerificationError as exc:
+        raise CapacityGemmVerificationError(str(exc)) from exc
 
     x_band, w_band = _workspace_bands(context, state_openings)
     x_padded, w_padded = _pad_inner_bands(context, x_band, w_band)
@@ -1076,21 +1057,21 @@ def verify_capacity_gemm_v2_strict(
     try:
         x_evaluation = _matrix_i8_mle_evaluate_native(x_padded, x_point)
         w_evaluation = _matrix_i8_mle_evaluate_native(w_padded, w_point)
-    except PCSUnavailableError:
+    except NativeUnavailableError:
         x_evaluation = _matrix_mle_evaluate(x_padded, x_point)
         w_evaluation = _matrix_mle_evaluate(w_padded, w_point)
     if x_evaluation != claims.x_values[0]:
-        raise CapacityGemmV2VerificationError("X terminal evaluation does not match")
+        raise CapacityGemmVerificationError("X terminal evaluation does not match")
     if w_evaluation != claims.w_values[0]:
-        raise CapacityGemmV2VerificationError("W terminal evaluation does not match")
+        raise CapacityGemmVerificationError("W terminal evaluation does not match")
     if _matrix_mle_evaluate(q_block, claims.y_point) != claims.y_values[0]:
-        raise CapacityGemmV2VerificationError("Y evaluation does not match")
+        raise CapacityGemmVerificationError("Y evaluation does not match")
 
 
-def verify_capacity_gemm_v2(
+def verify_capacity_gemm(
     *,
-    context: CapacityGemmV2Context,
-    payload: CapacityGemmV2Payload | Mapping[str, Any],
+    context: CapacityGemmContext,
+    payload: CapacityGemmPayload | Mapping[str, Any],
     q_block_i32: Sequence[Sequence[int]],
     q_merkle_path: Mapping[str, Any],
     state_openings: Sequence[Mapping[str, Any]] = (),
@@ -1100,10 +1081,10 @@ def verify_capacity_gemm_v2(
     try:
         decoded = (
             payload
-            if isinstance(payload, CapacityGemmV2Payload)
-            else CapacityGemmV2Payload.from_mapping(payload)
+            if isinstance(payload, CapacityGemmPayload)
+            else CapacityGemmPayload.from_mapping(payload)
         )
-        verify_capacity_gemm_v2_strict(
+        verify_capacity_gemm_strict(
             context=context,
             payload=decoded,
             q_block_i32=q_block_i32,
@@ -1112,24 +1093,10 @@ def verify_capacity_gemm_v2(
         )
     except Exception as exc:
         if isinstance(
-            exc, (CapacityGemmV2FormatError, CapacityGemmV2VerificationError)
+            exc, (CapacityGemmFormatError, CapacityGemmVerificationError)
         ):
             return False, str(exc)
         raise
     return True, "ok"
 
 
-__all__ = [
-    "CAPACITY_GEMM_V2_CHALLENGE_COUNT",
-    "CAPACITY_GEMM_V2_FORMAT",
-    "CAPACITY_GEMM_V2_PROTOCOL_VERSION",
-    "CapacityGemmV2Context",
-    "CapacityGemmV2FormatError",
-    "CapacityGemmV2Payload",
-    "CapacityGemmV2VerificationError",
-    "capacity_gemm_v2_context_from_workspace_proof",
-    "prove_capacity_gemm_v2",
-    "required_transition_state_blocks",
-    "verify_capacity_gemm_v2",
-    "verify_capacity_gemm_v2_strict",
-]

@@ -58,7 +58,8 @@ def post(client: TestClient, caller: Keypair, miner: Keypair, path: str, payload
 def test_manifest_is_public_and_acceptable(setup) -> None:
     client, miner, *_ , manifest = setup
     served = SignedManifest.model_validate(client.get("/v1/manifest").json())
-    assert accept(served, hotkey=miner.ss58_address, netuid=405, commitment=commitment_value(manifest.manifest.digest()))
+    assert accept(served, hotkey=miner.ss58_address, netuid=405,
+                  commitment=commitment_value(manifest.manifest.digest()))
 
 
 def test_answer_carries_binding_receipt(setup) -> None:

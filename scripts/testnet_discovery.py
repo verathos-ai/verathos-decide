@@ -45,12 +45,13 @@ def cmd_manifest_build(args: argparse.Namespace) -> None:
     wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
     st = subtensor(args)
     endpoints = [
-        Endpoint(endpoint_id=f"gpu{i}", url=url, model_id=model, hardware=Hardware(kind="cuda", device_id=f"GPU-test-{i}"),
-                 max_concurrency=64)
+        Endpoint(endpoint_id=f"gpu{i}", url=url, model_id=model,
+                 hardware=Hardware(kind="cuda", device_id=f"GPU-test-{i}"), max_concurrency=64)
         for i, (url, model) in enumerate(zip(args.endpoint_url, args.model_id))
     ]
     manifest = Manifest(netuid=args.netuid, mechid=args.mechid, hotkey=wallet.hotkey.ss58_address, seq=args.seq,
-                        issued_block=st.get_current_block(), catalog_digest=catalog_mod.load().digest(), endpoints=endpoints)
+                        issued_block=st.get_current_block(), catalog_digest=catalog_mod.load().digest(),
+                        endpoints=endpoints)
     signed = SignedManifest.create(manifest, wallet.hotkey)
     Path(args.out).write_text(signed.model_dump_json(indent=2))
     log.info("manifest seq=%d digest=%s written to %s", manifest.seq, manifest.digest(), args.out)
@@ -98,7 +99,8 @@ def cmd_discover(args: argparse.Namespace) -> None:
         result: dict = {"uid": uid, "hotkey": hotkey, "axon": f"{axon.ip}:{axon.port}", "commitment": commitment}
         try:
             body = urllib.request.urlopen(url, timeout=10).read()
-            manifest = accept(SignedManifest.model_validate_json(body), hotkey=hotkey, netuid=args.netuid, commitment=commitment)
+            manifest = accept(SignedManifest.model_validate_json(body), hotkey=hotkey, netuid=args.netuid,
+                              commitment=commitment)
             result.update(accepted=True, seq=manifest.seq, endpoints=[e.model_dump() for e in manifest.endpoints],
                           catalog_match=manifest.catalog_digest == local.digest())
         except ManifestRejected as e:

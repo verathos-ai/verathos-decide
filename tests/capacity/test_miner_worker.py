@@ -14,8 +14,8 @@ import httpx
 from bittensor_wallet import Keypair
 
 from verathos.capacity import core
-from verathos.capacity.proof.combined import COMBINED_PROOF_FORMAT
 from verathos.capacity.miner import AuditEndpoint, AuditWorker, DrainState
+from verathos.capacity.proof.combined import COMBINED_PROOF_FORMAT
 
 BLOCK_S = 0.05
 
@@ -79,7 +79,8 @@ def test_drafted_endpoint_runs_audit_and_publishes_signed_artifacts(tmp_path: Pa
         return httpx.Response(200, json={"ok": True})
 
     def bench_command(audit, *, out_dir, challenge_file, ready_file, start_file, start_timeout_s, challenge_timeout_s):
-        return [sys.executable, str(script), str(out_dir), audit.lease, str(challenge_file), str(start_file), str(ready_file)]
+        return [sys.executable, str(script), str(out_dir), audit.lease, str(challenge_file), str(start_file),
+                str(ready_file)]
 
     # Policy forcing every window to trigger and every slot to be drafted, on a fast clock.
     policy = core.AuditPolicy(auditor_hotkey="5Auditor", windows_per_epoch=360, cohort_fraction=360.0,

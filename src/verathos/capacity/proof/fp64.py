@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import struct
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 WORKLOAD_VERSION = "fp64_identity_c_merkle_v1"
 PROOF_FORMAT = "fp64_identity_merkle_dot_v1"

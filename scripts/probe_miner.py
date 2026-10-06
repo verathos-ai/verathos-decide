@@ -32,12 +32,15 @@ TOPICS = ["billed twice for March", "the export button returns a 500 error", "I 
           "my package arrived broken", "please delete my account and all data", "the app crashes when I open settings",
           "I was promised a discount that never applied", "our API key stopped working this morning",
           "can you send the invoice in German", "the delivery is three weeks late"]
-TONES = ["", "This is unacceptable. ", "Thanks a lot for your help! ", "If this is not fixed by Friday we will cancel. ", "No rush. "]
+TONES = ["", "This is unacceptable. ", "Thanks a lot for your help! ",
+         "If this is not fixed by Friday we will cancel. ", "No rush. "]
 QUESTIONS = {
     "department": {"type": "choice", "instructions": "Which team should handle this?",
-                   "criteria": {"billing": "Charges and refunds", "technical": "Bugs or outages", "sales": "Pricing and plans",
-                                "logistics": "Shipping and delivery", "privacy": "Data and account deletion", "other": "Everything else"}},
-    "urgency": {"type": "score", "instructions": "How urgent is this?", "criteria": ["Can wait", "This week", "Today", "Right now"]},
+                   "criteria": {"billing": "Charges and refunds", "technical": "Bugs or outages",
+                                "sales": "Pricing and plans", "logistics": "Shipping and delivery",
+                                "privacy": "Data and account deletion", "other": "Everything else"}},
+    "urgency": {"type": "score", "instructions": "How urgent is this?",
+                "criteria": ["Can wait", "This week", "Today", "Right now"]},
     "churn": {"type": "noul", "instructions": "Does the customer threaten to cancel?"},
     "bug": {"type": "noul", "instructions": "Is a product bug reported?"},
     "refund": {"type": "noul", "instructions": "Is a refund requested?"},
@@ -51,7 +54,10 @@ def states(n: int = 30) -> list[str]:
     out = []
     for i in range(n):
         t = rng.sample(TOPICS, 2)
-        out.append(f"Ticket {1000 + i}. {rng.choice(TONES)}Hi team, {t[0]}. Also, {t[1]}. {rng.choice(TONES)}Regards, customer {i}.")
+        out.append(
+            f"Ticket {1000 + i}. {rng.choice(TONES)}Hi team, {t[0]}. Also, {t[1]}. "
+            f"{rng.choice(TONES)}Regards, customer {i}."
+        )
     return out
 
 
@@ -86,7 +92,11 @@ def main() -> None:
     prefix = "/" + endpoint.url.split("/", 3)[3]
     challenge = secrets.token_hex(16)
     ident = post(base, prefix + "/v1/identity", {"challenge": challenge}, caller, hotkey)
-    ok = signing.verify(hotkey, IDENTITY_DOMAIN, identity_payload(endpoint.endpoint_id, challenge, caller.ss58_address), ident["signature"])
+    ok = signing.verify(
+        hotkey, IDENTITY_DOMAIN,
+        identity_payload(endpoint.endpoint_id, challenge, caller.ss58_address),
+        ident["signature"],
+    )
     print(f"identity challenge for {endpoint.endpoint_id}: {'verified' if ok else 'FAILED'}")
 
     reference = [distributions(r["answers"]) for r in json.loads(args.reference.read_text())]
@@ -97,11 +107,16 @@ def main() -> None:
         response = post(base, prefix + "/v1/systemone", request, caller, hotkey)
         latencies.append((time.time() - t0) * 1000)
         receipt = SignedReceipt.model_validate(response["receipt"])
-        receipts_ok += receipt.signature_valid() and receipt.binds(request, response["answers"]) and receipt.receipt.miner_hotkey == hotkey
+        receipts_ok += (
+            receipt.signature_valid()
+            and receipt.binds(request, response["answers"])
+            and receipt.receipt.miner_hotkey == hotkey
+        )
         tally.add(compare_request(ref, distributions(response["answers"]), tally.tolerance))
     print(f"requests {tally.requests}, receipts valid {receipts_ok}/{tally.requests}, "
           f"round trip median {statistics.median(latencies):.0f} ms")
-    print(f"mean abs diff vs reference {tally.mean_abs:.4f}, hard failures {len(tally.hard_failures)} -> verdict {tally.verdict().value}")
+    print(f"mean abs diff vs reference {tally.mean_abs:.4f}, hard failures {len(tally.hard_failures)} "
+          f"-> verdict {tally.verdict().value}")
     st.close()
 
 

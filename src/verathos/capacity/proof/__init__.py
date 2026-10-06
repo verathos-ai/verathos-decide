@@ -1,1 +1,1 @@
-"""Capacity-audit proofs: workspace transcript, GEMM-v2 arithmetic proof, combined payload."""
+"""Capacity-audit proofs: workspace lanes, the FP64 lane, the GEMM sumcheck binding and the combined payload."""
