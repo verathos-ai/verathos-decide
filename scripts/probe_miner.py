@@ -26,7 +26,7 @@ from verathos.protocol.api import distributions
 from verathos.protocol.manifest import SignedManifest, accept
 from verathos.protocol.receipts import SignedReceipt
 from verathos.protocol.requests import sign_request
-from verathos.verify.compare import EndpointTally, Tolerance, compare_request
+from verathos.validator.compare import EndpointTally, Tolerance, compare_request
 
 TOPICS = ["billed twice for March", "the export button returns a 500 error", "I want to upgrade to the enterprise plan",
           "my package arrived broken", "please delete my account and all data", "the app crashes when I open settings",

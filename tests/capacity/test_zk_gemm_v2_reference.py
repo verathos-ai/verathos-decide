@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from verathos.zk.crypto.gemm_v2_reference import (
+from verathos.capacity.zk.crypto.gemm_v2_reference import (
     GemmV2FormatError,
     GemmV2Proof,
     GemmV2Statement,

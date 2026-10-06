@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from verathos.capacity.core import derive_sampled_pass_index
-from verathos.capacity.v2 import (
+from verathos.capacity.proof.gemm_v2 import (
     CAPACITY_GEMM_V2_FORMAT,
     CapacityGemmV2Context,
     CapacityGemmV2FormatError,
@@ -18,7 +18,7 @@ from verathos.capacity.v2 import (
     required_transition_state_blocks,
     verify_capacity_gemm_v2,
 )
-from verathos.capacity.workspace_proof import (
+from verathos.capacity.proof.workspace import (
     WORKSPACE_PROOF_FORMAT,
     WorkspaceMerkleTree,
     WorkspaceStateMerkleTree,
@@ -34,8 +34,8 @@ from verathos.capacity.workspace_proof import (
     verify_workspace_proof_payload,
     workspace_transcript_root_v2,
 )
-from verathos.zk.crypto.gemm_v2_batch import GemmV2BatchProof, GemmV2BatchStatement
-from verathos.zk.crypto.pcs_v2 import PCSNativeError
+from verathos.capacity.zk.crypto.gemm_v2_batch import GemmV2BatchProof, GemmV2BatchStatement
+from verathos.capacity.zk.crypto.pcs_v2 import PCSNativeError
 
 
 @pytest.mark.parametrize("matrix_id", [0, 1])

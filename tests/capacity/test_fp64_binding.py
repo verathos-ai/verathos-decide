@@ -6,7 +6,7 @@ from copy import deepcopy
 
 import pytest
 
-from verathos.capacity.combined import _verify_fp64_identity_proof
+from verathos.capacity.proof.combined import _verify_fp64_identity_proof
 from verathos.capacity.bench import bench_fp64_identity as fp64
 
 

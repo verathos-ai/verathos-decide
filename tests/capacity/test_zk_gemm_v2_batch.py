@@ -5,13 +5,13 @@ from dataclasses import replace
 import pytest
 import numpy as np
 
-from verathos.zk.crypto.gemm_v2_batch import (
+from verathos.capacity.zk.crypto.gemm_v2_batch import (
     GemmV2BatchProof,
     GemmV2BatchStatement,
     prove_gemm_v2_batch_reference,
     verify_gemm_v2_batch_sumcheck,
 )
-from verathos.zk.crypto.gemm_v2_reference import (
+from verathos.capacity.zk.crypto.gemm_v2_reference import (
     GemmV2Statement,
     GemmV2SumcheckRound,
     GemmV2VerificationError,
@@ -79,7 +79,7 @@ def test_batch_sumcheck_roundtrip_and_canonical_encoding():
 
 
 def test_native_batch_prover_matches_the_reference_transcript_exactly():
-    from verathos.zk.crypto.pcs_v2 import prove_gemm_batch_sumcheck_i8
+    from verathos.capacity.zk.crypto.pcs_v2 import prove_gemm_batch_sumcheck_i8
 
     statement, xs, ws, ys = _witnesses()
     expected = prove_gemm_v2_batch_reference(statement, xs, ws, ys)
@@ -183,7 +183,7 @@ def test_batch_uses_maximum_padded_dimensions_for_heterogeneous_statements():
     proof = prove_gemm_v2_batch_reference(batch, xs, ws, ys)
     verify_gemm_v2_batch_sumcheck(batch, proof)
 
-    from verathos.zk.crypto.pcs_v2 import prove_gemm_batch_sumcheck_i8
+    from verathos.capacity.zk.crypto.pcs_v2 import prove_gemm_batch_sumcheck_i8
 
     x_values = np.zeros((2, 2, 16), dtype=np.int8)
     w_values = np.zeros((2, 16, 8), dtype=np.int8)

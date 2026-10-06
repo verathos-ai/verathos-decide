@@ -6,7 +6,7 @@ from copy import deepcopy
 from unittest.mock import patch
 
 from verathos.capacity.core import derive_sampled_pass_index
-from verathos.capacity.combined import (
+from verathos.capacity.proof.combined import (
     COMBINED_PROOF_FORMAT_V2,
     COMBINED_WORKLOAD_VERSION,
     _combined_transcript_root,
@@ -15,11 +15,11 @@ from verathos.capacity.combined import (
     combined_proof_protocol_version,
     verify_combined_proof_payload,
 )
-from verathos.capacity.v2 import (
+from verathos.capacity.proof.gemm_v2 import (
     capacity_gemm_v2_context_from_workspace_proof,
     prove_capacity_gemm_v2,
 )
-from verathos.capacity.workspace_proof import (
+from verathos.capacity.proof.workspace import (
     WORKSPACE_PROOF_FORMAT,
     WorkspaceMerkleTree,
     derive_challenge_block_index,
@@ -252,7 +252,7 @@ def _combined_v2_fixture():
 def test_combined_v2_dispatches_through_strict_arithmetic_verifier():
     proof, verifier_args = _combined_v2_fixture()
     with patch(
-        "verathos.capacity.combined.verify_workspace_proof_payload",
+        "verathos.capacity.proof.combined.verify_workspace_proof_payload",
         return_value=(True, "ok"),
     ):
         assert verify_combined_proof_payload(proof=proof, **verifier_args) == (
@@ -287,7 +287,7 @@ def test_combined_v2_malformed_or_tampered_payload_fails_closed():
         "00" if encoded[-2:] != "00" else "01"
     )
     with patch(
-        "verathos.capacity.combined.verify_workspace_proof_payload",
+        "verathos.capacity.proof.combined.verify_workspace_proof_payload",
         return_value=(True, "ok"),
     ):
         ok, reason = verify_combined_proof_payload(
@@ -300,7 +300,7 @@ def test_combined_v2_malformed_or_tampered_payload_fails_closed():
     malformed = deepcopy(proof)
     malformed["capacity_proof"].pop("gemm_v2_state_openings")
     with patch(
-        "verathos.capacity.combined.verify_workspace_proof_payload",
+        "verathos.capacity.proof.combined.verify_workspace_proof_payload",
         return_value=(True, "ok"),
     ):
         ok, reason = verify_combined_proof_payload(
@@ -334,7 +334,7 @@ def test_combined_v2_cannot_choose_smaller_than_scheduled_workload():
         capacity_matrix_dim=8,
     )
     with patch(
-        "verathos.capacity.combined.verify_workspace_proof_payload",
+        "verathos.capacity.proof.combined.verify_workspace_proof_payload",
         return_value=(True, "ok"),
     ):
         assert verify_combined_proof_payload(
@@ -346,7 +346,7 @@ def test_combined_v2_cannot_choose_smaller_than_scheduled_workload():
 def test_combined_v2_passes_exact_scheduled_spot_count_to_workspace_verifier():
     proof, verifier_args = _combined_v2_fixture()
     with patch(
-        "verathos.capacity.combined.verify_workspace_proof_payload",
+        "verathos.capacity.proof.combined.verify_workspace_proof_payload",
         return_value=(True, "ok"),
     ) as workspace_verify:
         assert verify_combined_proof_payload(

@@ -19,7 +19,12 @@ chain = ["bittensor==10.3.2"]
 test = ["pytest>=8", "fastapi>=0.115", "httpx>=0.27"]
 ops = ["keyring>=25", "secretstorage>=3.3"]
 
+[project.scripts]
+verathos-miner = "verathos.miner.__main__:main"
+verathos-validator = "verathos.validator.__main__:main"
+
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["verathos*"]
 
 [tool.setuptools.package-data]

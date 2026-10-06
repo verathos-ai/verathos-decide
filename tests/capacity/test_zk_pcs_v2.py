@@ -6,7 +6,7 @@ import struct
 
 import pytest
 
-from verathos.zk.crypto.pcs_v2 import (
+from verathos.capacity.zk.crypto.pcs_v2 import (
     ENCODING_PALLAS_SCALAR,
     ENCODING_SIGNED_I8,
     ENCODING_SIGNED_I64,

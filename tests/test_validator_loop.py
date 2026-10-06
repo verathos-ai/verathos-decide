@@ -21,7 +21,7 @@ from verathos.validator.audit import audit_epoch
 from verathos.validator.canaries import assignment, canary_pool
 from verathos.validator.discovery import Neuron, discover
 from verathos.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
-from verathos.verify.compare import Tolerance, Verdict
+from verathos.validator.compare import Tolerance, Verdict
 
 
 class HostRouter(httpx.AsyncBaseTransport):
@@ -116,7 +116,7 @@ def test_window_catches_subtle_drift_no_single_epoch_shows() -> None:
     """Each epoch alone has too few probabilities for the statistical bound; three epochs together fail it."""
     from verathos.validator.audit import EndpointResult
     from verathos.validator.discovery import DiscoveredEndpoint
-    from verathos.verify.compare import RequestComparison
+    from verathos.validator.compare import RequestComparison
 
     tol = Tolerance(min_probabilities=100, mean_abs=0.005)
     ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id="gpu0", url="http://x/e/gpu0", model_id="kev-4b",

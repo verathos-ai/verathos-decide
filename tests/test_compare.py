@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from verathos.protocol.api import distributions
-from verathos.verify.compare import EndpointTally, Tolerance, Verdict, compare_request
+from verathos.validator.compare import EndpointTally, Tolerance, Verdict, compare_request
 
 FIXTURES = Path(__file__).parent / "fixtures" / "drift"
 HONEST = ["4090", "5090", "M1Max", "CPUfp32"]

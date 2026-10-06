@@ -8,7 +8,7 @@ verathos/zk/cuda and verathos/capacity/bench (python build.py build_ext --inplac
 """
 import json, secrets, subprocess, sys, time
 from verathos.capacity import core
-from verathos.capacity.combined import CURRENT_COMBINED_PROOF_PROTOCOL_VERSION
+from verathos.capacity.proof.combined import CURRENT_COMBINED_PROOF_PROTOCOL_VERSION
 policy = core.AuditPolicy()
 ok, why, row = core.gpu_support_status(sys.argv[1], int(sys.argv[2]), policy)
 if not ok:
