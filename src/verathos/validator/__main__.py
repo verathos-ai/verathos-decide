@@ -22,13 +22,14 @@ import httpx
 
 from verathos import catalog
 from verathos.miner.engine import HttpEngine
-from verathos.subnet.chain import committed_catalog
+from verathos.subnet.chain import current_catalog
 from verathos.validator import chain
 from verathos.validator.audit import audit_epoch
 from verathos.validator.capacity import Capacity, unauditable_endpoints
 from verathos.validator.config import ValidatorConfig
 from verathos.validator.discovery import discover
 from verathos.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
+from verathos.validator.service import start_service
 
 log = logging.getLogger("verathos.validator")
 BLOCK_S = 12.0
@@ -42,22 +43,48 @@ def load_secret(state_dir: Path) -> bytes:
     return path.read_bytes()
 
 
+class CurrentCatalog:
+    """The catalog the subnet owner commits, re-resolved each epoch."""
+
+    def __init__(self, cfg: ValidatorConfig, st: bt.Subtensor) -> None:
+        self.cfg, self.st = cfg, st
+        self.store = catalog.CatalogStore(cfg.catalog_dir)
+        self.catalog = self._wait()
+
+    def _wait(self) -> catalog.Catalog:
+        while True:
+            try:
+                return current_catalog(self.st, self.cfg.netuid, self.store, self.cfg.catalog_mirrors)
+            except catalog.CatalogUnavailable as exc:
+                log.error("%s; retrying in 60 s", exc)
+                time.sleep(60)
+
+    def refresh(self) -> bool:
+        """Re-resolve; True if the committed catalog changed. Keeps the last catalog when the new one is unavailable."""
+        try:
+            new = current_catalog(self.st, self.cfg.netuid, self.store, self.cfg.catalog_mirrors)
+        except catalog.CatalogUnavailable as exc:
+            log.error("committed catalog unavailable, keeping %s: %s", self.catalog.digest()[:12], exc)
+            return False
+        changed, self.catalog = new.digest() != self.catalog.digest(), new
+        return changed
+
+
 async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, secret: bytes, state: ScoreState,
-                    epoch: int, blocks_left: int, capacity: Capacity) -> None:
-    cat = catalog.load()
-    committed = committed_catalog(st, cfg.netuid)
-    if committed != cat.digest():
-        log.error("epoch %d skipped: the subnet owner commits catalog %s, this release has %s; update verathos",
-                  epoch, committed, cat.digest())
-        return
+                    epoch: int, blocks_left: int, capacity: Capacity, current: CurrentCatalog) -> None:
+    if current.refresh():
+        log.info("catalog %s committed", current.catalog.digest()[:12])
+        capacity.set_policy(current.catalog.audit_policy())
+    cat = current.catalog
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
-    references = {m: HttpEngine(url) for m, url in cfg.references.items() if cat.get(m) is not None}
+    references = {m: HttpEngine(url) for m, url in cfg.references.items()
+                  if cat.get(m) is not None and cat.get(m).status != "retired"}
     tolerances = {m.model_id: m.tolerance for m in cat.models}
     async with httpx.AsyncClient() as client:
         miners = await discover(neurons, cfg.netuid, client, cat.digest())
         capacity.update_slots(miners)
-        endpoints = [e for m in miners for e in m.endpoints() if cat.get(e.endpoint.model_id) is not None
-                     and e.endpoint.tier == "open"]
+        endpoints = [e for m in miners for e in m.endpoints() if e.endpoint.tier == "open"
+                     and cat.get(e.endpoint.model_id) is not None and cat.get(e.endpoint.model_id).status != "retired"]
         log.info("epoch %d: %d miners, %d open endpoints", epoch, len(miners), len(endpoints))
         spread_s = blocks_left * BLOCK_S * cfg.audit_fraction / max(cfg.per_endpoint, 1)
         results = await audit_epoch(endpoints, epoch=epoch, secret=secret, keypair=wallet.hotkey,
@@ -71,7 +98,8 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         log.info("  %s/%s capacity gated: %s", hotkey, endpoint_id, rule)
     unauditable = unauditable_endpoints(miners, capacity.policy) if capacity.policy.mode == "score_gate" else set()
     record_window(state, results, cfg.window_epochs)
-    scores, failed = epoch_scores(results, {m.model_id: m.score_weight for m in cat.models}, state,
+    model_weight = {m.model_id: m.score_weight if m.status == "active" else 0.0 for m in cat.models}
+    scores, failed = epoch_scores(results, model_weight, state,
                                   {f"{hk}/{ep}" for hk, ep in gated}, unauditable)
     update(state, results, scores, failed, alpha=cfg.ema_alpha, probation_epochs=cfg.probation_epochs)
     for key, r in sorted(results.items()):
@@ -104,10 +132,18 @@ def main() -> None:
     state = ScoreState.load(state_path)
     wallet = bt.Wallet(name=cfg.wallet_name, hotkey=cfg.hotkey_name)
     st = bt.Subtensor(network=cfg.network)
-    capacity = Capacity.start(network=cfg.network, netuid=cfg.netuid, policy=catalog.load().audit_policy(), st=st,
-                              wallet=wallet, state_dir=state_dir, public_host=cfg.capacity_public_host,
-                              port=cfg.capacity_port)
-    capacity.start_slot_refresh(cfg.network, catalog.load().digest())
+    current = CurrentCatalog(cfg, st)
+    capacity = Capacity.start(network=cfg.network, netuid=cfg.netuid, policy=current.catalog.audit_policy(), st=st,
+                              wallet=wallet, state_dir=state_dir)
+    is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)
+    if is_owner or capacity.auditor is not None:
+        if not cfg.public_host:
+            raise SystemExit("this validator serves the catalog or the capacity audit: set public_host")
+        if is_owner:
+            current.store.put(current.catalog)
+        start_service(st=st, wallet=wallet, netuid=cfg.netuid, public_host=cfg.public_host, port=cfg.port,
+                      store=current.store if is_owner else None, auditor=capacity.auditor)
+    capacity.start_slot_refresh(cfg.network, lambda: current.catalog.digest())
 
     done: int | None = None
     while True:
@@ -116,7 +152,8 @@ def main() -> None:
         epoch = next_start  # an epoch is identified by the block it ends at
         if epoch != done:
             blocks_left = max(next_start - block, 1)
-            asyncio.run(run_epoch(cfg, st, wallet, secret, state, epoch, 1 if args.once else blocks_left, capacity))
+            asyncio.run(run_epoch(cfg, st, wallet, secret, state, epoch, 1 if args.once else blocks_left, capacity,
+                                  current))
             state.save(state_path)
             done = epoch
             if args.once:

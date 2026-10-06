@@ -32,6 +32,11 @@ class SubtensorChainView:
         self._tempo: tuple[float, int] | None = None
         self._auditor: tuple[float, str] | None = None
 
+    def set_auditor_hotkey(self, auditor_hotkey: str) -> None:
+        """Follow a newly committed auditor (empty: the subnet owner)."""
+        if auditor_hotkey != self._auditor_override:
+            self._auditor_override, self._auditor = auditor_hotkey, None
+
     def _st(self) -> bt.Subtensor:
         if self._subtensor is None:
             self._subtensor = bt.Subtensor(network=self._network)

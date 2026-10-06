@@ -6,6 +6,9 @@ import logging
 
 import bittensor as bt
 
+from verathos import catalog
+from verathos.catalog import Catalog, CatalogStore
+
 log = logging.getLogger(__name__)
 
 
@@ -26,8 +29,24 @@ def serve_axon(subtensor: bt.Subtensor, wallet: bt.Wallet, netuid: int, host: st
 
 def committed_catalog(subtensor: bt.Subtensor, netuid: int) -> str | None:
     """The catalog digest the subnet owner hotkey currently commits, or None."""
-    from verathos import catalog
-
     owner = subtensor.get_subnet_owner_hotkey(netuid)
     uid = subtensor.get_uid_for_hotkey_on_subnet(owner, netuid)
     return catalog.committed_digest(subtensor.get_commitment(netuid, uid)) if uid is not None else None
+
+
+def axon_url(subtensor: bt.Subtensor, netuid: int, hotkey: str) -> str | None:
+    neuron = subtensor.get_neuron_for_pubkey_and_subnet(hotkey, netuid)
+    if neuron is None or neuron.is_null or neuron.axon_info.ip in ("", "0.0.0.0") or not neuron.axon_info.port:
+        return None
+    return f"http://{neuron.axon_info.ip}:{neuron.axon_info.port}"
+
+
+def current_catalog(subtensor: bt.Subtensor, netuid: int, store: CatalogStore, mirrors: list[str]) -> Catalog:
+    """The catalog the subnet owner currently commits: from the shipped copy, the local store, the owner's axon or
+    a mirror (URL templates with ``{digest}``). Raises CatalogUnavailable."""
+    committed = committed_catalog(subtensor, netuid)
+    if committed is None:
+        raise catalog.CatalogUnavailable("the subnet owner has not committed a catalog")
+    owner = axon_url(subtensor, netuid, subtensor.get_subnet_owner_hotkey(netuid))
+    sources = ([owner + catalog.CATALOG_PATH] if owner else []) + list(mirrors)
+    return catalog.resolve(committed, store=store, sources=sources)

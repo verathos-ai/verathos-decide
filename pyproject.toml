@@ -11,6 +11,7 @@ license = "MIT"
 dependencies = [
     "pydantic>=2.9",
     "bittensor-wallet>=4.0",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]

@@ -1,4 +1,4 @@
-"""The auditor's HTTP service on its axon: artifact ingest for miners, signed verdicts for validators."""
+"""The auditor's routes: artifact ingest for miners and signed verdicts for validators."""
 
 from __future__ import annotations
 
@@ -19,7 +19,11 @@ MAX_RECEIPT_BYTES = 64 * 1024
 
 def create_ingest_app(auditor: Auditor, keypair: Keypair) -> FastAPI:
     app = FastAPI(title="verathos capacity audit", docs_url=None, redoc_url=None, openapi_url=None)
+    add_capacity_routes(app, auditor, keypair)
+    return app
 
+
+def add_capacity_routes(app: FastAPI, auditor: Auditor, keypair: Keypair) -> None:
     async def ingest(request: Request, kind: str, limit: int) -> JSONResponse:
         declared = request.headers.get("content-length")
         if declared is not None and declared.isdigit() and int(declared) > limit:
@@ -52,5 +56,3 @@ def create_ingest_app(auditor: Auditor, keypair: Keypair) -> FastAPI:
     @app.post(PROOF_PATH)
     async def proof(request: Request) -> JSONResponse:
         return await ingest(request, "proof", auditor.policy.max_proof_payload_bytes)
-
-    return app

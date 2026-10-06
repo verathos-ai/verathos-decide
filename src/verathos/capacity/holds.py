@@ -30,6 +30,11 @@ class HoldTracker:
         self._last_block = 0
         self._running = False
 
+    def set_policy(self, policy: core.AuditPolicy) -> None:
+        """Adopt a newly committed policy; windows already drafted keep their scheduled workload."""
+        policy.validate(self.block_time_s)
+        self.policy = policy
+
     def update_slots(self, slots: list[core.Slot]) -> None:
         with self._lock:
             self._slots = list(slots)

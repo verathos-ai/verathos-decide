@@ -36,6 +36,9 @@ class MinerConfig(BaseModel):
     gateway_hotkeys: list[str] = Field(default_factory=list,
                                        description="Extra caller hotkeys allowed besides permitted validators")
     endpoints: list[EndpointConfig] = Field(min_length=1)
+    catalog_mirrors: list[str] = Field(default_factory=list, description="Catalog URL templates with {digest}, "
+                                       "tried after the subnet owner's axon")
+    catalog_dir: Path = Path("~/.verathos/catalog")
 
     @model_validator(mode="after")
     def _unique(self) -> MinerConfig:

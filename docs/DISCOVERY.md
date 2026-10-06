@@ -30,8 +30,9 @@ Rules:
 - A manifest is accepted only if it is signed by the hotkey that owns the axon, is for this netuid, and its digest
   equals that hotkey's current commitment. A miner therefore cannot show different endpoint lists to different
   validators, and the commitment block records when each version was published.
-- A catalog is accepted only if its digest equals the subnet owner hotkey's current commitment. The file ships
-  with the code; anyone can mirror it because the digest proves it.
+- A catalog is accepted only if its digest equals the subnet owner hotkey's current commitment. A copy ships with
+  the code; newer ones come from the owner's axon (`GET /v1/catalog/{digest}`) or any mirror, since the digest
+  proves them. A new commitment takes effect without a code release.
 - Endpoint control (each endpoint signs a validator nonce with the listing hotkey) and the capacity audit
   (shared hardware) are separate checks applied after discovery.
 

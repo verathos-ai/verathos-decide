@@ -45,7 +45,7 @@ def setup():
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
                             hardware=config.endpoints[0].hardware, max_concurrency=4)]), miner)
     app = create_app(config=config, keypair=miner, manifest=lambda: manifest, engines={"gpu0": MockEngine("kev-4b")},
-                     authorized=lambda hk: hk == validator.ss58_address, catalog_digest=cat_digest)
+                     authorized=lambda hk: hk == validator.ss58_address)
     return TestClient(app), miner, validator, stranger, manifest
 
 

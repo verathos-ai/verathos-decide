@@ -1,8 +1,8 @@
 """Subnet administration: ``verathos-subnet``. The changing commands are signed with the subnet owner's keys.
 
-    status            mechanisms, emission split, UID cap, and whether the committed catalog matches this release
+    status            mechanisms, emission split, UID cap, the committed catalog and the shipped one
     setup-mechanisms  mechanism count 2 and the emission split (owner coldkey)
-    commit-catalog    commit this release's catalog digest from the owner hotkey
+    commit-catalog    publish a catalog file: store it where the owner's validator serves it, commit its digest
 
 The owner coldkey comes from a bittensor wallet (``--wallet``, password prompt) or, for unattended test networks,
 from a mnemonic in the OS keyring (``--keyring SERVICE:USER``).
@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import bittensor as bt
 from bittensor_wallet import Keypair
@@ -70,8 +71,8 @@ def status(st: bt.Subtensor, netuid: int) -> None:
         "mechanism_emission_split": q("SubtensorModule", "MechanismEmissionSplit", [netuid]).value,
         "owner_hotkey": st.get_subnet_owner_hotkey(netuid),
         "committed_catalog": committed,
-        "release_catalog": local,
-        "catalog_current": committed == local,
+        "shipped_catalog": local,
+        "shipped_catalog_is_committed": committed == local,
     }, indent=2), flush=True)
 
 
@@ -93,10 +94,15 @@ def setup_mechanisms(st: bt.Subtensor, kp: Keypair, netuid: int, split: str) -> 
                {"netuid": netuid, "maybe_split": [first, SPLIT_SCALE - first]})
 
 
-def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int) -> None:
+def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path | None, store_dir: Path) -> None:
+    """Validate the catalog, put it in the owner validator's catalog store, then commit its digest."""
     if wallet.hotkey.ss58_address != st.get_subnet_owner_hotkey(netuid):
         raise SystemExit(f"{wallet.hotkey.ss58_address} is not the subnet owner hotkey")
-    value = catalog.commitment_value(catalog.load().digest())
+    cat = catalog.load(path)
+    stored = catalog.CatalogStore(store_dir).put(cat)
+    print(f"catalog {cat.digest()} stored at {stored}; active models: "
+          f"{[m.model_id for m in cat.models if m.status == 'active']}", flush=True)
+    value = catalog.commitment_value(cat.digest())
     result = st.set_commitment(wallet, netuid, value)
     if not getattr(result, "success", False):
         raise SystemExit(f"set_commitment failed: {getattr(result, 'message', result)}")
@@ -116,6 +122,9 @@ def main() -> None:
     commit = sub.add_parser("commit-catalog")
     commit.add_argument("--wallet", required=True, help="wallet name of the owner hotkey")
     commit.add_argument("--hotkey", required=True)
+    commit.add_argument("--file", type=Path, help="catalog JSON to publish (default: the shipped catalog)")
+    commit.add_argument("--catalog-dir", type=Path, default=catalog.DEFAULT_CACHE_DIR,
+                        help="the owner validator's catalog_dir, where it serves catalogs from")
     args = parser.parse_args()
 
     st = bt.Subtensor(network=args.network)
@@ -125,7 +134,7 @@ def main() -> None:
         setup_mechanisms(st, owner_coldkey(args, st), args.netuid, args.split)
         status(st, args.netuid)
     else:
-        commit_catalog(st, bt.Wallet(name=args.wallet, hotkey=args.hotkey), args.netuid)
+        commit_catalog(st, bt.Wallet(name=args.wallet, hotkey=args.hotkey), args.netuid, args.file, args.catalog_dir)
     st.close()
 
 

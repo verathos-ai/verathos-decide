@@ -1,7 +1,8 @@
 # Mining
 
-A miner serves decision models from the catalog (`src/verathos/catalog/catalog.json`) on NVIDIA GPUs, one model
-per GPU. Each GPU runs a decision engine; the miner service in front of them publishes a signed manifest, answers
+A miner serves decision models from the catalog (the model list the subnet owner commits on chain; see
+`DISCOVERY.md`) on NVIDIA GPUs, one model per GPU. Only `active` catalog models earn score; `candidate` models can be
+served and are checked by validators but score zero. Each GPU runs a decision engine; the miner service in front of them publishes a signed manifest, answers
 signed requests, and runs the capacity audit when one of its endpoints is drafted.
 
 Validators score an endpoint by comparing its answers with a reference computation (see `SCORING.md`). The
@@ -47,10 +48,11 @@ kernels, the block prover and the Rust GEMM prover. Run it again after every upd
 
 ## 3. Start one engine per GPU
 
-Kev models run on the Kev engine, which serves `POST /v1/systemone`:
+Each catalog model names its engine and the exact engine revision (`engine.source` at `engine.revision`). Kev
+models run on the Kev engine, which serves `POST /v1/systemone`:
 
 ```bash
-git clone https://github.com/jaredpalmer/kev && cd kev
+git clone https://github.com/jaredpalmer/kev && cd kev && git checkout <engine.revision>
 uv sync --extra serve -p 3.12 && VIRTUAL_ENV=$PWD/.venv uv pip install flash-linear-attention
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m kev.serve --run jaredpalmer/kev-4b --port 8008
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m kev.serve --run jaredpalmer/kev-9b --port 8009
@@ -97,6 +99,8 @@ fails verification. Keep each engine on its own GPU and bind it to localhost.
 | `hardware.vram_gb` | `memory.total` in GiB, rounded (`nvidia-smi --query-gpu=memory.total --format=csv,noheader`) |
 | `max_concurrency` | requests the endpoint accepts at once (default 64) |
 | `gateway_hotkeys` | callers allowed in addition to validators with a permit |
+| `catalog_mirrors` | extra catalog sources, URL templates with `{digest}`, tried after the owner's axon |
+| `catalog_dir` | local catalog store (default `~/.verathos/catalog`) |
 
 ## 5. Run
 
@@ -105,12 +109,15 @@ fails verification. Keep each engine on its own GPU and bind it to localhost.
 ```
 
 On start the miner:
-1. checks that its catalog matches the one the subnet owner commits on chain, and exits otherwise (update and
-   restart);
+1. finds the catalog the subnet owner commits on chain (the shipped copy, its local store, the owner's axon or a
+   configured mirror; any copy is checked against the committed digest) and exits if an endpoint's model is not in
+   it;
 2. signs a manifest listing its endpoints, points its axon at `public_host:port` (`serve_axon`) and commits the
    manifest digest (`set_commitment`); both are free and only sent when they change;
 3. serves the manifest (`GET /v1/manifest`) and the endpoints (`/e/<endpoint_id>/v1/...`) on one port;
-4. follows the chain and runs the capacity audit for its CUDA endpoints.
+4. follows the chain and runs the capacity audit for its CUDA endpoints;
+5. checks the owner's commitment every 10 minutes; when the owner commits a new catalog it re-signs and
+   re-publishes the manifest by itself.
 
 Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted only
 from hotkeys holding a validator permit and from `gateway_hotkeys`, each signed and bound to this miner.
@@ -132,8 +139,8 @@ git pull && VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,capacity]"
 CUDA_HOME=/usr/local/cuda .venv/bin/verathos-build-native
 ```
 
-Then restart the miner. A release that changes the catalog becomes active when the owner commits the new catalog;
-from then on validators accept only manifests built with it.
+Then restart the miner. Catalog changes (new models, tolerances, audit policy) need no update: the miner picks up a
+new commitment by itself. Releases carry code changes, such as support for a new engine family.
 
 ## Checking a miner
 

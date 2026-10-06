@@ -1,9 +1,9 @@
 """The validator's side of the capacity audit.
 
 Every validator drafts the audit's slots from the manifests it discovers. The validator whose hotkey is the
-policy's auditor (by default the subnet owner) runs the audit: it serves the ingest and verdicts on its axon, times
-receipts, verifies proofs and gates endpoints. Every other validator tracks audit holds from public chain data and
-applies the auditor's signed verdicts.
+policy's auditor (by default the subnet owner) runs the audit: it times receipts, verifies proofs and gates
+endpoints, and serves the ingest and verdicts (``validator.service``). Every other validator tracks audit holds
+from public chain data and applies the auditor's signed verdicts.
 """
 
 from __future__ import annotations
@@ -12,19 +12,17 @@ import asyncio
 import logging
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import bittensor as bt
 import httpx
-import uvicorn
 
 from verathos.capacity.auditor import Auditor
 from verathos.capacity.chain import SubtensorChainView
 from verathos.capacity.core import AuditPolicy, Slot, gpu_support_status
 from verathos.capacity.holds import HoldTracker
-from verathos.capacity.ingest import create_ingest_app
 from verathos.capacity.verdicts import fetch_verdicts
-from verathos.subnet.chain import serve_axon
 from verathos.validator import chain as validator_chain
 from verathos.validator.discovery import DiscoveredMiner, discover
 
@@ -53,7 +51,8 @@ class Capacity:
 
     @classmethod
     def start(cls, *, network: str, netuid: int, policy: AuditPolicy, st: bt.Subtensor, wallet: bt.Wallet,
-              state_dir: Path, public_host: str | None, port: int) -> Capacity:
+              state_dir: Path) -> Capacity:
+        """The auditor role if this validator's hotkey is the auditor, else the hold tracker."""
         auditor_hotkey = policy.auditor_hotkey or st.get_subnet_owner_hotkey(netuid)
         chain = SubtensorChainView(network, netuid, auditor_hotkey)
         if wallet.hotkey.ss58_address != auditor_hotkey:
@@ -61,18 +60,19 @@ class Capacity:
             holds.start()
             log.info("capacity audits are evaluated by %s; applying its verdicts", auditor_hotkey)
             return cls(netuid=netuid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain, holds=holds)
-        if not public_host:
-            raise SystemExit("this validator is the capacity auditor: set capacity_public_host")
         auditor = Auditor(netuid=netuid, policy=policy, chain=chain, db_path=state_dir / "capacity.sqlite")
         auditor.start()
-        server = uvicorn.Server(uvicorn.Config(create_ingest_app(auditor, wallet.hotkey), host="0.0.0.0", port=port,
-                                               log_level="warning"))
-        threading.Thread(target=server.run, name="capacity-ingest", daemon=True).start()
-        serve_axon(st, wallet, netuid, public_host, port)
-        log.info("capacity auditor running (%s mode) on port %d", policy.mode, port)
+        log.info("capacity auditor running (%s mode)", policy.mode)
         return cls(netuid=netuid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain, auditor=auditor)
 
-    def start_slot_refresh(self, network: str, catalog_digest: str, interval_s: float = 600.0) -> None:
+    def set_policy(self, policy: AuditPolicy) -> None:
+        """Adopt the policy of a newly committed catalog. A change of auditor takes effect at the next restart."""
+        if (policy.auditor_hotkey or self.auditor_hotkey) != self.auditor_hotkey and policy.auditor_hotkey:
+            log.warning("the catalog names a new capacity auditor %s; restart to adopt it", policy.auditor_hotkey)
+        self.policy = policy
+        (self.auditor or self.holds).set_policy(policy)
+
+    def start_slot_refresh(self, network: str, catalog_digest: Callable[[], str], interval_s: float = 600.0) -> None:
         """Re-discover miners every ``interval_s`` so new or changed endpoints join the audit within minutes rather
         than at the next epoch."""
 
@@ -82,7 +82,7 @@ class Capacity:
                 time.sleep(interval_s)
                 try:
                     neurons, _ = validator_chain.snapshot(st, self.netuid)
-                    self.update_slots(asyncio.run(self._discover(neurons, catalog_digest)))
+                    self.update_slots(asyncio.run(self._discover(neurons, catalog_digest())))
                 except Exception:
                     log.exception("capacity slot refresh failed")
 

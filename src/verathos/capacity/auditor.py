@@ -94,6 +94,11 @@ class Auditor:
         self._running = False
 
     # ---- inputs ----
+    def set_policy(self, policy: core.AuditPolicy) -> None:
+        """Adopt a newly committed policy; windows already drafted keep their scheduled workload."""
+        policy.validate(self.block_time_s)
+        self.policy = policy
+
 
     def update_slots(self, slots: list[core.Slot]) -> None:
         """The slot universe: every endpoint listed in an accepted miner manifest."""

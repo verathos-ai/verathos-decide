@@ -49,7 +49,7 @@ def miner(host: str, keypair: Keypair, validator: Keypair, engine: MockEngine):
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
                             hardware=config.endpoints[0].hardware, max_concurrency=8)]), keypair)
     app = create_app(config=config, keypair=keypair, manifest=lambda: signed, engines={"gpu0": engine},
-                     authorized=lambda hk: hk == validator.ss58_address, catalog_digest=digest)
+                     authorized=lambda hk: hk == validator.ss58_address)
     return app, commitment_value(signed.manifest.digest())
 
 

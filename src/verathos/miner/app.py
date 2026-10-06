@@ -48,7 +48,6 @@ def create_app(
     manifest: Callable[[], SignedManifest],
     engines: dict[str, Engine],
     authorized: Callable[[str], bool],
-    catalog_digest: str,
     drained: Callable[[str], bool] = lambda endpoint_id: False,
 ) -> FastAPI:
     app = FastAPI(title="Verathos miner")
@@ -125,7 +124,7 @@ def create_app(
             return error(502, "engine returned no answers")
         receipt = Receipt(
             netuid=config.netuid, mechid=config.mechid, miner_hotkey=hotkey, endpoint_id=endpoint_id,
-            model_id=endpoint.model_id, catalog_digest=catalog_digest, caller_hotkey=caller.hotkey,
+            model_id=endpoint.model_id, catalog_digest=manifest().manifest.catalog_digest, caller_hotkey=caller.hotkey,
             request_nonce=caller.nonce, request_sha256=digest(raw), answers_sha256=digest(answers),
             received_ms=received_ms, responded_ms=int(time.time() * 1000),
             input_tokens=int((response.get("usage") or {}).get("input_tokens", 0)),

@@ -1,11 +1,15 @@
 {
   "version": 1,
-  "revision": "draft-2026-10-06",
+  "revision": "2026-10-06",
   "models": [
     {
       "model_id": "kev-4b",
-      "status": "candidate",
-      "engine": "kev",
+      "status": "active",
+      "engine": {
+        "name": "kev",
+        "source": "https://github.com/jaredpalmer/kev",
+        "revision": "5e42a7a03f28134853dd3ff77461457e921e5ec1"
+      },
       "hf_repo": "jaredpalmer/kev-4b",
       "hf_revision": "6cfce5c2fa4b4bd64026336ab649c5ca78857d52",
       "base_repo": "Qwen/Qwen3.5-4B-Base",
@@ -15,8 +19,12 @@
     },
     {
       "model_id": "kev-9b",
-      "status": "candidate",
-      "engine": "kev",
+      "status": "active",
+      "engine": {
+        "name": "kev",
+        "source": "https://github.com/jaredpalmer/kev",
+        "revision": "5e42a7a03f28134853dd3ff77461457e921e5ec1"
+      },
       "hf_repo": "jaredpalmer/kev-9b",
       "hf_revision": "db029f08b290afd9fee4aa4bbcd9ae48602d1eb0",
       "base_repo": "Qwen/Qwen3.5-9B-Base",

@@ -74,7 +74,9 @@ Run them on CPU without `flash-linear-attention` installed. Each engine must ser
 | `probation_epochs` | 6 | epochs an endpoint scores zero after a verification failure |
 | `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database |
 | `dry_run` | false | compute weights without setting them |
-| `capacity_public_host`, `capacity_port` | -, 8091 | the auditor's public IP and ingest port |
+| `public_host`, `port` | -, 8091 | public IP and port of the validator's service; needed by the subnet owner and the auditor |
+| `catalog_mirrors` | [] | extra catalog sources, URL templates with `{digest}`, tried after the owner's axon |
+| `catalog_dir` | `~/.verathos/catalog` | local catalog store; the owner's validator serves catalogs from it |
 
 ## 4. Run
 
@@ -83,14 +85,15 @@ Run them on CPU without `flash-linear-attention` installed. Each engine must ser
 ```
 
 Per epoch (one subnet tempo) the validator:
-1. checks that its catalog matches the owner's commitment; while it does not, the epoch is skipped (update and
-   restart);
+1. resolves the catalog the subnet owner commits (shipped copy, local store, owner's axon, mirrors; any copy is
+   checked against the committed digest) and adopts a newly committed one, including its audit policy;
 2. reads axons and commitments and accepts each miner's manifest if it is signed by the hotkey, matches the
    committed digest and was built for the current catalog;
 3. challenges each endpoint to sign a nonce with the listing hotkey;
 4. derives the epoch's canaries from its secret, computes the references, sends each endpoint its subset spread over
    the first `audit_fraction` of the epoch, and checks every signed receipt;
-5. scores, updates the EMA and probation, and sets weights on `mechid`.
+5. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
+   probation, and sets weights on `mechid`.
 
 `--once` runs one epoch immediately and exits. Keep `state_dir` across restarts: it holds the canary secret and the
 score history.
@@ -103,8 +106,8 @@ the epoch from the auditor's axon (`GET /capacity/v1/verdicts`), checks they are
 scores the gated endpoints zero with probation. Without a valid feed it gates nothing that epoch.
 
 If the validator's hotkey is the auditor, it also:
-- serves the ingest (`/capacity/v1/receipt`, `/capacity/v1/proof`) and the verdicts on `capacity_port` and
-  points its axon at `capacity_public_host:capacity_port`, where miners and validators find it;
+- serves the ingest (`/capacity/v1/receipt`, `/capacity/v1/proof`) and the verdicts on `port` and points its
+  axon at `public_host:port`, where miners and validators find it;
 - follows every block, drafts audit windows, times receipts and verifies proofs;
 - in `score_gate` mode, scores gated endpoints zero with probation, and open endpoints without a calibrated GPU
   class zero.
