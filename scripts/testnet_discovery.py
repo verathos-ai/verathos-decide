@@ -22,8 +22,8 @@ from pathlib import Path
 
 import bittensor as bt
 
-from decide import catalog as catalog_mod
-from decide.protocol.manifest import (
+from verathos import catalog as catalog_mod
+from verathos.protocol.manifest import (
     Endpoint,
     Hardware,
     Manifest,

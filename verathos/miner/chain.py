@@ -9,8 +9,8 @@ import time
 
 import bittensor as bt
 
-from decide.miner.config import MinerConfig
-from decide.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
+from verathos.miner.config import MinerConfig
+from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
 
 log = logging.getLogger(__name__)
 

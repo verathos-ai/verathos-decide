@@ -12,16 +12,16 @@ import httpx
 import pytest
 from bittensor_wallet import Keypair
 
-from decide import catalog
-from decide.miner.app import create_app
-from decide.miner.config import MinerConfig
-from decide.miner.engine import MockEngine
-from decide.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
-from decide.validator.audit import audit_epoch
-from decide.validator.canaries import assignment, canary_pool
-from decide.validator.discovery import Neuron, discover
-from decide.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
-from decide.verify.compare import Tolerance, Verdict
+from verathos import catalog
+from verathos.miner.app import create_app
+from verathos.miner.config import MinerConfig
+from verathos.miner.engine import MockEngine
+from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
+from verathos.validator.audit import audit_epoch
+from verathos.validator.canaries import assignment, canary_pool
+from verathos.validator.discovery import Neuron, discover
+from verathos.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
+from verathos.verify.compare import Tolerance, Verdict
 
 
 class HostRouter(httpx.AsyncBaseTransport):
@@ -114,9 +114,9 @@ def test_weights_ignore_reassigned_uids() -> None:
 
 def test_window_catches_subtle_drift_no_single_epoch_shows() -> None:
     """Each epoch alone has too few probabilities for the statistical bound; three epochs together fail it."""
-    from decide.validator.audit import EndpointResult
-    from decide.validator.discovery import DiscoveredEndpoint
-    from decide.verify.compare import RequestComparison
+    from verathos.validator.audit import EndpointResult
+    from verathos.validator.discovery import DiscoveredEndpoint
+    from verathos.verify.compare import RequestComparison
 
     tol = Tolerance(min_probabilities=100, mean_abs=0.005)
     ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id="gpu0", url="http://x/e/gpu0", model_id="kev-4b",

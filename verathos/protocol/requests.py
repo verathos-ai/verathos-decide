@@ -2,7 +2,7 @@
 
 The caller signs, with its sr25519 hotkey:
 
-    verathos-decide/request/v1 \\n METHOD \\n PATH \\n sha256(body) \\n timestamp_ms \\n nonce \\n receiver_hotkey
+    verathos/request/v1 \\n METHOD \\n PATH \\n sha256(body) \\n timestamp_ms \\n nonce \\n receiver_hotkey
 
 Binding the receiver's hotkey means a request signed for one miner cannot be replayed against another; the nonce
 plus the timestamp window means it cannot be replayed against the same miner.
@@ -18,12 +18,12 @@ from dataclasses import dataclass
 
 from bittensor_wallet import Keypair
 
-DOMAIN = "verathos-decide/request/v1"
-HDR_HOTKEY = "X-Decide-Hotkey"
-HDR_SIGNATURE = "X-Decide-Signature"
-HDR_TIMESTAMP = "X-Decide-Timestamp"
-HDR_NONCE = "X-Decide-Nonce"
-HDR_RECEIVER = "X-Decide-Receiver"
+DOMAIN = "verathos/request/v1"
+HDR_HOTKEY = "X-Verathos-Hotkey"
+HDR_SIGNATURE = "X-Verathos-Signature"
+HDR_TIMESTAMP = "X-Verathos-Timestamp"
+HDR_NONCE = "X-Verathos-Nonce"
+HDR_RECEIVER = "X-Verathos-Receiver"
 MAX_SKEW_MS = 60_000
 
 

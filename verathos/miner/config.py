@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from decide.protocol.manifest import Hardware
+from verathos.protocol.manifest import Hardware
 
 
 class EndpointConfig(BaseModel):

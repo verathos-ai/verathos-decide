@@ -8,15 +8,15 @@ import pytest
 from bittensor_wallet import Keypair
 from fastapi.testclient import TestClient
 
-from decide import catalog
-from decide.miner.app import IDENTITY_DOMAIN, create_app, identity_payload
-from decide.miner.config import MinerConfig
-from decide.miner.engine import MockEngine
-from decide.protocol import signing
-from decide.protocol.api import distributions
-from decide.protocol.manifest import Endpoint, Manifest, SignedManifest, accept, commitment_value
-from decide.protocol.receipts import SignedReceipt
-from decide.protocol.requests import sign_request
+from verathos import catalog
+from verathos.miner.app import IDENTITY_DOMAIN, create_app, identity_payload
+from verathos.miner.config import MinerConfig
+from verathos.miner.engine import MockEngine
+from verathos.protocol import signing
+from verathos.protocol.api import distributions
+from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, accept, commitment_value
+from verathos.protocol.receipts import SignedReceipt
+from verathos.protocol.requests import sign_request
 
 REQUEST = {
     "model": "kev-4b",

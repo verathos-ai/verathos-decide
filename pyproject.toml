@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "verathos-decide"
+name = "verathos"
 version = "0.0.1"
 description = "Decision-model network on Bittensor: typed answers with calibrated probabilities, verified by reference recomputation"
 requires-python = ">=3.12"
@@ -20,10 +20,10 @@ test = ["pytest>=8", "fastapi>=0.115", "httpx>=0.27"]
 ops = ["keyring>=25", "secretstorage>=3.3"]
 
 [tool.setuptools.packages.find]
-include = ["decide*"]
+include = ["verathos*"]
 
 [tool.setuptools.package-data]
-"decide.catalog" = ["catalog.json"]
+"verathos.catalog" = ["catalog.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

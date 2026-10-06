@@ -1,22 +1,23 @@
-# verathos-decide
+# Verathos
 
 Decision-model network on Bittensor: miners serve open decision models (typed questions in, calibrated
-probabilities out, SystemOne-compatible API); validators verify answers by reference recomputation.
+probabilities out, SystemOne-compatible API); validators verify answers against reference computations.
 
-Status: early. Implemented so far:
+Status: early development on testnet.
 
-| Module | Purpose |
+| Package | Purpose |
 |---|---|
-| `decide/protocol/api.py` | SystemOne request/response types; answers reduced to probability distributions |
-| `decide/protocol/manifest.py` | Signed miner manifests and their on-chain commitment |
-| `decide/protocol/signing.py`, `canonical.py` | sr25519 hotkey signatures over canonical JSON |
-| `decide/verify/compare.py` | Answer comparison: per-request hard bound, per-endpoint statistical bound |
-| `decide/catalog/` | Model catalog and its owner commitment |
-| `scripts/testnet_discovery.py` | Chain-native discovery exercised on a live network |
+| `verathos/protocol/` | Wire types: SystemOne API, signed manifests, receipts, request signing, canonical encoding |
+| `verathos/verify/` | Answer comparison: per-request hard bound, statistical bound |
+| `verathos/catalog/` | Model catalog and its owner commitment |
+| `verathos/miner/` | Miner service: manifest and endpoints behind one public port, chain publishing |
+| `verathos/validator/` | Discovery, canary audits, scoring, weights |
 
-Docs: `docs/DISCOVERY.md` (discovery design and testnet results).
+Docs: `docs/DISCOVERY.md` (chain-native discovery), `docs/TESTNET_RUNS.md` (testnet results).
 
 ```bash
-uv venv -p 3.12 .venv && VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[test]"
+uv venv -p 3.12 .venv && VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,test]"
 .venv/bin/python -m pytest
+python -m verathos.miner --config miner.json
+python -m verathos.validator --config validator.json
 ```

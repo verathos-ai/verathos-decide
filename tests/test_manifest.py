@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from bittensor_wallet import Keypair
 
-from decide.protocol.manifest import (
+from verathos.protocol.manifest import (
     Endpoint,
     Hardware,
     Manifest,

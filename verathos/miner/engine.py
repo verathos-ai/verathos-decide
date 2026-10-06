@@ -12,7 +12,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from decide.protocol.api import Choice, Noul, Score, SystemOneRequest, question_keys
+from verathos.protocol.api import Choice, Noul, Score, SystemOneRequest, question_keys
 
 
 class EngineError(Exception):

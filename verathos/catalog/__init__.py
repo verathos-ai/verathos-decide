@@ -14,10 +14,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from decide.protocol.canonical import digest
-from decide.verify.compare import Tolerance
+from verathos.protocol.canonical import digest
+from verathos.verify.compare import Tolerance
 
-COMMITMENT_PREFIX = "decide/v1 catalog sha256:"
+COMMITMENT_PREFIX = "verathos/catalog/v1 sha256:"
 
 
 class CatalogModel(BaseModel):

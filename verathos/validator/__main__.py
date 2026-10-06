@@ -1,4 +1,4 @@
-"""Run a validator: ``python -m decide.validator --config validator.json``.
+"""Run a validator: ``python -m verathos.validator --config validator.json``.
 
 Per epoch: snapshot chain, discover miners, audit every endpoint with the epoch's canaries spread over the first part
 of the epoch, score, and set weights on the configured mechanism (dry run until that mechanism exists).
@@ -17,15 +17,15 @@ from pathlib import Path
 import bittensor as bt
 import httpx
 
-from decide import catalog
-from decide.miner.engine import HttpEngine
-from decide.validator import chain
-from decide.validator.audit import audit_epoch
-from decide.validator.config import ValidatorConfig
-from decide.validator.discovery import discover
-from decide.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
+from verathos import catalog
+from verathos.miner.engine import HttpEngine
+from verathos.validator import chain
+from verathos.validator.audit import audit_epoch
+from verathos.validator.config import ValidatorConfig
+from verathos.validator.discovery import discover
+from verathos.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
 
-log = logging.getLogger("decide.validator")
+log = logging.getLogger("verathos.validator")
 BLOCK_S = 12.0
 
 

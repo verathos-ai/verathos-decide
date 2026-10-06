@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from decide import catalog
+from verathos import catalog
 
 
 def test_shipped_catalog_loads_and_digest_is_stable() -> None:
@@ -17,5 +17,5 @@ def test_digest_changes_with_content() -> None:
 
 
 def test_rejects_non_catalog_commitment() -> None:
-    assert catalog.committed_digest("decide/v1 manifest sha256:" + "a" * 64) is None
+    assert catalog.committed_digest("verathos/manifest/v1 sha256:" + "a" * 64) is None
     assert catalog.committed_digest(None) is None

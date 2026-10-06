@@ -6,7 +6,7 @@ Owner setup with `scripts/testnet_owner_ops.py` (owner coldkey from the OS keyri
 (chain rule: max UIDs x mechanisms <= 256), mechanism count 1 -> 2, emission split 90/10 ([58982, 6553]).
 
 Miner (one RTX 5090, hotkey `test_miner96/rehearsal-aug18`, UID 12): `gpu0` Kev-4B, `gpu1` Kev-0.8B advertised as
-`kev-4b`. Validator `python -m decide.validator --once` as UID 0 (`test_sn96`, validator permit) with a CPU fp32
+`kev-4b`. Validator `python -m verathos.validator --once` as UID 0 (`test_sn96`, validator permit) with a CPU fp32
 Kev-4B reference engine on another machine; 10 canaries per model, 6 per endpoint.
 
 | Endpoint | Answered | Identity | Mean abs diff | Verdict | Score |
@@ -25,7 +25,7 @@ accumulate over a rolling window of epochs.
 
 Setup:
 - One rented host with two RTX 5090s, Kev engines from `jaredpalmer/kev` (bf16, fused DeltaNet, CUDA graphs).
-- Miner `python -m decide.miner` with hotkey `test_miner96/rehearsal-aug18` (UID 12): one public port, two
+- Miner `python -m verathos.miner` with hotkey `test_miner96/rehearsal-aug18` (UID 12): one public port, two
   endpoints, both advertised as `kev-4b`.
   - `gpu0` runs Kev-4B (honest).
   - `gpu1` runs Kev-9B behind the `kev-4b` label (cheater).

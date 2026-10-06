@@ -11,10 +11,10 @@ from typing import Any, Literal
 from bittensor_wallet import Keypair
 from pydantic import BaseModel, Field
 
-from decide.protocol import signing
-from decide.protocol.canonical import digest
+from verathos.protocol import signing
+from verathos.protocol.canonical import digest
 
-RECEIPT_DOMAIN = "verathos-decide/receipt/v1"
+RECEIPT_DOMAIN = "verathos/receipt/v1"
 
 
 class Receipt(BaseModel):

@@ -18,8 +18,8 @@ import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from decide.validator.audit import EndpointResult
-from decide.verify.compare import Verdict
+from verathos.validator.audit import EndpointResult
+from verathos.verify.compare import Verdict
 
 LATENCY_CAP = (0.7, 1.3)
 

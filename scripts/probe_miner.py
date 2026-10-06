@@ -20,13 +20,13 @@ from pathlib import Path
 
 import bittensor as bt
 
-from decide.miner.app import IDENTITY_DOMAIN, identity_payload
-from decide.protocol import signing
-from decide.protocol.api import distributions
-from decide.protocol.manifest import SignedManifest, accept
-from decide.protocol.receipts import SignedReceipt
-from decide.protocol.requests import sign_request
-from decide.verify.compare import EndpointTally, Tolerance, compare_request
+from verathos.miner.app import IDENTITY_DOMAIN, identity_payload
+from verathos.protocol import signing
+from verathos.protocol.api import distributions
+from verathos.protocol.manifest import SignedManifest, accept
+from verathos.protocol.receipts import SignedReceipt
+from verathos.protocol.requests import sign_request
+from verathos.verify.compare import EndpointTally, Tolerance, compare_request
 
 TOPICS = ["billed twice for March", "the export button returns a 500 error", "I want to upgrade to the enterprise plan",
           "my package arrived broken", "please delete my account and all data", "the app crashes when I open settings",

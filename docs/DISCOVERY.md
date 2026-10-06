@@ -6,11 +6,11 @@ Miners and the model catalog are discovered from native chain state only. No EVM
                          SUBSTRATE (SN96)
   ┌──────────────────────────────────────────────────────────────────┐
   │  owner hotkey (UID 0)                                            │
-  │    commitment: "decide/v1 catalog sha256:<catalog digest>"       │
+  │    commitment: "verathos/catalog/v1 sha256:<catalog digest>"       │
   │                                                                  │
   │  miner hotkey (any UID)                                          │
   │    axon:       ip:port of the miner's manifest server            │
-  │    commitment: "decide/v1 manifest sha256:<manifest digest>"     │
+  │    commitment: "verathos/manifest/v1 sha256:<manifest digest>"     │
   └──────────────────────────────────────────────────────────────────┘
           ▲ serve_axon / set_commitment              │ read axons + commitments
           │ (free, hotkey-signed)                    ▼

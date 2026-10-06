@@ -13,10 +13,10 @@ from dataclasses import dataclass
 import httpx
 from bittensor_wallet import Keypair
 
-from decide.miner.app import IDENTITY_DOMAIN, identity_payload
-from decide.protocol import signing
-from decide.protocol.manifest import Endpoint, Manifest, ManifestRejected, SignedManifest, accept, committed_digest
-from decide.protocol.requests import sign_request
+from verathos.miner.app import IDENTITY_DOMAIN, identity_payload
+from verathos.protocol import signing
+from verathos.protocol.manifest import Endpoint, Manifest, ManifestRejected, SignedManifest, accept, committed_digest
+from verathos.protocol.requests import sign_request
 
 log = logging.getLogger(__name__)
 

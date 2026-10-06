@@ -19,17 +19,17 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from decide.miner.config import MinerConfig
-from decide.miner.engine import Engine, EngineError
-from decide.protocol import signing
-from decide.protocol.api import SystemOneRequest
-from decide.protocol.canonical import digest
-from decide.protocol.manifest import SignedManifest
-from decide.protocol.receipts import Receipt, SignedReceipt
-from decide.protocol.requests import NonceCache, RequestRejected, verify_request
+from verathos.miner.config import MinerConfig
+from verathos.miner.engine import Engine, EngineError
+from verathos.protocol import signing
+from verathos.protocol.api import SystemOneRequest
+from verathos.protocol.canonical import digest
+from verathos.protocol.manifest import SignedManifest
+from verathos.protocol.receipts import Receipt, SignedReceipt
+from verathos.protocol.requests import NonceCache, RequestRejected, verify_request
 
 log = logging.getLogger(__name__)
-IDENTITY_DOMAIN = "verathos-decide/identity/v1"
+IDENTITY_DOMAIN = "verathos/identity/v1"
 
 
 class IdentityChallenge(BaseModel):
@@ -49,7 +49,7 @@ def create_app(
     authorized: Callable[[str], bool],
     catalog_digest: str,
 ) -> FastAPI:
-    app = FastAPI(title="verathos-decide miner")
+    app = FastAPI(title="Verathos miner")
     nonces = NonceCache()
     endpoints = {e.endpoint_id: e for e in config.endpoints}
     slots = {e.endpoint_id: asyncio.Semaphore(e.max_concurrency) for e in config.endpoints}

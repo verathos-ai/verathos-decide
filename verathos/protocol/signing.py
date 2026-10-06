@@ -10,7 +10,7 @@ from typing import Any
 
 from bittensor_wallet import Keypair
 
-from decide.protocol.canonical import canonical_json
+from verathos.protocol.canonical import canonical_json
 
 
 def signing_payload(domain: str, value: Any) -> bytes:

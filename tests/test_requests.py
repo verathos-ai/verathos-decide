@@ -5,7 +5,7 @@ import time
 import pytest
 from bittensor_wallet import Keypair
 
-from decide.protocol.requests import NonceCache, RequestRejected, sign_request, verify_request
+from verathos.protocol.requests import NonceCache, RequestRejected, sign_request, verify_request
 
 
 def kp() -> Keypair:

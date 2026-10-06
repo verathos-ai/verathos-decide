@@ -22,7 +22,7 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
-from decide.protocol.api import Distribution
+from verathos.protocol.api import Distribution
 
 
 class Tolerance(BaseModel):

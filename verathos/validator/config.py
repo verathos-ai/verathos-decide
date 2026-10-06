@@ -21,7 +21,7 @@ class ValidatorConfig(BaseModel):
     audit_fraction: float = Field(0.6, gt=0, le=0.9, description="Share of the epoch over which canaries are spread")
     ema_alpha: float = Field(0.2, gt=0, le=1)
     probation_epochs: int = Field(6, ge=1)
-    state_dir: Path = Path("~/.verathos-decide/validator")
+    state_dir: Path = Path("~/.verathos/validator")
     dry_run: bool = False
 
     @classmethod

@@ -1,4 +1,4 @@
-"""Run a miner: ``python -m decide.miner --config miner.json``."""
+"""Run a miner: ``python -m verathos.miner --config miner.json``."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ from pathlib import Path
 import bittensor as bt
 import uvicorn
 
-from decide import catalog
-from decide.miner.app import create_app
-from decide.miner.chain import PermitAuthorizer, build_manifest, publish
-from decide.miner.config import MinerConfig
-from decide.miner.engine import HttpEngine
+from verathos import catalog
+from verathos.miner.app import create_app
+from verathos.miner.chain import PermitAuthorizer, build_manifest, publish
+from verathos.miner.config import MinerConfig
+from verathos.miner.engine import HttpEngine
 
 
 def main() -> None:

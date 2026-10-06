@@ -1,6 +1,6 @@
 """Subnet owner operations on a TESTNET subnet, signed with the owner coldkey held in the OS keyring.
 
-The mnemonic is read from the Secret Service keyring (service ``verathos-decide-testnet``,
+The mnemonic is read from the Secret Service keyring (service ``verathos-testnet``,
 user ``test_sn96-coldkey-mnemonic``) and only lives in memory. Mainnet endpoints are refused.
 
     status            mechanism count, split, max UIDs
@@ -18,7 +18,7 @@ import bittensor as bt
 import keyring
 from bittensor_wallet import Keypair
 
-SERVICE, USER = "verathos-decide-testnet", "test_sn96-coldkey-mnemonic"
+SERVICE, USER = "verathos-testnet", "test_sn96-coldkey-mnemonic"
 MAINNET = {"finney", "wss://entrypoint-finney.opentensor.ai:443", "archive"}
 
 

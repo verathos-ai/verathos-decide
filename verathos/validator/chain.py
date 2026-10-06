@@ -6,7 +6,7 @@ import logging
 
 import bittensor as bt
 
-from decide.validator.discovery import Neuron
+from verathos.validator.discovery import Neuron
 
 log = logging.getLogger(__name__)
 

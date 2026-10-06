@@ -18,13 +18,13 @@ from typing import Any
 import httpx
 from bittensor_wallet import Keypair
 
-from decide.miner.engine import Engine, EngineError
-from decide.protocol.api import distributions
-from decide.protocol.receipts import SignedReceipt
-from decide.protocol.requests import sign_request
-from decide.validator.canaries import assignment, canary_pool
-from decide.validator.discovery import DiscoveredEndpoint, verify_identity
-from decide.verify.compare import EndpointTally, Tolerance, compare_request
+from verathos.miner.engine import Engine, EngineError
+from verathos.protocol.api import distributions
+from verathos.protocol.receipts import SignedReceipt
+from verathos.protocol.requests import sign_request
+from verathos.validator.canaries import assignment, canary_pool
+from verathos.validator.discovery import DiscoveredEndpoint, verify_identity
+from verathos.verify.compare import EndpointTally, Tolerance, compare_request
 
 log = logging.getLogger(__name__)
 

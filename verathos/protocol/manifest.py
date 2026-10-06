@@ -18,11 +18,11 @@ from typing import Literal
 from bittensor_wallet import Keypair
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from decide.protocol import signing
-from decide.protocol.canonical import digest
+from verathos.protocol import signing
+from verathos.protocol.canonical import digest
 
-MANIFEST_DOMAIN = "verathos-decide/manifest/v1"
-COMMITMENT_PREFIX = "decide/v1 manifest sha256:"
+MANIFEST_DOMAIN = "verathos/manifest/v1"
+COMMITMENT_PREFIX = "verathos/manifest/v1 sha256:"
 MAX_ENDPOINTS = 64
 _ENDPOINT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
