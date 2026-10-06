@@ -42,8 +42,8 @@ The declared `capacity_rps` is `capacity_margin` (default 0.9) times the median 
 latency at the declared rate stays within `max_latency_s`, and a test warms up for at least that long, a test
 measures every honest endpoint in steady state. A measurement
 takes a few minutes. It is stored in `state_dir/capacity.json` together with a fingerprint of what it depends on (the
-endpoint's model, engine URL and `max_concurrency`, `max_latency_s`, the engine's `GET /v1/models` document, and the
-request mix) and is reused until one of them changes. `--remeasure` measures again, for example after a hardware change.
+endpoint's model, engine URL and `max_concurrency`, `max_latency_s`, the scalar fields of the engine's `GET /v1/models`
+document, and the request mix) and is reused until one of them changes. `--remeasure` measures again, for example after a hardware change.
 
 The miner never sends an engine more requests at once than its knee concurrency; further requests wait in the
 miner (up to four per engine slot, at most 30 s).

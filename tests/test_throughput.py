@@ -187,6 +187,19 @@ def test_measurement_finds_capacity_and_shares_of_one_engine(tmp_path) -> None:
     assert m["alone"].declared(0.9) == round(m["alone"].measured_rps * 0.9, 2)
 
 
+def test_fingerprint_ignores_engine_counters() -> None:
+    from verathos.throughput.measure import fingerprint
+
+    kev = {"models": [{"name": "kev-latest", "run": "jaredpalmer/kev-4b", "dtype": "bfloat16", "temperature": 2.41,
+                       "batches": {"count": 255, "queued": 0}, "prefix_cache": {"hits": 0, "misses": 255}}]}
+    later = {"models": [{**kev["models"][0], "batches": {"count": 9000, "queued": 3}}]}
+    other = {"models": [{**kev["models"][0], "dtype": "float16"}]}
+    config = {"model_id": "kev-4b", "engine_url": "http://127.0.0.1:8008"}
+    assert fingerprint(config, kev, KEV.workload) == fingerprint(config, later, KEV.workload)
+    assert fingerprint(config, kev, KEV.workload) != fingerprint(config, other, KEV.workload)
+    assert fingerprint(config, None, KEV.workload) == fingerprint(config, "not a document", KEV.workload)
+
+
 def test_measurement_waits_for_the_engine_and_fails_without_answers() -> None:
     from verathos.miner.engine import EngineError
     from verathos.throughput import measure

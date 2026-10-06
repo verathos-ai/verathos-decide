@@ -63,9 +63,20 @@ class Target:
     fingerprint: str
 
 
+def engine_identity(info: Any) -> Any:
+    """The static part of an engine's ``GET /v1/models`` document: the scalar fields of each listed model. Nested
+    sections (counters, caches) change while the engine serves."""
+    if not isinstance(info, dict):
+        return None
+    return {key: [{k: v for k, v in item.items() if not isinstance(v, dict | list)}
+                  for item in info[key] if isinstance(item, dict)]
+            for key in ("models", "data") if isinstance(info.get(key), list)}
+
+
 def fingerprint(endpoint_config: dict[str, Any], engine_info: Any, workload: Workload) -> str:
-    """What a measurement depends on: the endpoint's configuration, the engine's self-description and the mix."""
-    return digest({"endpoint": endpoint_config, "engine": engine_info, "workload": workload.model_dump(mode="json")})
+    """What a measurement depends on: the endpoint's configuration, the engine's identity and the mix."""
+    return digest({"endpoint": endpoint_config, "engine": engine_identity(engine_info),
+                   "workload": workload.model_dump(mode="json")})
 
 
 async def run_load(target: Target, concurrency: int, run_s: float = RUN_S) -> float:
