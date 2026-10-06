@@ -24,7 +24,7 @@ ops = ["keyring>=25", "secretstorage>=3.3"]
 verathos-miner = "verathos.miner.__main__:main"
 verathos-validator = "verathos.validator.__main__:main"
 verathos-build-native = "verathos.capacity.build_native:main"
-verathos-owner = "verathos.owner:main"
+verathos-subnet = "verathos.subnet.admin:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

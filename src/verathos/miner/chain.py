@@ -9,9 +9,9 @@ import time
 
 import bittensor as bt
 
-from verathos.chain import serve_axon
 from verathos.miner.config import MinerConfig
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
+from verathos.subnet.chain import serve_axon
 
 log = logging.getLogger(__name__)
 

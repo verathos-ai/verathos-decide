@@ -18,7 +18,7 @@ EVM and no central registry.
 | [Scoring](docs/SCORING.md) | how answers are verified and scored |
 | [Capacity audit](docs/CAPACITY_AUDIT.md) | the hardware audit: windows, workload, proofs, gating, policy |
 | [Discovery](docs/DISCOVERY.md) | manifests, commitments and the catalog on chain |
-| [Owner operations](docs/OWNER.md) | mechanisms, catalog releases, audit rollout |
+| [Subnet administration](docs/SUBNET_ADMIN.md) | mechanisms, catalog releases, audit rollout |
 | [Testnet runs](docs/TESTNET_RUNS.md) | measured results |
 
 ## Layout
@@ -30,8 +30,7 @@ src/verathos/
   miner/       miner service: manifest and endpoints behind one public port
   validator/   discovery, canaries, answer comparison, scoring, weights
   capacity/    capacity audit: public derivations, miner worker, GPU bench, auditor, proofs
-  chain.py     chain helpers shared by miners and validators
-  owner.py     verathos-owner
+  subnet/      chain helpers miners and validators share, and the verathos-subnet admin CLI
 native/gemm/   Rust GEMM sumcheck prover used by the capacity proofs
 scripts/       miner probe and capacity-bench round trip
 docs/

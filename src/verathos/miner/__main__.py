@@ -13,11 +13,11 @@ from verathos import catalog
 from verathos.capacity.chain import SubtensorChainView
 from verathos.capacity.core import AuditPolicy, gpu_support_status
 from verathos.capacity.miner import AuditEndpoint, AuditWorker, DrainState, bench_extension_available
-from verathos.chain import committed_catalog
 from verathos.miner.app import create_app
 from verathos.miner.chain import PermitAuthorizer, build_manifest, publish
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import HttpEngine
+from verathos.subnet.chain import committed_catalog
 
 log = logging.getLogger("verathos.miner")
 

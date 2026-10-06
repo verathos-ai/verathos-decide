@@ -1,12 +1,12 @@
-# Subnet owner operations
+# Subnet administration
 
 The owner sets up the mechanisms, publishes the catalog (models, verification tolerances and capacity-audit
-policy) by committing its digest from the owner hotkey, and runs the auditor validator. `verathos-owner` does the
+policy) by committing its digest from the owner hotkey, and runs the auditor validator. `verathos-subnet` does the
 chain side.
 
 ```bash
 VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[chain,ops]"
-.venv/bin/verathos-owner --network finney --netuid 96 status
+.venv/bin/verathos-subnet --network finney --netuid 96 status
 ```
 
 `status` shows the UID cap, the mechanisms and their emission split, the owner hotkey, and whether the catalog it
@@ -17,7 +17,7 @@ commits is this release's catalog.
 The network scores on mechanism 1. Two mechanisms require a UID cap of 128 (max UIDs x mechanisms <= 256):
 
 ```bash
-.venv/bin/verathos-owner --network finney --netuid 96 setup-mechanisms --split 90,10 --wallet <owner wallet>
+.venv/bin/verathos-subnet --network finney --netuid 96 setup-mechanisms --split 90,10 --wallet <owner wallet>
 ```
 
 It lowers the UID cap if needed (only possible with at most 128 registered UIDs), sets the mechanism count to 2 and
@@ -33,7 +33,7 @@ the emission split between mechanisms 0 and 1. Calls wait out the admin freeze w
 3. Commit the new catalog from the owner hotkey:
 
    ```bash
-   .venv/bin/verathos-owner --network finney --netuid 96 commit-catalog --wallet <owner wallet> --hotkey <owner hotkey>
+   .venv/bin/verathos-subnet --network finney --netuid 96 commit-catalog --wallet <owner wallet> --hotkey <owner hotkey>
    ```
 
 From the commit on, validators run only with the committed catalog and accept only manifests built with it, and

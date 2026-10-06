@@ -21,8 +21,8 @@ import bittensor as bt
 import httpx
 
 from verathos import catalog
-from verathos.chain import committed_catalog
 from verathos.miner.engine import HttpEngine
+from verathos.subnet.chain import committed_catalog
 from verathos.validator import chain
 from verathos.validator.audit import audit_epoch
 from verathos.validator.capacity import Capacity, unauditable_endpoints

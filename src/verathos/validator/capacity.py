@@ -24,7 +24,7 @@ from verathos.capacity.core import AuditPolicy, Slot, gpu_support_status
 from verathos.capacity.holds import HoldTracker
 from verathos.capacity.ingest import create_ingest_app
 from verathos.capacity.verdicts import fetch_verdicts
-from verathos.chain import serve_axon
+from verathos.subnet.chain import serve_axon
 from verathos.validator import chain as validator_chain
 from verathos.validator.discovery import DiscoveredMiner, discover
 

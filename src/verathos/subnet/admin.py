@@ -1,4 +1,4 @@
-"""Subnet owner operations: ``verathos-owner``.
+"""Subnet administration: ``verathos-subnet``. The changing commands are signed with the subnet owner's keys.
 
     status            mechanisms, emission split, UID cap, and whether the committed catalog matches this release
     setup-mechanisms  mechanism count 2 and the emission split (owner coldkey)
@@ -20,7 +20,7 @@ import bittensor as bt
 from bittensor_wallet import Keypair
 
 from verathos import catalog
-from verathos.chain import committed_catalog
+from verathos.subnet.chain import committed_catalog
 
 MAX_UIDS_TWO_MECHANISMS = 128  # chain rule: max UIDs x mechanism count <= 256
 SPLIT_SCALE = 65535

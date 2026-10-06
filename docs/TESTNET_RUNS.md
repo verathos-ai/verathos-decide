@@ -49,7 +49,7 @@ Issues found and fixed during the run:
 ## 2026-10-06: discovery and catalog anchoring (testnet 405)
 
 Miner hotkey `test_miner96/rehearsal-aug18` (UID 12), owner hotkey `test_sn96` (UID 0), manifest served from a
-temporary host, bittensor SDK 10.3.2, a discovery script since folded into the miner, validator and `verathos-owner`.
+temporary host, bittensor SDK 10.3.2, a discovery script since folded into the miner, validator and `verathos-subnet`.
 
 | Case | Result |
 |---|---|
