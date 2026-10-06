@@ -276,6 +276,20 @@ def transcript_root(pass_roots: Sequence[Any]) -> str:
     return h.hexdigest()
 
 
+def canonical_json(data: Mapping[str, Any], *, exclude_signature: bool = False) -> str:
+    """Canonical JSON used inside proof transcripts (ASCII, sorted keys); byte-identical to the original protocol."""
+    payload = dict(data)
+    if exclude_signature:
+        payload.pop("miner_signature", None)
+        payload.pop("signature", None)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def root_words_digest(root_words: Any) -> str:
+    """Digest of one compact CUDA root vector exactly as miner artifacts encode it."""
+    return hashlib.sha256(json.dumps(root_words, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
 def derive_sampled_pass_index(root_hex: str, lease_identifier: str, gpu_index: int, passes: int) -> int:
     if passes <= 0:
         return 0

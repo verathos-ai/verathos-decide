@@ -5,3 +5,9 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
+*.so
+*.so.*
+*.dylib
+native/pcs/target/
+verathos/capacity/bench/build/
+verathos/zk/cuda/build/
