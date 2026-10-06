@@ -61,6 +61,14 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m kev.serve --run jaredpalmer/kev-9b --
 Serve the exact weights the catalog pins (`hf_repo` at `hf_revision`). Any other weights, quantisation or model
 fails verification. Keep each engine on its own GPU and bind it to localhost.
 
+Clef models run on `verathos-engine`, which loads the inference code shipped in the model repository at the pinned
+revision. Install it in its own environment:
+
+```bash
+uv venv -p 3.12 /opt/clef && VIRTUAL_ENV=/opt/clef uv pip install -e ".[clef]"
+CUDA_VISIBLE_DEVICES=2 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8010
+```
+
 ## 4. Configure
 
 `miner.json`:

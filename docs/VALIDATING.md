@@ -47,6 +47,11 @@ CUDA_VISIBLE_DEVICES="" KEV_DTYPE=fp32 .venv/bin/python -m kev.serve --run jared
 ```
 
 Run them on CPU without `flash-linear-attention` installed. Each engine must serve the catalog's pinned weights.
+Clef models use `verathos-engine` in float32 (see `MINING.md` for the install):
+
+```bash
+/opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8103 --device cpu --dtype float32
+```
 
 ## 3. Configure
 
