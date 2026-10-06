@@ -16,13 +16,13 @@ from verathos.subnet.chain import serve_axon
 log = logging.getLogger(__name__)
 
 
-def build_manifest(config: MinerConfig, endpoints: list[EndpointConfig], keypair,
+def build_manifest(config: MinerConfig, endpoints: list[EndpointConfig], capacity_rps: dict[str, float], keypair,
                    catalog_digest: str) -> SignedManifest:
-    """Sign a manifest for ``endpoints``. The same configuration and catalog always give the same manifest, so a
-    restart does not change the on-chain commitment."""
+    """Sign a manifest for ``endpoints`` with their declared capacities. The same configuration, measurements and
+    catalog always give the same manifest, so a restart does not change the on-chain commitment."""
     listed = [
         Endpoint(endpoint_id=e.endpoint_id, url=config.endpoint_url(e.endpoint_id), model_id=e.model_id, tier=e.tier,
-                 hardware=e.hardware, max_concurrency=e.max_concurrency)
+                 capacity_rps=capacity_rps[e.endpoint_id])
         for e in endpoints
     ]
     manifest = Manifest(netuid=config.netuid, mechid=config.mechid, hotkey=keypair.ss58_address,

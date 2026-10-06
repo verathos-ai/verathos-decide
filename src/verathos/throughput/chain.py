@@ -1,4 +1,5 @@
-"""Chain access for the capacity audit (bittensor SDK 10.x)."""
+"""Chain access for the throughput audit (bittensor SDK 10.x): head blocks, block hashes, finality and the
+auditor's axon."""
 
 from __future__ import annotations
 

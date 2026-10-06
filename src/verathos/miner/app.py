@@ -1,14 +1,16 @@
 """Miner HTTP service: one public port (the axon) for the manifest and every endpoint.
 
     GET  /v1/manifest                      signed manifest (public)
-    POST /e/{endpoint_id}/v1/systemone     signed caller request -> answers + signed receipt
+    POST /e/{endpoint_id}/v1/systemone     signed caller request, or auditor test traffic -> answers + signed receipt
     POST /e/{endpoint_id}/v1/identity      signed caller challenge -> hotkey signature proving endpoint control
     GET  /health
+
+Test traffic carries the auditor's session for this endpoint and test instead of a per-request signature (see
+``throughput.policy``); its receipts name the auditor as caller and the request id as nonce.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -20,6 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
+from verathos.miner.admission import Admission
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
@@ -27,7 +30,8 @@ from verathos.protocol.api import SystemOneRequest
 from verathos.protocol.canonical import digest
 from verathos.protocol.manifest import SignedManifest
 from verathos.protocol.receipts import Receipt, SignedReceipt
-from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, verify_request
+from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, VerifiedCaller, verify_request
+from verathos.throughput.policy import HDR_SESSION, SessionGate
 
 log = logging.getLogger(__name__)
 IDENTITY_DOMAIN = "verathos/identity/v1"
@@ -49,13 +53,17 @@ def create_app(
     manifest: Callable[[], SignedManifest],
     engines: dict[str, Engine],
     authorized: Callable[[str], bool],
-    drained: Callable[[str], bool] = lambda endpoint_id: False,
+    auditor: Callable[[], str | None],
+    admissions: dict[str, Admission] | None = None,
 ) -> FastAPI:
+    """``auditor`` gives the hotkey whose test sessions are accepted; ``admissions`` the engine admission per
+    endpoint (default: ``max_concurrency`` slots)."""
     app = FastAPI(title="Verathos miner")
     nonces = NonceCache()
     endpoints = {e.endpoint_id: e for e in config.endpoints}
-    slots = {e.endpoint_id: asyncio.Semaphore(e.max_concurrency) for e in config.endpoints}
+    admissions = admissions or {e.endpoint_id: Admission(e.max_concurrency) for e in config.endpoints}
     hotkey = keypair.ss58_address
+    sessions = SessionGate(config.netuid, hotkey)
 
     def error(status: int, message: str) -> JSONResponse:
         return JSONResponse(status_code=status, content={"error": message})
@@ -85,6 +93,19 @@ def create_app(
         except RequestRejected as e:
             return None, None, error(401, str(e))
         return caller, body, None
+
+    async def authenticate_test(request: Request, endpoint_id: str):
+        """-> (auditor as caller with the request id as nonce, body, None) or (None, None, error response). The
+        session is checked before the body is read."""
+        try:
+            session, request_id = sessions.check(request.headers, auditor=auditor(), endpoint_id=endpoint_id,
+                                                 now_ms=int(time.time() * 1000))
+        except RequestRejected as e:
+            return None, None, error(401, str(e))
+        body = await read_body(request)
+        if body is None:
+            return None, None, error(413, "request too large")
+        return VerifiedCaller(session.auditor, request_id), body, None
 
     def listed(endpoint_id: str) -> bool:
         """Whether the current manifest lists the endpoint (a catalog change can withdraw one)."""
@@ -118,7 +139,8 @@ def create_app(
         if endpoint is None or not listed(endpoint_id):
             return error(404, "unknown endpoint")
         received_ms = int(time.time() * 1000)
-        caller, body, rejected = await authenticate(request)
+        test = HDR_SESSION in request.headers
+        caller, body, rejected = await (authenticate_test(request, endpoint_id) if test else authenticate(request))
         if rejected:
             return rejected
         try:
@@ -128,17 +150,16 @@ def create_app(
             return error(422, f"invalid request: {e}")
         if parsed.model != endpoint.model_id:
             return error(422, f"endpoint serves {endpoint.model_id}, not {parsed.model}")
-        if drained(endpoint_id):
-            return error(503, "endpoint is running a capacity audit")
-        slot = slots[endpoint_id]
-        if slot.locked():
+        admission = admissions[endpoint_id]
+        if not await admission.acquire(test=test):
             return error(503, "endpoint at capacity")
-        async with slot:
-            try:
-                response = await engines[endpoint_id].answer(raw)
-            except EngineError as e:
-                log.warning("engine %s failed: %s", endpoint_id, e)
-                return error(502, "engine failure")
+        try:
+            response = await engines[endpoint_id].answer(raw)
+        except EngineError as e:
+            log.warning("engine %s failed: %s", endpoint_id, e)
+            return error(502, "engine failure")
+        finally:
+            admission.release()
         answers = response.get("answers")
         if not isinstance(answers, dict):
             return error(502, "engine returned no answers")

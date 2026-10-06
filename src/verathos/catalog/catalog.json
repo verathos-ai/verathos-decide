@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "revision": "2026-10-06",
+  "revision": "2026-10-06b",
   "epoch_blocks": 180,
   "models": [
     {
@@ -16,7 +16,55 @@
       "base_repo": "Qwen/Qwen3.5-4B-Base",
       "base_revision": "1001bb4d826a52d1f399e183466143f4da7b741b",
       "license": "apache-2.0",
-      "max_state_tokens": 65536
+      "max_state_tokens": 65536,
+      "workload": {
+        "state_words": [
+          150,
+          1200
+        ],
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which team should handle this?",
+            "criteria": {
+              "billing": "Charges and refunds",
+              "technical": "Bugs or outages",
+              "sales": "Pricing and plans",
+              "logistics": "Shipping and delivery",
+              "privacy": "Data and account deletion",
+              "other": "Everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this?",
+            "criteria": [
+              "Can wait",
+              "This week",
+              "Today",
+              "Right now"
+            ]
+          },
+          "churn": {
+            "type": "noul",
+            "instructions": "Does the customer threaten to cancel?"
+          },
+          "bug": {
+            "type": "noul",
+            "instructions": "Is a product bug reported?"
+          },
+          "refund": {
+            "type": "noul",
+            "instructions": "Is a refund requested?"
+          },
+          "angry": {
+            "type": "noul",
+            "instructions": "Is the customer angry?"
+          }
+        }
+      },
+      "score_per_rps": 1.0,
+      "first_test_rps": 50.0
     },
     {
       "model_id": "kev-9b",
@@ -31,7 +79,55 @@
       "base_repo": "Qwen/Qwen3.5-9B-Base",
       "base_revision": "68c46c4b3498877f3ef123c856ecfde50c39f404",
       "license": "apache-2.0",
-      "max_state_tokens": 65536
+      "max_state_tokens": 65536,
+      "workload": {
+        "state_words": [
+          150,
+          1200
+        ],
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which team should handle this?",
+            "criteria": {
+              "billing": "Charges and refunds",
+              "technical": "Bugs or outages",
+              "sales": "Pricing and plans",
+              "logistics": "Shipping and delivery",
+              "privacy": "Data and account deletion",
+              "other": "Everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this?",
+            "criteria": [
+              "Can wait",
+              "This week",
+              "Today",
+              "Right now"
+            ]
+          },
+          "churn": {
+            "type": "noul",
+            "instructions": "Does the customer threaten to cancel?"
+          },
+          "bug": {
+            "type": "noul",
+            "instructions": "Is a product bug reported?"
+          },
+          "refund": {
+            "type": "noul",
+            "instructions": "Is a refund requested?"
+          },
+          "angry": {
+            "type": "noul",
+            "instructions": "Is the customer angry?"
+          }
+        }
+      },
+      "score_per_rps": 2.0,
+      "first_test_rps": 25.0
     },
     {
       "model_id": "clef-flash",
@@ -44,52 +140,76 @@
       "hf_repo": "Cloudflare/clef-flash",
       "hf_revision": "17f0b0ad64efb65d273590632833508766b2aae6",
       "license": "apache-2.0",
-      "max_state_tokens": 65536
+      "max_state_tokens": 65536,
+      "workload": {
+        "state_words": [
+          150,
+          1200
+        ],
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which team should handle this?",
+            "criteria": {
+              "billing": "Charges and refunds",
+              "technical": "Bugs or outages",
+              "sales": "Pricing and plans",
+              "logistics": "Shipping and delivery",
+              "privacy": "Data and account deletion",
+              "other": "Everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this?",
+            "criteria": [
+              "Can wait",
+              "This week",
+              "Today",
+              "Right now"
+            ]
+          },
+          "churn": {
+            "type": "noul",
+            "instructions": "Does the customer threaten to cancel?"
+          },
+          "bug": {
+            "type": "noul",
+            "instructions": "Is a product bug reported?"
+          },
+          "refund": {
+            "type": "noul",
+            "instructions": "Is a refund requested?"
+          },
+          "angry": {
+            "type": "noul",
+            "instructions": "Is the customer angry?"
+          }
+        }
+      },
+      "score_per_rps": 2.0,
+      "first_test_rps": 25.0
     }
   ],
-  "capacity_audit": {
-    "mode": "score_gate",
-    "windows_per_epoch": 12,
-    "draft_probability": 0.25,
-    "group_stress_fraction": 0.35,
-    "qualification_epochs": 5,
+  "throughput_audit": {
+    "mode": "enforce",
     "lead_blocks": 5,
-    "proof_challenge_delay_blocks": 4,
-    "deadline_s": 30.0,
-    "transport_grace_s": 3.0,
-    "payload_deadline_s": 45.0,
-    "max_proof_payload_bytes": 33554432,
-    "repeat_window_epochs": 10,
-    "timing_misses_for_zero_score": 2,
-    "hard_proof_misses_for_zero_score": 2,
-    "invalid_proof_misses_for_zero_score": 1,
-    "gpu_classes": [
-      {"gpu_name": "NVIDIA GeForce RTX 4090", "vram_gb": 24, "capacity_passes": 222, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA GeForce RTX 3090", "vram_gb": 24, "capacity_passes": 90, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA GeForce RTX 3090 Ti", "vram_gb": 24, "capacity_passes": 115, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA GeForce RTX 5090", "vram_gb": 32, "capacity_passes": 337, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "vram_gb": 96, "capacity_passes": 311, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA RTX 4000 Ada Generation", "vram_gb": 20, "capacity_passes": 62, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA RTX A4500", "vram_gb": 20, "capacity_passes": 53, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA RTX A5000", "vram_gb": 24, "capacity_passes": 69, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA RTX 5000 Ada Generation", "vram_gb": 32, "capacity_passes": 144, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA L4", "vram_gb": 23, "capacity_passes": 45, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA A40", "vram_gb": 46, "capacity_passes": 93, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA RTX A6000", "vram_gb": 49, "capacity_passes": 96, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA L40", "vram_gb": 46, "capacity_passes": 150, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA L40S", "vram_gb": 46, "capacity_passes": 196, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA RTX 6000 Ada Generation", "vram_gb": 49, "capacity_passes": 156, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA RTX PRO 4000 Blackwell", "vram_gb": 24, "capacity_passes": 105, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA RTX PRO 4500 Blackwell", "vram_gb": 32, "capacity_passes": 154, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA RTX PRO 5000 Blackwell", "vram_gb": 48, "capacity_passes": 195, "capacity_rounds": 8},
-      {"gpu_name": "NVIDIA A100-SXM4-40GB", "vram_gb": 40, "capacity_passes": 6, "capacity_tail_passes": 14, "fp64_passes": 654, "transition_mix_rounds": 3, "transition_fanout": 64},
-      {"gpu_name": "NVIDIA A100 80GB PCIe", "vram_gb": 80, "capacity_passes": 9, "capacity_tail_passes": 9, "fp64_passes": 681, "transition_mix_rounds": 3, "transition_fanout": 64},
-      {"gpu_name": "NVIDIA A100-SXM4-80GB", "vram_gb": 80, "capacity_passes": 8, "capacity_tail_passes": 9, "fp64_passes": 645, "transition_mix_rounds": 3, "transition_fanout": 64},
-      {"gpu_name": "NVIDIA H100 80GB HBM3", "vram_gb": 80, "capacity_passes": 16, "capacity_tail_passes": 4, "fp64_passes": 1629, "transition_mix_rounds": 3, "transition_fanout": 64},
-      {"gpu_name": "NVIDIA H100 PCIe", "vram_gb": 80, "capacity_passes": 9, "capacity_tail_passes": 1, "fp64_passes": 1335, "transition_mix_rounds": 3, "transition_fanout": 64},
-      {"gpu_name": "NVIDIA H100 NVL", "vram_gb": 96, "capacity_passes": 14, "capacity_tail_passes": 4, "fp64_passes": 1462, "transition_mix_rounds": 3, "transition_fanout": 64},
-      {"gpu_name": "NVIDIA H200", "vram_gb": 141, "capacity_passes": 20, "capacity_tail_passes": 12, "fp64_passes": 1629, "transition_mix_rounds": 3, "transition_fanout": 64},
-      {"gpu_name": "NVIDIA B200", "vram_gb": 192, "capacity_passes": 43, "capacity_tail_passes": 1, "fp64_passes": 1110, "transition_mix_rounds": 3, "transition_fanout": 64}
-    ]
+    "warmup_s": 2.0,
+    "test_s": 8.0,
+    "request_timeout_s": 20.0,
+    "pass_fraction": 0.95,
+    "samples_per_test": 10,
+    "capacity_margin": 0.9,
+    "qualification_tests": 1,
+    "credit_ttl_epochs": 2,
+    "rate_growth": 2.0
+  },
+  "scoring": {
+    "canary_pool_size": 16,
+    "canaries_per_endpoint": 10,
+    "canary_spread_fraction": 0.6,
+    "statistical_window_epochs": 3,
+    "ema_alpha": 0.2,
+    "probation_epochs": 6
   }
 }

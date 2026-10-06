@@ -2,7 +2,7 @@
 
 Discovery uses only native chain state:
 - the hotkey's axon (``serve_axon``) points at the miner's manifest server, ``GET /v1/manifest``;
-- the manifest lists every endpoint (one per GPU or Mac) with its model, and is signed by the hotkey;
+- the manifest lists every endpoint with its model and declared capacity, and is signed by the hotkey;
 - the hotkey's commitment (``set_commitment``) holds the manifest digest, so every validator scores the same
   version.
 
@@ -30,21 +30,13 @@ MAX_ENDPOINTS = 64
 _ENDPOINT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 
-class Hardware(BaseModel):
-    kind: Literal["cuda", "apple"]
-    device_id: str = Field(min_length=1, max_length=128)
-    gpu_name: str | None = Field(None, max_length=128,
-                                 description="Claimed GPU class; selects the capacity-audit workload")
-    vram_gb: int | None = Field(None, ge=1, le=4096)
-
-
 class Endpoint(BaseModel):
     endpoint_id: str
     url: str = Field(min_length=1, max_length=256)
     model_id: str = Field(min_length=1, max_length=128)
     tier: Literal["open", "private"] = "open"
-    hardware: Hardware
-    max_concurrency: int = Field(ge=1, le=4096)
+    capacity_rps: float = Field(ge=0, le=100_000, description="Declared serving capacity in requests/s of the "
+                                "model's standard request mix, measured by the miner; the throughput audit tests it")
 
     @field_validator("endpoint_id")
     @classmethod
@@ -74,9 +66,6 @@ class Manifest(BaseModel):
         ids = [e.endpoint_id for e in self.endpoints]
         if len(ids) != len(set(ids)):
             raise ValueError("endpoint ids must be unique")
-        devices = [(e.hardware.kind, e.hardware.device_id) for e in self.endpoints]
-        if len(devices) != len(set(devices)):
-            raise ValueError("one hardware device may back only one endpoint")
         return self
 
     def digest(self) -> str:

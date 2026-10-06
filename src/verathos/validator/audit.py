@@ -30,8 +30,8 @@ from verathos.validator.compare import EndpointTally, RequestComparison, Toleran
 from verathos.validator.discovery import DiscoveredEndpoint, verify_identity
 
 log = logging.getLogger(__name__)
-DRAIN_POLL_S = 2.0
-MAX_DRAIN_WAIT_S = 600.0
+HOLD_POLL_S = 2.0
+MAX_HOLD_WAIT_S = 120.0
 REQUEST_TIMEOUT_S = 60.0
 MAX_REPLY_BYTES = 1 << 20
 
@@ -109,16 +109,16 @@ async def _canary(result: EndpointResult, request: dict[str, Any], reference: di
 
 async def _audit_endpoint(result: EndpointResult, canaries: list[tuple[dict[str, Any], dict[str, dict[str, float]]]],
                           keypair: Keypair, client: httpx.AsyncClient, spread_s: float, rng: random.Random,
-                          drained: Callable[[str, str], bool], netuid: int, mechid: int) -> None:
+                          holding: Callable[[], bool], netuid: int, mechid: int) -> None:
     ep = result.endpoint
     result.identity_ok = await verify_identity(ep, keypair, client)
     for request, reference in canaries:
         if spread_s:
             await asyncio.sleep(rng.uniform(0, spread_s))
         waited = 0.0
-        while drained(ep.hotkey, ep.endpoint.endpoint_id) and waited < MAX_DRAIN_WAIT_S:
-            await asyncio.sleep(DRAIN_POLL_S)  # the endpoint is inside a capacity-audit hold
-            waited += DRAIN_POLL_S
+        while holding() and waited < MAX_HOLD_WAIT_S:
+            await asyncio.sleep(HOLD_POLL_S)  # a throughput test is running
+            waited += HOLD_POLL_S
         await _canary(result, request, reference, keypair, client, netuid, mechid)
 
 
@@ -136,7 +136,7 @@ async def audit_epoch(
     pool_size: int = 16,
     per_endpoint: int = 10,
     spread_s: float = 0.0,
-    drained: Callable[[str, str], bool] = lambda hotkey, endpoint_id: False,
+    holding: Callable[[], bool] = lambda: False,
 ) -> dict[str, EndpointResult]:
     """Audit every endpoint whose model has a reference engine. Returns results keyed by endpoint key; endpoints
     without a usable canary this epoch (no reference engine, or every reference failed) have no result."""
@@ -160,7 +160,7 @@ async def audit_epoch(
             continue
         res = EndpointResult(ep, tolerances[ep.endpoint.model_id])
         results[ep.key] = res
-        tasks.append(_audit_endpoint(res, picked, keypair, client, spread_s, random.Random(rng.random()), drained,
+        tasks.append(_audit_endpoint(res, picked, keypair, client, spread_s, random.Random(rng.random()), holding,
                                      netuid, mechid))
     for res, outcome in zip(results.values(), await asyncio.gather(*tasks, return_exceptions=True)):
         if isinstance(outcome, BaseException):  # an aborted audit verifies nothing, so it fails

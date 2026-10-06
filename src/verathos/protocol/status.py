@@ -8,15 +8,15 @@ from pydantic import BaseModel
 
 STATUS_PATH = "/v1/status/{hotkey}"
 
-State = Literal["scored", "qualifying", "candidate", "failed", "gated", "probation", "unauditable", "unanswered",
-                "not_audited"]
+State = Literal["scored", "qualifying", "candidate", "failed", "invalid", "probation", "unanswered", "not_audited"]
 
 
 class EndpointStatus(BaseModel):
     endpoint_id: str
     model_id: str
     state: State
-    scored_from_epoch: int | None = None  # set while qualifying
+    declared_rps: float = 0.0
+    credited_rps: float = 0.0  # capacity proven by the throughput audit, as scored this epoch
     sent: int = 0
     answered: int = 0
     verdict: str = ""  # this epoch's answer check, over the statistical window
@@ -25,21 +25,28 @@ class EndpointStatus(BaseModel):
     score: float = 0.0
     ema: float = 0.0
     probation_epochs: int = 0  # epochs of zero score still to come
-    capacity_rule: str = ""
 
 
-class AuditOutcome(BaseModel):
+class ThroughputOutcome(BaseModel):
+    """One endpoint's result in a throughput test, as the auditor recorded it."""
+
     endpoint_id: str
-    selection_block: int
-    window: str  # pending | confirmed | void
-    outcome: str
+    epoch: int
+    start_block: int
+    state: str  # unconfirmed | confirmed | void
+    outcome: str  # passed | partial | invalid | void
     reason: str = ""
-    final_s: float | None = None  # seconds from the auditor's B_start observation to the final receipt
+    declared_rps: float = 0.0
+    tested_rps: float = 0.0
+    delivered_rps: float = 0.0
+    credited_rps: float = 0.0
+    latency_p50_ms: float = 0.0
+    latency_p95_ms: float = 0.0
 
 
 class HotkeyStatus(BaseModel):
     hotkey: str
-    epoch: int | None = None  # None: the validator has not scored the hotkey yet (audit outcomes only)
+    epoch: int | None = None  # None: the validator has not scored the hotkey yet (test outcomes only)
     epoch_blocks: int | None = None
     endpoints: list[EndpointStatus] = []
-    audits: list[AuditOutcome] = []
+    tests: list[ThroughputOutcome] = []

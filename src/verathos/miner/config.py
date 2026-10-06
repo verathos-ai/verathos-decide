@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from verathos.protocol.manifest import Hardware, axon_base, endpoint_url, public_ip
+from verathos.protocol.manifest import axon_base, endpoint_url, public_ip
 
 
 class EndpointConfig(BaseModel):
@@ -16,10 +16,8 @@ class EndpointConfig(BaseModel):
     model_id: str
     engine_url: str = Field(description="Local decision engine serving POST /v1/systemone, e.g. http://127.0.0.1:8008")
     engine_api_key: str | None = None
-    hardware: Hardware
-    cuda_device: int | None = Field(None, ge=0, description="CUDA device index of this endpoint's GPU; the capacity "
-                                    "audit bench runs on it")
-    max_concurrency: int = Field(64, ge=1, le=4096)
+    max_concurrency: int = Field(256, ge=1, le=4096, description="Highest concurrency the capacity measurement tries; "
+                                 "the engine then never gets more than the concurrency that measured best")
     tier: Literal["open", "private"] = "open"
 
 
@@ -38,6 +36,7 @@ class MinerConfig(BaseModel):
     catalog_mirrors: list[str] = Field(default_factory=list, description="Catalog URL templates with {digest}, "
                                        "tried after the subnet owner's axon")
     catalog_dir: Path = Path("~/.verathos/catalog")
+    state_dir: Path = Path("~/.verathos/miner")
 
     @field_validator("public_host")
     @classmethod

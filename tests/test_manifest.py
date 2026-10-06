@@ -5,7 +5,6 @@ from bittensor_wallet import Keypair
 
 from verathos.protocol.manifest import (
     Endpoint,
-    Hardware,
     Manifest,
     ManifestRejected,
     SignedManifest,
@@ -27,10 +26,8 @@ def make(keypair: Keypair, **overrides) -> Manifest:
         hotkey=keypair.ss58_address,
         catalog_digest=CATALOG,
         endpoints=[
-            Endpoint(endpoint_id="gpu0", url=endpoint_url(AXON, "gpu0"), model_id="kev-4b",
-                     hardware=Hardware(kind="cuda", device_id="GPU-aaaa"), max_concurrency=64),
-            Endpoint(endpoint_id="gpu1", url=endpoint_url(AXON, "gpu1"), model_id="kev-9b",
-                     hardware=Hardware(kind="cuda", device_id="GPU-bbbb"), max_concurrency=32),
+            Endpoint(endpoint_id="gpu0", url=endpoint_url(AXON, "gpu0"), model_id="kev-4b", capacity_rps=48.5),
+            Endpoint(endpoint_id="gpu1", url=endpoint_url(AXON, "gpu1"), model_id="kev-9b", capacity_rps=21.0),
         ],
     )
     fields.update(overrides)
@@ -76,7 +73,7 @@ def test_malformed_documents_are_rejected_not_raised(keypair: Keypair, document)
 def test_rejects_tampered_manifest(keypair: Keypair) -> None:
     signed = SignedManifest.create(make(keypair), keypair)
     document = signed.model_dump(mode="json")
-    document["manifest"]["endpoints"][0]["max_concurrency"] = 4096
+    document["manifest"]["endpoints"][0]["capacity_rps"] = 4096.0
     with pytest.raises(ManifestRejected, match="signature"):
         check(document, keypair, commitment=commitment_value(signed.manifest.digest()))
 
@@ -108,11 +105,16 @@ def test_endpoints_must_be_on_the_hotkeys_axon(keypair: Keypair) -> None:
               axon=axon_base("198.51.100.9", 8091))
 
 
-def test_one_device_per_endpoint(keypair: Keypair) -> None:
-    dup = make(keypair).endpoints
-    dup[1].hardware = Hardware(kind="cuda", device_id="GPU-aaaa")
-    with pytest.raises(ValueError, match="hardware device"):
-        make(keypair, endpoints=dup)
+@pytest.mark.parametrize("capacity", [-1.0, 100_001.0, float("nan")])
+def test_declared_capacity_must_be_in_range(capacity: float) -> None:
+    with pytest.raises(ValueError):
+        Endpoint(endpoint_id="gpu0", url=endpoint_url(AXON, "gpu0"), model_id="kev-4b", capacity_rps=capacity)
+
+
+def test_endpoint_ids_are_unique(keypair: Keypair) -> None:
+    endpoints = make(keypair).endpoints
+    with pytest.raises(ValueError, match="unique"):
+        make(keypair, endpoints=[endpoints[0], endpoints[0]])
 
 
 def test_accepts_previous_catalog_during_transition(keypair: Keypair) -> None:

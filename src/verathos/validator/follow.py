@@ -1,6 +1,6 @@
 """The catalog the subnet owner commits, followed in the background.
 
-The validator checks the owner's commitment every ``POLICY_WATCH_S``, like the miners, so a new capacity-audit
+The validator checks the owner's commitment every ``POLICY_WATCH_S``, like the miners, so a new throughput-audit
 policy reaches the audit within a minute of the miners. Models, tolerances and the epoch length apply from the next
 epoch. Manifests built for the previous catalog stay acceptable for one epoch after a change, while miners
 re-publish.
@@ -16,8 +16,8 @@ from collections.abc import Callable
 import bittensor as bt
 
 from verathos import catalog
-from verathos.capacity.core import DEFAULT_BLOCK_TIME_S, POLICY_WATCH_S
 from verathos.subnet.chain import current_catalog
+from verathos.throughput.policy import BLOCK_TIME_S, POLICY_WATCH_S
 
 log = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ class CatalogFollower:
         if new.digest() == self.catalog.digest():
             return False
         with self._lock:
-            grace_s = self.catalog.epoch_blocks * DEFAULT_BLOCK_TIME_S
+            grace_s = self.catalog.epoch_blocks * BLOCK_TIME_S
             self._previous = (self.catalog.digest(), time.time() + grace_s)
             self.catalog = new
         log.info("catalog %s committed", new.digest()[:12])

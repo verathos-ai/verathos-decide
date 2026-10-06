@@ -8,4 +8,5 @@ dist/
 *.so
 *.so.*
 *.dylib
-native/gemm/target/
+native/loadgen/target/
+src/verathos/throughput/verathos-loadgen

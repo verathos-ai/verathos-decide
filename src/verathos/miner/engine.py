@@ -27,9 +27,18 @@ class HttpEngine:
     """A local engine process speaking ``POST /v1/systemone``."""
 
     def __init__(self, base_url: str, api_key: str | None = None, timeout_s: float = 120.0) -> None:
-        self._url = base_url.rstrip("/") + "/v1/systemone"
+        self._base = base_url.rstrip("/")
+        self._url = self._base + "/v1/systemone"
         self._headers = {"Authorization": f"Bearer {api_key or 'local'}"}
         self._client = httpx.AsyncClient(timeout=timeout_s)
+
+    async def info(self) -> Any:
+        """The engine's ``GET /v1/models`` document, or None if it serves none."""
+        try:
+            r = await self._client.get(self._base + "/v1/models", headers=self._headers)
+            return r.json() if r.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            return None
 
     async def answer(self, request: dict[str, Any]) -> dict[str, Any]:
         try:

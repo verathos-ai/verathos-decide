@@ -1,4 +1,4 @@
-"""Subnet catalog: the models the network serves, how their answers are verified, and the capacity-audit policy.
+"""Subnet catalog: the models the network serves, how their answers are verified and scored, and the audit policy.
 
 The catalog is a JSON document. The subnet owner commits its digest on chain; miners and validators use the catalog
 whose digest equals the owner's current commitment, whatever its source: the copy shipped with the code, a local
@@ -11,7 +11,6 @@ Only ``active`` models are scored. ``candidate`` models may be served and checke
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
 import re
@@ -22,9 +21,10 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_validator
 
-from verathos.capacity.core import AuditPolicy, GpuClass
 from verathos.protocol.canonical import digest
 from verathos.protocol.http import get_json
+from verathos.throughput.policy import AuditPolicy, policy_from
+from verathos.throughput.workload import Workload
 from verathos.validator.compare import Tolerance
 
 log = logging.getLogger(__name__)
@@ -54,11 +54,23 @@ class CatalogModel(BaseModel):
     base_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     license: str
     max_state_tokens: int = Field(ge=1)
-    score_weight: float = Field(1.0, gt=0, description="Relative score per verified answer")
+    workload: Workload = Field(description="Standard request mix capacity is declared and tested with")
+    score_per_rps: float = Field(gt=0, description="Score per request/s of proven capacity, so models of different "
+                                 "cost per request score fairly")
+    first_test_rps: float = Field(gt=0, description="Highest rate an endpoint is tested at before its first test; "
+                                  "later tests grow from what it delivered")
     tolerance: Tolerance = Tolerance()
 
 
-_AUDIT_FIELDS = {f.name for f in dataclasses.fields(AuditPolicy)} - {"epoch_blocks"}
+class Scoring(BaseModel):
+    """Scoring settings every validator applies."""
+
+    canary_pool_size: int = Field(16, ge=1, description="Canaries per model per epoch, each computed once")
+    canaries_per_endpoint: int = Field(10, ge=1)
+    canary_spread_fraction: float = Field(0.6, gt=0, le=0.9, description="Share of the epoch canaries spread over")
+    statistical_window_epochs: int = Field(3, ge=1)
+    ema_alpha: float = Field(0.2, gt=0, le=1)
+    probation_epochs: int = Field(6, ge=1)
 
 
 class Catalog(BaseModel):
@@ -67,8 +79,9 @@ class Catalog(BaseModel):
     epoch_blocks: int = Field(180, ge=50, description="Length of the subnet's scoring epoch in blocks; validators "
                               "score, set weights and evaluate capacity evidence once per epoch")
     models: list[CatalogModel]
-    capacity_audit: dict[str, Any] = Field(default_factory=dict, description="Capacity-audit policy settings over "
-                                           "the code defaults, including the calibrated GPU classes")
+    throughput_audit: dict[str, Any] = Field(default_factory=dict, description="Throughput-audit settings over the "
+                                             "code defaults")
+    scoring: Scoring = Scoring()
     _document: Any = PrivateAttr(None)
 
     @classmethod
@@ -95,19 +108,12 @@ class Catalog(BaseModel):
         ids = [m.model_id for m in self.models]
         if len(ids) != len(set(ids)):
             raise ValueError("model ids must be unique")
-        unknown = set(self.capacity_audit) - _AUDIT_FIELDS
-        if unknown:
-            raise ValueError(f"unknown capacity_audit settings: {sorted(unknown)}")
-        self.audit_policy().validate()
+        self.audit_policy()
         return self
 
     def audit_policy(self) -> AuditPolicy:
-        """The capacity-audit policy: code defaults with this catalog's settings. GPU classes come only from the
-        catalog; an endpoint whose GPU has no class here cannot be audited."""
-        settings = {**self.capacity_audit, "epoch_blocks": self.epoch_blocks}
-        if "gpu_classes" in settings:
-            settings["gpu_classes"] = tuple(GpuClass.from_dict(row) for row in settings["gpu_classes"])
-        return dataclasses.replace(AuditPolicy(), **settings)
+        """The throughput-audit policy: code defaults with this catalog's settings."""
+        return policy_from(self.throughput_audit, self.epoch_blocks)
 
     def digest(self) -> str:
         return digest(self.document())

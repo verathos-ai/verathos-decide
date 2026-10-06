@@ -1,7 +1,7 @@
 """Where each endpoint stands, as a validator saw it in its last epoch.
 
-Validators that run a service (the subnet owner and the capacity auditor) serve it read-only at
-``GET /v1/status/{hotkey}``, together with the hotkey's recent capacity-audit outcomes when the validator is the
+Validators that run a service (the subnet owner and the throughput auditor) serve it read-only at
+``GET /v1/status/{hotkey}``, together with the hotkey's recent throughput-test results when the validator is the
 auditor. Miners poll it and log it. It is that validator's own view; every validator scores the same way from the
 same rules.
 """
@@ -18,32 +18,29 @@ from verathos.validator.scoring import ScoreState, windowed_verdict
 
 
 def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint], results: dict[str, EndpointResult],
-          scores: dict[str, float], failed: Collection[str], gated: dict[str, str], unauditable: Collection[str],
-          qualifying: Collection[str], scored_models: Collection[str], qualification_epochs: int,
-          state: ScoreState) -> dict[str, HotkeyStatus]:
+          scores: dict[str, float], failed: Collection[str], invalid_hotkeys: Collection[str],
+          credited: dict[str, float], scored_models: Collection[str], state: ScoreState) -> dict[str, HotkeyStatus]:
     """Status per hotkey after ``update`` has folded the epoch into ``state``."""
     out: dict[str, HotkeyStatus] = {}
     for ep in endpoints:
         key, r = ep.key, results.get(ep.key)
         status = EndpointStatus(endpoint_id=ep.endpoint.endpoint_id, model_id=ep.endpoint.model_id,
-                                state="scored", score=scores.get(key, 0.0), ema=state.ema.get(key, 0.0),
-                                probation_epochs=state.probation.get(key, 0), capacity_rule=gated.get(key, ""))
+                                state="scored", declared_rps=ep.endpoint.capacity_rps,
+                                credited_rps=credited.get(key, 0.0), score=scores.get(key, 0.0),
+                                ema=state.ema.get(key, 0.0), probation_epochs=state.probation.get(key, 0))
         if r is not None:
             status.sent, status.answered, status.mean_abs = r.sent, r.answered, r.tally.mean_abs
             status.verdict, status.errors = windowed_verdict(state, key, r).value, sorted(set(r.errors))
-        if key in gated:
-            status.state = "gated"
+        if ep.hotkey in invalid_hotkeys:
+            status.state = "invalid"
         elif key in failed:
             status.state = "failed"
         elif status.probation_epochs:
             status.state = "probation"
-        elif key in unauditable:
-            status.state = "unauditable"
         elif r is None:
             status.state = "not_audited"
-        elif key in qualifying:
+        elif key not in credited:
             status.state = "qualifying"
-            status.scored_from_epoch = state.first_seen[key] + qualification_epochs
         elif ep.endpoint.model_id not in scored_models:
             status.state = "candidate"
         elif not r.identity_ok or not r.answered:
