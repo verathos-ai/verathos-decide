@@ -324,12 +324,12 @@ class AuditWorker:
                 log.warning("endpoint %s drafted for audit %s but its GPU class is not auditable: %s",
                             ep.endpoint_id, audit_id[:12], reason)
                 continue
-            if self.drain.drained(ep.endpoint_id) or block_number <= self._busy_until_block.get(ep.endpoint_id, 0):
-                log.info("endpoint %s busy; skipping overlapping audit %s", ep.endpoint_id, audit_id[:12])
-                continue
+            if block_number <= self._busy_until_block.get(ep.endpoint_id, 0):
+                continue  # the auditor applies the same cooldown and does not draft this slot
             audit = SelectedAudit(ep, slot, row, core.gpu_workload_spec(row), audit_id, block_number, audit_block,
                                   proof_block, core.lease_id(slot, epoch))
-            self._busy_until_block[ep.endpoint_id] = proof_block + 1
+            self._busy_until_block[ep.endpoint_id] = proof_block + core.payload_cooldown_blocks(self.policy,
+                                                                                                self.block_time_s)
             self.drain.set(ep.endpoint_id, time.time() + core.active_hold_seconds(self.policy, self.block_time_s))
             t = threading.Thread(target=self._run_audit, args=(audit,), name=f"audit-{audit_id[:8]}-{ep.endpoint_id}",
                                  daemon=True)
@@ -360,7 +360,6 @@ class AuditWorker:
         finally:
             if proc is not None and proc.poll() is None:
                 proc.kill()
-            self._busy_until_block[ep_id] = max(self._busy_until_block.get(ep_id, 0), self._last_block)
             self.drain.clear(ep_id)
 
     def _execute(self, audit: SelectedAudit) -> subprocess.Popen | None:
