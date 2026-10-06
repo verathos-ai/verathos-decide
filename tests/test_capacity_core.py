@@ -1,10 +1,10 @@
-"""Capacity audit core: identity, selection, signing, and byte-compatibility of the proof derivations with the
-original protocol (checked against verathos-core when it is available next to this repository)."""
+"""Capacity audit core: identity, selection, signing, and the stored reference vectors for the beacon and proof
+derivations (``fixtures/capacity_vectors.json``) that the GPU bench and the verifier depend on."""
 
 from __future__ import annotations
 
 import hashlib
-import sys
+import json
 from pathlib import Path
 
 import pytest
@@ -12,49 +12,35 @@ from bittensor_wallet import Keypair
 
 from verathos.capacity import core
 
-CORE = Path(__file__).resolve().parents[2] / "verathos-core"
-
-
-@pytest.fixture(scope="module")
-def legacy():
-    if not (CORE / "neurons" / "capacity_audit.py").exists():
-        pytest.skip("verathos-core not available")
-    sys.path.insert(0, str(CORE))
-    try:
-        from neurons import capacity_audit
-    finally:
-        sys.path.remove(str(CORE))
-    return capacity_audit
+VECTORS = json.loads((Path(__file__).parent / "fixtures" / "capacity_vectors.json").read_text())
 
 
 def h(i: int) -> str:
     return hashlib.sha256(f"block-{i}".encode()).hexdigest()
 
 
-def test_proof_derivations_match_original(legacy) -> None:
-    for i in range(20):
-        slot_hex, lease = h(1000 + i), h(2000 + i)
-        assert core.derive_proof_seed(h(i), slot_hex, i % 4) == legacy.derive_proof_seed(h(i), slot_hex, i % 4)
-        assert core.derive_proof_challenge_seed(h(i), h(i + 1), lease, slot_hex, i % 2) == \
-            legacy.derive_proof_challenge_seed(h(i), h(i + 1), lease, slot_hex, i % 2)
-        assert core.derive_sampled_pass_index(h(i), lease, 0, 337) == legacy.derive_sampled_pass_index(h(i), lease, 0, 337)
-        assert core.derive_audit_seed(h(i), 22600 + i) == legacy.derive_audit_seed(h(i), 22600 + i)
-    roots = [h(i) for i in range(5)] + [[1, 2, 3], [4, 5]]
-    assert core.transcript_root(roots) == legacy.transcript_root(roots)
+def test_proof_derivations_match_reference_vectors() -> None:
+    for block, slot_hex, gpu, expected in VECTORS["proof_seed"]:
+        assert core.derive_proof_seed(block, slot_hex, gpu) == expected
+    for root, block, lease, slot_hex, gpu, expected in VECTORS["challenge_seed"]:
+        assert core.derive_proof_challenge_seed(root, block, lease, slot_hex, gpu) == expected
+    for root, lease, gpu, passes, expected in VECTORS["sampled_pass"]:
+        assert core.derive_sampled_pass_index(root, lease, gpu, passes) == expected
+    for block, epoch, expected in VECTORS["audit_seed"]:
+        assert core.derive_audit_seed(block, epoch) == expected
+    roots, expected = VECTORS["transcript_root"]
+    assert core.transcript_root(roots) == expected
 
 
-def test_beacon_and_gpu_rows_match_original(legacy) -> None:
-    policy = core.AuditPolicy(windows_per_epoch=5)
-    old_cfg = legacy.CapacityAuditRuntimeConfig(windows_per_epoch=5, lead_blocks=5, proof_challenge_delay_blocks=4)
-    for b in range(9_000_000, 9_000_400):
-        assert core.window_triggered(b, h(b), 360, policy) == legacy.capacity_audit_window_triggered(b, h(b), 360, old_cfg)
-        assert core.window_fits_epoch(b, 360, policy) == legacy.capacity_audit_window_fits_epoch(b, 360, old_cfg)
-    for name, vram in [("NVIDIA GeForce RTX 4090", 24), ("NVIDIA GeForce RTX 5090", 32), ("NVIDIA H100 80GB HBM3", 80)]:
-        new = core.gpu_workload_spec(core.match_gpu_class(name, vram, policy))
-        old = legacy.capacity_gpu_workload_spec(legacy.match_gpu_class(name, vram, old_cfg))
-        assert new == old
-    for host in ["a.b.example.co.uk", "miner.example.com", "203.0.113.5", "localhost"]:
-        assert core.registered_domain_from_host(host) == legacy.registered_domain_from_host(host)
+def test_beacon_and_gpu_rows_match_reference_vectors() -> None:
+    policy = core.AuditPolicy(windows_per_epoch=5, lead_blocks=5, proof_challenge_delay_blocks=4)
+    for block, block_hash, triggered, fits in VECTORS["window"]:
+        assert core.window_triggered(block, block_hash, 360, policy) == triggered
+        assert core.window_fits_epoch(block, 360, policy) == fits
+    for name, (vram, spec) in VECTORS["workload_specs"].items():
+        assert core.gpu_workload_spec(core.match_gpu_class(name, vram, policy)) == spec
+    for host, expected in VECTORS["registered_domain"].items():
+        assert core.registered_domain_from_host(host) == expected
 
 
 def slot(hotkey: str, endpoint_id: str = "gpu0", url: str = "http://203.0.113.5:8091/e/gpu0", model: str = "kev-4b") -> core.Slot:
