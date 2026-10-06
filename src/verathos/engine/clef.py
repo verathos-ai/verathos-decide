@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ def load(repo: str, revision: str, *, device: str, dtype: str):
     path = Path(snapshot_download(repo, revision=revision))
     spec = importlib.util.spec_from_file_location("joint_schema_model", path / "joint_schema_model.py")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # its dataclasses resolve annotations through sys.modules
     spec.loader.exec_module(module)
     model, processor = module.load_release_model(str(path), device=device, dtype=getattr(torch, dtype))
     model.eval()
