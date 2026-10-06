@@ -148,8 +148,6 @@ async def measure_all(targets: Sequence[Target], run_s: float = RUN_S) -> list[M
         runs = tuple(round(f[i], 2) for f in finals)
         if statistics.median(runs) <= 0:
             raise MeasurementFailed(f"endpoint {t.endpoint_id}: the engine completed no requests under load")
-        log.info("endpoint %s: %.1f requests/s at concurrency %d (runs %s)", t.endpoint_id, statistics.median(runs),
-                 best[i][0], list(runs))
         out.append(Measurement(t.endpoint_id, t.fingerprint, statistics.median(runs), best[i][0], runs, time.time()))
     return out
 

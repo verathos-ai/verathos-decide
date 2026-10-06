@@ -102,8 +102,9 @@ class Publisher:
         for e in endpoints:
             m = measured[e.endpoint_id]
             self.admissions[e.endpoint_id].limit = m.concurrency
-            log.info("endpoint %s (%s): measured %.1f requests/s at concurrency %d, declares %.1f", e.endpoint_id,
-                     e.model_id, m.measured_rps, m.concurrency, m.declared(margin))
+            log.info("endpoint %s (%s): %.1f requests/s at concurrency %d (runs %s), declares %.1f", e.endpoint_id,
+                     e.model_id, m.measured_rps, m.concurrency, ", ".join(f"{r:.1f}" for r in m.runs),
+                     m.declared(margin))
         return build_manifest(self.config, endpoints, {k: m.declared(margin) for k, m in measured.items()},
                               self.wallet.hotkey, cat.digest())
 

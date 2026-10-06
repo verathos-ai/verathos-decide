@@ -1,7 +1,9 @@
 # Answer verification and scoring
 
 An epoch is `epoch_blocks` blocks (catalog, default 180, about 36 minutes), independent of the subnet tempo: every
-validator scores and sets weights once per epoch, within the chain's weight rate limit (100 blocks on SN96).
+validator scores and sets weights once per epoch, within the chain's weight rate limit (100 blocks on SN96). The
+settings below are the catalog's `scoring` section and each model's `tolerance`, so every validator applies the
+same ones.
 
 ## Why answers can be checked
 
@@ -15,13 +17,14 @@ The validator therefore recomputes a sample of requests itself, in fp32, and com
 
 ## Canaries
 
-Each epoch the validator derives a pool of `pool_size` requests per model from a private secret, the epoch and the
-model (support tickets and code-review requests with generated details and a varying subset of questions). Miners
+Each epoch the validator derives a pool of `canary_pool_size` (16) requests per model from a private secret, the
+epoch and the model (support tickets and code-review requests with generated details and a varying subset of questions). Miners
 cannot predict them. Canaries are signed by the validator's hotkey, so a miner can tell validator traffic from
 gateway traffic; the checks here cover what validators are served, and answers to other callers are not verified.
 The reference engine answers each canary once; every endpoint of that model receives its own random subset of
-`per_endpoint` canaries, spread over the first `audit_fraction` of the epoch. If the reference engine cannot answer,
-the model's endpoints are not audited that epoch and keep their score.
+`canaries_per_endpoint` (10) canaries, spread over the first `canary_spread_fraction` (0.6) of the epoch. Canaries
+wait while a throughput test runs (`THROUGHPUT_AUDIT.md`). If the reference engine cannot answer, the model's
+endpoints are not audited that epoch and keep their score.
 
 Every request is signed by the validator and bound to the miner and a nonce. Every answer comes with a receipt
 signed by the miner hotkey that binds the request, the answers, the endpoint, the model, the caller, the nonce, the
@@ -37,29 +40,31 @@ Per request (hard check). The request fails if:
 - the top answer changes where the reference was confident (its margin over the runner-up is at least
   `flip_margin`, default 0.20).
 
-Per endpoint (statistical check). Over the endpoint's last `window_epochs` audited epochs, the mean absolute
-difference over all compared probabilities must stay below `mean_abs` (default 0.005) once at least `min_probabilities` (default 100)
-have been compared. This catches lower-precision substitutes that stay under the hard bound on single requests.
+Per endpoint (statistical check). Over the endpoint's last `statistical_window_epochs` (3) audited epochs, the mean
+absolute difference over all compared probabilities must stay below `mean_abs` (default 0.005) once at least
+`min_probabilities` (default 100) have been compared. This catches lower-precision substitutes that stay under the
+hard bound on single requests.
 
 Tolerances are per model and set in the catalog.
 
 ## Score
 
 Per endpoint and epoch:
-- zero, with probation, if a request failed the hard check, the statistical check failed, or the capacity audit
-  gated the endpoint;
-- zero if the endpoint failed the identity challenge or answered nothing, and, while the capacity audit gates
-  (`score_gate`), if the audit cannot cover it (not CUDA, or its GPU has no class in the catalog) or the endpoint
-  is in its first `qualification_epochs` epochs (see `CAPACITY_AUDIT.md`: the audit needs that time to catch an
-  endpoint sharing a GPU);
-- otherwise `score_weight(model) x answered / sent x latency factor`, where the latency factor is
-  `sqrt(median latency of the model's passing endpoints / own median latency)`, capped to [0.7, 1.3]. Only
-  endpoints that passed this epoch set the median.
+- zero, with probation, if a request failed the hard check or the statistical check failed;
+- zero, with probation for every endpoint of the hotkey and their averages reset to zero, if the throughput auditor
+  proved a wrong answer the hotkey signed in a test (see `THROUGHPUT_AUDIT.md`);
+- zero if the endpoint failed the identity challenge, answered nothing, or has not yet proven capacity in a
+  throughput test;
+- otherwise `score_per_rps(model) x proven capacity x answered / sent x latency factor`. The proven capacity is the
+  auditor's credit in requests/s of the model's standard mix, at most what the endpoint declares now (in `observe`
+  mode the declaration itself). `score_per_rps` makes models of different cost per request comparable; `candidate`
+  models have none. The latency factor is `sqrt(median latency of the model's passing endpoints / own median
+  latency)`, capped to [0.7, 1.3]. Only endpoints that passed this epoch set the median.
 
-Probation lasts `probation_epochs` epochs, the failing one included, whatever the later results; a new failure
+Probation lasts `probation_epochs` (6) epochs, the failing one included, whatever the later results; a new failure
 restarts the count. An endpoint a hotkey adds while one of its endpoints is on probation inherits the remaining
-probation, so renaming an endpoint does not escape it. Scores enter an exponential moving average (`ema_alpha`);
-endpoints that disappear decay toward zero and are forgotten once negligible.
+probation, so renaming an endpoint does not escape it. Scores enter an exponential moving average (`ema_alpha`,
+0.2); endpoints that disappear decay toward zero and are forgotten once negligible.
 
 ## Weights
 

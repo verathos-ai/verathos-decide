@@ -30,8 +30,8 @@ Rules:
 - A manifest is accepted only if it is signed by the hotkey that owns the axon, is for this netuid and mechanism,
   its digest equals that hotkey's current commitment, and every endpoint URL is `http://<axon ip>:<axon port>/e/<id>`.
   A miner therefore cannot show different endpoint lists to different validators, nor claim hosts other than its
-  own axon. The manifest depends only on the miner's configuration and the catalog, so a restart does not change
-  the commitment.
+  own axon. The manifest depends only on the miner's configuration, its capacity measurements and the catalog, so a
+  restart does not change the commitment.
 - A manifest names the catalog it was built for. Validators accept the current catalog and, for one epoch after a
   change, the previous one, while miners re-publish (they check every minute).
 - A catalog is accepted only if its digest equals the subnet owner hotkey's current commitment. A copy ships with
@@ -39,8 +39,8 @@ Rules:
   proves them. A new commitment takes effect without a code release.
 - Signatures and digests cover the JSON documents exactly as published (canonical encoding of the parsed JSON), so
   nodes whose code knows fewer fields still agree on them. Responses from other neurons are size- and time-bounded.
-- Endpoint control (each endpoint signs a validator nonce with the listing hotkey) and the capacity audit
-  (shared hardware) are separate checks applied after discovery.
+- Endpoint control (each endpoint signs a validator nonce with the listing hotkey) and the throughput audit
+  (declared capacity, see `THROUGHPUT_AUDIT.md`) are separate checks applied after discovery.
 
 Chain limits (read from subtensor main and testnet 405 on 2026-10-06):
 - `serve_axon`: no fee (`Pays::No`), at most once per `ServingRateLimit` = 50 blocks (about 10 minutes). Needed only
