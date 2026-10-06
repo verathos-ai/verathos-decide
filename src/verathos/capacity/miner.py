@@ -263,7 +263,7 @@ class AuditWorker:
         self._running = True
         threading.Thread(target=self._run, name="capacity-audit", daemon=True).start()
         log.info("capacity audit worker started for %d endpoints (auditor %s)", len(self.endpoints),
-                 self.policy.auditor_hotkey[:12] or "unset")
+                 self.policy.auditor_hotkey[:12] or "subnet owner")
 
     def stop(self) -> None:
         self._running = False
