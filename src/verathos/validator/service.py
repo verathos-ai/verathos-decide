@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 
 import bittensor as bt
 import uvicorn
@@ -70,7 +71,12 @@ def start_service(*, st: bt.Subtensor, wallet: bt.Wallet, netuid: int, public_ho
         add_verdicts_route(app, auditor)
     logging.getLogger("uvicorn.error").addFilter(_DropInvalidRequests())
     server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning", access_log=False))
-    threading.Thread(target=server.run, name="validator-service", daemon=True).start()
+    thread = threading.Thread(target=server.run, name="validator-service", daemon=True)
+    thread.start()
+    while not server.started:
+        if not thread.is_alive():
+            raise SystemExit(f"the validator service could not start on port {port}")
+        time.sleep(0.1)
     serve_axon(st, wallet, netuid, public_host, port)
     log.info("validator service on port %d (%s)", port, ", ".join(
         role for role, on in (("catalog", store is not None), ("throughput verdicts", auditor is not None)) if on))

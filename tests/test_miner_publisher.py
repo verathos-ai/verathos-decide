@@ -63,7 +63,7 @@ def test_capacity_is_measured_through_the_service_and_a_dead_engine_is_withdrawn
                                      subtensor=chain)
     engines = {"gpu0": CapacityEngine(rps=100), "gpu1": Down()}
     app = create_app(config=config, keypair=keypair, manifest=lambda: publisher.signed, engines=engines,
-                     authorized=lambda hk: False, auditor=lambda: publisher.auditor, admissions=publisher.admissions,
+                     authorized=lambda hk: False, auditors=publisher.auditors, admissions=publisher.admissions,
                      serving=lambda: publisher.serving)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     threading.Thread(target=server.run, daemon=True).start()

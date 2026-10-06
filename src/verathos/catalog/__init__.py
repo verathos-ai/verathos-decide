@@ -18,8 +18,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
 
-import httpx
-from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from verathos.protocol.canonical import digest
 from verathos.protocol.http import get_json
@@ -111,9 +110,10 @@ class Catalog(BaseModel):
         self.audit_policy()
         return self
 
-    def audit_policy(self) -> AuditPolicy:
-        """The throughput-audit policy: code defaults with this catalog's settings."""
-        return policy_from(self.throughput_audit, self.epoch_blocks)
+    def audit_policy(self, *, strict: bool = False) -> AuditPolicy:
+        """The throughput-audit policy: code defaults with this catalog's settings (``strict``: settings this code
+        does not know are an error, as when publishing a catalog)."""
+        return policy_from(self.throughput_audit, self.epoch_blocks, strict=strict)
 
     def digest(self) -> str:
         return digest(self.document())
@@ -171,15 +171,16 @@ def resolve(catalog_digest: str, *, store: CatalogStore, sources: list[str]) -> 
     for template in sources:
         url = template.format(digest=catalog_digest)
         try:
-            catalog = Catalog.parse(get_json(url, limit=MAX_CATALOG_BYTES, timeout=15))
-        except (httpx.HTTPError, ValueError, ValidationError) as exc:
+            document = get_json(url, limit=MAX_CATALOG_BYTES, timeout=15)
+            if digest(document) != catalog_digest:
+                log.warning("catalog from %s is not the committed %s", url, catalog_digest[:12])
+                continue
+            catalog = Catalog.parse(document)
+        except Exception as exc:  # whatever a source serves, it only costs that source
             log.info("catalog %s not available from %s: %s", catalog_digest[:12], url, exc)
             continue
-        if catalog.digest() == catalog_digest:
-            store.put(catalog)
-            return catalog
-        log.warning("catalog from %s has digest %s, not the committed %s", url, catalog.digest()[:12],
-                    catalog_digest[:12])
+        store.put(catalog)
+        return catalog
     raise CatalogUnavailable(f"catalog {catalog_digest} not found in the shipped copy, {store.directory} or "
                              f"{len(sources)} sources")
 

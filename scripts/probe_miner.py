@@ -26,7 +26,7 @@ from verathos.protocol import signing
 from verathos.protocol.api import distributions
 from verathos.protocol.manifest import accept, axon_base
 from verathos.protocol.receipts import SignedReceipt
-from verathos.protocol.requests import sign_request
+from verathos.protocol.requests import HDR_NONCE, sign_request
 from verathos.subnet.chain import current_catalog
 from verathos.validator.compare import EndpointTally, Tolerance, compare_request
 
@@ -78,7 +78,8 @@ def main() -> None:
     p.add_argument("--uid", type=int, required=True)
     p.add_argument("--caller-wallet", required=True)
     p.add_argument("--caller-hotkey", required=True)
-    p.add_argument("--reference", type=Path, required=True, help="fixture JSON with reference answers")
+    p.add_argument("--reference", type=Path, required=True,
+                   help="fixture JSON with reference answers, named drift-<model>-<hardware>.json")
     p.add_argument("--endpoint", default=None)
     args = p.parse_args()
 
@@ -105,19 +106,27 @@ def main() -> None:
     )
     print(f"identity challenge for {endpoint.endpoint_id}: {'verified' if ok else 'FAILED'}")
 
+    if f"-{endpoint.model_id}-" not in args.reference.name:
+        raise SystemExit(f"{args.reference.name} holds reference answers for another model than {endpoint.model_id}")
     reference = [distributions(r["answers"]) for r in json.loads(args.reference.read_text())]
     tolerance = cat.get(endpoint.model_id).tolerance if cat.get(endpoint.model_id) else Tolerance()
     tally, latencies, receipts_ok = EndpointTally(tolerance), [], 0
     for state, ref in zip(states(len(reference)), reference):
         request = {"model": endpoint.model_id, "state": state, "questions": QUESTIONS}
         t0 = time.time()
-        response = post(base, prefix + "/v1/systemone", request, caller, hotkey)
+        body = json.dumps(request).encode()
+        path = prefix + "/v1/systemone"
+        headers = {"Content-Type": "application/json", **sign_request(caller, "POST", path, body, hotkey)}
+        response = json.loads(urllib.request.urlopen(urllib.request.Request(base + path, body, headers),
+                                                     timeout=120).read())
         latencies.append((time.time() - t0) * 1000)
         receipt = SignedReceipt.model_validate(response["receipt"])
-        receipts_ok += (
-            receipt.signature_valid()
-            and receipt.binds(request, response["answers"])
-            and receipt.receipt.miner_hotkey == hotkey
+        r = receipt.receipt
+        receipts_ok += (  # the checks validators make
+            receipt.signature_valid() and receipt.binds(request, response["answers"]) and r.miner_hotkey == hotkey
+            and r.endpoint_id == endpoint.endpoint_id and r.model_id == endpoint.model_id
+            and r.caller_hotkey == caller.ss58_address and r.request_nonce == headers[HDR_NONCE]
+            and r.netuid == args.netuid and r.mechid == args.mechid
         )
         tally.add(compare_request(ref, distributions(response["answers"]), tally.tolerance))
     print(f"requests {tally.requests}, receipts valid {receipts_ok}/{tally.requests}, "

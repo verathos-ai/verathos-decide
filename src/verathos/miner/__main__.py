@@ -2,8 +2,9 @@
 
 The miner starts its service, measures the capacity of its endpoints through it with each model's standard request
 mix (all endpoints at once), declares it in its manifest, and publishes. Measurements are stored and reused until an
-endpoint's engine, configuration or request mix changes, or ``--remeasure`` is given. An endpoint that cannot be
-measured is withdrawn; the others are served.
+endpoint's engine, configuration, model revision or request mix changes, or ``--remeasure`` is given. An endpoint that
+cannot be measured is withdrawn; the others are served. Until the first measurement is done, the service serves the
+manifest the miner last published.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import resource
 import threading
 import time
 from collections.abc import Callable
@@ -29,12 +31,13 @@ from verathos.miner.chain import PermitAuthorizer, build_manifest, publish
 from verathos.miner.config import EndpointConfig, MinerConfig
 from verathos.miner.engine import HttpEngine
 from verathos.miner.status import StatusWatcher
-from verathos.protocol.manifest import axon_base
+from verathos.protocol.manifest import SignedManifest, axon_base
 from verathos.subnet.chain import committed_catalog, current_catalog
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.measure import (
     Measurement,
     MeasurementFailed,
+    MeasurementInterrupted,
     MeasurementStore,
     ServicePath,
     Target,
@@ -43,7 +46,7 @@ from verathos.throughput.measure import (
     stored,
     wait_ready,
 )
-from verathos.throughput.policy import POLICY_WATCH_S
+from verathos.throughput.policy import BLOCK_TIME_S, POLICY_WATCH_S
 
 log = logging.getLogger("verathos.miner")
 LOCAL_HOSTS = {"0.0.0.0": "127.0.0.1", "": "127.0.0.1", "::": "::1"}
@@ -66,46 +69,89 @@ def servable(config: MinerConfig, cat: catalog.Catalog) -> list[EndpointConfig]:
 
 
 async def engine_fingerprint(e: EndpointConfig, cat: catalog.Catalog) -> str:
+    """What the endpoint's measurement depends on: its configuration, the model's pinned revisions, the engine's
+    self-description and the request mix."""
     engine = HttpEngine(e.engine_url, e.engine_api_key)
     try:
         info = await engine.info()
     finally:
         await engine.close()
+    model = cat.get(e.model_id)
     config = {"model_id": e.model_id, "engine_url": e.engine_url, "max_concurrency": e.max_concurrency,
-              "max_latency_s": cat.audit_policy().max_latency_s}
-    return fingerprint(config, info, cat.get(e.model_id).workload)
+              "max_latency_s": cat.audit_policy().max_latency_s, "hf_revision": model.hf_revision,
+              "engine_revision": model.engine.revision}
+    return fingerprint(config, info, model.workload)
+
+
+def raise_open_file_limit() -> int:
+    """Raise the soft open-file limit to the hard one (every connection holds a descriptor); returns it."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < hard:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
 
 
 class Publisher:
     """The current signed manifest: the endpoints whose capacity is measured, rebuilt when the subnet owner commits a
-    new catalog, and published on chain."""
+    new catalog or an engine changes, and published on chain."""
 
     def __init__(self, config: MinerConfig, wallet: bt.Wallet, cat: catalog.Catalog, *, publish_on_chain: bool,
                  subtensor: bt.Subtensor) -> None:
         self.config, self.wallet, self.publish_on_chain = config, wallet, publish_on_chain
         self.store = MeasurementStore(config.state_dir / "capacity.json")
+        self.manifest_path = config.state_dir.expanduser() / "manifest.json"
         self.admissions = {e.endpoint_id: Admission(e.max_concurrency) for e in config.endpoints}
         endpoints = servable(config, cat)
         if not endpoints:
             raise SystemExit(f"no configured endpoint serves a model of catalog {cat.digest()[:12]}")
-        # Until the first measurement: an unpublished manifest, so the service can be measured through.
         self.catalog = cat
-        self.signed = build_manifest(config, endpoints, dict.fromkeys((e.endpoint_id for e in endpoints), 0.0),
-                                     wallet.hotkey, cat.digest())
+        # Until the first measurement: the manifest last published (so validators find the miner as committed), or
+        # an unpublished one, so the service can be measured through.
+        self.signed = self._last_published() or build_manifest(
+            config, endpoints, dict.fromkeys((e.endpoint_id for e in endpoints), 0.0), wallet.hotkey, cat.digest())
         self.serving = {e.endpoint_id for e in endpoints}
-        self.auditor = self._auditor(subtensor)
+        self._auditors: dict[str, float] = {}  # hotkey -> accepted until (monotonic); the current one: forever
+        self._set_auditor(self._auditor(subtensor))
+        self.test_seen = 0.0  # monotonic time the auditor's test traffic last arrived
         self._published = False
         self.on_catalog: list[Callable[[catalog.Catalog], None]] = []
 
+    # ---- the auditor ----
+
     def _auditor(self, st: bt.Subtensor) -> str:
         return self.catalog.audit_policy().auditor_hotkey or st.get_subnet_owner_hotkey(self.config.netuid)
+
+    def _set_auditor(self, hotkey: str) -> None:
+        """A new auditor is accepted at once; the previous one for one more epoch, while validators switch."""
+        grace = time.monotonic() + self.catalog.epoch_blocks * BLOCK_TIME_S
+        self._auditors = {h: grace if until == float("inf") else until for h, until in self._auditors.items()
+                          if until > time.monotonic()} | {hotkey: float("inf")}
+
+    def auditors(self) -> set[str]:
+        now = time.monotonic()
+        return {h for h, until in self._auditors.items() if until > now}
+
+    def note_test_traffic(self) -> None:
+        self.test_seen = time.monotonic()
+
+    # ---- measuring ----
+
+    def _last_published(self) -> SignedManifest | None:
+        try:
+            signed = SignedManifest.model_validate_json(self.manifest_path.read_text())
+        except (OSError, ValueError):
+            return None
+        m = signed.manifest
+        same = (m.hotkey, m.netuid, m.mechid) == (self.wallet.hotkey.ss58_address, self.config.netuid,
+                                                  self.config.mechid)
+        return signed if same else None
 
     def _local_url(self, endpoint_id: str) -> str:
         host = LOCAL_HOSTS.get(self.config.listen_host, self.config.listen_host)
         return f"{axon_base(host, self.config.port)}/e/{endpoint_id}/v1/systemone"
 
-    async def _measure(self, endpoints: list[EndpointConfig], cat: catalog.Catalog,
-                       remeasure: bool) -> tuple[dict[str, Measurement], dict[str, str]]:
+    async def _measure(self, endpoints: list[EndpointConfig], cat: catalog.Catalog, remeasure: bool,
+                       stop: Callable[[], bool]) -> tuple[dict[str, Measurement], dict[str, str]]:
         limits = httpx.Limits(max_connections=None, max_keepalive_connections=1024)
         async with httpx.AsyncClient(timeout=120.0, limits=limits) as client:
             targets = [Target(e.endpoint_id, e.model_id,
@@ -128,26 +174,36 @@ class Publisher:
             if reuse is not None:
                 return reuse, failures
             measured, failed = await measure_and_store(targets, self.store,
-                                                       max_latency_s=cat.audit_policy().max_latency_s)
+                                                       max_latency_s=cat.audit_policy().max_latency_s, stop=stop)
             return measured, failures | failed
 
     def adopt(self, cat: catalog.Catalog, *, remeasure: bool = False) -> bool:
         """Measure the endpoints ``cat`` serves (or reuse their stored measurements) through the running service and
-        sign a manifest of those measured. False if none could be measured; the current manifest stays."""
+        sign a manifest of those measured. A measurement steps aside when the auditor's test traffic arrives. False if
+        none could be measured or the measurement stepped aside; the current manifest stays."""
         endpoints = servable(self.config, cat)
         if not endpoints:
             log.error("no configured endpoint serves a model of catalog %s", cat.digest()[:12])
             return False
-        previous = set(self.serving)
-        self.serving = previous | {e.endpoint_id for e in endpoints}
+        previous_serving = set(self.serving)
+        previous_limits = {k: a.limit for k, a in self.admissions.items()}
+        self.serving = previous_serving | {e.endpoint_id for e in endpoints}
         for e in endpoints:
             self.admissions[e.endpoint_id].limit = e.max_concurrency
-        measured, failures = asyncio.run(self._measure(endpoints, cat, remeasure))
+        started = time.monotonic()
+        try:
+            measured, failures = asyncio.run(self._measure(endpoints, cat, remeasure,
+                                                           stop=lambda: self.test_seen > started))
+        except MeasurementInterrupted:
+            log.info("a throughput test reached the miner; measuring again later")
+            measured, failures = {}, {}
         for endpoint_id, reason in sorted(failures.items()):
             log.error("endpoint %s withdrawn: %s", endpoint_id, reason)
         listed = [e for e in endpoints if e.endpoint_id in measured]
         if not listed:
-            self.serving = previous
+            self.serving = previous_serving
+            for k, limit in previous_limits.items():
+                self.admissions[k].limit = limit
             return False
         margin = cat.audit_policy().capacity_margin
         for e in listed:
@@ -163,36 +219,63 @@ class Publisher:
         self._published = False
         return True
 
+    def engines_changed(self) -> bool:
+        """Whether a listed endpoint's engine or configuration no longer matches its stored measurement."""
+        listed = {e.endpoint_id for e in self.signed.manifest.endpoints}
+        endpoints = [e for e in servable(self.config, self.catalog) if e.endpoint_id in listed]
+        stored_now = self.store.load()
+
+        async def check() -> bool:
+            for e in endpoints:
+                m = stored_now.get(e.endpoint_id)
+                if m is None or m.fingerprint != await engine_fingerprint(e, self.catalog):
+                    return True
+            return False
+
+        return asyncio.run(check())
+
+    # ---- publishing ----
+
     def publish(self, st: bt.Subtensor) -> None:
         if self.publish_on_chain and not self._published:
             publish(st, self.wallet, self.config, self.signed)
+            self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            self.manifest_path.write_text(self.signed.model_dump_json())
         self._published = True
 
     def watch(self, interval_s: float = POLICY_WATCH_S) -> None:
-        """Follow the owner's catalog commitment. A new catalog is adopted at once (measuring again if it changed what
-        a measurement depends on); its on-chain publication is retried until it succeeds."""
+        """Follow the owner's catalog commitment and the engines. A new catalog is adopted at once (measuring again
+        if it changed what a measurement depends on), so is a changed engine; on-chain publication is retried until
+        it succeeds."""
 
         def run() -> None:
-            st = bt.Subtensor(network=self.config.network)
             store = catalog.CatalogStore(self.config.catalog_dir)
+            st: bt.Subtensor | None = None
             while True:
                 time.sleep(interval_s)
                 try:
+                    st = st or bt.Subtensor(network=self.config.network)
                     if committed_catalog(st, self.config.netuid) != self.catalog.digest():
                         cat = current_catalog(st, self.config.netuid, store, self.config.catalog_mirrors)
+                        self._set_auditor(cat.audit_policy().auditor_hotkey
+                                          or st.get_subnet_owner_hotkey(self.config.netuid))
                         if self.adopt(cat):
                             log.info("catalog %s committed; manifest rebuilt", cat.digest()[:12])
                             for callback in self.on_catalog:
                                 callback(cat)
                         else:
-                            log.error("catalog %s committed but no endpoint could be measured; keeping the "
-                                      "current manifest", cat.digest()[:12])
-                    self.auditor = self._auditor(st)
+                            log.error("catalog %s committed but not adopted yet; keeping the current manifest",
+                                      cat.digest()[:12])
+                    elif self.engines_changed():
+                        log.info("an engine changed; measuring again")
+                        self.adopt(self.catalog)
+                    self._set_auditor(self._auditor(st))
                     if not self._published:
                         self.publish(st)
                         log.info("manifest published")
                 except Exception:
                     log.exception("catalog follow failed; retrying")
+                    st = None
 
         threading.Thread(target=run, name="catalog-watch", daemon=True).start()
 
@@ -224,14 +307,22 @@ def main() -> None:
     cat = catalog.load() if args.no_publish else resolve_catalog(subtensor, config)
     publisher = Publisher(config, wallet, cat, publish_on_chain=not args.no_publish, subtensor=subtensor)
 
-    authorizer = PermitAuthorizer(subtensor, config.netuid, config.gateway_hotkeys)
+    authorizer = PermitAuthorizer(config.network, config.netuid, config.gateway_hotkeys)
     engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key, max_connections=e.max_concurrency)
                for e in config.endpoints}
+
+    def max_state_tokens(model_id: str) -> int | None:
+        model = publisher.catalog.get(model_id)
+        return model.max_state_tokens if model is not None else None
+
     app = create_app(config=config, keypair=wallet.hotkey, manifest=lambda: publisher.signed, engines=engines,
-                     authorized=authorizer, auditor=lambda: publisher.auditor, admissions=publisher.admissions,
-                     serving=lambda: publisher.serving)
+                     authorized=authorizer, auditors=publisher.auditors, admissions=publisher.admissions,
+                     serving=lambda: publisher.serving, max_state_tokens=max_state_tokens,
+                     on_test_traffic=publisher.note_test_traffic)
+    # Connections beyond the descriptors left are refused, so a flood of idle connections cannot starve the rest.
+    limit = max(256, raise_open_file_limit() - 256)
     server = uvicorn.Server(uvicorn.Config(app, host=config.listen_host, port=config.port, log_level="warning",
-                                           access_log=False))
+                                           access_log=False, limit_concurrency=limit))
     service = threading.Thread(target=server.run, name="service", daemon=True)
     service.start()
     while not server.started:
@@ -249,7 +340,7 @@ def main() -> None:
         StatusWatcher(hotkey=wallet.hotkey.ss58_address, auditor_url=chain.auditor_url,
                       listed=lambda: [e.endpoint_id for e in publisher.signed.manifest.endpoints]).start()
     log.info("serving %d endpoints on port %d; throughput tests are accepted from %s; status is logged once per "
-             "epoch", len(publisher.signed.manifest.endpoints), config.port, publisher.auditor)
+             "epoch", len(publisher.signed.manifest.endpoints), config.port, ", ".join(sorted(publisher.auditors())))
     service.join()
     os._exit(1)  # the service stopped
 

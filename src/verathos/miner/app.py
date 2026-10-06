@@ -11,6 +11,7 @@ Test traffic carries the auditor's session for this endpoint and test instead of
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -27,8 +28,8 @@ from verathos.miner.admission import Admission
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
-from verathos.protocol.api import SystemOneRequest
-from verathos.protocol.canonical import digest
+from verathos.protocol.api import SystemOneRequest, distributions, question_keys
+from verathos.protocol.canonical import canonical_json, digest
 from verathos.protocol.manifest import SignedManifest
 from verathos.protocol.receipts import Receipt, SignedReceipt
 from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, verify_request
@@ -37,6 +38,9 @@ from verathos.throughput.policy import HDR_SESSION, SessionGate
 log = logging.getLogger(__name__)
 IDENTITY_DOMAIN = "verathos/identity/v1"
 MAX_REQUEST_BYTES = 1 << 20
+BODY_TIMEOUT_S = 10.0
+CALLER_CONCURRENCY = 4
+STATE_CHARS_PER_TOKEN = 4  # a generous bound: tokens of these models average fewer characters
 
 
 @dataclass(frozen=True)
@@ -61,33 +65,42 @@ def create_app(
     manifest: Callable[[], SignedManifest],
     engines: dict[str, Engine],
     authorized: Callable[[str], bool],
-    auditor: Callable[[], str | None],
+    auditors: Callable[[], Collection[str]],
     admissions: dict[str, Admission] | None = None,
     serving: Callable[[], Collection[str]] | None = None,
+    max_state_tokens: Callable[[str], int | None] = lambda model_id: None,
+    on_test_traffic: Callable[[], None] = lambda: None,
 ) -> FastAPI:
-    """``auditor`` gives the hotkey whose test sessions are accepted (besides the miner's own, for its measurement);
-    ``admissions`` the engine admission per endpoint (default: ``max_concurrency`` slots); ``serving`` the endpoints
-    answered (default: those the manifest lists)."""
+    """``auditors`` gives the hotkeys whose test sessions are accepted (besides the miner's own, for its
+    measurement), and ``on_test_traffic`` is called for each of their requests; ``admissions`` the engine admission per
+    endpoint (default: ``max_concurrency`` slots); ``serving`` the endpoints answered (default: those the manifest
+    lists); ``max_state_tokens`` a model's state limit."""
     app = FastAPI(title="Verathos miner")
     nonces = NonceCache()
     endpoints = {e.endpoint_id: e for e in config.endpoints}
     admissions = admissions or {e.endpoint_id: Admission(e.max_concurrency) for e in config.endpoints}
     hotkey = keypair.ss58_address
     sessions = SessionGate(config.netuid, hotkey)
+    gateways = set(config.gateway_hotkeys)
+    in_flight: dict[tuple[str, str], int] = {}  # (caller, endpoint) -> requests, for callers other than gateways
 
     def error(status: int, message: str) -> JSONResponse:
         return JSONResponse(status_code=status, content={"error": message})
 
     async def read_body(request: Request) -> bytes | None:
-        """The request body, or None if it exceeds MAX_REQUEST_BYTES."""
+        """The request body, or None if it exceeds MAX_REQUEST_BYTES or takes longer than BODY_TIMEOUT_S."""
         declared = request.headers.get("content-length", "")
         if declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
             return None
         body = bytearray()
-        async for chunk in request.stream():
-            body += chunk
-            if len(body) > MAX_REQUEST_BYTES:
-                return None
+        try:
+            async with asyncio.timeout(BODY_TIMEOUT_S):
+                async for chunk in request.stream():
+                    body += chunk
+                    if len(body) > MAX_REQUEST_BYTES:
+                        return None
+        except TimeoutError:
+            return None
         return bytes(body)
 
     async def authenticate(request: Request):
@@ -97,7 +110,7 @@ def create_app(
             return None, None, error(403, "caller is not a permitted validator or gateway")
         body = await read_body(request)
         if body is None:
-            return None, None, error(413, "request too large")
+            return None, None, error(413, "request too large or too slow")
         try:
             caller = verify_request(dict(request.headers), request.method, request.url.path, body, hotkey, nonces)
         except RequestRejected as e:
@@ -108,13 +121,15 @@ def create_app(
         """-> (the session's signer as caller, with the request id as nonce, body, None) or (None, None, error
         response). The session is checked before the body is read."""
         try:
-            session, request_id = sessions.check(request.headers, auditor=auditor(), endpoint_id=endpoint_id,
+            session, request_id = sessions.check(request.headers, auditors=auditors(), endpoint_id=endpoint_id,
                                                  now_ms=int(time.time() * 1000))
         except RequestRejected as e:
             return None, None, error(401, str(e))
+        if session.auditor != hotkey:
+            on_test_traffic()
         body = await read_body(request)
         if body is None:
-            return None, None, error(413, "request too large")
+            return None, None, error(413, "request too large or too slow")
         return TestCaller(session.auditor, request_id, session.not_after_ms), body, None
 
     def listed(endpoint_id: str) -> bool:
@@ -162,6 +177,26 @@ def create_app(
             return error(422, f"invalid request: {e}")
         if parsed.model != endpoint.model_id:
             return error(422, f"endpoint serves {endpoint.model_id}, not {parsed.model}")
+        limit = max_state_tokens(endpoint.model_id)
+        state = parsed.state if isinstance(parsed.state, str) else canonical_json(parsed.state).decode()
+        if limit is not None and len(state) > STATE_CHARS_PER_TOKEN * limit:
+            return error(413, "state longer than the model accepts")
+        # Callers other than gateways (validators) send a few requests at a time; more would crowd out tests.
+        capped = (caller.hotkey, endpoint_id) if not test and caller.hotkey not in gateways else None
+        if capped is not None and in_flight.get(capped, 0) >= CALLER_CONCURRENCY:
+            return error(429, "too many concurrent requests from this caller")
+        if capped is not None:
+            in_flight[capped] = in_flight.get(capped, 0) + 1
+        try:
+            return await answer(endpoint, endpoint_id, request, raw, parsed, caller, test, received_ms)
+        finally:
+            if capped is not None:
+                in_flight[capped] -= 1
+                if not in_flight[capped]:
+                    del in_flight[capped]
+
+    async def answer(endpoint, endpoint_id: str, request: Request, raw: dict[str, Any], parsed: SystemOneRequest,
+                     caller, test: bool, received_ms: int):
         admission = admissions[endpoint_id]
         # A test request is useful only until its session ends.
         wait_s = (caller.not_after_ms - time.time() * 1000) / 1000 if test else None
@@ -177,8 +212,9 @@ def create_app(
         finally:
             admission.release()
         answers = response.get("answers")
-        if not isinstance(answers, dict):
-            return error(502, "engine returned no answers")
+        if not well_formed(parsed, answers):
+            log.warning("engine %s returned malformed answers; not signed", endpoint_id)
+            return error(502, "engine returned malformed answers")
         receipt = Receipt(
             netuid=config.netuid, mechid=config.mechid, miner_hotkey=hotkey, endpoint_id=endpoint_id,
             model_id=endpoint.model_id, catalog_digest=manifest().manifest.catalog_digest, caller_hotkey=caller.hotkey,
@@ -190,3 +226,14 @@ def create_app(
                 "receipt": SignedReceipt.create(receipt, keypair).model_dump(mode="json")}
 
     return app
+
+
+def well_formed(request: SystemOneRequest, answers: Any) -> bool:
+    """Whether the answers give one valid distribution per question, over the question's own options. The miner signs
+    nothing else: a signed malformed answer counts as a wrong answer."""
+    try:
+        got = distributions(answers)
+    except Exception:
+        return False
+    return set(got) == set(request.questions) and all(set(got[qid]) == set(question_keys(q))
+                                                       for qid, q in request.questions.items())

@@ -18,7 +18,7 @@ import random
 import secrets
 import statistics
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -38,14 +38,18 @@ RUN_START_SHARE = 0.125  # every run first sends this share of its duration unco
 STABLE_TOLERANCE = 0.05
 MAX_WARMUP_RUNS = 12
 FINAL_RUNS = 5
-CONCURRENCY_LADDER = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+CONCURRENCY_LADDER = tuple(2 ** i for i in range(13))  # 1 .. 4096
 READY_TIMEOUT_S = 900.0
 KNEE_SHARE = 0.97
-SESSION_S = 3600.0
+SESSION_S = 240.0  # within the session lifetime the miner's replay protection covers
 
 
 class MeasurementFailed(RuntimeError):
     pass
+
+
+class MeasurementInterrupted(RuntimeError):
+    """The measurement stopped early (a throughput test reached the miner); nothing was measured."""
 
 
 @dataclass(frozen=True)
@@ -114,8 +118,10 @@ class ServicePath:
         return r.json()
 
 
-async def run_load(target: Target, concurrency: int, run_s: float = RUN_S) -> float:
-    """Requests/s completed during one closed-loop run at ``concurrency`` (after a short uncounted start)."""
+async def run_load(target: Target, concurrency: int, run_s: float = RUN_S,
+                   stop: Callable[[], bool] = lambda: False) -> float:
+    """Requests/s completed during one closed-loop run at ``concurrency`` (after a short uncounted start). Raises
+    MeasurementInterrupted once ``stop`` returns True."""
     rng = random.Random()
     begin = time.monotonic() + RUN_START_SHARE * run_s
     end = begin + run_s
@@ -124,6 +130,8 @@ async def run_load(target: Target, concurrency: int, run_s: float = RUN_S) -> fl
     async def worker() -> None:
         nonlocal done
         while time.monotonic() < end:
+            if stop():
+                raise MeasurementInterrupted()
             try:
                 await target.engine.answer(make_request(target.model_id, target.workload, rng))
             except EngineError:
@@ -161,18 +169,20 @@ def knee(steps: list[tuple[int, float]]) -> tuple[int, float]:
 
 
 def _ladder(target: Target) -> list[int]:
-    return [c for c in CONCURRENCY_LADDER if c <= target.max_concurrency] or [target.max_concurrency]
+    return sorted({c for c in CONCURRENCY_LADDER if c < target.max_concurrency} | {target.max_concurrency})
 
 
 async def measure_all(targets: Sequence[Target], max_latency_s: float, run_s: float = RUN_S,
-                      ready_timeout_s: float = READY_TIMEOUT_S) -> tuple[dict[str, Measurement], dict[str, str]]:
+                      ready_timeout_s: float = READY_TIMEOUT_S,
+                      stop: Callable[[], bool] = lambda: False) -> tuple[dict[str, Measurement], dict[str, str]]:
     """Measure every endpoint in the same rounds, so endpoints sharing an engine or a GPU always compete as they do in
     a test: warm up together until every endpoint's last two runs agree, step up the concurrency ladder together
     (an endpoint past its best, or whose latency exceeds ``max_latency_s``, stays at its knee), then run the final
     rounds together at each one's knee. In a closed loop the latency is concurrency / throughput.
 
     -> (measurements, failures): an endpoint fails if it never answers, takes longer than ``max_latency_s`` for a
-    single request, or completes nothing under load; the others are measured without it."""
+    single request, or completes nothing under load; the others are measured without it. Raises
+    MeasurementInterrupted once ``stop`` returns True."""
     failures: dict[str, str] = {}
     for t, outcome in zip(targets, await asyncio.gather(*(wait_ready(t, ready_timeout_s) for t in targets),
                                                         return_exceptions=True)):
@@ -185,7 +195,7 @@ async def measure_all(targets: Sequence[Target], max_latency_s: float, run_s: fl
         return {}, failures
 
     async def round_(concurrency: list[int]) -> list[float]:
-        return list(await asyncio.gather(*(run_load(t, c, run_s) for t, c in zip(targets, concurrency))))
+        return list(await asyncio.gather(*(run_load(t, c, run_s, stop) for t, c in zip(targets, concurrency))))
 
     ladders = [_ladder(t) for t in targets]
     warm = [min(16, ladder[-1]) for ladder in ladders]
@@ -257,11 +267,13 @@ def stored(targets: Sequence[Target], store: MeasurementStore) -> dict[str, Meas
 
 
 async def measure_and_store(targets: Sequence[Target], store: MeasurementStore, *, max_latency_s: float,
-                            run_s: float = RUN_S) -> tuple[dict[str, Measurement], dict[str, str]]:
-    """Measure all ``targets`` together and store the results (failed endpoints are not stored)."""
-    runs = MAX_WARMUP_RUNS / 3 + len(CONCURRENCY_LADDER) + FINAL_RUNS
+                            run_s: float = RUN_S, stop: Callable[[], bool] = lambda: False,
+                            ) -> tuple[dict[str, Measurement], dict[str, str]]:
+    """Measure all ``targets`` together and store the results (failed endpoints are not stored). Raises
+    MeasurementInterrupted once ``stop`` returns True."""
+    runs = MAX_WARMUP_RUNS / 3 + max(len(_ladder(t)) for t in targets) + FINAL_RUNS
     log.info("measuring the capacity of %d endpoints (about %d minutes)", len(targets),
              max(1, round(runs * run_s * (1 + RUN_START_SHARE) / 60)))
-    measured, failures = await measure_all(targets, max_latency_s, run_s)
+    measured, failures = await measure_all(targets, max_latency_s, run_s, stop=stop)
     store.save(measured)
     return measured, failures

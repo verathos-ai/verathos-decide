@@ -35,6 +35,7 @@ from verathos.validator.status import StatusBoard
 from verathos.validator.throughput import Throughput
 
 log = logging.getLogger("verathos.validator")
+WEIGHT_ATTEMPTS = 10
 
 
 def load_secret(state_dir: Path) -> bytes:
@@ -53,28 +54,40 @@ def load_secret(state_dir: Path) -> bytes:
     return secret
 
 
-def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | None, mode: str) -> dict[str, float]:
-    """Proven capacity per endpoint key, for the model the endpoint serves now and at most what it declares now. In
-    observe mode the declarations count as proven."""
+def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | None, cat: catalog.Catalog,
+                      mode: str) -> tuple[dict[str, float], dict[str, float]]:
+    """-> (proven capacity, test latency) per endpoint key, for the model the endpoint serves now and at most what it
+    declares now. In observe mode an endpoint's declaration counts, up to its model's ``first_test_rps``, and there
+    are no latencies."""
     if mode == "observe":
-        return {e.key: e.endpoint.capacity_rps for e in endpoints}
-    credits = {(c.hotkey, c.endpoint_id, c.model_id): c.credited_rps for c in (verdicts.credits if verdicts else [])
-               if c.qualified}
-    return {e.key: min(credits[e.hotkey, e.endpoint.endpoint_id, e.endpoint.model_id], e.endpoint.capacity_rps)
-            for e in endpoints if (e.hotkey, e.endpoint.endpoint_id, e.endpoint.model_id) in credits}
+        first = {m.model_id: m.first_test_rps for m in cat.models}
+        return {e.key: min(e.endpoint.capacity_rps, first.get(e.endpoint.model_id, 0.0)) for e in endpoints}, {}
+    credits = {(c.hotkey, c.endpoint_id, c.model_id): c for c in (verdicts.credits if verdicts else []) if c.qualified}
+    credited, latency = {}, {}
+    for e in endpoints:
+        c = credits.get((e.hotkey, e.endpoint.endpoint_id, e.endpoint.model_id))
+        if c is not None:
+            credited[e.key], latency[e.key] = min(c.credited_rps, e.endpoint.capacity_rps), c.latency_ms
+    return credited, latency
+
+
+def missing_references(cfg: ValidatorConfig, cat: catalog.Catalog) -> list[str]:
+    return [m.model_id for m in cat.models if m.status == "active" and m.model_id not in cfg.references]
 
 
 async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, secret: bytes, state: ScoreState,
                     epoch: int, blocks_left: int, throughput: Throughput, current: CatalogFollower,
                     board: StatusBoard) -> None:
-    cat = current.catalog
+    cat = current.for_epoch(st, epoch * current.catalog.epoch_blocks)
     sc, policy = cat.scoring, cat.audit_policy()
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
     references = {m: r.engine() for m, r in cfg.references.items()
                   if cat.get(m) is not None and cat.get(m).status != "retired"}
     tolerances = {m.model_id: m.tolerance for m in cat.models}
-    async with httpx.AsyncClient() as client:
-        miners = await discover(neurons, cfg.netuid, cfg.mechid, client, current.accepted())
+    # No pool limit: a miner's hanging connections must not delay requests to the others.
+    limits = httpx.Limits(max_connections=None, max_keepalive_connections=256)
+    async with httpx.AsyncClient(limits=limits) as client:
+        miners = await discover(neurons, cfg.netuid, cfg.mechid, client, {cat.digest(), *current.accepted()})
         throughput.update_slots(miners, neurons)
         endpoints = [e for m in miners for e in m.endpoints() if e.endpoint.tier == "open"
                      and cat.get(e.endpoint.model_id) is not None and cat.get(e.endpoint.model_id).status != "retired"]
@@ -100,11 +113,11 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         log.info("  %s/%s gave a wrong answer in throughput test %s: %s", e.hotkey, e.endpoint_id, e.test_id[:12],
                  e.reason)
     invalid_hotkeys = {e.hotkey for e in evidence}
-    credited = credited_capacity(endpoints, verdicts, policy.mode)
+    credited, latency_ms = credited_capacity(endpoints, verdicts, cat, policy.mode)
     record_window(state, results, sc.statistical_window_epochs)
     score_per_rps = {m.model_id: m.score_per_rps if m.status == "active" else 0.0 for m in cat.models}
-    scores, failed = epoch_scores(results, score_per_rps=score_per_rps, credited=credited, state=state,
-                                  failed_hotkeys=invalid_hotkeys)
+    scores, failed = epoch_scores(results, score_per_rps=score_per_rps, credited=credited, latency_ms=latency_ms,
+                                  state=state, failed_hotkeys=invalid_hotkeys)
     held = {e.key for e in endpoints} - set(results)
     if held:
         log.info("  %d endpoints not audited this epoch (no usable reference answers); scores held", len(held))
@@ -135,8 +148,12 @@ def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: di
     if cfg.dry_run or not chain.mechanism_ready(st, cfg.netuid, cfg.mechid):
         log.info("dry run (mechanism %d %s): weights %s", cfg.mechid,
                  "not enabled on chain" if not cfg.dry_run else "configured dry", w)
-    elif w:
-        chain.submit_weights(st, wallet, cfg.netuid, cfg.mechid, w)
+        return
+    for attempt in range(1, WEIGHT_ATTEMPTS + 1):
+        if not w or chain.submit_weights(st, wallet, cfg.netuid, cfg.mechid, w):
+            return
+        log.warning("setting weights failed (attempt %d of %d); retrying in one block", attempt, WEIGHT_ATTEMPTS)
+        time.sleep(BLOCK_TIME_S)
 
 
 def main() -> None:
@@ -156,6 +173,8 @@ def main() -> None:
     wallet = bt.Wallet(name=cfg.wallet_name, hotkey=cfg.hotkey_name)
     st = bt.Subtensor(network=cfg.network)
     current = CatalogFollower(st, cfg.network, cfg.netuid, catalog.CatalogStore(cfg.catalog_dir), cfg.catalog_mirrors)
+    if missing := missing_references(cfg, current.catalog):
+        raise SystemExit(f"no reference engine configured for the active models {missing}")
     throughput = Throughput.start(network=cfg.network, netuid=cfg.netuid, mechid=cfg.mechid,
                                   current=lambda: current.catalog, st=st, wallet=wallet, references=cfg.references,
                                   screens=cfg.audit_screens,
@@ -169,7 +188,14 @@ def main() -> None:
             current.store.put(current.catalog)
         start_service(st=st, wallet=wallet, netuid=cfg.netuid, public_host=cfg.public_host, port=cfg.port,
                       store=current.store if is_owner else None, auditor=throughput.auditor, board=board)
-    current.on_change.append(lambda cat: throughput.set_policy(cat.audit_policy()))
+    def adopt(cat: catalog.Catalog) -> None:
+        if missing := missing_references(cfg, cat):
+            log.critical("catalog %s activates %s, which this validator has no reference engine for; stopping",
+                         cat.digest()[:12], missing)
+            os._exit(1)
+        throughput.set_policy(cat.audit_policy())
+
+    current.on_change.append(adopt)
     current.start()
     throughput.start_slot_refresh(cfg.network, current.accepted)
 

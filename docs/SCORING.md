@@ -24,7 +24,7 @@ gateway traffic; the checks here cover what validators are served, and answers t
 The reference engine answers each canary once; every endpoint of that model receives its own random subset of
 `canaries_per_endpoint` (10) canaries, spread over the first `canary_spread_fraction` (0.6) of the epoch. Canaries
 wait while a throughput test runs (`THROUGHPUT_AUDIT.md`). If the reference engine cannot answer, the model's
-endpoints are not audited that epoch and keep their score.
+endpoints are not audited that epoch and keep their score, for at most 3 epochs in a row.
 
 Every request is signed by the validator and bound to the miner and a nonce. Every answer comes with a receipt
 signed by the miner hotkey that binds the request, the answers, the endpoint, the model, the caller, the nonce, the
@@ -50,20 +50,22 @@ Tolerances are per model and set in the catalog.
 ## Score
 
 Per endpoint and epoch:
-- zero, with probation, if a request failed the hard check or the statistical check failed;
-- zero, with probation for every endpoint of the hotkey and their averages reset to zero, if the throughput auditor
-  proved a wrong answer the hotkey signed in a test (see `THROUGHPUT_AUDIT.md`);
+- zero, with probation for every endpoint of the hotkey and their averages reset to zero, if a request failed the
+  hard check, the statistical check failed, or the throughput auditor proved a wrong answer the hotkey signed in a
+  test (see `THROUGHPUT_AUDIT.md`);
 - zero if the endpoint failed the identity challenge, answered nothing, or has not yet proven capacity in a
   throughput test;
 - otherwise `score_per_rps(model) x proven capacity x answered / sent x latency factor`. The proven capacity is the
   auditor's credit in requests/s of the model's standard mix, at most what the endpoint declares now (in `observe`
-  mode the declaration itself). `score_per_rps` makes models of different cost per request comparable; `candidate`
-  models have none. The latency factor is `sqrt(median latency of the model's passing endpoints / own median
-  latency)`, capped to [0.7, 1.3]. Only endpoints that passed this epoch set the median.
+  mode the declaration itself, up to the model's `first_test_rps`). `score_per_rps` makes models of different cost
+  per request comparable; `candidate` models have none. The latency factor is `sqrt(median of the model's scored
+  endpoints / own latency)`, capped to [0.7, 1.3], where an endpoint's latency is its median latency in its
+  throughput test, as the auditor's verdicts state it, so every validator applies the same factor. In `observe`
+  mode there is no latency factor.
 
 Probation lasts `probation_epochs` (6) epochs, the failing one included, whatever the later results; a new failure
-restarts the count. An endpoint a hotkey adds while one of its endpoints is on probation inherits the remaining
-probation, so renaming an endpoint does not escape it. Scores enter an exponential moving average (`ema_alpha`,
+restarts the count, and the hotkey's statistical windows start over. An endpoint a hotkey adds while one of its
+endpoints is on probation inherits the remaining probation, so renaming an endpoint does not escape it. Scores enter an exponential moving average (`ema_alpha`,
 0.2); endpoints that disappear decay toward zero and are forgotten once negligible.
 
 ## Weights

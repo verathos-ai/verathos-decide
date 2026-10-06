@@ -29,6 +29,9 @@ trial update upgrade upload urgent user verify version wallet warehouse warranty
 """.split())
 
 
+MAX_STATE_WORDS = 100_000  # the load generator's limit
+
+
 class Workload(BaseModel):
     """A model's standard request mix."""
 
@@ -38,8 +41,8 @@ class Workload(BaseModel):
     @model_validator(mode="after")
     def _check(self) -> Workload:
         low, high = self.state_words
-        if not 1 <= low <= high:
-            raise ValueError("state_words must be an increasing range of positive counts")
+        if not 1 <= low <= high <= MAX_STATE_WORDS:
+            raise ValueError(f"state_words must be a range [low, high] with 1 <= low <= high <= {MAX_STATE_WORDS}")
         SystemOneRequest.model_validate({"model": "m", "state": "s", "questions": self.questions})
         return self
 

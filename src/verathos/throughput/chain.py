@@ -9,6 +9,8 @@ import time
 
 import bittensor as bt
 
+from verathos.protocol.manifest import axon_base
+
 log = logging.getLogger(__name__)
 
 
@@ -103,4 +105,4 @@ class SubtensorChainView:
         if axon.ip in ("", "0.0.0.0") or not axon.port:
             log.warning("auditor hotkey %s has no axon served", hotkey)
             return None
-        return f"http://{axon.ip}:{axon.port}"
+        return axon_base(axon.ip, axon.port)

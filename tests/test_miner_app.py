@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import time
 
+import httpx
 import pytest
 from bittensor_wallet import Keypair
 from fastapi.testclient import TestClient
@@ -50,7 +52,8 @@ def setup():
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
                             capacity_rps=40.0)]), miner)
     app = create_app(config=config, keypair=miner, manifest=lambda: manifest, engines={"gpu0": MockEngine("kev-4b")},
-                     authorized=lambda hk: hk == validator.ss58_address, auditor=lambda: AUDITOR.ss58_address)
+                     authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: {AUDITOR.ss58_address},
+                     max_state_tokens=lambda model_id: 200)
     return TestClient(app), miner, validator, stranger, manifest
 
 
@@ -148,3 +151,60 @@ def test_the_miner_measures_itself_through_its_own_sessions(setup) -> None:
     headers["X-Verathos-Session-Signature"] = headers["X-Verathos-Session-Signature"].upper()
     r = client.post("/e/gpu0/v1/systemone", json=REQUEST, headers={**headers, HDR_REQUEST_ID: secrets.token_hex(16)})
     assert (r.status_code, r.json()["error"]) == (401, "bad test session signature")
+
+
+def test_sessions_cannot_outlast_the_replay_protection(setup) -> None:
+    client, miner, *_ = setup
+    assert "lasts too long" in session_post(client, miner, expires_in_ms=3_600_000).json()["error"]
+
+
+def test_states_longer_than_the_model_accepts_are_refused(setup) -> None:
+    client, miner, validator, *_ = setup
+    r = post(client, validator, miner, "/e/gpu0/v1/systemone", {**REQUEST, "state": "word " * 200})
+    assert (r.status_code, r.json()["error"]) == (413, "state longer than the model accepts")
+
+
+def test_the_miner_signs_only_well_formed_answers() -> None:
+    from verathos.miner.app import well_formed
+    from verathos.protocol.api import SystemOneRequest
+
+    request = SystemOneRequest.model_validate(REQUEST)
+    good = asyncio.run(MockEngine("kev-4b").answer(REQUEST))["answers"]
+    assert well_formed(request, good)
+    assert not well_formed(request, {**good, "churn": {"type": "noul", "noul": 1.02}})
+    assert not well_formed(request, {k: v for k, v in good.items() if k != "churn"})
+    assert not well_formed(request, {**good, "team": {"type": "choice", "probabilities": {"billing": 1.0}}})
+
+
+def test_a_validator_cannot_crowd_out_a_test_with_many_requests() -> None:
+    """Callers other than gateways get at most CALLER_CONCURRENCY requests at once per endpoint."""
+    from verathos.miner.app import CALLER_CONCURRENCY
+
+    miner, validator = (Keypair.create_from_mnemonic(Keypair.generate_mnemonic()) for _ in range(2))
+    config = MinerConfig.model_validate({
+        "netuid": 405, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5", "port": 8091,
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1"}]})
+    manifest = SignedManifest.create(Manifest(
+        netuid=405, mechid=1, hotkey=miner.ss58_address, catalog_digest=catalog.load().digest(),
+        endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
+                            capacity_rps=40.0)]), miner)
+
+    class Slow(MockEngine):
+        async def answer(self, request):
+            await asyncio.sleep(0.3)
+            return await super().answer(request)
+
+    app = create_app(config=config, keypair=miner, manifest=lambda: manifest, engines={"gpu0": Slow("kev-4b")},
+                     authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set())
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://m") as client:
+            async def one():
+                body = json.dumps(REQUEST).encode()
+                headers = {"Content-Type": "application/json",
+                           **sign_request(validator, "POST", "/e/gpu0/v1/systemone", body, miner.ss58_address)}
+                return (await client.post("/e/gpu0/v1/systemone", content=body, headers=headers)).status_code
+            return await asyncio.gather(*(one() for _ in range(CALLER_CONCURRENCY + 3)))
+
+    codes = asyncio.run(run())
+    assert sorted(codes) == [200] * CALLER_CONCURRENCY + [429] * 3

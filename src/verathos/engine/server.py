@@ -16,7 +16,9 @@ from verathos.protocol.api import SystemOneRequest
 Runner = Callable[[dict[str, Any]], dict[str, Any]]
 
 
-def create_app(runner: Runner, served_models: list[str] | None = None) -> FastAPI:
+def create_app(runner: Runner, served_models: list[dict[str, Any]] | None = None) -> FastAPI:
+    """``served_models`` describe what the engine serves (``GET /v1/models``): id, revision, device and dtype, so a
+    miner can tell when its engine changed."""
     app = FastAPI(title="verathos engine", docs_url=None, redoc_url=None, openapi_url=None)
     lock = threading.Lock()  # one forward pass at a time on the device
 
@@ -26,7 +28,7 @@ def create_app(runner: Runner, served_models: list[str] | None = None) -> FastAP
 
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
-        return {"data": [{"id": m} for m in served_models or []]}
+        return {"data": served_models or []}
 
     @app.post("/v1/systemone")
     async def systemone(request: Request) -> JSONResponse:

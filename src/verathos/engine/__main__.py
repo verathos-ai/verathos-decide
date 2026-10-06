@@ -34,7 +34,8 @@ def main() -> None:
     from verathos.engine import clef
 
     runner = clef.load(args.repo, args.revision, device=args.device, dtype=args.dtype)
-    uvicorn.run(create_app(runner, [args.repo]), host=args.host, port=args.port, log_level="info")
+    served = {"id": args.repo, "revision": args.revision, "device": args.device, "dtype": args.dtype}
+    uvicorn.run(create_app(runner, [served]), host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

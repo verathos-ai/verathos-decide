@@ -16,13 +16,14 @@ use std::{
 
 pub const MAX_TARGETS: usize = 100_000;
 pub const MAX_RATE_RPS: u32 = 1_000_000;
-/// Longest warmup plus test plus grace.
+/// Longest warmup plus test.
 pub const MAX_RUN_S: u32 = 3_600;
 pub const MAX_TIMEOUT_S: u32 = 3_600;
 pub const MAX_STATE_WORDS: u32 = 100_000;
 pub const MAX_SAMPLES: usize = 10_000;
 pub const MAX_START_DELAY_MS: u64 = 3_600_000;
 pub const MIN_SEED_BYTES: usize = 16;
+pub const MAX_RESPONSE_BYTES: usize = 16 << 20;
 
 pub const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-verathos-request-id");
 
@@ -44,6 +45,7 @@ struct PlanInput {
     test_s: f64,
     grace_s: f64,
     timeout_s: f64,
+    max_response_bytes: usize,
     words: Vec<String>,
     seed: String,
     targets: Vec<TargetInput>,
@@ -69,9 +71,12 @@ pub struct Plan {
     pub start_at_ms: u64,
     pub warmup: Duration,
     pub test: Duration,
-    /// After the window: how long its requests may still complete and count.
+    /// Before the window: how early a request may be scheduled and its reply inside the window still
+    /// count. At most the warmup.
     pub grace: Duration,
     pub timeout: Duration,
+    /// Largest reply body read; a larger 200 reply is `too_large`.
+    pub max_response_bytes: usize,
     pub words: Vec<String>,
     /// ChaCha key for all generated randomness: SHA-256 of the seed bytes.
     pub key: [u8; 32],
@@ -103,10 +108,13 @@ impl Plan {
             f64::MIN_POSITIVE,
             f64::from(MAX_RUN_S),
         )?;
-        let grace = seconds("grace_s", input.grace_s, 0.0, f64::from(MAX_RUN_S))?;
-        if warmup + test + grace > Duration::from_secs(MAX_RUN_S.into()) {
+        if warmup + test > Duration::from_secs(MAX_RUN_S.into()) {
+            return Err(format!("warmup_s + test_s must be at most {MAX_RUN_S}"));
+        }
+        let grace = seconds("grace_s", input.grace_s, 0.0, input.warmup_s)?;
+        if !(1..=MAX_RESPONSE_BYTES).contains(&input.max_response_bytes) {
             return Err(format!(
-                "warmup_s + test_s + grace_s must be at most {MAX_RUN_S}"
+                "max_response_bytes must be between 1 and {MAX_RESPONSE_BYTES}"
             ));
         }
         let timeout = seconds(
@@ -148,6 +156,7 @@ impl Plan {
             test,
             grace,
             timeout,
+            max_response_bytes: input.max_response_bytes,
             words: input.words,
             key,
             targets,
@@ -259,6 +268,7 @@ pub(crate) mod tests {
             "test_s": 8.0,
             "grace_s": 2.0,
             "timeout_s": 20.0,
+            "max_response_bytes": 65536,
             "words": ["invoice", "refund", "late", "card"],
             "seed": "00112233445566778899aabbccddeeff",
             "targets": [{
@@ -329,10 +339,9 @@ pub(crate) mod tests {
         rejects(|p| p["test_s"] = json!(0.0), "test_s");
         rejects(|p| p["timeout_s"] = json!(0), "timeout_s");
         rejects(|p| p["grace_s"] = json!(-1.0), "grace_s");
-        rejects(
-            |p| p["test_s"] = json!(3_600.0),
-            "warmup_s + test_s + grace_s",
-        );
+        rejects(|p| p["grace_s"] = json!(2.5), "grace_s");
+        rejects(|p| p["max_response_bytes"] = json!(0), "max_response_bytes");
+        rejects(|p| p["test_s"] = json!(3_600.0), "warmup_s + test_s");
         rejects(
             |p| p["start_at_ms"] = json!(NOW_MS + 2 * MAX_START_DELAY_MS),
             "start_at_ms",

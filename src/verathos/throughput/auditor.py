@@ -4,20 +4,24 @@ Per test:
 
 1. At the selection block the auditor fixes the targets: every listed open endpoint with a declared capacity, each at
    its declared rate, but at most ``rate_growth`` times what it delivered in its last test (at most the model's
-   ``first_test_rps`` before its first, and never less than ``min_test_share`` of that). An endpoint cannot make the
-   auditor send much more than it has shown it serves.
-2. When the start block appears, the load generator drives all targets at once: ``warmup_s`` unmeasured, then
-   ``test_s`` measured. Endpoints sharing hardware, or a pool behind several endpoints, must deliver the sum of their
-   rates at the same time.
-3. Per endpoint: delivered = requests sent in the measured window and answered by its end plus ``max_latency_s``, per
-   second, scaled by the share of sampled responses whose receipt is valid. The reference recomputes
-   ``answer_checks_per_test`` of the signed answers (the expensive check; a wrong model is wrong on every request).
-   Credit = delivered (up to the tested rate); below ``pass_fraction`` of the tested rate it is scaled by delivered /
-   tested once more, so declaring more than an endpoint serves costs credit. A sampled answer the miner signed and
-   the reference proves wrong makes the result invalid; the evidence is kept for the verdicts.
+   ``first_test_rps`` before its first, and never less than ``min_test_share`` of that). A hotkey's endpoints
+   together get at most ``rate_growth`` times what the hotkey delivered last, measured in first tests' worth, and at
+   least one first test's worth. Neither an endpoint nor a hotkey can make the auditor send much more than it has
+   shown it serves.
+2. When the start block appears, the load generator drives all targets at once: a warmup drawn from
+   [``warmup_s``, 2 x ``warmup_s``], then the measured window of ``test_s``. Endpoints sharing hardware, or a pool
+   behind several endpoints, must deliver the sum of their rates at the same time.
+3. Per endpoint: delivered = replies inside the window to requests sent no earlier than ``max_latency_s`` before it,
+   per second, scaled by the share of sampled responses whose receipt is valid. Every signed sample must be well
+   formed; ``answer_checks_per_test`` of them are recomputed (on the bf16 screen if there is one, whose flags the
+   fp32 reference must confirm). Credit = delivered (up to the tested rate); below ``pass_fraction`` of the tested
+   rate it is scaled by delivered / tested once more. A sampled answer the miner signed and the reference proves
+   wrong makes the result invalid; the evidence is kept for the verdicts. The recomputed answers' differences are
+   tallied per endpoint; one whose mean over its last ``drift_window_tests`` tests exceeds the model's ``mean_abs``
+   gets no credit.
 4. Once the selection block is final with the hash it was selected by, the test is confirmed; otherwise void. A test
-   is also void when the load generator fails or falls behind its schedule (for one endpoint: that endpoint's
-   result).
+   is also void when the load generator fails or starts late; one endpoint's result is void when the generator fell
+   behind its schedule or ran out of local resources for it, or when the auditor could not evaluate it.
 
 An endpoint is credited from the latest confirmed test only: one that was not among its targets has no credit.
 """
@@ -53,13 +57,16 @@ from verathos.throughput.feed import (
     ReferenceUnavailable,
     SignedVerdicts,
     Verdicts,
-    answer_fault,
+    fault_of,
+    parse_response,
+    readable,
+    recompute,
     signed_answers,
 )
 from verathos.throughput.follow import POLL_S, ScheduleFollower
 from verathos.throughput.policy import AuditPolicy, ScheduledTest, Session, session_headers
 from verathos.throughput.workload import WORDS
-from verathos.validator.compare import Tolerance
+from verathos.validator.compare import RequestComparison, Tolerance
 from verathos.validator.config import ReferenceEngine
 
 log = logging.getLogger(__name__)
@@ -67,7 +74,11 @@ START_DELAY_MS = 500  # from observing the start block to the first request
 MAX_LATE_START_MS = 1000
 LATE_SEND_SHARE = 0.01  # more late sends than this voids an endpoint's result
 REFERENCE_CONCURRENCY = 4
+REFERENCE_TIMEOUT_S = 30.0
+RECOMPUTE_BUDGET_S = 900.0  # after this, a test's remaining recomputes are skipped
+BREAKER_FAILURES = 3  # an engine failing this often in a row is not asked again in the test
 KEEP_EPOCHS = 30
+SCHEMA_VERSION = 2
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
 
 
@@ -90,19 +101,56 @@ class Checks:
     references: dict[str, Engine]
     screens: dict[str, Engine]
 
-    async def fault(self, model_id: str, request: dict[str, Any], answers: Any, tolerance: Tolerance, *,
-                    recompute: bool) -> str | None:
-        """Why the answers are wrong, or None. Without ``recompute`` only their form is checked. Raises
-        ReferenceUnavailable."""
-        reference = self.references.get(model_id)
-        screen = self.screens.get(model_id) if recompute else None
-        fault = await answer_fault(request, answers, screen or (reference if recompute else None), tolerance)
-        if fault is None or screen is None or fault == MALFORMED:
-            return fault
+    def for_test(self, budget_s: float = RECOMPUTE_BUDGET_S) -> Recomputes:
+        return Recomputes(self, time.monotonic() + budget_s)
+
+
+class Recomputes:
+    """The answer checks of one test: recomputes stop at the test's deadline, and an engine that fails
+    ``BREAKER_FAILURES`` times in a row is not asked again in it."""
+
+    def __init__(self, checks: Checks, deadline: float) -> None:
+        self.checks, self.deadline = checks, deadline
+        self._failures: dict[int, int] = {}
+
+    async def _compare(self, engine: Engine, model_id: str, request: dict[str, Any], got: dict[str, Any],
+                       tolerance: Tolerance) -> RequestComparison | None:
+        if time.monotonic() > self.deadline or self._failures.get(id(engine), 0) >= BREAKER_FAILURES:
+            return None
+        try:
+            comparison = await recompute(request, got, engine, tolerance)
+        except ReferenceUnavailable as exc:
+            self._failures[id(engine)] = self._failures.get(id(engine), 0) + 1
+            log.warning("a %s recompute failed, the answer is unchecked: %s", model_id, exc)
+            return None
+        self._failures[id(engine)] = 0
+        return comparison
+
+    async def check(self, model_id: str, request: dict[str, Any], answers: Any, tolerance: Tolerance, *,
+                    recompute_answers: bool) -> tuple[str | None, RequestComparison | None]:
+        """-> (why the answers are wrong or None, the comparison made or None). Without ``recompute_answers`` only
+        their form is checked."""
+        got = readable(answers)
+        if got is None:
+            return MALFORMED, None
+        reference = self.checks.references.get(model_id)
+        screen = self.checks.screens.get(model_id)
+        first = screen or reference
+        if not recompute_answers or first is None:
+            return None, None
+        comparison = await self._compare(first, model_id, request, got, tolerance)
+        if comparison is None:
+            return None, None
+        fault = fault_of(comparison, tolerance)
+        if fault is None or screen is None:
+            return fault, comparison
         if reference is None:
             log.warning("the %s screen flagged an answer but there is no fp32 reference to confirm it", model_id)
-            return None
-        return await answer_fault(request, answers, reference, tolerance)
+            return None, comparison
+        confirmed = await self._compare(reference, model_id, request, got, tolerance)
+        if confirmed is None:
+            return None, comparison
+        return fault_of(confirmed, tolerance), confirmed
 
 
 @dataclass(frozen=True)
@@ -137,28 +185,34 @@ class Result:
     latency_p95_ms: float = 0.0
     detail: str = "{}"
     evidence: Evidence | None = None
+    drift_sum: float = 0.0  # summed absolute differences of the recomputed answers
+    drift_count: int = 0
 
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS tests (
+CREATE TABLE tests (
     test_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL, selection_block INTEGER NOT NULL, selection_hash TEXT NOT NULL,
     start_block INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS results (
+CREATE TABLE results (
     test_id TEXT NOT NULL, hotkey TEXT NOT NULL, endpoint_id TEXT NOT NULL, model_id TEXT NOT NULL,
     declared_rps REAL NOT NULL, tested_rps REAL NOT NULL, delivered_rps REAL NOT NULL, credited_rps REAL NOT NULL,
     outcome TEXT NOT NULL, reason TEXT NOT NULL, latency_p50_ms REAL NOT NULL, latency_p95_ms REAL NOT NULL,
-    detail TEXT NOT NULL, evidence TEXT, PRIMARY KEY (test_id, hotkey, endpoint_id));
+    detail TEXT NOT NULL, evidence TEXT, drift_sum REAL NOT NULL, drift_count INTEGER NOT NULL,
+    PRIMARY KEY (test_id, hotkey, endpoint_id));
 """
 # test states: running -> unconfirmed -> confirmed | void
 
 
 class Store:
-    """Tests and results, kept for ``KEEP_EPOCHS`` epochs."""
+    """Tests and results, kept for ``KEEP_EPOCHS`` epochs. A database of another schema version is started over."""
 
     def __init__(self, path: Path) -> None:
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-        self._db.executescript(_SCHEMA)
         self._lock = threading.Lock()
+        if self._db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            self._db.executescript("DROP TABLE IF EXISTS results; DROP TABLE IF EXISTS tests;" + _SCHEMA
+                                   + f"PRAGMA user_version = {SCHEMA_VERSION};")
+            log.info("auditor database %s started for schema %d", path, SCHEMA_VERSION)
         self._query("UPDATE tests SET state = 'void', reason = 'the auditor restarted during the test' "
                     "WHERE state = 'running'")
 
@@ -181,11 +235,11 @@ class Store:
         rows = [(test_id, r.target.slot.hotkey, r.target.slot.endpoint_id, r.target.slot.model_id,
                  r.target.slot.declared_rps, r.target.tested_rps, r.delivered_rps, r.credited_rps, r.outcome,
                  r.reason, r.latency_p50_ms, r.latency_p95_ms, r.detail,
-                 r.evidence.model_dump_json() if r.evidence else None) for r in results]
+                 r.evidence.model_dump_json() if r.evidence else None, r.drift_sum, r.drift_count) for r in results]
         with self._lock:
             self._db.execute("BEGIN")
-            self._db.executemany("INSERT OR REPLACE INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                 rows)
+            self._db.executemany("INSERT OR REPLACE INTO results VALUES "
+                                 "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
             self._db.execute("UPDATE tests SET state = 'unconfirmed' WHERE test_id = ?", (test_id,))
             self._db.execute("COMMIT")
 
@@ -193,18 +247,19 @@ class Store:
         """-> [(test_id, selection_block, selection_hash)]"""
         return self._query("SELECT test_id, selection_block, selection_hash FROM tests WHERE state = 'unconfirmed'")
 
-    def last_delivered(self) -> dict[str, float]:
-        """Endpoint key -> delivered rate in its latest counted result."""
+    def last_delivered(self) -> dict[str, tuple[str, float]]:
+        """Endpoint key -> (model, delivered rate) in its latest counted result."""
         rows = self._query(
-            "SELECT r.hotkey, r.endpoint_id, r.delivered_rps FROM results r JOIN tests t USING (test_id) "
-            "WHERE t.state != 'void' AND r.outcome != 'void' ORDER BY t.epoch")
-        return {f"{hk}/{ep}": rps for hk, ep, rps in rows}
+            "SELECT r.hotkey, r.endpoint_id, r.model_id, r.delivered_rps FROM results r JOIN tests t USING (test_id) "
+            "WHERE t.state != 'void' AND r.outcome != 'void' ORDER BY t.epoch, t.start_block")
+        return {f"{hk}/{ep}": (model, rps) for hk, ep, model, rps in rows}
 
     def pending(self, first_epoch: int, last_epoch: int) -> bool:
         return bool(self._query("SELECT 1 FROM tests WHERE epoch BETWEEN ? AND ? AND state IN "
                                 "('running', 'unconfirmed')", (first_epoch, last_epoch)))
 
-    def credits(self, first_epoch: int, last_epoch: int, qualification_tests: int) -> list[Credit]:
+    def credits(self, first_epoch: int, last_epoch: int, policy: AuditPolicy,
+                tolerance_of: Callable[[str], Tolerance | None]) -> list[Credit]:
         """The endpoints of the latest confirmed test in the epoch range, with their credit; an endpoint whose result
         there is void keeps its latest counted result from the range."""
         latest = self._query("SELECT test_id FROM tests WHERE state = 'confirmed' AND epoch BETWEEN ? AND ? "
@@ -212,17 +267,37 @@ class Store:
         if not latest:
             return []
         targeted = self._query("SELECT hotkey, endpoint_id FROM results WHERE test_id = ?", (latest[0][0],))
-        counted = {(hk, ep): (model, rps, epoch) for hk, ep, model, rps, epoch in self._query(
-            "SELECT r.hotkey, r.endpoint_id, r.model_id, r.credited_rps, t.epoch FROM results r "
+        counted = {(hk, ep): row for hk, ep, *row in self._query(
+            "SELECT r.hotkey, r.endpoint_id, r.model_id, r.credited_rps, r.latency_p50_ms, t.epoch FROM results r "
             "JOIN tests t USING (test_id) WHERE t.state = 'confirmed' AND r.outcome != 'void' "
             "AND t.epoch BETWEEN ? AND ? ORDER BY t.epoch, t.start_block", (first_epoch, last_epoch))}
         passed = {(hk, ep): n for hk, ep, n in self._query(
             "SELECT r.hotkey, r.endpoint_id, COUNT(*) FROM results r JOIN tests t USING (test_id) "
             "WHERE t.state = 'confirmed' AND r.credited_rps > 0 AND t.epoch <= ? GROUP BY r.hotkey, r.endpoint_id",
             (last_epoch,))}
-        return [Credit(hotkey=hk, endpoint_id=ep, model_id=counted[hk, ep][0], credited_rps=counted[hk, ep][1],
-                       test_epoch=counted[hk, ep][2], qualified=passed.get((hk, ep), 0) >= qualification_tests)
-                for hk, ep in sorted(targeted) if (hk, ep) in counted]
+        credits = []
+        for hk, ep in sorted(targeted):
+            if (hk, ep) not in counted:
+                continue
+            model_id, credited, latency, epoch = counted[hk, ep]
+            drift = self._drifted(hk, ep, model_id, last_epoch, policy.drift_window_tests, tolerance_of(model_id))
+            credits.append(Credit(hotkey=hk, endpoint_id=ep, model_id=model_id, credited_rps=0.0 if drift else credited,
+                                  latency_ms=latency, test_epoch=epoch, drift=drift,
+                                  qualified=passed.get((hk, ep), 0) >= policy.qualification_tests))
+        return credits
+
+    def _drifted(self, hotkey: str, endpoint_id: str, model_id: str, last_epoch: int, tests: int,
+                 tolerance: Tolerance | None) -> bool:
+        """Whether the endpoint's recomputed answers over its last ``tests`` confirmed tests drift beyond the
+        model's mean tolerance (once they cover enough probabilities)."""
+        if tolerance is None:
+            return False
+        rows = self._query(
+            "SELECT r.drift_sum, r.drift_count FROM results r JOIN tests t USING (test_id) WHERE r.hotkey = ? "
+            "AND r.endpoint_id = ? AND r.model_id = ? AND t.state = 'confirmed' AND t.epoch <= ? "
+            "ORDER BY t.epoch DESC, t.start_block DESC LIMIT ?", (hotkey, endpoint_id, model_id, last_epoch, tests))
+        total, count = sum(r[0] for r in rows), sum(r[1] for r in rows)
+        return count >= tolerance.min_probabilities and total / count > tolerance.mean_abs
 
     def evidence(self, first_epoch: int, last_epoch: int) -> list[Evidence]:
         """The first wrong answer proven against each hotkey in the confirmed tests of the epoch range."""
@@ -254,7 +329,7 @@ class Store:
 
 
 def planned_rate(slot: Slot, first_test_rps: float, last_delivered: float | None, policy: AuditPolicy) -> float:
-    """The rate an endpoint is tested at."""
+    """The rate an endpoint is tested at, before its hotkey's budget."""
     if last_delivered is None:
         ceiling = first_test_rps
     else:
@@ -269,17 +344,6 @@ def credit(tested_rps: float, delivered_rps: float, policy: AuditPolicy) -> floa
     if delivered >= policy.pass_fraction * tested_rps:
         return round(delivered, 2)
     return round(delivered * delivered / tested_rps, 2)
-
-
-def parse_response(text: str) -> dict[str, Any] | None:
-    """A sampled response body as a JSON object, or None if it is not one (or too large to be an answer)."""
-    if len(text) > MAX_EVIDENCE_BYTES:
-        return None
-    try:
-        value = json.loads(text)
-    except (ValueError, RecursionError):
-        return None
-    return value if isinstance(value, dict) else None
 
 
 class Auditor:
@@ -302,9 +366,9 @@ class Auditor:
     # ---- inputs ----
 
     def set_policy(self, policy: AuditPolicy) -> None:
+        """Adopt a new policy for the tests and verdicts to come; verdicts already served stay as they are."""
         self.policy = policy
         self.follower.set_policy(policy)
-        self._verdicts = {}
 
     def update_slots(self, slots: list[Slot]) -> None:
         self._slots = slots
@@ -318,8 +382,9 @@ class Auditor:
         threading.Thread(target=lambda: asyncio.run(self.run()), name="throughput-auditor", daemon=True).start()
 
     async def run(self) -> None:
-        checks = Checks({m: BoundedEngine(r.engine()) for m, r in self.reference_specs.items()},
-                        {m: BoundedEngine(r.engine()) for m, r in self.screen_specs.items()})
+        checks = Checks(
+            {m: BoundedEngine(r.engine(REFERENCE_TIMEOUT_S)) for m, r in self.reference_specs.items()},
+            {m: BoundedEngine(r.engine(REFERENCE_TIMEOUT_S)) for m, r in self.screen_specs.items()})
         tasks: set[asyncio.Task] = set()
         while True:
             try:
@@ -334,14 +399,23 @@ class Auditor:
 
     def targets(self, policy: AuditPolicy) -> list[Target]:
         cat, last = self.catalog(), self.store.last_delivered()
-        out = []
+        by_hotkey: dict[str, list[tuple[Slot, catalog_module.CatalogModel]]] = {}
         for slot in self._slots:
             model = cat.get(slot.model_id)
-            if model is None or model.status == "retired":
-                continue
-            rate = planned_rate(slot, model.first_test_rps, last.get(slot.key), policy)
-            if rate > 0:
-                out.append(Target(slot, rate))
+            if model is not None and model.status != "retired":
+                by_hotkey.setdefault(slot.hotkey, []).append((slot, model))
+        out = []
+        for hotkey, slots in by_hotkey.items():
+            rates = [planned_rate(slot, model.first_test_rps, last.get(slot.key, (None, None))[1], policy)
+                     for slot, model in slots]
+            # The hotkey's budget in first tests' worth, from what all its endpoints (renamed ones too) delivered.
+            delivered = sum(rps / cat.get(m).first_test_rps for key, (m, rps) in last.items()
+                            if key.startswith(hotkey + "/") and cat.get(m) is not None)
+            budget = max(1.0, policy.rate_growth * delivered)
+            units = sum(rate / model.first_test_rps for rate, (_, model) in zip(rates, slots))
+            scale = min(1.0, budget / units) if units else 1.0
+            out += [Target(slot, round(rate * scale, 2)) for rate, (slot, _) in zip(rates, slots)
+                    if round(rate * scale, 2) > 0]
         return out
 
     def plan(self, test: ScheduledTest, targets: list[Target], start_ms: int, policy: AuditPolicy) -> dict[str, Any]:
@@ -358,9 +432,11 @@ class Auditor:
                 "state_words": list(workload.state_words), "questions": workload.questions,
                 "samples": policy.samples_per_test,
             })
-        return {"start_at_ms": start_ms, "warmup_s": policy.warmup_s, "test_s": policy.test_s,
-                "grace_s": policy.max_latency_s, "timeout_s": policy.request_timeout_s, "words": list(WORDS),
-                "seed": secrets.token_hex(16), "targets": planned}
+        # The miner cannot know when the window opens, so it cannot time held-back answers to it.
+        warmup = round(policy.warmup_s * (1 + secrets.SystemRandom().random()), 3)
+        return {"start_at_ms": start_ms, "warmup_s": warmup, "test_s": policy.test_s, "grace_s": policy.max_latency_s,
+                "timeout_s": policy.request_timeout_s, "max_response_bytes": MAX_EVIDENCE_BYTES,
+                "words": list(WORDS), "seed": secrets.token_hex(16), "targets": planned}
 
     async def run_test(self, test: ScheduledTest, checks: Checks) -> None:
         """Run one test; any failure of the auditor itself voids it."""
@@ -398,7 +474,8 @@ class Auditor:
         if result.late_start_ms > MAX_LATE_START_MS:
             self.store.set_state(test.test_id, "void", "the auditor's load generator started late")
             return
-        results = await asyncio.gather(*(self.evaluate(test, t, r, checks, policy)
+        recomputes = checks.for_test()
+        results = await asyncio.gather(*(self.evaluate(test, t, r, recomputes, policy)
                                          for t, r in zip(targets, result.targets)))
         self.store.add_results(test.test_id, results)
         counts = {o: sum(r.outcome == o for r in results) for o in ("passed", "partial", "invalid", "void")}
@@ -406,16 +483,27 @@ class Auditor:
                  ", ".join(f"{n} {o}" for o, n in counts.items() if n), sum(r.credited_rps for r in results),
                  sum(t.tested_rps for t in targets))
 
-    async def evaluate(self, test: ScheduledTest, target: Target, r: loadgen.TargetResult,
-                       checks: Checks, policy: AuditPolicy) -> Result:
+    async def evaluate(self, test: ScheduledTest, target: Target, r: loadgen.TargetResult, recomputes: Recomputes,
+                       policy: AuditPolicy) -> Result:
+        """One endpoint's result; whatever its responses contain, a failure here voids only this endpoint."""
+        try:
+            return await self._evaluate(test, target, r, recomputes, policy)
+        except Exception:
+            log.exception("evaluating %s in the test of epoch %d failed", target.slot.key, test.epoch)
+            return Result(target, "void", "the auditor could not evaluate this endpoint")
+
+    async def _evaluate(self, test: ScheduledTest, target: Target, r: loadgen.TargetResult, recomputes: Recomputes,
+                        policy: AuditPolicy) -> Result:
         detail = json.dumps({"sent": r.sent, "completed": r.completed, "skipped": r.skipped, "errors": r.errors,
                              "late_sends": r.late_sends, "samples": len(r.samples)}, sort_keys=True)
         latency = {"latency_p50_ms": r.latency_ms.p50 or 0.0, "latency_p95_ms": r.latency_ms.p95 or 0.0,
                    "detail": detail}
         if r.late_sends > LATE_SEND_SHARE * max(r.sent, 1):
             return Result(target, "void", "the auditor's load generator fell behind", **latency)
+        if r.errors.get("local"):
+            return Result(target, "void", "the auditor's load generator ran out of local resources", **latency)
         slot, model = target.slot, self.catalog().get(target.slot.model_id)
-        signed = []  # (sample, response, answers) whose receipt is valid
+        signed = []  # (sample, answers) whose receipt is valid
         for sample in r.samples:
             response = parse_response(sample.response)
             answers = None if response is None else signed_answers(
@@ -423,34 +511,30 @@ class Auditor:
                 endpoint_id=slot.endpoint_id, model_id=slot.model_id, auditor=self.hotkey, netuid=self.netuid,
                 mechid=self.mechid)
             if answers is not None:
-                signed.append((sample, response, answers))
-        valid, evidence = len(signed), None
-        # Every signed answer is checked for form; the reference recomputes a few of them.
-        recomputed = {id(s) for s, _, _ in random.sample(signed, min(policy.answer_checks_per_test, len(signed)))}
-        for sample, response, answers in signed if model is not None else []:
-            try:
-                fault = await checks.fault(slot.model_id, sample.request, answers, model.tolerance,
-                                           recompute=id(sample) in recomputed)
-            except ReferenceUnavailable as exc:
-                log.warning("reference for %s unavailable, a sample of %s is unchecked: %s", slot.model_id,
-                            slot.key, exc)
-                fault = None
+                signed.append((sample, answers))
+        valid, evidence, drift_sum, drift_count = len(signed), None, 0.0, 0
+        recomputed = {id(s) for s, _ in random.sample(signed, min(policy.answer_checks_per_test, len(signed)))}
+        for sample, answers in signed if model is not None else []:
+            fault, comparison = await recomputes.check(slot.model_id, sample.request, answers, model.tolerance,
+                                                       recompute_answers=id(sample) in recomputed)
+            if comparison is not None:
+                drift_sum, drift_count = drift_sum + comparison.sum_abs, drift_count + comparison.count
             if fault:
                 evidence = Evidence(hotkey=slot.hotkey, endpoint_id=slot.endpoint_id, model_id=slot.model_id,
                                     test_id=test.test_id, reason=fault, request_id=sample.request_id,
-                                    request=sample.request,
-                                    response={"answers": answers, "receipt": response["receipt"]})
+                                    request=sample.request, response=sample.response)
                 break
+        drift = {"drift_sum": drift_sum, "drift_count": drift_count}
         delivered = round(r.completed / policy.test_s * (valid / len(r.samples) if r.samples else 1.0), 2)
         if evidence is not None:
-            return Result(target, "invalid", evidence.reason, delivered, 0.0, evidence=evidence, **latency)
+            return Result(target, "invalid", evidence.reason, delivered, 0.0, evidence=evidence, **latency, **drift)
         credited = credit(target.tested_rps, delivered, policy)
         if delivered >= policy.pass_fraction * target.tested_rps:
-            return Result(target, "passed", "", delivered, credited, **latency)
+            return Result(target, "passed", "", delivered, credited, **latency, **drift)
         reason = f"delivered {delivered:.1f} of {target.tested_rps:.1f} requests/s"
         if valid < len(r.samples):
             reason += f", {len(r.samples) - valid} of {len(r.samples)} sampled responses without a valid receipt"
-        return Result(target, "partial", reason, delivered, credited, **latency)
+        return Result(target, "partial", reason, delivered, credited, **latency, **drift)
 
     def settle(self) -> None:
         """Confirm tests whose selection block is final with the hash they were selected by; void the others."""
@@ -477,16 +561,21 @@ class Auditor:
 
     def verdicts(self, epoch: int) -> SignedVerdicts | None:
         """The signed verdicts for scoring epoch ``epoch`` (the current one or the two before); None otherwise, or
-        while a test they cover is not settled."""
+        while a test they cover is not settled. Once served, an epoch's verdicts do not change."""
         cached = self._verdicts.get(epoch)
         if cached is not None:
             return cached
-        policy = self.policy
+        policy, cat = self.policy, self.catalog()
         current, first = self.follower.head // policy.epoch_blocks, epoch - policy.credit_ttl_epochs
         if not current - 2 <= epoch <= current or self.store.pending(first, epoch - 1):
             return None
+
+        def tolerance_of(model_id: str) -> Tolerance | None:
+            model = cat.get(model_id)
+            return model.tolerance if model is not None else None
+
         verdicts = Verdicts(netuid=self.netuid, auditor=self.hotkey, epoch=epoch,
-                            credits=self.store.credits(first, epoch - 1, policy.qualification_tests),
+                            credits=self.store.credits(first, epoch - 1, policy, tolerance_of),
                             invalid=self.store.evidence(first, epoch - 1))
         signed = SignedVerdicts.create(verdicts, self.keypair)
         self._verdicts = {e: v for e, v in self._verdicts.items() if e >= current - 2} | {epoch: signed}

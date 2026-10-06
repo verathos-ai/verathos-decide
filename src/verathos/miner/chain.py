@@ -44,10 +44,11 @@ def publish(subtensor: bt.Subtensor, wallet: bt.Wallet, config: MinerConfig, sig
 
 
 class PermitAuthorizer:
-    """Allows validators with a validator permit plus configured gateway hotkeys; refreshed in the background."""
+    """Allows validators with a validator permit plus configured gateway hotkeys; refreshed in the background over
+    its own chain connection."""
 
-    def __init__(self, subtensor: bt.Subtensor, netuid: int, extra: list[str], refresh_s: float = 600.0) -> None:
-        self._subtensor, self._netuid, self._extra = subtensor, netuid, set(extra)
+    def __init__(self, network: str, netuid: int, extra: list[str], refresh_s: float = 600.0) -> None:
+        self._subtensor, self._netuid, self._extra = bt.Subtensor(network=network), netuid, set(extra)
         self._allowed: set[str] = set(extra)
         self._logged = False
         self._refresh_s = refresh_s

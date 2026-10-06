@@ -1,5 +1,5 @@
 //! Drives a plan: one scheduler task per target sends open loop on that target's timetable, every
-//! request runs in its own task, and the per-target stats are read at the window's deadline.
+//! request runs in its own task, and the per-target stats are read once the window has closed.
 //!
 //! Target `i` sends request `k` at `start + (k + phase_i) / rate_i`, with `phase_i` in [0, 1) drawn
 //! from the seed. The phases keep targets of equal rates from firing in lockstep, which would turn
@@ -99,7 +99,7 @@ pub async fn run(plan: Plan) -> Result<Outcome, String> {
     let window = Window {
         start: start + plan.warmup,
         end: start + plan.warmup + plan.test,
-        deadline: start + plan.warmup + plan.test + plan.grace,
+        earliest_send: start + plan.warmup - plan.grace,
     };
     let generator = Generator::new(plan.key, plan.words);
     let targets = plan
@@ -121,7 +121,7 @@ pub async fn run(plan: Plan) -> Result<Outcome, String> {
         .collect::<Vec<_>>();
     let shared = Arc::new(Shared {
         generator,
-        client: Client::new(),
+        client: Client::new(plan.max_response_bytes),
         start,
         duration: plan.warmup + plan.test,
         timeout: plan.timeout,
@@ -163,7 +163,7 @@ pub async fn run(plan: Plan) -> Result<Outcome, String> {
             .map_err(|error| format!("a scheduler task failed: {error}"))?;
     }
     while all_sends_recorded.recv().await.is_some() {}
-    sleep_until(window.deadline.into()).await;
+    sleep_until(window.end.into()).await;
 
     let summaries = targets
         .iter()
@@ -232,7 +232,7 @@ async fn send(
     };
     let mut stats = lock(&target.stats);
     // The completion time is read under the lock, so any record made after the final read of the
-    // stats is timed at or after the deadline: no reply in time can be missed.
+    // stats is timed at or after the window end: nothing inside the window can be missed.
     stats.record_exchange(exchange, Instant::now());
 }
 

@@ -31,8 +31,8 @@ standard request mix `workload`, `score_per_rps`, `first_test_rps`, status), the
 owner hotkey commits; publishing a new one needs no code release.
 
 `score_per_rps` sets what one proven request per second of the model's mix is worth, so models of different cost
-per request score fairly. `first_test_rps` caps the rate of an endpoint's first test; later tests grow from what it
-delivered.
+per request score fairly. `first_test_rps` caps the rate of an endpoint's first test, and of all a new hotkey's
+endpoints together; later tests grow from what was delivered.
 
 Model status: `active` models are scored; `candidate` models can be served and are checked but weighted zero, which
 lets a new model run on the network before it is scored; `retired` models are skipped, and miners withdraw endpoints
@@ -51,16 +51,18 @@ To publish a catalog:
        --hotkey <owner hotkey> --file catalog.json
    ```
 
-   It validates the file, stores it in `catalog_dir` and commits its digest. Mirrors (`catalog_mirrors` in miner and
+   It validates the file (an unknown `throughput_audit` setting is an error), stores it in `catalog_dir` and commits
+   its digest. Mirrors (`catalog_mirrors` in miner and
    validator configs) can serve the same file; every copy is checked against the digest.
 
 Miners and validators check the commitment every minute: miners re-publish their manifests (measuring again if a
-model's request mix changed), the auditor applies a new audit policy at once, and validators use the new models,
-tolerances and scoring settings from their next epoch, accepting manifests built for the previous catalog for one
-more epoch. A changed request mix lowers declared capacities while miners measure again, so change it rarely and
-announce it. Announce
-model changes before committing so validators can start a reference engine for a new model and miners can deploy
-it. A model family whose engine needs new code, or a protocol change, still goes out as a code release.
+model's request mix changed), the auditor applies a new audit policy at once, and validators score each epoch
+under the catalog committed at its first block, accepting manifests built for the previous catalog for one more
+epoch. A changed request mix lowers declared capacities while miners measure again, so change it rarely and
+announce it. Announce model changes before committing so validators can start a reference engine for a new model
+and miners can deploy it: a validator without a reference engine for an `active` model stops. Naming another
+`auditor_hotkey` restarts every validator (exit code 3, for its supervisor) to take its new role. A model family
+whose engine needs new code, or a protocol change, still goes out as a code release.
 
 ## Throughput audit
 
@@ -68,7 +70,7 @@ The shipped catalog runs the audit in `enforce` mode. Check results in the audit
 (`state_dir/throughput.sqlite`, tables `tests` and `results`): honest endpoints should be `passed`, and `partial`
 or `void` results should have identifiable causes. If the audit misbehaves (for example the auditor's connection
 cannot carry the network's test traffic), publish a catalog with `"mode": "observe"`: tests still run and are
-recorded, validators count declared capacities and apply no evidence. `docs/THROUGHPUT_AUDIT.md` describes every
+recorded, validators count declared capacities (up to each model's `first_test_rps`) and apply no evidence. `docs/THROUGHPUT_AUDIT.md` describes every
 setting.
 
 ## Test network first

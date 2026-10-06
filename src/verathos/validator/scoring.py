@@ -3,17 +3,18 @@
 Per endpoint and epoch:
 - zero if the identity challenge failed or verification failed. A hard failure counts in the epoch it happens; the
   statistical bound is evaluated over the endpoint's last ``statistical_window_epochs`` audited epochs, because one
-  epoch of canaries is too few probabilities to separate a lower-precision substitute from honest drift. A
-  verification failure also starts probation: the endpoint scores zero for ``probation_epochs`` epochs, the failing
-  one included, regardless of later results. An endpoint a hotkey adds while one of its endpoints is on probation
-  inherits the remaining probation, so renaming an endpoint does not escape it;
-- a wrong answer the throughput auditor proved (an answer the miner signed in a test) fails every endpoint of the
-  hotkey: probation, and their averages reset to zero;
+  epoch of canaries is too few probabilities to separate a lower-precision substitute from honest drift;
+- a verification failure, or a wrong answer the throughput auditor proved (an answer the miner signed in a test),
+  fails every endpoint of the hotkey: their averages reset to zero and they score zero for ``probation_epochs``
+  epochs, the failing one included, regardless of later results. An endpoint the hotkey adds while on probation
+  inherits the remaining probation, so moving hardware to another endpoint does not escape it;
 - zero until the endpoint has proven capacity in a throughput test;
 - otherwise score per request/s of the model x proven capacity (requests/s) x availability (answered / sent) x latency
-  factor, where the latency factor compares the endpoint's median latency with the median over the passing endpoints
-  serving the same model, capped to [0.7, 1.3]. Candidate models score zero.
-Per UID: the sum of its endpoints' EMAs. Weights: UID values normalised to 1.
+  factor. The latency factor compares the endpoint's median latency in its throughput test with the median over the
+  scored endpoints serving the same model, capped to [0.7, 1.3]; every validator reads the same latencies from the
+  auditor's verdicts. Candidate models score zero.
+An endpoint that could not be audited (no usable reference answers) keeps its average for at most ``MAX_HELD_EPOCHS``
+epochs in a row. Per UID: the sum of its endpoints' EMAs. Weights: UID values normalised to 1.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from verathos.validator.compare import Verdict
 
 LATENCY_CAP = (0.7, 1.3)
 PRUNE_BELOW = 1e-4  # EMA under which an endpoint that is gone is forgotten
+MAX_HELD_EPOCHS = 3
 
 
 @dataclass
@@ -39,6 +41,7 @@ class ScoreState:
     uid_of: dict[str, int] = field(default_factory=dict)
     window: dict[str, list[list[float]]] = field(default_factory=dict)  # key -> [[sum_abs, count], ...] newest last
     evidence_seen: dict[str, int] = field(default_factory=dict)  # evidence id -> epoch it was applied
+    held: dict[str, int] = field(default_factory=dict)  # key -> epochs in a row its average was held
     last_epoch: int | None = None  # the last epoch scored, so a restart does not score it again
 
     @classmethod
@@ -83,11 +86,13 @@ def windowed_verdict(state: ScoreState, key: str, result: EndpointResult) -> Ver
 
 
 def epoch_scores(results: dict[str, EndpointResult], *, score_per_rps: dict[str, float], credited: dict[str, float],
-                 state: ScoreState, failed_hotkeys: Collection[str] = ()) -> tuple[dict[str, float], set[str]]:
+                 latency_ms: dict[str, float], state: ScoreState,
+                 failed_hotkeys: Collection[str] = ()) -> tuple[dict[str, float], set[str]]:
     """-> (score per endpoint key, keys that failed verification this epoch). Call after ``record_window``.
 
-    ``credited`` holds each endpoint's proven capacity in requests/s (missing: none proven yet); ``failed_hotkeys``
-    the hotkeys with a wrong answer proven by the throughput auditor.
+    ``credited`` holds each endpoint's proven capacity in requests/s (missing: none proven yet), ``latency_ms`` its
+    median latency in that test (missing: no latency factor); ``failed_hotkeys`` the hotkeys with a wrong answer
+    proven by the throughput auditor.
     """
     scores: dict[str, float] = {}
     failed: set[str] = set()
@@ -102,16 +107,17 @@ def epoch_scores(results: dict[str, EndpointResult], *, score_per_rps: dict[str,
         else:
             eligible[key] = r
 
-    medians_by_model: dict[str, list[float]] = {}
-    for r in eligible.values():
-        medians_by_model.setdefault(r.endpoint.endpoint.model_id, []).append(statistics.median(r.latencies_ms))
-    model_median = {m: statistics.median(v) for m, v in medians_by_model.items()}
+    latencies_by_model: dict[str, list[float]] = {}
     for key, r in eligible.items():
-        model = r.endpoint.endpoint.model_id
-        own = statistics.median(r.latencies_ms)
-        latency = math.sqrt(model_median[model] / own) if own > 0 else LATENCY_CAP[1]
-        latency = min(max(latency, LATENCY_CAP[0]), LATENCY_CAP[1])
-        scores[key] = score_per_rps.get(model, 0.0) * credited[key] * (r.answered / r.sent) * latency
+        if latency_ms.get(key, 0.0) > 0:
+            latencies_by_model.setdefault(r.endpoint.endpoint.model_id, []).append(latency_ms[key])
+    model_median = {m: statistics.median(v) for m, v in latencies_by_model.items()}
+    for key, r in eligible.items():
+        model, own = r.endpoint.endpoint.model_id, latency_ms.get(key, 0.0)
+        factor = 1.0
+        if own > 0:
+            factor = min(max(math.sqrt(model_median[model] / own), LATENCY_CAP[0]), LATENCY_CAP[1])
+        scores[key] = score_per_rps.get(model, 0.0) * credited[key] * (r.answered / r.sent) * factor
     return scores, failed
 
 
@@ -120,14 +126,16 @@ def update(state: ScoreState, results: dict[str, EndpointResult], scores: dict[s
            reset_hotkeys: Collection[str] = ()) -> None:
     """Fold one epoch into the state. ``held`` endpoints were discovered but could not be audited this epoch (no
     usable reference answers); their EMA is kept. Other endpoints absent this epoch decay toward zero and are
-    forgotten once their EMA is negligible. Every endpoint of a hotkey in ``reset_hotkeys`` starts probation with
-    its average reset to zero."""
-    for key in failed:
-        state.probation[key] = probation_epochs
-    for key in set(state.ema) | set(results) | set(held):
-        if key.split("/", 1)[0] in reset_hotkeys:
+    forgotten once their EMA is negligible. Every endpoint of a hotkey with a failed endpoint or in ``reset_hotkeys``
+    starts probation with its average reset to zero and its statistical window cleared."""
+    reset = set(reset_hotkeys) | {key.split("/", 1)[0] for key in failed}
+    for key in set(state.ema) | set(results) | set(held) | set(state.window):
+        if key.split("/", 1)[0] in reset:
             state.probation[key] = probation_epochs
             state.ema[key] = 0.0
+            state.window.pop(key, None)
+    state.held = {k: state.held.get(k, 0) + 1 for k in held}
+    held = {k for k in held if state.held[k] <= MAX_HELD_EPOCHS}
     on_probation: dict[str, int] = {}
     for key, remaining in state.probation.items():
         hotkey = key.split("/", 1)[0]

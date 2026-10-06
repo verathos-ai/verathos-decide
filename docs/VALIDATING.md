@@ -15,9 +15,11 @@ the auditor's signed verdicts. Each validator finds its role at startup from the
 - One reference engine per catalog model. The reference is the model run in fp32; CPU is enough because each
   canary is computed once per epoch and reused for every endpoint. Measured on a rented server CPU: Kev-4B 3.4 s and
   Kev-9B 6.6 s per request; the fp32 weights alone take about 16 GB and 36 GB of RAM. A GPU in fp32 is faster.
-- The auditor additionally needs Rust (rustup) and `build-essential` for the load generator, a reference engine
-  per model on a GPU (it recomputes 2 answers per endpoint and test, about 2 per second on an A100), a public IP
-  and one open TCP port.
+- The auditor additionally needs Rust (rustup) and `build-essential` for the load generator, a public IP and one
+  open TCP port with an uplink for the network's test traffic, and fast recomputes: 2 answers per endpoint and
+  test, within 15 minutes. A bf16 screen per model on a GPU does that (on an A100, Kev-4B recomputes about 6
+  answers per second in bf16 and 2 in fp32; the bf16 weights of Kev-4B, Kev-9B and Clef-flash take about 45 GB), with the
+  fp32 references confirming what it flags.
 - A public IP of its own: behind most NATs a machine cannot reach other machines that share its public IP through
   that IP, so a validator next to miners on one NAT cannot send them canaries.
 
@@ -75,7 +77,7 @@ needs about 36 GB of RAM in fp32.
 | Field | Default | Meaning |
 |---|---|---|
 | `mechid` | 1 | mechanism the weights are set on |
-| `references` | | model id -> the model's fp32 reference engine: a URL, or `{"url", "api_key"}` for a remote engine behind https (the Kev server takes its key from `KEV_API_KEY`); models without one are not audited by this validator |
+| `references` | | model id -> the model's fp32 reference engine: a URL, or `{"url", "api_key"}` for a remote engine behind https (the Kev server takes its key from `KEV_API_KEY`). Every `active` model needs one: the validator does not start without, and stops when a new catalog activates a model it has none for; `candidate` models without one are not audited by this validator |
 | `audit_screens` | {} | auditor only: model id -> a bf16 engine (same forms) that screens the sampled test answers; an answer it flags counts as wrong only once the fp32 reference confirms it |
 | `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database |
 | `dry_run` | false | compute weights without setting them |
@@ -92,10 +94,14 @@ the same ones.
 .venv/bin/verathos-validator --config validator.json
 ```
 
+Run it under a supervisor (systemd, pm2) that restarts it: when a new catalog names another auditor, the validator
+exits (code 3) to take its new role on restart.
+
 Per epoch (`epoch_blocks` from the catalog, default 180 blocks) the validator:
 1. uses the catalog the subnet owner commits (shipped copy, local store, owner's axon, mirrors; any copy is
    checked against the committed digest). The validator checks the commitment every minute in the background and
-   applies a new audit policy at once; models, tolerances and the epoch length apply from the next epoch;
+   applies a new audit policy at once; each epoch is scored under the catalog committed at its first block, so
+   models, tolerances and the epoch length change for every validator at the same epoch;
 2. reads axons and commitments and accepts each miner's manifest if it is signed by the hotkey, matches the
    committed digest, lists its endpoints on the hotkey's axon and was built for the current catalog (or, for one
    epoch after a change, the previous one);
@@ -105,7 +111,7 @@ Per epoch (`epoch_blocks` from the catalog, default 180 blocks) the validator:
    signed receipt;
 5. reads the auditor's verdicts for the epoch: each endpoint's proven capacity and any proven wrong answers;
 6. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
-   probation, and sets weights on `mechid`.
+   probation, and sets weights on `mechid` (retried once per block, up to 10 times).
 
 Nothing a miner returns can stop the epoch: replies are size- and time-bounded and every malformed reply is
 recorded against that endpoint. Chain errors are retried every block. `--once` runs one epoch immediately and exits. Keep `state_dir` across restarts: it holds the canary secret and the
@@ -119,7 +125,7 @@ signed by the auditor hotkey, and scores each endpoint by the capacity credited 
 It applies a proven wrong answer only after checking the miner's receipt in the evidence and, if it runs a reference
 engine for the model, recomputing the answer (if that engine does not answer, it applies the auditor's verdict). If the verdicts stay unavailable it uses the last ones it holds while they still cover a
 recent test; without any, no endpoint has proven capacity that epoch. In `observe` mode it counts declared
-capacities and fetches nothing.
+capacities, up to the model's `first_test_rps`, and fetches nothing.
 
 Validators that run a service (the subnet owner's and the auditor's) also serve each hotkey's status for its miners
 at `GET /v1/status/<hotkey>`: per endpoint the state in the last epoch (scored, qualifying, candidate, failed,

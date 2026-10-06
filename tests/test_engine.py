@@ -15,7 +15,8 @@ def test_engine_answers_and_rejects_malformed_requests() -> None:
         return {"model": body["model"], "answers": {"outage": {"type": "noul", "noul": 0.93}},
                 "usage": {"input_tokens": 12, "output_tokens": 0}}
 
-    client = TestClient(create_app(runner, ["Cloudflare/clef-flash"]))
-    assert client.get("/v1/models").json() == {"data": [{"id": "Cloudflare/clef-flash"}]}
+    served = {"id": "Cloudflare/clef-flash", "revision": "17f0b0ad", "device": "cuda", "dtype": "bfloat16"}
+    client = TestClient(create_app(runner, [served]))
+    assert client.get("/v1/models").json() == {"data": [served]}
     assert client.post("/v1/systemone", json=REQUEST).json()["answers"]["outage"]["noul"] == 0.93
     assert client.post("/v1/systemone", json={"model": "x", "questions": {}}).status_code == 422

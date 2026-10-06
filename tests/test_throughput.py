@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import json
 import random
 
 import httpx
@@ -108,10 +109,14 @@ def test_a_policy_change_never_selects_a_second_test_in_an_epoch() -> None:
 
 def test_policy_comes_from_the_catalog_and_is_checked() -> None:
     assert policy_from({"pass_fraction": 0.9, "samples_per_test": 20}, 360).samples_per_test == 20
-    for bad in ({"unknown": 1}, {"epoch_blocks": 100}, {"pass_fraction": 1.5}, {"rate_growth": 0.5},
-                {"test_s": 400.0}, {"answer_checks_per_test": 11}):
+    for bad in ({"pass_fraction": 1.5}, {"rate_growth": 0.5}, {"test_s": 400.0}, {"answer_checks_per_test": 11}):
         with pytest.raises(ValueError):
             policy_from(bad, 180)
+    # settings this code does not know: an error when publishing, ignored when following
+    for unknown in ({"future_setting": 1}, {"epoch_blocks": 100}):
+        with pytest.raises(ValueError, match="unknown"):
+            policy_from(unknown, 180, strict=True)
+        assert policy_from(unknown, 180) == AuditPolicy()
     with pytest.raises(ValueError, match="too short"):
         policy_from({"lead_blocks": 60}, 50)
     assert catalog.load().audit_policy() == AuditPolicy()
@@ -276,7 +281,7 @@ def miner_app(host: str, keypair: Keypair, auditor: Keypair, engines: dict[str, 
         endpoints=[Endpoint(endpoint_id=e, url=config.endpoint_url(e), model_id="kev-4b", capacity_rps=declared)
                    for e in engines]), keypair)
     app = create_app(config=config, keypair=keypair, manifest=lambda: signed, engines=engines,
-                     authorized=lambda hk: False, auditor=lambda: auditor.ss58_address)
+                     authorized=lambda hk: False, auditors=lambda: {auditor.ss58_address})
     return app, signed.manifest
 
 
@@ -329,7 +334,9 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
         agrees = await validator.proven_invalid(verdicts.invalid, {"kev-4b": MockEngine("kev-4b", salt="kev-4b-int4")},
                                                 catalog.load())
         tampered = verdicts.invalid[0].model_copy(deep=True)
-        tampered.response["answers"] = (await reference.answer(tampered.request))["answers"]
+        response = json.loads(tampered.response)
+        response["answers"] = (await reference.answer(tampered.request))["answers"]
+        tampered.response = json.dumps(response)
         forged = await validator.proven_invalid([tampered], {}, catalog.load())
         return auditor, verdicts, accepted, agrees, forged
 
@@ -341,7 +348,7 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
     # delivers about half its declaration, so it is credited about a quarter of it
     assert 5 < credits[f"{by_name['over']}/gpu0"].credited_rps < 15
     shares = [credits[f"{by_name['shared']}/{e}"].credited_rps for e in ("gpu0", "gpu1")]
-    assert sum(shares) < 30  # one engine cannot pass for two
+    assert sum(shares) < 40  # one engine (40 requests/s) cannot pass for two
     wrong = credits[f"{by_name['wrong']}/gpu0"]
     assert wrong.credited_rps == 0.0 and not wrong.qualified
     assert [(e.hotkey, e.endpoint_id) for e in verdicts.invalid] == [(keys["wrong"].ss58_address, "gpu0")]
@@ -350,7 +357,7 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
 
     outcomes = {o.outcome for o in auditor.outcomes(keys["over"].ss58_address, 4)}
     assert outcomes == {"partial"}
-    assert auditor.store.last_delivered()[f"{keys['honest'].ss58_address}/gpu0"] == pytest.approx(40, rel=0.2)
+    assert auditor.store.last_delivered()[f"{keys['honest'].ss58_address}/gpu0"][1] == pytest.approx(40, rel=0.2)
 
 
 def test_a_test_whose_selection_block_is_not_final_is_void(tmp_path) -> None:
@@ -422,13 +429,17 @@ def test_a_screen_flag_counts_only_once_the_fp32_reference_confirms_it() -> None
         honest = (await MockEngine("kev-4b").answer(request))["answers"]
         wrong = (await MockEngine("kev-4b", salt="other").answer(request))["answers"]
         tol = KEV.tolerance
-        noisy_screen = Checks({"kev-4b": MockEngine("kev-4b")}, {"kev-4b": MockEngine("kev-4b", salt="bf16 noise")})
-        assert await noisy_screen.fault("kev-4b", request, honest, tol, recompute=True) is None  # not confirmed
-        assert "differ from the reference" in await noisy_screen.fault("kev-4b", request, wrong, tol, recompute=True)
-        assert await noisy_screen.fault("kev-4b", request, wrong, tol, recompute=False) is None  # form only
-        assert await noisy_screen.fault("kev-4b", request, {"q": []}, tol, recompute=False) == "malformed answers"
-        unconfirmable = Checks({}, {"kev-4b": MockEngine("kev-4b")})
-        assert await unconfirmable.fault("kev-4b", request, wrong, tol, recompute=True) is None
+        screened = Checks({"kev-4b": MockEngine("kev-4b")},
+                          {"kev-4b": MockEngine("kev-4b", salt="bf16 noise")}).for_test()
+
+        async def fault(checks, answers, recompute_answers=True):
+            return (await checks.check("kev-4b", request, answers, tol, recompute_answers=recompute_answers))[0]
+
+        assert await fault(screened, honest) is None  # flagged by the noisy screen, not confirmed
+        assert "differ from the reference" in await fault(screened, wrong)
+        assert await fault(screened, wrong, recompute_answers=False) is None  # form only
+        assert await fault(screened, {"q": []}, recompute_answers=False) == "malformed answers"
+        assert await fault(Checks({}, {"kev-4b": MockEngine("kev-4b")}).for_test(), wrong) is None  # unconfirmable
 
     asyncio.run(run())
 
@@ -444,3 +455,127 @@ def test_reference_engines_take_a_url_or_a_keyed_tls_endpoint() -> None:
     with pytest.raises(ValueError, match="needs https"):
         ValidatorConfig.model_validate({**base, "references": {"kev-4b": {"url": "http://203.0.113.7:8101",
                                                                           "api_key": "k"}}})
+
+
+# ---- review fixes: the auditor stays robust whatever endpoints do ----
+
+def _result(target_id: str, *, completed: int = 160, samples: list | None = None, errors: dict | None = None,
+            late_sends: int = 0, sent: int = 160):
+    from verathos.throughput.loadgen import TargetResult
+    return TargetResult.model_validate({"id": target_id, "sent": sent, "skipped": 0, "completed": completed,
+                                        "latency_ms": {"p50": 400.0, "p95": 900.0, "max": 1200.0},
+                                        "errors": errors or {}, "late_sends": late_sends, "samples": samples or []})
+
+
+def _auditor(tmp_path, **policy_overrides):
+    policy = dataclasses.replace(AuditPolicy(), **policy_overrides)
+    return Auditor(netuid=405, mechid=1, keypair=kp(), chain=FakeChain(head=3 * 180 + 40), policy=policy,
+                   catalog=catalog.load, references={}, db_path=tmp_path / "t.sqlite")
+
+
+def test_a_hostile_response_voids_nothing_but_its_own_endpoint(tmp_path) -> None:
+    from verathos.throughput.auditor import Target
+
+    auditor = _auditor(tmp_path)
+    test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+    target = Target(Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 10.0), 10.0)
+    deep = '{"answers": ' + "[" * 300 + "]" * 300 + ', "receipt": {}}'
+    sample = {"request": {"model": "kev-4b"}, "request_id": "ab" * 16, "response": deep}
+
+    async def run(r):
+        return await auditor.evaluate(test, target, r, Checks({}, {}).for_test(), auditor.policy)
+
+    hostile = asyncio.run(run(_result("hk/gpu0", samples=[sample])))
+    assert hostile.outcome == "partial" and hostile.delivered_rps == 0.0  # no valid receipt: nothing delivered
+    assert asyncio.run(run(_result("hk/gpu0", late_sends=5))).outcome == "void"
+    assert asyncio.run(run(_result("hk/gpu0", errors={"local": 3}))).reason.startswith("the auditor's load generator")
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("unexpected")
+
+    auditor._evaluate = broken
+    assert asyncio.run(run(_result("hk/gpu0"))).outcome == "void"
+
+
+def test_a_hotkey_cannot_reset_its_test_rate_by_renaming_endpoints(tmp_path) -> None:
+    from verathos.throughput.auditor import Result, Target
+
+    auditor = _auditor(tmp_path)
+    old = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 50.0)
+    test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+    auditor.store.add_test(test)
+    auditor.store.add_results(test.test_id, [Result(Target(old, 50.0), "partial", "", 2.0, 0.16)])
+    # the old endpoint delivered 2 requests/s; eight renamed endpoints are tested at 2 x 2 in total
+    auditor.update_slots([Slot("hk", f"new{i}", f"http://x/e/new{i}", "kev-4b", 50.0) for i in range(8)])
+    rates = [t.tested_rps for t in auditor.targets(auditor.policy)]
+    assert sum(rates) == pytest.approx(50.0, abs=0.1)  # at least one first test's worth, never 8 x 50
+    auditor.update_slots([Slot("fresh", f"g{i}", f"http://y/e/g{i}", "kev-4b", 50.0) for i in range(8)])
+    assert sum(t.tested_rps for t in auditor.targets(auditor.policy)) == pytest.approx(50.0, abs=0.1)
+
+
+def test_answers_drifting_across_tests_lose_their_credit(tmp_path) -> None:
+    from verathos.throughput.auditor import Result, Target
+
+    auditor = _auditor(tmp_path, drift_window_tests=3)
+    slot = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 20.0)
+    tol = KEV.tolerance
+    for epoch, block in ((1, 200), (2, 380), (3, 560)):
+        test = ScheduledTest(epoch, block, block_hash(block).hex(), block + 5)
+        auditor.store.add_test(test)
+        # each test recomputed 40 probabilities, off by twice the model's mean tolerance
+        auditor.store.add_results(test.test_id, [Result(Target(slot, 20.0), "passed", "", 20.0, 20.0, 400.0,
+                                                        drift_sum=40 * 2 * tol.mean_abs, drift_count=40)])
+        auditor.store.set_state(test.test_id, "confirmed")
+    (credit_,) = auditor.store.credits(2, 3, auditor.policy, lambda m: tol)
+    assert credit_.drift and credit_.credited_rps == 0.0 and credit_.latency_ms == 400.0
+
+
+def test_served_verdicts_do_not_change_with_the_policy(tmp_path) -> None:
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()
+    chain = auditor.chain
+    chain.head_block = 4 * 180 + 1
+    auditor.follower.poll()
+    first = auditor.verdicts(4)
+    auditor.set_policy(dataclasses.replace(auditor.policy, credit_ttl_epochs=5))
+    assert auditor.verdicts(4) is first
+
+
+def test_an_auditor_database_of_another_schema_starts_over(tmp_path) -> None:
+    import sqlite3
+
+    from verathos.throughput.auditor import SCHEMA_VERSION, Store
+
+    db = sqlite3.connect(tmp_path / "t.sqlite")
+    db.executescript("CREATE TABLE tests (test_id TEXT); CREATE TABLE results (old TEXT); PRAGMA user_version = 1;")
+    db.close()
+    store = Store(tmp_path / "t.sqlite")
+    assert store._query("PRAGMA user_version") == [(SCHEMA_VERSION,)]
+    assert store.last_delivered() == {}
+
+
+def test_the_ladder_reaches_max_concurrency_and_a_measurement_steps_aside() -> None:
+    from verathos.throughput import measure
+
+    target = Target("gpu0", "kev-4b", MockEngine("kev-4b"), KEV.workload, 48, "f")
+    assert measure._ladder(target) == [1, 2, 4, 8, 16, 32, 48]
+    with pytest.raises(measure.MeasurementInterrupted):
+        asyncio.run(measure.measure_all([target], 1.0, run_s=0.1, stop=lambda: True))
+
+
+def test_the_previous_auditor_is_accepted_for_one_epoch(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from verathos.miner import __main__ as miner_main
+    from verathos.miner.config import MinerConfig
+
+    config = MinerConfig.model_validate({
+        "netuid": 405, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5", "port": 8091,
+        "state_dir": str(tmp_path),
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:9"}]})
+    publisher = miner_main.Publisher(config, SimpleNamespace(hotkey=kp()), catalog.load(), publish_on_chain=False,
+                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "old"))
+    publisher._set_auditor("new")
+    assert publisher.auditors() == {"old", "new"}
+    publisher._auditors["old"] = 0.0  # its grace has passed
+    assert publisher.auditors() == {"new"}

@@ -123,3 +123,11 @@ def test_accepts_previous_catalog_during_transition(keypair: Keypair) -> None:
     with pytest.raises(ManifestRejected, match="another catalog"):
         check(signed.model_dump(mode="json"), keypair, commitment=commitment, catalogs=("1" * 64,))
     assert check(signed.model_dump(mode="json"), keypair, commitment=commitment, catalogs=("1" * 64, CATALOG))
+
+
+def test_ipv6_public_hosts_are_normalised_as_the_chain_returns_them() -> None:
+    from verathos.protocol.manifest import public_ip
+
+    assert public_ip("2001:DB8:0:0::1") == "2001:db8::1"
+    assert public_ip("203.0.113.5") == "203.0.113.5"
+    assert axon_base("2001:db8::1", 8091) == "http://[2001:db8::1]:8091"

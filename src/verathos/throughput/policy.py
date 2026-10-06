@@ -16,9 +16,10 @@ import base64
 import dataclasses
 import hashlib
 import json
+import logging
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +30,7 @@ from verathos.protocol import signing
 from verathos.protocol.canonical import canonical_json
 from verathos.protocol.requests import MAX_SKEW_MS, NonceCache, RequestRejected
 
+log = logging.getLogger(__name__)
 BLOCK_TIME_S = 12.0
 POLICY_WATCH_S = 60.0  # miners and validators check the committed catalog (and so the policy) this often
 SELECTION_PREFIX = b"VERATHOS_THROUGHPUT_TEST_V1"
@@ -51,9 +53,9 @@ class AuditPolicy:
     epoch_blocks: int = 180  # the catalog's epoch length
     lead_blocks: int = 5
     max_latency_s: float = 2.0  # the miner declares capacity only at concurrencies answering within this
-    warmup_s: float = 3.0  # at least max_latency_s, so a test measures in steady state
+    warmup_s: float = 3.0  # at least max_latency_s; each test draws its warmup from [warmup_s, 2 x warmup_s]
     test_s: float = 16.0
-    request_timeout_s: float = 20.0
+    request_timeout_s: float = 10.0
     pass_fraction: float = 0.95
     samples_per_test: int = 10  # responses whose receipts are checked
     answer_checks_per_test: int = 2  # of those, answers the reference recomputes
@@ -62,6 +64,7 @@ class AuditPolicy:
     credit_ttl_epochs: int = 2
     rate_growth: float = 2.0  # an endpoint is tested at no more than this times what it last delivered
     min_test_share: float = 0.125  # ... but at least this share of the model's first_test_rps
+    drift_window_tests: int = 8  # tests over which an endpoint's recomputed answers are held to mean_abs
 
     def validate(self) -> None:
         if self.mode not in ("enforce", "observe"):
@@ -75,9 +78,9 @@ class AuditPolicy:
         if self.session_s > MAX_SESSION_S:
             raise ValueError(f"warmup_s + test_s + request_timeout_s must stay under {MAX_SESSION_S - 5:.0f} s")
         if min(self.lead_blocks, self.samples_per_test, self.answer_checks_per_test, self.qualification_tests,
-               self.credit_ttl_epochs) < 1:
-            raise ValueError("lead_blocks, samples_per_test, answer_checks_per_test, qualification_tests and "
-                             "credit_ttl_epochs must be at least 1")
+               self.credit_ttl_epochs, self.drift_window_tests) < 1:
+            raise ValueError("lead_blocks, samples_per_test, answer_checks_per_test, qualification_tests, "
+                             "credit_ttl_epochs and drift_window_tests must be at least 1")
         if self.answer_checks_per_test > self.samples_per_test:
             raise ValueError("answer_checks_per_test cannot exceed samples_per_test")
         if self.rate_growth < 1:
@@ -89,20 +92,27 @@ class AuditPolicy:
 
     @property
     def session_s(self) -> float:
-        """How long a test session stays valid after traffic starts: the traffic plus the last request's timeout."""
-        return self.warmup_s + self.test_s + self.request_timeout_s + 5.0
+        """How long a test session stays valid after traffic starts: the longest traffic plus the last request's
+        timeout."""
+        return 2 * self.warmup_s + self.test_s + self.request_timeout_s + 5.0
 
     @property
     def traffic_blocks(self) -> int:
-        """Blocks the test traffic spans until its last answers are due, rounded up."""
-        return math.ceil((self.warmup_s + self.test_s + self.max_latency_s) / BLOCK_TIME_S)
+        """Blocks the longest test traffic spans, rounded up."""
+        return math.ceil((2 * self.warmup_s + self.test_s) / BLOCK_TIME_S)
 
 
-def policy_from(settings: Mapping[str, Any], epoch_blocks: int) -> AuditPolicy:
+def policy_from(settings: Mapping[str, Any], epoch_blocks: int, *, strict: bool = False) -> AuditPolicy:
+    """The policy for the catalog's ``throughput_audit`` settings. Settings this code does not know are an error
+    when publishing a catalog (``strict``) and are ignored when following one, so a catalog for newer code does not
+    stop older nodes."""
     unknown = set(settings) - {f.name for f in dataclasses.fields(AuditPolicy)} | ({"epoch_blocks"} & set(settings))
-    if unknown:
+    if unknown and strict:
         raise ValueError(f"unknown throughput_audit settings: {sorted(unknown)}")
-    policy = dataclasses.replace(AuditPolicy(), **settings, epoch_blocks=epoch_blocks)
+    if unknown:
+        log.warning("ignoring throughput_audit settings this code does not know: %s", sorted(unknown))
+    policy = dataclasses.replace(AuditPolicy(), **{k: v for k, v in settings.items() if k not in unknown},
+                                 epoch_blocks=epoch_blocks)
     policy.validate()
     return policy
 
@@ -218,8 +228,8 @@ class SessionGate:
         self._verified: dict[str, Session] = {}
         self._request_ids = NonceCache(window_ms=int(MAX_SESSION_S * 1000) + MAX_SKEW_MS)
 
-    def check(self, headers: Mapping[str, str], *, auditor: str | None, endpoint_id: str, now_ms: int) -> tuple[
-            Session, str]:
+    def check(self, headers: Mapping[str, str], *, auditors: Collection[str], endpoint_id: str,
+              now_ms: int) -> tuple[Session, str]:
         """-> (session, request id). Raises RequestRejected."""
         found = read_session(headers)
         if found is None:
@@ -228,11 +238,13 @@ class SessionGate:
         request_id = {k.lower(): v for k, v in headers.items()}.get(HDR_REQUEST_ID.lower(), "")
         if not _REQUEST_ID.fullmatch(request_id):
             raise RequestRejected("malformed request id")
-        if not (session.auditor in (auditor, self.miner_hotkey) and session.netuid == self.netuid
+        if not ((session.auditor in auditors or session.auditor == self.miner_hotkey) and session.netuid == self.netuid
                 and session.miner_hotkey == self.miner_hotkey and session.endpoint_id == endpoint_id):
             raise RequestRejected("test session is for another auditor, miner or endpoint")
         if now_ms > session.not_after_ms + MAX_SKEW_MS:
             raise RequestRejected("test session expired")
+        if session.not_after_ms > now_ms + MAX_SESSION_S * 1000 + MAX_SKEW_MS:
+            raise RequestRejected("test session lasts too long")
         if self._verified.get(signature) != session:
             if not (_SIGNATURE.fullmatch(signature)
                     and signing.verify(session.auditor, SESSION_DOMAIN, session.model_dump(), signature)):

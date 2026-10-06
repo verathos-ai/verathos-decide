@@ -1,9 +1,9 @@
 """The catalog the subnet owner commits, followed in the background.
 
 The validator checks the owner's commitment every ``POLICY_WATCH_S``, like the miners, so a new throughput-audit
-policy reaches the audit within a minute of the miners. Models, tolerances and the epoch length apply from the next
-epoch. Manifests built for the previous catalog stay acceptable for one epoch after a change, while miners
-re-publish.
+policy reaches the audit within a minute of the miners. Each epoch is scored under the catalog committed at its first
+block (``for_epoch``), the same for every validator. Manifests built for the previous catalog stay acceptable for
+one epoch after a change, while miners re-publish.
 """
 
 from __future__ import annotations
@@ -46,6 +46,16 @@ class CatalogFollower:
             if self._previous and time.time() < self._previous[1]:
                 digests.add(self._previous[0])
         return digests
+
+    def for_epoch(self, st: bt.Subtensor, start_block: int) -> catalog.Catalog:
+        """The catalog committed at an epoch's first block, so every validator scores the epoch under the same one,
+        whenever it noticed a new commitment. Falls back to the current catalog if that one is unavailable."""
+        try:
+            return current_catalog(st, self.netuid, self.store, self.mirrors, block=start_block)
+        except Exception as exc:
+            log.error("catalog committed at block %d unavailable, using %s: %s", start_block,
+                      self.catalog.digest()[:12], exc)
+            return self.catalog
 
     def refresh(self, st: bt.Subtensor) -> bool:
         """Re-resolve the committed catalog; True if it changed. Keeps the current one while a new one is

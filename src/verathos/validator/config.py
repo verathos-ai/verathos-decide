@@ -32,8 +32,8 @@ class ReferenceEngine(BaseModel):
             raise ValueError(f"{self.url}: a key for a remote engine needs https")
         return self
 
-    def engine(self) -> HttpEngine:
-        return HttpEngine(self.url, self.api_key)
+    def engine(self, timeout_s: float = 120.0) -> HttpEngine:
+        return HttpEngine(self.url, self.api_key, timeout_s=timeout_s)
 
 
 def _engines(value: Any) -> Any:

@@ -19,28 +19,39 @@ use serde_json::value::RawValue;
 use std::time::{Duration, Instant};
 use tokio::time::timeout_at;
 
-/// Largest accepted response body.
-pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
 /// Shorter than the 5 s keep-alive of common Python servers (uvicorn), so an idle connection is
 /// never reused just as the server closes it. Enforced when a connection is taken from the pool;
 /// the pool's background reaper stays off because it evicts every expired connection at once under
 /// the pool's global lock, which stalls all sends when thousands expire together.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// `errno` values that mean this host, not the target, ran out of a resource.
+const LOCAL_ERRNOS: [i32; 5] = [
+    23,  // ENFILE: system file table full
+    24,  // EMFILE: process file descriptors exhausted
+    98,  // EADDRINUSE
+    99,  // EADDRNOTAVAIL: no local port left
+    105, // ENOBUFS
+];
+
 #[derive(Clone)]
 pub struct Client {
     pool: PooledClient<HttpConnector, Full<Bytes>>,
+    max_response_bytes: usize,
 }
 
 impl Client {
-    pub fn new() -> Self {
+    pub fn new(max_response_bytes: usize) -> Self {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
         let pool = PooledClient::builder(TokioExecutor::new())
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .pool_max_idle_per_host(usize::MAX)
             .build(connector);
-        Self { pool }
+        Self {
+            pool,
+            max_response_bytes,
+        }
     }
 
     /// Sends one request. `Ok` carries the body of a 200 reply that is a JSON object.
@@ -52,6 +63,7 @@ impl Client {
         let deadline = tokio::time::Instant::from_std(deadline);
         let response = match timeout_at(deadline, self.pool.request(request)).await {
             Err(_) => return Err(ErrorKind::Timeout),
+            Ok(Err(error)) if local_failure(&error) => return Err(ErrorKind::Local),
             Ok(Err(error)) if error.is_connect() => return Err(ErrorKind::Connect),
             Ok(Err(_)) => return Err(ErrorKind::Transport),
             Ok(Ok(response)) => response,
@@ -59,7 +71,7 @@ impl Client {
         let status = response.status();
         let body = timeout_at(
             deadline,
-            Limited::new(response.into_body(), MAX_RESPONSE_BYTES).collect(),
+            Limited::new(response.into_body(), self.max_response_bytes).collect(),
         )
         .await;
         if status != StatusCode::OK {
@@ -92,6 +104,23 @@ pub fn post(target: &Target, request: &GeneratedRequest) -> Request<Full<Bytes>>
         HeaderValue::from_str(&request.id).expect("a hex request id is a valid header value"),
     );
     post
+}
+
+/// Whether an error comes from this host running out of sockets, descriptors or ports.
+fn local_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            if io
+                .raw_os_error()
+                .is_some_and(|code| LOCAL_ERRNOS.contains(&code))
+            {
+                return true;
+            }
+        }
+        source = error.source();
+    }
+    false
 }
 
 /// Full syntax check without building the value.

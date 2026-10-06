@@ -96,7 +96,7 @@ CUDA_VISIBLE_DEVICES=2 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --rev
 | `gateway_hotkeys` | callers allowed in addition to validators with a permit |
 | `catalog_mirrors` | extra catalog sources, URL templates with `{digest}`, tried after the owner's axon |
 | `catalog_dir` | local catalog store (default `~/.verathos/catalog`) |
-| `state_dir` | capacity measurements (default `~/.verathos/miner`) |
+| `state_dir` | capacity measurements and the last published manifest (default `~/.verathos/miner`) |
 
 ## 5. Run
 
@@ -111,18 +111,24 @@ On start the miner:
 2. starts its service: the manifest (`GET /v1/manifest`) and the endpoints (`/e/<endpoint_id>/v1/...`) on one port;
 3. waits until every engine answers, then measures the endpoints' capacity through its own service, all at once (a
    few minutes; see `THROUGHPUT_AUDIT.md`), or reuses the stored measurements if nothing they depend on changed.
-   An endpoint that cannot be measured is withdrawn, and the miner stops only if none is left;
+   Meanwhile it serves the manifest it last published. An endpoint that cannot be measured is withdrawn, and the
+   miner stops only if none is left;
 4. signs a manifest listing its endpoints and their declared capacity, points its axon at `public_host:port`
    (`serve_axon`) and commits the manifest digest (`set_commitment`); both are free and only sent when they change,
    so a restart with the same configuration and measurements writes nothing;
-5. checks the owner's commitment every minute; when the owner commits a new catalog it re-signs and re-publishes
-   the manifest by itself, withdrawing endpoints whose model was retired and measuring again if the catalog changed
-   what a measurement depends on (a model's request mix or `max_latency_s`). A failed measurement then keeps the
-   current manifest.
+5. checks the owner's commitment and its engines every minute; when the owner commits a new catalog it re-signs
+   and re-publishes the manifest by itself, withdrawing endpoints whose model was retired and measuring again if the
+   catalog changed what a measurement depends on (a model's request mix or `max_latency_s`); when an engine changed
+   (its version, weights or settings), it measures again. A failed measurement keeps the current manifest, and a
+   measurement that a throughput test interrupts is retried later.
 
 Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted from
-hotkeys holding a validator permit, from `gateway_hotkeys`, and as test traffic under a session the auditor signed;
-other callers are refused before their request body is read, and bodies are capped at 1 MiB.
+hotkeys holding a validator permit, from `gateway_hotkeys`, and as test traffic under a session the auditor signed
+(after the catalog names a new auditor, the previous one's sessions are accepted for one more epoch). Other callers
+are refused before their request body is read; bodies are capped at 1 MiB and must arrive within 10 s, and a state
+may hold at most 4 characters per token of the model's `max_state_tokens`. A validator gets at most 4 requests at
+once per endpoint (HTTP 429 beyond that); gateways are not limited. The miner signs only well-formed answers: an
+engine that returns anything else gets an error back to the caller, never a signed receipt.
 
 ## Reading the log
 
@@ -161,12 +167,15 @@ validator's epoch 45352:
 
 ## Throughput tests
 
-Once per epoch, at a block nobody knows in advance, every endpoint gets its declared rate for about 20 s; a
-request counts if it is answered within 2 s of the end of the measured window. Nothing needs to be done by hand,
-but:
+Once per epoch, at a block nobody knows in advance, every endpoint gets its declared rate for 19-22 s: a warmup
+of random length, then a 16 s measured window. A reply counts if it arrives inside the window, to a request sent at
+most 2 s before the window opened, so an endpoint whose latency stays within 2 s has every reply counted. Nothing
+needs to be done by hand, but:
 - keep the engines warm and their GPUs free of other work: a test delivers what the hardware has at that moment;
 - run `--remeasure` after changing an endpoint's hardware; the miner measures again by itself when the engine's
   identity, the endpoint's configuration, the request mix or `max_latency_s` changes;
+- serve the catalog's precision: the auditor recomputes test answers, and an endpoint whose answers drift from the
+  reference over several tests loses its credit;
 - an engine that just restarted runs slow for its first minutes, and a test then credits less;
 - requests from validators and gateways are always served before test requests, so a busy endpoint delivers less
   of the test rate.

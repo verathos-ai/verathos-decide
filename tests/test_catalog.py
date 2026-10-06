@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from verathos import catalog
 
 
@@ -48,3 +50,20 @@ def test_resolve_prefers_shipped_then_store_then_verified_download(tmp_path, mon
 def test_changed_copies_are_digested_from_their_fields() -> None:
     c = catalog.load()
     assert c.model_copy(update={"revision": "other"}).digest() != c.digest()
+
+
+def test_a_fetched_catalog_is_checked_against_the_commitment_before_parsing(tmp_path, monkeypatch) -> None:
+    """A source serving anything but the committed document is skipped, whatever its content would do to the
+    parser."""
+    import verathos.catalog as catalog_module
+
+    real = catalog_module.load()
+    doc = json.loads(json.dumps(real.document()))
+    doc["revision"] = "next"
+    wanted = catalog_module.Catalog.parse(doc).digest()
+    hostile = {**doc, "throughput_audit": {**doc["throughput_audit"], "lead_blocks": "5"}}
+    served = {"https://a/": hostile, "https://b/": doc}
+    monkeypatch.setattr(catalog_module, "get_json", lambda url, **kw: served[url.split(wanted)[0]])
+    got = catalog_module.resolve(wanted, store=catalog_module.CatalogStore(tmp_path),
+                                 sources=["https://a/{digest}", "https://b/{digest}"])
+    assert got.digest() == wanted

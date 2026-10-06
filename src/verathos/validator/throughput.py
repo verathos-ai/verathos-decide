@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable, Collection
@@ -31,6 +32,7 @@ from verathos.validator.config import ReferenceEngine
 from verathos.validator.discovery import DiscoveredMiner, Neuron, discover
 
 log = logging.getLogger(__name__)
+RESTART_EXIT_CODE = 3
 SLOT_REFRESH_S = 120.0
 VERDICTS_RETRY_S = 30.0
 VERDICTS_WAIT_S = 300.0
@@ -44,10 +46,11 @@ def slots(miners: list[DiscoveredMiner]) -> list[Slot]:
 
 class Throughput:
     def __init__(self, *, netuid: int, mechid: int, policy: AuditPolicy, auditor_hotkey: str,
-                 chain: SubtensorChainView, auditor: Auditor | None = None,
+                 chain: SubtensorChainView, owner_hotkey: str = "", auditor: Auditor | None = None,
                  follower: ScheduleFollower | None = None) -> None:
         self.netuid, self.mechid, self.policy, self.auditor_hotkey, self.chain = (netuid, mechid, policy,
                                                                                   auditor_hotkey, chain)
+        self.owner_hotkey = owner_hotkey or auditor_hotkey
         self.auditor, self.follower = auditor, follower
         self._known: dict[str, tuple[str | None, list[Slot]]] = {}
         self._last: feed.Verdicts | None = None
@@ -58,26 +61,30 @@ class Throughput:
               screens: dict[str, ReferenceEngine], state_dir: Path) -> Throughput:
         """The auditor role if this validator's hotkey is the auditor, else a schedule follower."""
         policy = current().audit_policy()
-        auditor_hotkey = policy.auditor_hotkey or st.get_subnet_owner_hotkey(netuid)
+        owner_hotkey = st.get_subnet_owner_hotkey(netuid)
+        auditor_hotkey = policy.auditor_hotkey or owner_hotkey
         chain = SubtensorChainView(network, netuid, auditor_hotkey)
         if wallet.hotkey.ss58_address != auditor_hotkey:
             follower = ScheduleFollower(chain, policy)
             follower.start()
             log.info("throughput tests are run by %s; applying its verdicts", auditor_hotkey)
             return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
-                       follower=follower)
+                       owner_hotkey=owner_hotkey, follower=follower)
         auditor = Auditor(netuid=netuid, mechid=mechid, keypair=wallet.hotkey, chain=chain, policy=policy,
                           catalog=current, references=references, screens=screens,
                           db_path=state_dir / "throughput.sqlite")
         auditor.start()
         log.info("throughput auditor running (%s mode)", policy.mode)
         return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
-                   auditor=auditor)
+                   owner_hotkey=owner_hotkey, auditor=auditor)
 
     def set_policy(self, policy: AuditPolicy) -> None:
-        """Adopt the policy of a newly committed catalog. A change of auditor takes effect at the next restart."""
-        if policy.auditor_hotkey and policy.auditor_hotkey != self.auditor_hotkey:
-            log.warning("the catalog names a new throughput auditor %s; restart to adopt it", policy.auditor_hotkey)
+        """Adopt the policy of a newly committed catalog. A new auditor changes this validator's role, which a
+        restart sets up: the process exits for its supervisor to start it again."""
+        if (policy.auditor_hotkey or self.owner_hotkey) != self.auditor_hotkey:
+            log.critical("the catalog names %s as the throughput auditor; restarting to take the new role",
+                         policy.auditor_hotkey or self.owner_hotkey)
+            os._exit(RESTART_EXIT_CODE)
         self.policy = policy
         (self.auditor or self.follower).set_policy(policy)
 
@@ -153,8 +160,13 @@ class Throughput:
             if signed is None:
                 raise feed.VerdictsUnavailable("the epoch's tests are not settled yet")
             return signed.verdicts
-        return await feed.fetch(client, self.chain.auditor_url(), auditor_hotkey=self.auditor_hotkey,
-                                netuid=self.netuid, epoch=epoch)
+        try:
+            url = await asyncio.to_thread(self.chain.auditor_url)
+            return await feed.fetch(client, url, auditor_hotkey=self.auditor_hotkey, netuid=self.netuid, epoch=epoch)
+        except feed.VerdictsUnavailable:
+            raise
+        except Exception as exc:  # chain or transport trouble is an unavailable feed, never a failed epoch
+            raise feed.VerdictsUnavailable(f"{type(exc).__name__}: {exc}") from None
 
     async def proven_invalid(self, evidence: list[feed.Evidence], references: dict[str, Engine],
                              cat: catalog.Catalog) -> list[feed.Evidence]:
@@ -163,9 +175,10 @@ class Throughput:
         accepted = []
         for e in evidence:
             model = cat.get(e.model_id)
-            answers = feed.signed_answers(e.response, e.request, request_id=e.request_id, hotkey=e.hotkey,
-                                          endpoint_id=e.endpoint_id, model_id=e.model_id,
-                                          auditor=self.auditor_hotkey, netuid=self.netuid, mechid=self.mechid)
+            response = feed.parse_response(e.response)
+            answers = None if response is None else feed.signed_answers(
+                response, e.request, request_id=e.request_id, hotkey=e.hotkey, endpoint_id=e.endpoint_id,
+                model_id=e.model_id, auditor=self.auditor_hotkey, netuid=self.netuid, mechid=self.mechid)
             if answers is None or model is None:
                 log.warning("evidence against %s/%s rejected: %s", e.hotkey, e.endpoint_id,
                             "unknown model" if model is None else "the receipt does not bind it")

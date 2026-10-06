@@ -1,9 +1,11 @@
 //! Per-target accounting over the measurement window.
 //!
-//! Only requests scheduled inside the window count. A request counts as completed if its 200 reply
-//! arrives before the window's deadline (its end plus the grace); a reply after that is `late`.
-//! Answers to requests sent before the window never count, so holding back warmup answers until
-//! the window opens gains nothing.
+//! A request counts as completed if its 200 reply arrives inside the window and it was scheduled no
+//! earlier than the grace before the window opened. Completions inside the window are bounded by
+//! what the target serves while the window is open, so declaring more than it serves gains nothing;
+//! a backlog of older requests served first does not count either. An honest target whose latency
+//! stays within the grace has every reply inside the window counted. Send-side counts (`sent`,
+//! `skipped`, send lag) are attributed by scheduled time inside the window.
 
 use crate::reservoir::Reservoir;
 use bytes::Bytes;
@@ -20,18 +22,18 @@ pub const LATE_SEND: Duration = Duration::from_millis(50);
 pub struct Window {
     pub start: Instant,
     pub end: Instant,
-    /// The end plus the grace: replies after it do not count.
-    pub deadline: Instant,
+    /// The start minus the grace: replies to requests scheduled earlier do not count.
+    pub earliest_send: Instant,
 }
 
 impl Window {
+    /// Half-open: an event timed after the final read of the stats can never fall inside.
     pub fn contains(&self, at: Instant) -> bool {
         self.start <= at && at < self.end
     }
 
-    /// Half-open: a reply timed after the final read of the stats can never be in time.
-    pub fn in_time(&self, at: Instant) -> bool {
-        at < self.deadline
+    pub fn counts_send(&self, scheduled: Instant) -> bool {
+        self.earliest_send <= scheduled && scheduled < self.end
     }
 }
 
@@ -43,8 +45,8 @@ pub enum ErrorKind {
     InvalidJson,
     TooLarge,
     Transport,
-    /// A 200 reply after the window's deadline.
-    Late,
+    /// The generator's own host ran out of sockets, file descriptors or local ports.
+    Local,
 }
 
 impl fmt::Display for ErrorKind {
@@ -56,7 +58,7 @@ impl fmt::Display for ErrorKind {
             Self::InvalidJson => f.write_str("invalid_json"),
             Self::TooLarge => f.write_str("too_large"),
             Self::Transport => f.write_str("transport"),
-            Self::Late => f.write_str("late"),
+            Self::Local => f.write_str("local"),
         }
     }
 }
@@ -143,13 +145,10 @@ impl TargetStats {
     }
 
     pub fn record_exchange(&mut self, exchange: Exchange, completed_at: Instant) {
-        if !self.window.contains(exchange.scheduled) {
+        if !(self.window.counts_send(exchange.scheduled) && self.window.contains(completed_at)) {
             return;
         }
         match exchange.outcome {
-            Ok(_) if !self.window.in_time(completed_at) => {
-                *self.errors.entry(ErrorKind::Late).or_default() += 1
-            }
             Ok(response) => {
                 self.latencies
                     .push(completed_at.saturating_duration_since(exchange.sent_at));
@@ -209,13 +208,13 @@ mod tests {
     }
 
     impl Fixture {
-        /// Window from 2 s to 10 s after the origin, replies until 12 s.
+        /// Window from 2 s to 10 s after the origin, counting requests sent from 1 s on.
         fn new(samples: usize) -> Self {
             let origin = Instant::now();
             let window = Window {
                 start: origin + 2_000 * MS,
                 end: origin + 10_000 * MS,
-                deadline: origin + 12_000 * MS,
+                earliest_send: origin + 1_000 * MS,
             };
             let reservoir = Reservoir::new(samples, ChaCha12Rng::seed_from_u64(0));
             Self {
@@ -245,26 +244,25 @@ mod tests {
     }
 
     #[test]
-    fn outcomes_count_requests_sent_in_the_window_and_answered_by_the_deadline() {
+    fn outcomes_count_replies_inside_the_window_to_requests_sent_from_the_grace_on() {
         let mut fixture = Fixture::new(100);
-        fixture.finish(1_000, 2_500, ok()); // sent in warmup, answered in the window: not counted
-        fixture.finish(1_999, 2_000, ok()); // sent in warmup
-        fixture.finish(2_000, 2_100, ok());
+        fixture.finish(500, 2_500, ok()); // scheduled before the grace: a held-back warmup answer
+        fixture.finish(1_000, 2_100, ok()); // scheduled at the start of the grace
+        fixture.finish(1_500, 1_999, ok()); // answered before the window opened
         fixture.finish(5_000, 5_500, ok());
-        fixture.finish(9_999, 11_999, ok()); // answered just before the deadline
-        fixture.finish(9_000, 12_000, ok()); // answered at the deadline: late
-        fixture.finish(10_000, 10_100, ok()); // sent after the window
-        fixture.finish(1_000, 2_500, Err(ErrorKind::Timeout)); // sent in warmup
+        fixture.finish(9_000, 9_999, ok());
+        fixture.finish(9_000, 10_000, ok()); // answered as the window closes
         fixture.finish(3_000, 3_001, Err(ErrorKind::Http(503)));
-        fixture.finish(9_000, 11_000, Err(ErrorKind::Timeout));
+        fixture.finish(3_000, 3_100, Err(ErrorKind::Local));
+        fixture.finish(500, 3_000, Err(ErrorKind::Timeout)); // scheduled before the grace
         let summary = fixture.stats.summary();
         assert_eq!(summary.completed, 3);
         assert_eq!(
             summary.latency,
             Some(Latency {
-                p50: 500 * MS,
-                p95: 2_000 * MS,
-                max: 2_000 * MS
+                p50: 999 * MS,
+                p95: 1_100 * MS,
+                max: 1_100 * MS
             })
         );
         assert_eq!(
@@ -273,18 +271,14 @@ mod tests {
                 .iter()
                 .map(|(kind, n)| (kind.to_string(), *n))
                 .collect::<Vec<_>>(),
-            vec![
-                ("http_503".to_owned(), 1),
-                ("timeout".to_owned(), 1),
-                ("late".to_owned(), 1)
-            ]
+            vec![("http_503".to_owned(), 1), ("local".to_owned(), 1)]
         );
         let sent = summary
             .samples
             .iter()
             .map(|sample| sample.request_id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(sent, ["2000", "5000", "9999"]);
+        assert_eq!(sent, ["1000", "5000", "9000"]);
     }
 
     #[test]
@@ -351,7 +345,7 @@ mod tests {
             ErrorKind::InvalidJson,
             ErrorKind::TooLarge,
             ErrorKind::Transport,
-            ErrorKind::Late,
+            ErrorKind::Local,
         ]
         .map(|kind| kind.to_string());
         assert_eq!(
@@ -363,7 +357,7 @@ mod tests {
                 "invalid_json",
                 "too_large",
                 "transport",
-                "late"
+                "local"
             ]
         );
     }

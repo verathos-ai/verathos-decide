@@ -35,17 +35,20 @@ do in a test:
 
 1. warm-up runs of 8 s at concurrency `min(16, max_concurrency)`, until every endpoint's last two runs agree within
    5% (at most 13 runs);
-2. one run per concurrency step (1, 2, 4, 8, ... up to `max_concurrency`); an endpoint stops climbing once its
+2. one run per concurrency step (1, 2, 4, 8, ... up to `max_concurrency`, at most 4,096); an endpoint stops climbing once its
    throughput falls below 90% of its best or its latency (concurrency / throughput) exceeds `max_latency_s`
    (default 2 s);
 3. five runs at each endpoint's knee: the lowest concurrency within 3% of its best throughput.
 
 The declared `capacity_rps` is `capacity_margin` (default 0.95) times the median of the five runs. A measurement
 takes a few minutes. It is stored in `state_dir/capacity.json` together with a fingerprint of what it depends on (the
-endpoint's model, engine URL and `max_concurrency`, `max_latency_s`, the scalar fields of the engine's
-`GET /v1/models` document, and the request mix) and is reused until one of them changes; `--remeasure` measures
-again, for example after a hardware change. An endpoint whose engine does not answer, or answers a single request
-slower than `max_latency_s`, is withdrawn from the manifest; the others are served.
+endpoint's model with its pinned weight and engine revisions, engine URL and `max_concurrency`, `max_latency_s`, the
+scalar fields of the engine's `GET /v1/models` document, and the request mix) and is reused until one of them
+changes. The miner checks its engines every minute and measures again when one changed; `--remeasure` measures
+again, for example after a hardware change. A measurement steps aside when the auditor's test traffic reaches the
+miner and is retried later. An endpoint whose engine does not answer, or answers a single request slower than
+`max_latency_s`, is withdrawn from the manifest; the others are served. Until its first measurement is done, a
+restarted miner serves the manifest it last published.
 
 The miner never sends an engine more requests at once than its knee concurrency; further requests wait in the
 miner (up to four per engine slot).
@@ -59,10 +62,11 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
 - Block `b` draws a hit when `H("VERATHOS_THROUGHPUT_TEST_V1" || b || hash(b)) x (last - b + 1) < 2^256`. The
   epoch's first hit selects the test; the last eligible block always hits, so there is exactly one test per epoch,
   uniformly placed.
-- Traffic starts at `start_block = selection block + lead_blocks` (default 5 blocks, about 60 s) and lasts
-  `warmup_s + test_s` (3 s + 16 s); answers are due `max_latency_s` (2 s) after that.
+- Traffic starts at `start_block = selection block + lead_blocks` (default 5 blocks, about 60 s). It lasts an
+  unmeasured warmup, which the auditor draws for each test from [`warmup_s`, 2 x `warmup_s`] (3-6 s), then the
+  measured window of `test_s` (16 s).
 - Validators hold their canaries from `start_block - 1` to `start_block + traffic_blocks + 1`, where
-  `traffic_blocks` is the time until the last answers are due, in blocks, rounded up.
+  `traffic_blocks` is the longest traffic in blocks, rounded up.
 - A new policy applies from the next block; a test already selected stays the epoch's only test.
 
 ## A test
@@ -70,33 +74,44 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
 1. **Targets.** At the selection block the auditor takes every open endpoint listed in an accepted manifest with a
    declared capacity and a model that is not retired. Each is tested at its declared rate, but at most
    `rate_growth` (2) times what it delivered in its last counted test (at least `min_test_share` (1/8) of the
-   model's `first_test_rps`), and at most `first_test_rps` before its first. An endpoint cannot make the auditor send
-   much more than it has shown it serves.
+   model's `first_test_rps`), and at most `first_test_rps` before its first. Counted in first tests' worth (rate /
+   the model's `first_test_rps`), a hotkey's endpoints together get at most `rate_growth` times what all its
+   endpoints delivered last, renamed ones included, and at least one first test's worth; beyond that their rates are
+   scaled down together. Neither an endpoint nor a hotkey can make the auditor send much more than it has shown it
+   serves.
 2. **Sessions.** For each endpoint the auditor signs one session: netuid, auditor, miner hotkey, endpoint, test id
    and expiry, sent as `X-Verathos-Session` (base64 of the canonical JSON) and `X-Verathos-Session-Signature`.
    Every request carries a fresh `X-Verathos-Request-Id`. The miner checks the session once and refuses a request id
    it has seen; its receipts name the auditor as caller and the request id as nonce.
 3. **Traffic.** At the start block the load generator sends each endpoint its rate, open loop (sending never waits
-   for answers): `warmup_s` unmeasured, then the measured window of `test_s`. Delivered = requests sent inside the
-   window and answered (HTTP 200 with a JSON body) by the window's end plus `max_latency_s`, per second of the
-   window. Answers to warm-up requests never count, so holding them back gains nothing; an endpoint that cannot keep
-   up answers the window's requests late and delivers less.
+   for answers): the warmup, then the measured window. Delivered = replies (HTTP 200, a JSON object of at most
+   64 KiB) that arrive inside the window to requests sent no earlier than `max_latency_s` before it opened, per
+   second of the window. An endpoint can answer inside the window only what it serves while the window is open, so
+   declaring more than it serves gains nothing; an honest endpoint whose latency stays within `max_latency_s` has
+   every reply counted. The miner cannot know when the window opens, so it cannot time held-back answers to it.
+   Requests time out after `request_timeout_s`.
 4. **Samples.** For `samples_per_test` (10) random delivered responses per endpoint the auditor checks the receipt:
    signed by the miner, binding the request and the answers, naming the auditor and the request id. Delivered is
    scaled by the share of valid receipts. Every signed answer must be well formed, and the auditor recomputes
    `answer_checks_per_test` (2) of them, picked at random: an answer that fails the hard check (`SCORING.md`) is a
-   wrong answer, proven by the miner's own signature. The request, the answers and the receipt are kept as evidence.
-   A wrong model is wrong on every request, so two recomputes per endpoint suffice. The auditor may recompute on a
-   bf16 screen (`audit_screens`, several times faster than fp32); two bf16 runs on different GPUs can differ by
-   about 0.06, so an answer the screen flags counts only once the fp32 reference confirms it.
+   wrong answer, proven by the miner's own signature. The request and the response as received (answers and
+   receipt) are kept as evidence. A wrong model is wrong on every request, so two recomputes per endpoint suffice.
+   The auditor may recompute on a bf16 screen (`audit_screens`, about three times faster than fp32); Kev bounds
+   bf16 within about 0.03 of fp32, so two bf16 runs can differ by about 0.06, and an answer the screen flags counts
+   only once the fp32 reference confirms it. The recomputed answers' differences are also tallied per endpoint: over
+   its last `drift_window_tests` tests, their mean must stay within the model's `mean_abs` (the bound the
+   validators' canaries apply), so a lower-precision engine serving test traffic does not pass.
 5. **Credit.** What was delivered, up to the tested rate. If delivered falls short of `pass_fraction` (0.95) of the
    tested rate, the credit is scaled by delivered / tested once more: an endpoint that declares twice what it serves
    is credited a quarter of its declaration, so declaring more than an endpoint serves never pays. A result with a
-   wrong answer is `invalid` and credits nothing.
+   wrong answer is `invalid` and credits nothing; an endpoint whose answers drift credits nothing.
 6. **Confirmation.** Once the selection block is final with the hash it was selected by, the test is confirmed;
    otherwise it is void. A test is also void if the load generator fails, starts more than 1 s late, or the
    auditor observes the start block more than one block late. One endpoint's result is void if more than 1% of its
-   sends left the generator late.
+   sends left the generator late, if the generator's own host ran out of sockets or ports for it, or if the auditor
+   could not evaluate it; what one endpoint returns affects only its own result. Recomputes stop 15 minutes after
+   the traffic, and an engine that fails three times in a row is not asked again in that test, so an unreachable
+   screen or reference skips recomputes instead of holding the test open.
 
 Outcomes per endpoint: `passed` (delivered at least `pass_fraction` of the tested rate), `partial`, `invalid`,
 `void`.
@@ -107,19 +122,23 @@ The miner admits requests from validators and gateways ahead of test requests: a
 other request waits, and a request that finds the queue full takes the place of the newest waiting test request. A
 test request is dropped once its session expires, or when the load generator has given up on it. A test never
 delays other traffic; test requests beyond the endpoint's spare capacity are not delivered, and the credit shows
-it.
+it. A caller other than the miner's own gateways gets at most 4 requests at once per endpoint, so a validator cannot
+crowd a competitor's test out with priority traffic. The miner signs only well-formed answers: an engine fault
+returns an error, never a signed wrong answer.
 
 ## Verdicts
 
 For scoring epoch `E` the auditor publishes, signed by its hotkey, at `GET /v1/throughput/{E}` on its axon:
 
 - the credit of every endpoint the latest confirmed test of epochs `E - credit_ttl_epochs` to `E - 1` targeted (an
-  endpoint whose result there is void keeps its latest counted result from those epochs), with its model and
-  whether it has qualified (at least `qualification_tests` confirmed tests with a credit). An endpoint the latest
-  test did not target has no credit, so leaving a test out does not keep an older credit;
+  endpoint whose result there is void keeps its latest counted result from those epochs), with its model, its
+  median latency in that test, whether its answers drifted, and whether it has qualified (at least
+  `qualification_tests` confirmed tests with a credit). An endpoint the latest test did not target has no credit,
+  so leaving a test out does not keep an older credit;
 - for every hotkey with a wrong answer in those tests, the evidence of one.
 
-The verdicts for the current epoch and the two before are served once their tests are settled (404 otherwise).
+The verdicts for the current epoch and the two before are served once their tests are settled (404 otherwise);
+once served, an epoch's verdicts do not change.
 Validators wait up to 5 minutes for them, then use the last verdicts they hold while those still cover a test in
 the window. A validator counts a credit only for the model the endpoint serves now, and at most the capacity it
 declares now. It applies a piece of evidence only if the receipt in it binds the request and the answers to the
@@ -136,8 +155,12 @@ How credits and wrong answers enter the score is in `SCORING.md`.
 | A pool of machines behind many endpoints or hotkeys | tested together, the pool delivers its capacity once |
 | Declaring more than the endpoint serves | credited less than it serves |
 | Leaving an endpoint out of a test (withdrawing it at the selection) | no credit until the next test |
-| Holding warm-up answers back into the measured window | warm-up requests never count |
+| Holding answers back into the measured window | the window opens at a time the miner does not know; requests sent more than `max_latency_s` before it never count |
+| Serving test traffic from a lower-precision engine | the recomputed answers drift over a few tests and the credit goes |
+| Renaming or adding endpoints to make the auditor send more | a hotkey's test rate grows only from what its endpoints delivered |
 | Fast junk responses | receipts that do not bind scale delivered down; a signed wrong answer invalidates the hotkey |
+| Responses built to break the auditor | size and nesting limits; each endpoint is evaluated on its own |
+| Flooding a competitor's endpoint with validator traffic during its test | at most 4 requests at once per caller and endpoint |
 | Caching or sharing answers | every request is unique |
 
 What a test proves is that an endpoint delivers its declared rate on about 60 s notice: test traffic is
@@ -153,8 +176,8 @@ recognisable by its session, so hardware used for other work between tests could
 | `auditor_hotkey` | subnet owner | hotkey that runs the tests and signs the verdicts |
 | `lead_blocks` | 5 | blocks from the selection block to the start of the traffic |
 | `max_latency_s` | 2 | highest latency at which a miner's measurement counts throughput |
-| `warmup_s`, `test_s` | 3, 16 | unmeasured and measured traffic, seconds; `warmup_s` is at least `max_latency_s` |
-| `request_timeout_s` | 20 | per-request timeout of the load generator |
+| `warmup_s`, `test_s` | 3, 16 | shortest unmeasured traffic (each test draws it from [`warmup_s`, 2 x `warmup_s`]) and the measured window, seconds; `warmup_s` is at least `max_latency_s` |
+| `request_timeout_s` | 10 | per-request timeout of the load generator |
 | `pass_fraction` | 0.95 | share of the tested rate below which the credit is scaled down once more |
 | `samples_per_test` | 10 | responses per endpoint whose receipts are checked |
 | `answer_checks_per_test` | 2 | of those, answers the reference recomputes |
@@ -163,6 +186,7 @@ recognisable by its session, so hardware used for other work between tests could
 | `credit_ttl_epochs` | 2 | how many closed epochs back a test still counts |
 | `rate_growth` | 2.0 | tested rate at most this times the last delivered rate |
 | `min_test_share` | 0.125 | ... but at least this share of the model's `first_test_rps` |
+| `drift_window_tests` | 8 | tests over which an endpoint's recomputed answers must stay within the model's `mean_abs` |
 
 Per model: `workload` (the request mix), `score_per_rps` and `first_test_rps`.
 
@@ -170,11 +194,12 @@ Per model: `workload` (the request mix), `score_per_rps` and `first_test_rps`.
 
 The auditor needs:
 - the load generator: `verathos-build-loadgen` (Rust) builds `native/loadgen` and installs it next to the code;
-- the answer recomputes: `answer_checks_per_test` per endpoint and test. In fp32 an A100 recomputes about 2 per
-  second for Kev-4B's request mix, so about 1,000 endpoints take 17 minutes; a bf16 screen on a GPU is several times
-  faster, with the fp32 reference (CPU is enough) confirming only what it flags. The screen can run on another
-  machine behind https with a key; while it is unreachable, recomputes are skipped and receipts are still checked;
-- a public IP and port for its service, and a steady connection: one machine sends the whole network's test
-  traffic in one burst.
+- the answer recomputes: `answer_checks_per_test` per endpoint and test, within 15 minutes of the traffic. On an
+  A100 with Kev-4B's request mix, fp32 recomputes about 2 per second and bf16 about 6, so a bf16 screen covers
+  1,000 endpoints in about 6 minutes, with the fp32 reference (CPU is enough) confirming only what it flags. The
+  screen can run on another machine behind https with a key; while it is unreachable, recomputes are skipped and
+  receipts are still checked;
+- a public IP and port for its service, and an uplink for the whole network's test traffic in one burst: about
+  6 KB per request, so 1,000 endpoints at 20,000 requests/s take about 1 Gbit/s, and 2-3 CPU cores.
 
 Its database is `state_dir/throughput.sqlite` (tables `tests` and `results`, the last 30 epochs).

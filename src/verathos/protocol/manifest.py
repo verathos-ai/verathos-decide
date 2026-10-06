@@ -112,9 +112,9 @@ def endpoint_url(axon: str, endpoint_id: str) -> str:
 
 
 def public_ip(value: str) -> str:
-    """``value`` if it is an IP address literal (the chain stores axons as IPs); raises ValueError otherwise."""
-    ipaddress.ip_address(value)
-    return value
+    """``value`` as a normalised IP address literal (the chain stores axons as IPs, and gives IPv6 back in its
+    normal form); raises ValueError for anything else."""
+    return str(ipaddress.ip_address(value))
 
 
 def accept(document: Any, *, hotkey: str, netuid: int, mechid: int, axon: str, commitment: str | None,

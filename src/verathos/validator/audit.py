@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 HOLD_POLL_S = 2.0
 MAX_HOLD_WAIT_S = 120.0
 REQUEST_TIMEOUT_S = 60.0
+IDENTITY_CONCURRENCY = 256
 MAX_REPLY_BYTES = 1 << 20
 
 
@@ -109,9 +110,11 @@ async def _canary(result: EndpointResult, request: dict[str, Any], reference: di
 
 async def _audit_endpoint(result: EndpointResult, canaries: list[tuple[dict[str, Any], dict[str, dict[str, float]]]],
                           keypair: Keypair, client: httpx.AsyncClient, spread_s: float, rng: random.Random,
-                          holding: Callable[[], bool], netuid: int, mechid: int) -> None:
+                          holding: Callable[[], bool], netuid: int, mechid: int,
+                          identity_slots: asyncio.Semaphore) -> None:
     ep = result.endpoint
-    result.identity_ok = await verify_identity(ep, keypair, client)
+    async with identity_slots:  # the wait for a slot is not part of the endpoint's time limit
+        result.identity_ok = await verify_identity(ep, keypair, client)
     for request, reference in canaries:
         if spread_s:
             await asyncio.sleep(rng.uniform(0, spread_s))
@@ -151,6 +154,7 @@ async def audit_epoch(
     results: dict[str, EndpointResult] = {}
     tasks = []
     rng = random.Random(int.from_bytes(secret[:8], "big") ^ epoch)
+    identity_slots = asyncio.Semaphore(IDENTITY_CONCURRENCY)
     for ep in endpoints:
         pool = pools.get(ep.endpoint.model_id)
         if pool is None:
@@ -161,7 +165,7 @@ async def audit_epoch(
         res = EndpointResult(ep, tolerances[ep.endpoint.model_id])
         results[ep.key] = res
         tasks.append(_audit_endpoint(res, picked, keypair, client, spread_s, random.Random(rng.random()), holding,
-                                     netuid, mechid))
+                                     netuid, mechid, identity_slots))
     for res, outcome in zip(results.values(), await asyncio.gather(*tasks, return_exceptions=True)):
         if isinstance(outcome, BaseException):  # an aborted audit verifies nothing, so it fails
             log.error("audit of %s failed: %r", res.endpoint.key, outcome)

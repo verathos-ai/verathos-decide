@@ -49,7 +49,7 @@ def miner(host: str, keypair: Keypair, validator: Keypair, engine: MockEngine):
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
                             capacity_rps=40.0)]), keypair)
     app = create_app(config=config, keypair=keypair, manifest=lambda: signed, engines={"gpu0": engine},
-                     authorized=lambda hk: hk == validator.ss58_address, auditor=lambda: None)
+                     authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set())
     return app, commitment_value(signed.manifest.digest())
 
 
@@ -97,7 +97,7 @@ def test_epoch_scores_honest_and_zeroes_cheater() -> None:
     state = ScoreState()
     record_window(state, results, 3)
     scores, failed = epoch_scores(results, score_per_rps={"kev-4b": 1.0}, credited=dict.fromkeys(results, 40.0),
-                                  state=state)
+                                  latency_ms={}, state=state)
     update(state, results, scores, failed)
     w = weights(state, {1: honest_kp.ss58_address, 2: cheat_kp.ss58_address})
     assert w == {1: pytest.approx(1.0)}
@@ -131,7 +131,7 @@ def test_window_catches_subtle_drift_no_single_epoch_shows() -> None:
         r.tally.add(RequestComparison(max_abs=0.03, sum_abs=0.6, count=60, confident_flips=0))
         record_window(state, {"hkA/gpu0": r}, 3)
         scores, failed = epoch_scores({"hkA/gpu0": r}, score_per_rps={"kev-4b": 1.0}, credited={"hkA/gpu0": 40.0},
-                                      state=state)
+                                      latency_ms={}, state=state)
         verdicts.append(bool(failed))
     assert verdicts == [False, True, True]  # 60 probabilities: insufficient; 120 and 180: mean 0.01 > 0.005
 
@@ -153,8 +153,8 @@ def test_score_is_proven_capacity_and_a_proven_wrong_answer_resets_the_hotkey() 
     state = ScoreState(ema={"hkC/gpu0": 30.0, "hkC/gpu1": 30.0, "hkC/old": 30.0})
     record_window(state, results, 3)
     credited = {"hkA/gpu0": 50.0, "hkC/gpu0": 40.0, "hkC/gpu1": 40.0}
-    scores, failed = epoch_scores(results, score_per_rps={"kev-4b": 2.0}, credited=credited, state=state,
-                                  failed_hotkeys={"hkC"})
+    scores, failed = epoch_scores(results, score_per_rps={"kev-4b": 2.0}, credited=credited, latency_ms={},
+                                  state=state, failed_hotkeys={"hkC"})
     assert scores == {"hkA/gpu0": pytest.approx(100.0), "hkB/gpu0": 0.0, "hkC/gpu0": 0.0, "hkC/gpu1": 0.0}
     assert failed == {"hkC/gpu0", "hkC/gpu1"}
     update(state, results, scores, failed, alpha=0.2, probation_epochs=6, reset_hotkeys={"hkC"})
@@ -175,16 +175,65 @@ def test_credited_capacity() -> None:
                                        ("d", "kev-9b", 50.0))]
 
     def credit(hotkey: str, endpoint_id: str, qualified: bool = True, model_id: str = "kev-4b") -> Credit:
-        return Credit(hotkey=hotkey, endpoint_id=endpoint_id, model_id=model_id, credited_rps=45.0, test_epoch=8,
-                      qualified=qualified)
+        return Credit(hotkey=hotkey, endpoint_id=endpoint_id, model_id=model_id, credited_rps=45.0,
+                      latency_ms=800.0, test_epoch=8, qualified=qualified)
 
     verdicts = Verdicts(netuid=405, auditor="aud", epoch=9, invalid=[], credits=[
         credit("hkA", "a"), credit("hkA", "b", qualified=False), credit("hkB", "a"), credit("hkA", "d")])
+    cat = catalog.load()
     # capped at today's declaration; unqualified, untested and re-modelled endpoints have no credit
-    assert credited_capacity(endpoints, verdicts, "enforce") == {"hkA/a": 30.0}
-    assert credited_capacity(endpoints, None, "enforce") == {}
-    assert credited_capacity(endpoints, None, "observe") == {"hkA/a": 30.0, "hkA/b": 50.0, "hkA/c": 50.0,
-                                                             "hkA/d": 50.0}
+    assert credited_capacity(endpoints, verdicts, cat, "enforce") == ({"hkA/a": 30.0}, {"hkA/a": 800.0})
+    assert credited_capacity(endpoints, None, cat, "enforce") == ({}, {})
+    # observe mode counts declarations, but no more than a model's first test
+    assert credited_capacity(endpoints, None, cat, "observe") == ({"hkA/a": 30.0, "hkA/b": 50.0, "hkA/c": 50.0,
+                                                                   "hkA/d": 25.0}, {})
+
+
+def test_latency_factor_comes_from_the_test_latencies() -> None:
+    from verathos.validator.audit import EndpointResult
+    from verathos.validator.discovery import DiscoveredEndpoint
+
+    def result(endpoint_id: str) -> EndpointResult:
+        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}",
+                                model_id="kev-4b", capacity_rps=20.0))
+        # canary latencies (the validator's own view) no longer matter
+        return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4,
+                              latencies_ms=[9_999.0] * 4)
+
+    results = {k: result(k.split("/")[1]) for k in ("hkA/fast", "hkA/mid", "hkA/slow")}
+    state = ScoreState()
+    record_window(state, results, 3)
+    scores, _ = epoch_scores(results, score_per_rps={"kev-4b": 1.0}, credited=dict.fromkeys(results, 20.0),
+                             latency_ms={"hkA/fast": 250.0, "hkA/mid": 1000.0, "hkA/slow": 4000.0}, state=state)
+    assert scores == {"hkA/fast": pytest.approx(26.0), "hkA/mid": pytest.approx(20.0), "hkA/slow": pytest.approx(14.0)}
+
+
+def test_a_canary_failure_puts_the_whole_hotkey_on_probation() -> None:
+    """Moving the hardware to a spare endpoint of the same hotkey does not escape probation."""
+    from verathos.validator.audit import EndpointResult
+    from verathos.validator.discovery import DiscoveredEndpoint
+
+    def result(endpoint_id: str) -> EndpointResult:
+        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}",
+                                model_id="kev-4b", capacity_rps=20.0))
+        return EndpointResult(ep, Tolerance(), identity_ok=True, sent=4, answered=4, latencies_ms=[40.0] * 4)
+
+    state = ScoreState(ema={"hkA/gpu0": 10.0, "hkA/spare": 0.0}, window={"hkA/gpu0": [[1.0, 10.0]]})
+    update(state, {"hkA/gpu0": result("gpu0"), "hkA/spare": result("spare")}, {"hkA/gpu0": 0.0, "hkA/spare": 0.0},
+           {"hkA/gpu0"}, probation_epochs=6)
+    assert state.probation == {"hkA/gpu0": 5, "hkA/spare": 5} and state.ema["hkA/gpu0"] == 0.0
+    assert "hkA/gpu0" not in state.window  # the failing epoch's data does not extend the probation
+
+
+def test_endpoints_are_held_for_a_few_epochs_at_most() -> None:
+    from verathos.validator.scoring import MAX_HELD_EPOCHS
+
+    state = ScoreState(ema={"hkA/gpu0": 0.5}, uid_of={"hkA/gpu0": 1})
+    for _ in range(MAX_HELD_EPOCHS):
+        update(state, {}, {}, set(), held={"hkA/gpu0"})
+    assert state.ema == {"hkA/gpu0": 0.5}
+    update(state, {}, {}, set(), held={"hkA/gpu0"})
+    assert state.ema["hkA/gpu0"] == pytest.approx(0.4)
 
 
 def test_a_restarted_validator_does_not_score_the_same_epoch_twice(tmp_path) -> None:
@@ -306,3 +355,17 @@ def test_huge_numbers_and_deep_json_are_malformed_not_fatal() -> None:
     found, results = asyncio.run(run())
     assert found == []
     assert results[ep.key].sent == 3 and len(results[ep.key].tally.hard_failures) == 3
+
+
+def test_chain_trouble_fetching_verdicts_is_an_unavailable_feed() -> None:
+    from verathos.throughput import feed
+    from verathos.throughput.policy import AuditPolicy
+    from verathos.validator.throughput import Throughput
+
+    class BrokenChain:
+        def auditor_url(self):
+            raise ConnectionError("node down")
+
+    t = Throughput(netuid=405, mechid=1, policy=AuditPolicy(), auditor_hotkey="aud", chain=BrokenChain())
+    with pytest.raises(feed.VerdictsUnavailable, match="ConnectionError"):
+        asyncio.run(t._fetch(None, 9))
