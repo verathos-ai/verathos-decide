@@ -17,6 +17,9 @@ auditor's signed verdicts. Each validator finds its role at startup from the cat
   Kev-9B 6.6 s per request; the fp32 weights alone take about 16 GB and 36 GB of RAM. A GPU in fp32 is faster.
 - The auditor additionally needs Rust (rustup), `build-essential`, `libssl-dev`, a public IP and one open TCP
   port.
+- A public IP of its own: behind most NATs a machine cannot reach other machines that share its public IP through
+  that IP, so a validator next to miners on one NAT can neither send them canaries nor receive their audit
+  artifacts.
 
 ## 1. Install
 
