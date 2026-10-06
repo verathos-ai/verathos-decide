@@ -151,7 +151,9 @@ be done by hand, but:
 - use a new `endpoint_id` when an endpoint moves to other hardware;
 - use a reliable subtensor node: artifacts name the block hashes the miner used, and work built on a fork the
   chain did not keep is a miss;
-- keep the machine responsive; a late final receipt is a miss.
+- keep the machine responsive; a late final receipt is a miss;
+- restart the miner between audits: an endpoint drafted when the miner stops misses that audit (a `no_show`).
+  The miner logs each drafted endpoint, and an audit takes about two minutes.
 
 ## Updating
 
