@@ -18,32 +18,10 @@ from verathos.capacity.zk.types import MerklePath
 from verathos.capacity.zk.crypto.hash_utils import hash_digest, HASH_NAME
 
 
-# Try to import CUDA BLAKE3 support
-_HAS_CUDA_BLAKE3 = False
-try:
-    from verathos.capacity.zk.cuda import zkllm_native as _native
-    if _native is None:
-        raise ImportError("zkllm_native unavailable")
-    _HAS_CUDA_BLAKE3 = (
-        getattr(_native, 'HAS_CUDA', False)
-        and hasattr(_native, 'cuda_blake3_merkle_leaves')
-        and HASH_NAME == "blake3"  # GPU path must match CPU hash function
-    )
-except ImportError:
-    try:
-        import sys
-        from pathlib import Path
-        _cuda_path = Path(__file__).parent.parent / "cuda"
-        if str(_cuda_path) not in sys.path:
-            sys.path.insert(0, str(_cuda_path))
-        import zkllm_native as _native
-        _HAS_CUDA_BLAKE3 = (
-            getattr(_native, 'HAS_CUDA', False)
-            and hasattr(_native, 'cuda_blake3_merkle_leaves')
-            and HASH_NAME == "blake3"
-        )
-    except ImportError:
-        pass
+from verathos.capacity.zk.cuda import HAS_CUDA, native as _native
+
+# The GPU leaf hashing path must use the same hash as the CPU path.
+_HAS_CUDA_BLAKE3 = HAS_CUDA and HASH_NAME == "blake3"
 
 
 # Domain separation tags

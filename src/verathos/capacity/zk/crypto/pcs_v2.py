@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ctypes
 import operator
-import os
 import sys
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -389,32 +388,8 @@ _NATIVE: _NativePCS | None = None
 _NATIVE_LOCK = Lock()
 
 
-def _library_names() -> tuple[str, ...]:
-    if sys.platform == "darwin":
-        return ("libverathos_pcs_v2.dylib", "libverathos_pcs_v2.so")
-    if os.name == "nt":
-        return ("verathos_pcs_v2.dll",)
-    return ("libverathos_pcs_v2.so",)
-
-
-def _library_candidates() -> tuple[Path, ...]:
-    configured = os.environ.get("VERATHOS_PCS_V2_LIB")
-    if configured:
-        return (Path(configured).expanduser().resolve(),)
-
-    crypto_dir = Path(__file__).resolve().parent
-    repo_native = crypto_dir.parents[4] / "native" / "pcs" / "target"  # src/verathos/capacity/zk/crypto -> repo root
-    candidates: list[Path] = []
-    for name in _library_names():
-        candidates.extend(
-            (
-                crypto_dir / name,
-                Path(sys.prefix) / "lib" / "verathos" / name,
-                repo_native / "release" / name,
-                repo_native / "debug" / name,
-            )
-        )
-    return tuple(candidates)
+LIBRARY_NAME = "libverathos_pcs_v2.dylib" if sys.platform == "darwin" else "libverathos_pcs_v2.so"
+LIBRARY_PATH = Path(__file__).resolve().parents[1] / LIBRARY_NAME
 
 
 def _native() -> _NativePCS:
@@ -422,19 +397,10 @@ def _native() -> _NativePCS:
     if _NATIVE is not None:
         return _NATIVE
     with _NATIVE_LOCK:
-        if _NATIVE is not None:
-            return _NATIVE
-        candidates = _library_candidates()
-        existing = [candidate for candidate in candidates if candidate.is_file()]
-        if not existing:
-            searched = ", ".join(str(candidate) for candidate in candidates)
-            raise PCSUnavailableError(
-                f"PCS native library not found; searched: {searched}"
-            )
-        # An explicitly configured path is authoritative.  For package/dev
-        # discovery, report the first existing library's ABI/load error rather
-        # than silently selecting a different binary.
-        _NATIVE = _NativePCS(existing[0])
+        if _NATIVE is None:
+            if not LIBRARY_PATH.is_file():
+                raise PCSUnavailableError(f"{LIBRARY_PATH} not found; run verathos-build-native")
+            _NATIVE = _NativePCS(LIBRARY_PATH)
         return _NATIVE
 
 

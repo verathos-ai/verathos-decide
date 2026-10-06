@@ -14,6 +14,7 @@ import httpx
 from bittensor_wallet import Keypair
 
 from verathos.capacity import core
+from verathos.capacity.proof.combined import COMBINED_PROOF_FORMAT
 from verathos.capacity.miner import AuditEndpoint, AuditWorker, DrainState
 
 BLOCK_S = 0.05
@@ -29,13 +30,13 @@ seed = json.loads(pathlib.Path(start_file).read_text())["seed_hex"]
 (out / f"{lease}_pass0.json").write_text(json.dumps({"root": "aa" * 32}))
 time.sleep(0.02)
 (out / f"{lease}_final_timing.json").write_text(json.dumps({
-    "root": "bb" * 32, "transcript_root": "cc" * 32, "proof_format": "hot_capacity_combined_proof_v2",
-    "proof_protocol_version": 2, "workload_version": "hot_capacity_combined", "pass_count": 337}))
+    "root": "bb" * 32, "transcript_root": "cc" * 32, "combined_transcript_root": "cc" * 32,
+    "workload_version": "hot_capacity_combined", "pass_count": 337}))
 while not pathlib.Path(challenge_file).exists():
     time.sleep(0.005)
 challenge = pathlib.Path(challenge_file).read_text()
 (out / f"{lease}_final.json").write_text(json.dumps({"proof_payload": {
-    "format": "hot_capacity_combined_proof_v2", "proof_protocol_version": 2,
+    "format": "capacity_combined_proof_v1",
     "capacity_proof": {"sampled": {"pass_index": 3}}, "seed_seen": seed, "challenge_seen": challenge}}))
 '''
 
@@ -116,7 +117,8 @@ def test_drafted_endpoint_runs_audit_and_publishes_signed_artifacts(tmp_path: Pa
     final, proof = first[1], first[2]
     slot = core.Slot(405, kp.ss58_address, "gpu0", endpoints[0].url, "kev-4b", "NVIDIA GeForce RTX 5090", 32)
     assert final["slot_id"] == slot.slot_id
-    assert final["combined"]["format"] == "hot_capacity_combined_proof_v2"
+    assert final["combined"]["format"] == COMBINED_PROOF_FORMAT
+    assert final["combined"]["combined_transcript_root"] == "cc" * 32
     lease = proof["sampled_opening"]["lease_id"]
     payload = proof["sampled_pass_proof"]
     assert payload["seed_seen"] == core.derive_proof_seed(block_hash(final["B_start"]), slot.slot_id, 0)

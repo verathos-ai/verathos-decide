@@ -25,8 +25,8 @@ from verathos.capacity.proof.workspace import (
     derive_challenge_block_index,
     derive_sampled_round_index,
     serialize_merkle_path,
-    workspace_i8_value_after_mix,
-    workspace_i8_values_after_mix,
+    workspace_i8_value,
+    workspace_i8_values,
     workspace_q_block_hash_i32,
     workspace_seed_for,
     workspace_state_block_hash_i8,
@@ -39,43 +39,15 @@ from verathos.capacity.zk.crypto.pcs_v2 import PCSNativeError
 
 
 @pytest.mark.parametrize("matrix_id", [0, 1])
-@pytest.mark.parametrize("memory_mix_rounds", [0, 1, 3])
-def test_vectorized_workspace_values_match_scalar_reference(
-    matrix_id, memory_mix_rounds
-):
+def test_vectorized_workspace_values_match_scalar_reference(matrix_id):
     matrix_dim = 17
-    indices = np.array(
-        [[0, 1, 16], [17, 117, matrix_dim * matrix_dim - 1]],
-        dtype=np.uint64,
-    )
-    actual = workspace_i8_values_after_mix(
-        workspace_seed=0xFEDCBA9876543210,
-        pass_index=123,
-        round_index=7,
-        matrix_id=matrix_id,
-        element_indices=indices,
-        memory_mix_rounds=memory_mix_rounds,
-    )
-    expected = np.array(
-        [
-            [
-                workspace_i8_value_after_mix(
-                    workspace_seed=0xFEDCBA9876543210,
-                    pass_index=123,
-                    round_index=7,
-                    matrix_id=matrix_id,
-                    row=int(index) // matrix_dim,
-                    col=int(index) % matrix_dim,
-                    matrix_dim=matrix_dim,
-                    memory_mix_rounds=memory_mix_rounds,
-                )
-                for index in row
-            ]
-            for row in indices
-        ],
-        dtype=np.int8,
-    )
-    np.testing.assert_array_equal(actual, expected)
+    indices = np.array([[0, 1, 16], [17, 117, matrix_dim * matrix_dim - 1]], dtype=np.uint64)
+    actual = workspace_i8_values(workspace_seed=0xFEDCBA9876543210, pass_index=123, round_index=7,
+                                 matrix_id=matrix_id, element_indices=indices)
+    expected = [[workspace_i8_value(workspace_seed=0xFEDCBA9876543210, pass_index=123, round_index=7,
+                                    matrix_id=matrix_id, row=int(i) // matrix_dim, col=int(i) % matrix_dim,
+                                    matrix_dim=matrix_dim) for i in row] for row in indices]
+    np.testing.assert_array_equal(actual, np.array(expected, dtype=np.int8))
 
 
 def _matmul(a, b):
@@ -91,7 +63,6 @@ def _matmul(a, b):
 def _deterministic_fixture(
     *,
     false_output: bool = False,
-    memory_mix_rounds: int = 0,
     matrix_dim: int = 4,
 ):
     lease_id = "capacity-lease-v2"
@@ -115,7 +86,7 @@ def _deterministic_fixture(
     )
     a = [
         [
-            workspace_i8_value_after_mix(
+            workspace_i8_value(
                 workspace_seed=workspace_seed,
                 pass_index=pass_index,
                 round_index=round_index,
@@ -123,7 +94,6 @@ def _deterministic_fixture(
                 row=row,
                 col=column,
                 matrix_dim=matrix_dim,
-                memory_mix_rounds=memory_mix_rounds,
             )
             for column in range(matrix_dim)
         ]
@@ -131,7 +101,7 @@ def _deterministic_fixture(
     ]
     b = [
         [
-            workspace_i8_value_after_mix(
+            workspace_i8_value(
                 workspace_seed=workspace_seed,
                 pass_index=pass_index,
                 round_index=round_index,
@@ -139,7 +109,6 @@ def _deterministic_fixture(
                 row=row,
                 col=column,
                 matrix_dim=matrix_dim,
-                memory_mix_rounds=memory_mix_rounds,
             )
             for column in range(matrix_dim)
         ]
@@ -177,7 +146,6 @@ def _deterministic_fixture(
         block_size=block_size,
         row_block=row_block,
         column_block=column_block,
-        memory_mix_rounds=memory_mix_rounds,
     )
     q_block = [
         row[column_block * block_size : (column_block + 1) * block_size]
@@ -307,11 +275,8 @@ def _transition_fixture():
     return context, q_block, q_path, openings
 
 
-@pytest.mark.parametrize("memory_mix_rounds", [0, 2])
-def test_deterministic_workspace_v2_roundtrip(memory_mix_rounds):
-    context, q_block, q_path = _deterministic_fixture(
-        memory_mix_rounds=memory_mix_rounds
-    )
+def test_deterministic_workspace_roundtrip():
+    context, q_block, q_path = _deterministic_fixture()
     payload = prove_capacity_gemm_v2(
         context=context,
         q_block_i32=q_block,
@@ -473,7 +438,6 @@ def test_context_requires_fixed_nonzero_challenge_set_and_derived_coordinates():
     [
         ("workload_version", "different_workspace_v2"),
         ("transcript_root", bytes.fromhex("aa" * 32)),
-        ("memory_mix_rounds", 1),
     ],
 )
 def test_statement_context_is_not_replayable(field, value):

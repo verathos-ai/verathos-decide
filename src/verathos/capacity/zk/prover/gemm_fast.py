@@ -34,24 +34,7 @@ from verathos.capacity.zk.crypto.mle_fast import (
     build_mle_from_matrix_fast,
 )
 
-# Try to import native extension for additional speedup
-_HAS_NATIVE = False
-try:
-    from verathos.capacity.zk.cuda import zkllm_native as _native
-    if _native is None:
-        raise ImportError("zkllm_native unavailable")
-    _HAS_NATIVE = True
-except ImportError:
-    try:
-        import sys
-        from pathlib import Path
-        cuda_path = Path(__file__).parent.parent / "cuda"
-        if str(cuda_path) not in sys.path:
-            sys.path.insert(0, str(cuda_path))
-        import zkllm_native as _native
-        _HAS_NATIVE = True
-    except ImportError:
-        pass
+from verathos.capacity.zk.cuda import HAS_NATIVE as _HAS_NATIVE, native as _native
 
 
 class GEMMProverFast:

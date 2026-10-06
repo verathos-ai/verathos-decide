@@ -9,5 +9,3 @@ dist/
 *.so.*
 *.dylib
 native/pcs/target/
-verathos/capacity/bench/build/
-verathos/zk/cuda/build/

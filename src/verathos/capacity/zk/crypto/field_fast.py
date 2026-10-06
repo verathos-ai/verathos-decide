@@ -26,27 +26,7 @@ _SHIFT60 = np.uint64(60)
 _SHIFT61 = np.uint64(61)
 _ONE = np.uint64(1)
 
-# Try to import native extension with CUDA support
-_HAS_NATIVE = False
-_HAS_CUDA = False
-try:
-    from verathos.capacity.zk.cuda import zkllm_native as _native
-    if _native is None:
-        raise ImportError("zkllm_native unavailable")
-    _HAS_NATIVE = True
-    _HAS_CUDA = getattr(_native, 'HAS_CUDA', False)
-except ImportError:
-    try:
-        import sys
-        from pathlib import Path
-        cuda_path = Path(__file__).parent.parent / "cuda"
-        if str(cuda_path) not in sys.path:
-            sys.path.insert(0, str(cuda_path))
-        import zkllm_native as _native
-        _HAS_NATIVE = True
-        _HAS_CUDA = getattr(_native, 'HAS_CUDA', False)
-    except ImportError:
-        pass
+from verathos.capacity.zk.cuda import HAS_CUDA as _HAS_CUDA, HAS_NATIVE as _HAS_NATIVE, native as _native
 
 # Minimum size to use CUDA (CUDA only faster for large arrays due to kernel launch overhead)
 _CUDA_MIN_SIZE = 8192

@@ -14,12 +14,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from verathos.capacity.proof.workspace import (
-    WORKSPACE_MIXED_PROOF_FORMAT,
     WORKSPACE_PROOF_FORMAT,
     WORKSPACE_TRANSITION_PROOF_FORMAT,
     derive_challenge_block_index,
     derive_sampled_round_index,
-    workspace_i8_values_after_mix,
+    workspace_i8_values,
     workspace_q_block_hash_i32,
     workspace_seed_for,
     verify_workspace_merkle_path,
@@ -160,7 +159,6 @@ class CapacityGemmV2Context:
     block_size: int
     row_block: int
     column_block: int
-    memory_mix_rounds: int = 0
     transition_mix_rounds: int = 0
     transition_fanout: int = 1
     state_root: bytes = b""
@@ -222,12 +220,6 @@ class CapacityGemmV2Context:
             minimum=0,
             maximum=blocks_per_row - 1,
         )
-        memory_mix_rounds = _integer(
-            self.memory_mix_rounds,
-            "memory_mix_rounds",
-            minimum=0,
-            maximum=(1 << 16) - 1,
-        )
         transition_mix_rounds = _integer(
             self.transition_mix_rounds,
             "transition_mix_rounds",
@@ -240,10 +232,6 @@ class CapacityGemmV2Context:
             minimum=1,
             maximum=(1 << 16) - 1,
         )
-        if memory_mix_rounds and transition_mix_rounds:
-            raise CapacityGemmV2FormatError(
-                "workspace mix modes are mutually exclusive"
-            )
         if transition_mix_rounds:
             _fixed_bytes(self.state_root, 32, "state_root")
         elif self.state_root:
@@ -336,7 +324,6 @@ class CapacityGemmV2Context:
                 (b"block_size", struct.pack("<I", self.block_size)),
                 (b"row_block", struct.pack("<I", self.row_block)),
                 (b"column_block", struct.pack("<I", self.column_block)),
-                (b"memory_mix_rounds", struct.pack("<I", self.memory_mix_rounds)),
                 (
                     b"transition_mix_rounds",
                     struct.pack("<I", self.transition_mix_rounds),
@@ -471,29 +458,19 @@ def capacity_gemm_v2_context_from_workspace_proof(
             )
 
     proof_format = proof.get("format")
-    memory_mix_rounds = _integer(
-        proof.get("memory_mix_rounds"),
-        "workspace memory_mix_rounds",
-        minimum=0,
-        maximum=(1 << 16) - 1,
-    )
     if proof_format == WORKSPACE_PROOF_FORMAT:
         expected_workload = "fixed_workspace_merkle_gemm_v1"
-        if memory_mix_rounds or transition_mix_rounds or transition_fanout != 1:
+        if transition_mix_rounds or transition_fanout != 1:
             raise CapacityGemmV2FormatError(
                 "deterministic workspace mode is inconsistent"
             )
-    elif proof_format == WORKSPACE_MIXED_PROOF_FORMAT:
-        expected_workload = "fixed_workspace_mixed_v2"
-        if not memory_mix_rounds or transition_mix_rounds or transition_fanout != 1:
-            raise CapacityGemmV2FormatError("mixed workspace mode is inconsistent")
     elif proof_format == WORKSPACE_TRANSITION_PROOF_FORMAT:
         expected_workload = (
             "fixed_workspace_transition_fanout_v3"
             if transition_fanout > 1
             else "fixed_workspace_transition_mix_v3"
         )
-        if memory_mix_rounds or not transition_mix_rounds:
+        if not transition_mix_rounds:
             raise CapacityGemmV2FormatError("transition workspace mode is inconsistent")
     else:
         raise CapacityGemmV2FormatError("workspace proof format is not supported by v2")
@@ -593,7 +570,6 @@ def capacity_gemm_v2_context_from_workspace_proof(
         block_size=block_size,
         row_block=row_block,
         column_block=column_block,
-        memory_mix_rounds=memory_mix_rounds,
         transition_mix_rounds=transition_mix_rounds,
         transition_fanout=transition_fanout,
         state_root=state_root,
@@ -907,13 +883,12 @@ def _deterministic_bands(
         local_rows[:, np.newaxis] * np.uint64(context.matrix_dim)
         + inner_columns[np.newaxis, :]
     )
-    x_band = workspace_i8_values_after_mix(
+    x_band = workspace_i8_values(
         workspace_seed=context.workspace_seed,
         pass_index=context.pass_index,
         round_index=context.round_index,
         matrix_id=0,
         element_indices=x_indices,
-        memory_mix_rounds=context.memory_mix_rounds,
     )
 
     inner_rows = np.arange(context.matrix_dim, dtype=np.uint64)
@@ -922,13 +897,12 @@ def _deterministic_bands(
         inner_rows[:, np.newaxis] * np.uint64(context.matrix_dim)
         + local_columns[np.newaxis, :]
     )
-    w_band = workspace_i8_values_after_mix(
+    w_band = workspace_i8_values(
         workspace_seed=context.workspace_seed,
         pass_index=context.pass_index,
         round_index=context.round_index,
         matrix_id=1,
         element_indices=w_indices,
-        memory_mix_rounds=context.memory_mix_rounds,
     )
     return x_band, w_band
 

@@ -33,15 +33,10 @@ import httpx
 from bittensor_wallet import Keypair
 
 from verathos.capacity import core
-from verathos.capacity.proof.combined import (
-    CURRENT_COMBINED_PROOF_PROTOCOL_VERSION,
-    combined_commitment_from_final_timing,
-    combined_proof_protocol_version,
-)
+from verathos.capacity.proof.combined import COMBINED_PROOF_FORMAT, final_commitment
 
 log = logging.getLogger(__name__)
 
-BENCH_DIR = Path(__file__).resolve().parent / "bench"
 RECEIPT_PATH = "/capacity/v1/receipt"
 PROOF_PATH = "/capacity/v1/proof"
 UNKNOWN_SLOT_ERROR = "unknown audit slot"
@@ -115,9 +110,9 @@ class DrainState:
 
 
 def bench_extension_available() -> tuple[bool, str]:
-    """Whether the compiled bench extension imports in a fresh interpreter."""
-    code = ("import sys; sys.path.insert(0, %r); import torch; import hot_capacity_workspace_cuda; "
-            "import verathos.capacity.bench.bench_combined" % str(BENCH_DIR))
+    """Whether the bench and its native extensions import in a fresh interpreter."""
+    code = ("import verathos.capacity.bench.combined as c; c.load_extension(); "
+            "from verathos.capacity.zk.cuda import native; assert native is not None, 'zk native extension missing'")
     try:
         proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     except Exception as exc:
@@ -127,14 +122,10 @@ def bench_extension_available() -> tuple[bool, str]:
 
 def default_bench_command(audit: SelectedAudit, *, out_dir: Path, challenge_file: Path, ready_file: Path,
                           start_file: Path, start_timeout_s: float, challenge_timeout_s: float) -> list[str]:
-    cmd = [sys.executable, "-m", "verathos.capacity.bench.bench_combined", "--child", "--out-dir", str(out_dir),
-           "--lease-id", audit.lease, "--gpu-index", "0", "--device-index", "0",
-           "--challenge-file", str(challenge_file), "--challenge-timeout-s", str(challenge_timeout_s),
-           "--ready-file", str(ready_file), "--start-file", str(start_file), "--start-timeout-s", str(start_timeout_s)]
-    for key, value in audit.workload_spec.items():
-        if key not in {"workload_version", "pass_count", "proof_protocol_version"}:
-            cmd += [f"--{key.replace('_', '-')}", str(value)]
-    return cmd + ["--proof-protocol-version", str(CURRENT_COMBINED_PROOF_PROTOCOL_VERSION)]
+    return [sys.executable, "-m", "verathos.capacity.bench.combined", "--lease-id", audit.lease,
+            "--workload", json.dumps(audit.workload_spec, sort_keys=True), "--out-dir", str(out_dir),
+            "--start-file", str(start_file), "--ready-file", str(ready_file), "--start-timeout-s", str(start_timeout_s),
+            "--challenge-file", str(challenge_file), "--challenge-timeout-s", str(challenge_timeout_s)]
 
 
 def _root_hex(root_words: Any) -> str:
@@ -417,10 +408,7 @@ class AuditWorker:
                 final_root = _root_hex(timing.get("root") or [])
                 transcript = str(timing.get("transcript_root") or "") or core.transcript_root([pass0_root, final_root])
                 final = dict(artifact_type="capacity_audit_final_receipt", pass0_root=pass0_root, final_root=final_root,
-                             final_transcript_commit=transcript)
-                combined = combined_commitment_from_final_timing(timing)
-                if combined:
-                    final["combined"] = combined
+                             final_transcript_commit=transcript, combined=final_commitment(timing))
                 self.publisher.publish(RECEIPT_PATH, self._artifact(audit, **final), attempts=3, retry_delay_s=0.25)
                 break
             if proc.poll() is not None:
@@ -448,7 +436,7 @@ class AuditWorker:
             proc.communicate()
         summary = json.loads(files["final.json"].read_text()) if files["final.json"].exists() else {}
         payload = summary.get("proof_payload")
-        if not isinstance(payload, dict) or combined_proof_protocol_version(payload) is None:
+        if not isinstance(payload, dict) or payload.get("format") != COMBINED_PROOF_FORMAT:
             log.warning("audit %s: bench produced no proof payload", audit.audit_id[:12])
             return proc
         sampled = (payload.get("capacity_proof") or {}).get("sampled") or {}

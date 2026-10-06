@@ -20,82 +20,10 @@ from verathos.capacity.zk.crypto.field_fast import (
     fold_table_vec,
 )
 
-# Try to import native extension. Prefer the package loader because it selects
-# the torch/Python-compatible .so or JIT-builds one when running from source.
-_HAS_NATIVE = False
-_HAS_CUDA = False
-try:
-    from verathos.capacity.zk.cuda import zkllm_native as _native
-    if _native is None:
-        raise ImportError("zkllm_native unavailable")
-    _HAS_NATIVE = True
-    _HAS_CUDA = getattr(_native, 'HAS_CUDA', False)
-except ImportError:
-    try:
-        import sys
-        from pathlib import Path
-        cuda_path = Path(__file__).parent.parent / "cuda"
-        if str(cuda_path) not in sys.path:
-            sys.path.insert(0, str(cuda_path))
-        import zkllm_native as _native
-        _HAS_NATIVE = True
-        _HAS_CUDA = getattr(_native, 'HAS_CUDA', False)
-    except ImportError:
-        pass
+from verathos.capacity.zk.cuda import HAS_CUDA as _HAS_CUDA, HAS_NATIVE as _HAS_NATIVE, native as _native
 
 # Minimum table size to use CUDA (CUDA only faster for large tables due to kernel launch overhead)
 _CUDA_MIN_SIZE = 8192
-
-# Debug, not info: this fires at import time and every interactive CLI
-# (manage, chat) imports through here, so at info it printed a stray
-# diagnostic above the welcome banner. The slow-fallback case below
-# stays a warning: that one is actionable.
-if _HAS_CUDA:
-    logger.debug("zkllm: Using CUDA acceleration for sumcheck (GPU fast path)")
-elif _HAS_NATIVE:
-    logger.debug("zkllm: Using native extension for sumcheck (CPU fast path)")
-else:
-    logger.warning("zkllm CUDA extension not available — sumcheck using slow NumPy fallback! "
-                   "Build it: cd zkllm/cuda && python build.py")
-
-# Dev-only escape hatch. Production proving MUST run on the native/CUDA backend:
-# the NumPy fallback is orders of magnitude slower and is not the audited path,
-# so a miner that silently fell back would look healthy while serving degraded.
-_ALLOW_NUMPY_ENV = "VERALLM_ALLOW_NUMPY_SUMCHECK"
-
-
-def native_backend_available() -> bool:
-    """True when the native (C++/CUDA) sumcheck backend is loaded."""
-    return _HAS_NATIVE
-
-
-def assert_native_backend(context: str = "proof generation") -> None:
-    """Fail closed unless the native backend is present.
-
-    Raises RuntimeError when only the NumPy fallback is available, so a proving
-    process refuses to start rather than silently running the slow/unaudited
-    path. Set VERALLM_ALLOW_NUMPY_SUMCHECK=1 to override for local dev/CI only.
-    """
-    import os
-
-    if _HAS_NATIVE:
-        return
-    if os.environ.get(_ALLOW_NUMPY_ENV, "").strip() == "1":
-        logger.warning(
-            "%s running on the NumPy sumcheck fallback (%s=1). This is DEV-ONLY "
-            "and must never be used in production.",
-            context,
-            _ALLOW_NUMPY_ENV,
-        )
-        return
-    raise RuntimeError(
-        f"zkllm native CUDA extension not available — refusing to run {context} on the "
-        f"slow, unaudited NumPy fallback. Build the extension for this Python/torch "
-        f"(cd zkllm/cuda && python build.py), or copy a matching prebuilt "
-        f"zkllm_native.*.so into zkllm/cuda/. Set {_ALLOW_NUMPY_ENV}=1 to override "
-        f"(local dev only)."
-    )
-
 
 def compute_round_evals_fast(T_A: np.ndarray, T_B: np.ndarray) -> Tuple[int, int, int]:
     """
