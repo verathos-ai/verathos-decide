@@ -50,15 +50,15 @@ Issues found and fixed during the run:
 
 See `DISCOVERY.md`.
 
-## 2026-10-06: capacity audit proof stack round trip (RTX 5090)
+## 2026-10-06: capacity audit on an RTX 5090
 
-Native parts built from source on the box: Rust GEMM library (cargo 1.99), zk extension, bench kernel.
-Full test suite with native builds: 151 passed, 2 skipped (golden vectors need verathos-core next to the repo).
-`scripts/capacity_roundtrip.py "NVIDIA GeForce RTX 5090" 32` with the calibrated 5090 row (337 passes of
-8960x8960 int8):
+`verathos-build-native` on a clean `nvidia/cuda:12.8.2-devel-ubuntu22.04` box (torch 2.10.0+cu128, Rust 1.85);
+test suite 72 passed. Results:
 
-| Timed GPU work | Deadline | Proof build | Payload | Verification |
-|---|---|---|---|---|
-| 20.5 s | 30 s | 1.7 s | 257 KB | ok in 52 ms |
+| Run | Timed GPU work | Deadline | Proof build | Payload | Verification |
+|---|---|---|---|---|---|
+| Calibrated 5090 row, 337 passes of 8960x8960 int8 (`scripts/capacity_roundtrip.py`) | 20.4 s | 30 s | 0.1 s | 257 KB | ok in 58 ms |
+| Datacenter shape at small pass counts: transition mix 3 / fanout 64, tail lane, FP64 lane | 2.8 s | n/a | 5.6 s | 11.6 MB | ok in 178 ms |
+| Miner hot-start file protocol with the real bench (ready, start seed, final timing, challenge) | 20.5 s | 30 s | | | ok, derived as the auditor does |
 
 Peak GPU memory about 0.6 GB, so the bench fits beside a resident model.

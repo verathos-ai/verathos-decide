@@ -56,13 +56,13 @@ def _build_extension(kind: str, name: str, sources: list[Path], cxx: list[str], 
 def build_workspace() -> None:
     bench = PACKAGE / "bench"
     _build_extension("cuda", "verathos.capacity.bench._workspace_cuda",
-                     [bench / "binding.cpp", bench / "workspace_kernel.cu"], ["-O3", "-std=c++17"],
+                     [bench / "binding.cpp", bench / "workspace_kernel.cu"], ["-O3"],
                      ["-O3", "-Xcompiler", "-fPIC", "--expt-relaxed-constexpr"], ["-lcublas"])
 
 
 def build_block_prover() -> None:
     _build_extension("cpu", "verathos.capacity.zk.native._block_prover", [PACKAGE / "zk" / "native" / "binding.cpp"],
-                     ["-O3", "-std=c++17"], [], ["-lcrypto"])
+                     ["-O3"], [], ["-lcrypto"])
 
 
 def build_gemm() -> None:
