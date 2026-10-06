@@ -19,7 +19,6 @@ EVM and no central registry.
 | [Capacity audit](docs/CAPACITY_AUDIT.md) | the hardware audit: windows, workload, proofs, gating, policy |
 | [Discovery](docs/DISCOVERY.md) | manifests, commitments and the catalog on chain |
 | [Subnet administration](docs/SUBNET_ADMIN.md) | mechanisms, catalog releases, audit rollout |
-| [Testnet runs](docs/TESTNET_RUNS.md) | measured results |
 
 ## Layout
 
