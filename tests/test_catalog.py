@@ -43,3 +43,8 @@ def test_resolve_prefers_shipped_then_store_then_verified_download(tmp_path, mon
         catalog.resolve(newer.digest(), store=store, sources=["http://forged/{digest}"])
     got = catalog.resolve(newer.digest(), store=store, sources=["http://forged/{digest}", "http://good/{digest}"])
     assert got.digest() == newer.digest() and store.get(newer.digest()).digest() == newer.digest()
+
+
+def test_changed_copies_are_digested_from_their_fields() -> None:
+    c = catalog.load()
+    assert c.model_copy(update={"revision": "other"}).digest() != c.digest()

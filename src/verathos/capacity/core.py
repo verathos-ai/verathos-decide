@@ -44,6 +44,8 @@ RECEIPT_PATH = "/capacity/v1/receipt"
 PROOF_PATH = "/capacity/v1/proof"
 HDR_AUDIT_ID = "X-Verathos-Audit-Id"
 HDR_SLOT_ID = "X-Verathos-Slot-Id"
+HDR_UPLOAD_SIGNATURE = "X-Verathos-Upload-Signature"
+UPLOAD_DOMAIN = "verathos/capacity-upload/v1"
 
 # Slot, lease and audit identity
 SLOT_PREFIX = b"VERATHOS_CAPACITY_SLOT_V1"
@@ -441,6 +443,16 @@ def gpu_workload_spec(row: GpuClass) -> dict[str, Any]:
         "spot_checks": row.spot_checks,
         "pass_count": gpu_pass_count(row),
     }
+
+
+def workload_digest(spec: Mapping[str, Any]) -> str:
+    """Digest of a workload spec; artifacts bind it, so miner and auditor provably ran the same row."""
+    return hashlib.sha256(canonical_json(spec).encode()).hexdigest()
+
+
+def upload_claim(audit_id: str, slot_id: str) -> dict[str, str]:
+    """What a miner signs (``UPLOAD_DOMAIN``) to announce a proof upload for its slot."""
+    return {"audit_id": audit_id, "slot_id": slot_id}
 
 
 def _unsigned(data: Mapping[str, Any]) -> dict[str, Any]:

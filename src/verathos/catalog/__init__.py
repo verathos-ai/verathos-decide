@@ -77,6 +77,13 @@ class Catalog(BaseModel):
         catalog._document = document
         return catalog
 
+    def model_copy(self, *, update: dict[str, Any] | None = None, deep: bool = False) -> Catalog:
+        """A copy; a changed copy no longer carries the parsed document, so its digest covers its own fields."""
+        copy = super().model_copy(update=update, deep=deep)
+        if update:
+            copy._document = None
+        return copy
+
     def document(self) -> Any:
         """The JSON document this catalog was parsed from (or its own fields if built in code)."""
         return self._document if self._document is not None else self.model_dump(mode="json")

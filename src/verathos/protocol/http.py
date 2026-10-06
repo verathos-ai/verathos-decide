@@ -15,7 +15,10 @@ class ResponseTooLarge(ValueError):
 
 
 def _parse(chunks: list[bytes]) -> Any:
-    return json.loads(b"".join(chunks))
+    try:
+        return json.loads(b"".join(chunks))
+    except RecursionError:
+        raise ValueError("JSON nested too deeply") from None
 
 
 async def request_json(client: httpx.AsyncClient, method: str, url: str, *, limit: int, timeout: float,

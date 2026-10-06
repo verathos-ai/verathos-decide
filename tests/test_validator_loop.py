@@ -247,3 +247,46 @@ def test_endpoints_the_validator_could_not_audit_keep_their_score() -> None:
     assert state.ema == {"hkA/gpu0": 0.5}
     update(state, {}, {}, set())
     assert state.ema["hkA/gpu0"] == pytest.approx(0.4)
+
+
+def test_huge_numbers_and_deep_json_are_malformed_not_fatal() -> None:
+    """Replies built to make parsing raise unusual exceptions still fail the request, and discovery survives a
+    manifest nested too deeply to parse."""
+    from fastapi import FastAPI
+    from fastapi.responses import PlainTextResponse
+
+    from verathos.protocol.api import distributions
+    from verathos.validator.discovery import DiscoveredEndpoint
+
+    with pytest.raises(ValueError):
+        distributions({"q": {"noul": 10**400}})
+
+    validator, hostile_kp = kp(), kp()
+    app = FastAPI()
+
+    @app.get("/v1/manifest")
+    async def manifest():
+        return PlainTextResponse("[" * 50000, media_type="application/json")
+
+    @app.post("/e/gpu0/v1/systemone")
+    async def systemone():
+        return PlainTextResponse('{"answers": {"q": {"noul": 1' + "0" * 400 + '}}, "receipt": {}}',
+                                 media_type="application/json")
+
+    ep = DiscoveredEndpoint(1, hostile_kp.ss58_address, "http://10.0.0.9:80", Endpoint(
+        endpoint_id="gpu0", url="http://10.0.0.9:80/e/gpu0", model_id="kev-4b",
+        hardware={"kind": "cuda", "device_id": "GPU-x"}, max_concurrency=1))
+
+    async def run():
+        async with httpx.AsyncClient(transport=HostRouter({"10.0.0.9": app})) as client:
+            found = await discover([Neuron(1, hostile_kp.ss58_address, "10.0.0.9", 80,
+                                           commitment_value("0" * 64))], 405, 1, client, {"0" * 64})
+            results = await audit_epoch([ep], epoch=1, secret=b"k" * 32, keypair=validator,
+                                        references={"kev-4b": MockEngine("kev-4b")},
+                                        tolerances={"kev-4b": Tolerance()}, client=client, netuid=405, mechid=1,
+                                        pool_size=4, per_endpoint=3)
+            return found, results
+
+    found, results = asyncio.run(run())
+    assert found == []
+    assert results[ep.key].sent == 3 and len(results[ep.key].tally.hard_failures) == 3

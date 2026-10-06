@@ -1,5 +1,44 @@
 # Testnet runs
 
+## 2026-10-06: full subnet run with the capacity audit gating (testnet 405)
+
+Four rented hosts, each with its own public IP (the validator needs one: a miner on the same NAT cannot reach it
+through the public address):
+
+| Role | Hardware | Hotkey (UID) | Endpoints |
+|---|---|---|---|
+| Honest miner | RTX 5090 | `test_miner96/rehearsal-aug18` (12) | `gpu0` Kev-4B |
+| Answer cheater | RTX 5090 | `test_miner96/default` (1) | `gpu0` Kev-0.8B advertised as `kev-4b` |
+| Sybil | one RTX 5090 | `test_sn96/decide-sybil` (14) | `gpu0` and `gpu1`, both Kev-4B on the same GPU, declared as two 5090s |
+| Auditor validator | A100 | `test_sn96` owner (0) | CPU fp32 Kev-4B reference; serves the catalog and the audit |
+| Follower validator | same host | `test_vali96/default`, dry run | applies the auditor's verdicts |
+
+Catalog committed by the owner hotkey with `capacity_audit` in `score_gate` and a raised audit rate (30 windows
+per tempo, every slot drafted). The miners fetched it from the owner's axon and published their manifests by
+themselves.
+
+Capacity audit, first four windows (seconds from the auditor's `B_start` observation to the final receipt; proof
+delivery after `B_proof`):
+
+| Endpoint | Outcome (each window) | Final receipt | Proof |
+|---|---|---|---|
+| Honest `gpu0` | passed x4 | 20.4-21.3 s | 1.1-1.7 s |
+| Cheater `gpu0` (real 5090) | passed x4 | 20.9-21.8 s | 1.2-1.5 s |
+| Sybil `gpu0`, `gpu1` (one GPU) | timing_miss x4 each | 43.3-44.5 s | - |
+
+All windows were confirmed final. Epoch results, identical on the auditor and on the follower (which gated the
+sybil from the auditor's signed verdict feed):
+
+| Endpoint | Canaries | Mean abs diff | Result | Score |
+|---|---|---|---|---|
+| Honest `gpu0` | 10/10 | 0.0014 | pass | 1.00 |
+| Cheater `gpu0` | 10/10 | 0.139 | fail_hard, probation | 0 |
+| Sybil `gpu0`, `gpu1` | 7/10 each | 0.0015 | capacity gated (timing), probation | 0 |
+
+The auditor set weights on mechanism 1 for UID 12 only. Found in this run and fixed afterwards: the auditor held
+canaries only while an audit was open, so 3 of the sybil's canaries hit its audit-hold `503`s (holds are now timed
+like the miners'); a cached empty auditor URL stopped receipt delivery until restart.
+
 ## 2026-10-06: first validator epoch on mechanism 1 (testnet 405)
 
 Owner setup with `scripts/testnet_owner_ops.py` (owner coldkey from the OS keyring): `max_allowed_uids` 256 -> 128

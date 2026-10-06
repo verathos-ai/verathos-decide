@@ -109,6 +109,8 @@ def update(state: ScoreState, results: dict[str, EndpointResult], scores: dict[s
     """Fold one epoch into the state. ``held`` endpoints were discovered but could not be audited this epoch (no
     usable reference answers); their EMA is kept. Other endpoints absent this epoch decay toward zero and are
     forgotten once their EMA is negligible."""
+    for key in failed:
+        state.probation[key] = probation_epochs
     on_probation: dict[str, int] = {}
     for key, remaining in state.probation.items():
         hotkey = key.split("/", 1)[0]
@@ -117,8 +119,6 @@ def update(state: ScoreState, results: dict[str, EndpointResult], scores: dict[s
         if key not in state.ema and key not in state.probation and on_probation.get(r.endpoint.hotkey):
             state.probation[key] = on_probation[r.endpoint.hotkey]
         state.uid_of[key] = r.endpoint.uid
-    for key in failed:
-        state.probation[key] = probation_epochs
     for key in set(state.ema) | set(scores) | set(state.probation):
         if key in held and key not in scores and key not in state.probation:
             continue

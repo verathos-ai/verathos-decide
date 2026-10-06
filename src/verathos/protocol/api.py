@@ -85,7 +85,10 @@ def probability(value: Any) -> float:
     """A JSON number in [0, 1]; raises ValueError for anything else (strings, booleans, NaN, infinities)."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError("probability must be a number")
-    p = float(value)
+    try:
+        p = float(value)
+    except OverflowError:
+        raise ValueError("probability out of range") from None
     if not (math.isfinite(p) and 0.0 <= p <= 1.0):
         raise ValueError("probability must be finite and within [0, 1]")
     return p

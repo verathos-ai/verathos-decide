@@ -18,7 +18,7 @@ from bittensor_wallet import Keypair
 from verathos.miner.app import IDENTITY_DOMAIN, identity_payload
 from verathos.protocol import signing
 from verathos.protocol.http import request_json
-from verathos.protocol.manifest import Endpoint, Manifest, ManifestRejected, accept, axon_base, committed_digest
+from verathos.protocol.manifest import Endpoint, Manifest, accept, axon_base, committed_digest
 from verathos.protocol.requests import sign_request
 
 log = logging.getLogger(__name__)
@@ -72,7 +72,7 @@ async def _fetch_manifest(n: Neuron, netuid: int, mechid: int, client: httpx.Asy
                                       timeout=FETCH_TIMEOUT_S)
         manifest = accept(document, hotkey=n.hotkey, netuid=netuid, mechid=mechid, axon=base,
                           commitment=n.commitment, catalog_digests=catalog_digests)
-    except (httpx.HTTPError, TimeoutError, ManifestRejected, ValueError) as e:
+    except Exception as e:  # whatever a neuron serves, it only costs that neuron its discovery
         log.info("uid %d manifest not accepted: %s", n.uid, e or type(e).__name__)
         return None
     return DiscoveredMiner(n.uid, n.hotkey, base, manifest)
@@ -107,7 +107,7 @@ async def verify_identity(endpoint: DiscoveredEndpoint, keypair: Keypair, client
         reply = await request_json(client, "POST", endpoint.base_url + path, content=body, headers=headers,
                                    limit=MAX_IDENTITY_BYTES, timeout=FETCH_TIMEOUT_S)
         signature = reply["signature"] if isinstance(reply, dict) else None
-    except (httpx.HTTPError, TimeoutError, KeyError, ValueError):
+    except Exception:
         return False
     return signing.verify(endpoint.hotkey, IDENTITY_DOMAIN,
                           identity_payload(endpoint.endpoint.endpoint_id, challenge, keypair.ss58_address), signature)

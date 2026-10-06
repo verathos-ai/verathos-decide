@@ -112,11 +112,12 @@ def run(tmp_path_factory: pytest.TempPathFactory):
     holds.update_slots([slot for _, _, slot in miners.values()])
     drained_seen = set()
 
-    # Miners start at this block; skip the start-up replay of earlier blocks, which they never followed.
+    # Everyone starts at this block; skip the start-up replay of earlier blocks.
     auditor._last_block = holds._last_block = chain.n - 1
     auditor.poll_once()
     holds.poll_once()
     for _, worker, _ in miners.values():
+        worker._last_block = chain.n - 1
         worker.start()
     # One window is enough: every slot is drafted at the first block and busy until its payload cooldown ends.
     for _ in range(45):

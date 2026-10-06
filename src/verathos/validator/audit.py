@@ -91,19 +91,20 @@ async def _canary(result: EndpointResult, request: dict[str, Any], reference: di
         receipt = SignedReceipt.model_validate(data["receipt"])
         answers = data["answers"]
         got = distributions(answers)
-    except (KeyError, TypeError, ValueError):
-        result.errors.append("malformed reply")
+        r_ = receipt.receipt
+        bound = (receipt.signature_valid() and receipt.binds(request, answers) and r_.miner_hotkey == ep.hotkey
+                 and r_.endpoint_id == ep.endpoint.endpoint_id and r_.model_id == ep.endpoint.model_id
+                 and r_.caller_hotkey == keypair.ss58_address and r_.request_nonce == headers[HDR_NONCE]
+                 and r_.netuid == netuid and r_.mechid == mechid)
+        comparison = compare_request(reference, got, result.tolerance) if bound else None
+    except Exception as e:  # anything a reply can make the parser or comparison raise fails the request
+        result.errors.append(f"malformed reply: {type(e).__name__}")
         result.tally.add(_invalid("malformed reply"))
         return
-    r_ = receipt.receipt
-    if not (receipt.signature_valid() and receipt.binds(request, answers) and r_.miner_hotkey == ep.hotkey
-            and r_.endpoint_id == ep.endpoint.endpoint_id and r_.model_id == ep.endpoint.model_id
-            and r_.caller_hotkey == keypair.ss58_address and r_.request_nonce == headers[HDR_NONCE]
-            and r_.netuid == netuid and r_.mechid == mechid):
+    if comparison is None:
         result.errors.append("invalid receipt")
-        result.tally.add(_invalid("invalid receipt"))
-        return
-    result.tally.add(compare_request(reference, got, result.tolerance))
+        comparison = _invalid("invalid receipt")
+    result.tally.add(comparison)
 
 
 async def _audit_endpoint(result: EndpointResult, canaries: list[tuple[dict[str, Any], dict[str, dict[str, float]]]],
@@ -162,7 +163,8 @@ async def audit_epoch(
         tasks.append(_audit_endpoint(res, picked, keypair, client, spread_s, random.Random(rng.random()), drained,
                                      netuid, mechid))
     for res, outcome in zip(results.values(), await asyncio.gather(*tasks, return_exceptions=True)):
-        if isinstance(outcome, BaseException):
+        if isinstance(outcome, BaseException):  # an aborted audit verifies nothing, so it fails
             log.error("audit of %s failed: %r", res.endpoint.key, outcome)
             res.errors.append(f"audit failed: {type(outcome).__name__}")
+            res.tally.add(_invalid("audit aborted"))
     return results

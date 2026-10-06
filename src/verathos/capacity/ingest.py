@@ -2,7 +2,8 @@
 
 Arrival time is taken when a request arrives, before its body is read; parsing and signature checks run off the
 event loop, so neither a slow chain read in the auditor nor a large upload delays other miners' receipts. A proof
-upload names its slot in headers and is refused before its body is read unless that slot is waiting for a proof.
+upload names its slot in headers, signed by the slot's hotkey, and is refused before its body is read unless that
+slot is waiting for a proof and has no other upload in progress.
 """
 
 from __future__ import annotations
@@ -76,8 +77,12 @@ def add_capacity_routes(app: FastAPI, auditor: Auditor, keypair: Keypair) -> Non
     @app.post(core.PROOF_PATH)
     async def proof(request: Request) -> JSONResponse:
         received_at = auditor.clock()
-        early = await run_in_threadpool(auditor.proof_precheck, request.headers.get(core.HDR_AUDIT_ID),
-                                        request.headers.get(core.HDR_SLOT_ID))
-        if early is not None:
-            return _json(early)
-        return await ingest(request, "proof", auditor.policy.max_proof_payload_bytes, received_at)
+        audit_id, slot_id = request.headers.get(core.HDR_AUDIT_ID), request.headers.get(core.HDR_SLOT_ID)
+        refused = await run_in_threadpool(auditor.begin_upload, audit_id, slot_id,
+                                          request.headers.get(core.HDR_UPLOAD_SIGNATURE))
+        if refused is not None:
+            return _json(refused)
+        try:
+            return await ingest(request, "proof", auditor.policy.max_proof_payload_bytes, received_at)
+        finally:
+            auditor.end_upload(audit_id, slot_id)

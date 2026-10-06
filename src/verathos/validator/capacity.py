@@ -24,7 +24,7 @@ from verathos.capacity.core import AuditPolicy, Slot, gpu_support_status
 from verathos.capacity.holds import HoldTracker
 from verathos.capacity.verdicts import fetch_verdicts
 from verathos.validator import chain as validator_chain
-from verathos.validator.discovery import DiscoveredMiner, discover
+from verathos.validator.discovery import DiscoveredMiner, Neuron, discover
 
 log = logging.getLogger(__name__)
 SLOT_REFRESH_S = 120.0
@@ -49,6 +49,8 @@ class Capacity:
                  auditor: Auditor | None = None, holds: HoldTracker | None = None) -> None:
         self.netuid, self.policy, self.auditor_hotkey, self.chain = netuid, policy, auditor_hotkey, chain
         self.auditor, self.holds = auditor, holds
+        self._known: dict[str, tuple[str | None, list[Slot]]] = {}
+        self._known_lock = threading.Lock()
 
     @classmethod
     def start(cls, *, network: str, netuid: int, policy: AuditPolicy, st: bt.Subtensor, wallet: bt.Wallet,
@@ -84,7 +86,7 @@ class Capacity:
                 time.sleep(interval_s)
                 try:
                     neurons, _ = validator_chain.snapshot(st, self.netuid)
-                    self.update_slots(asyncio.run(self._discover(neurons, mechid, catalog_digests())))
+                    self.update_slots(asyncio.run(self._discover(neurons, mechid, catalog_digests())), neurons)
                 except Exception:
                     log.exception("capacity slot refresh failed")
 
@@ -94,9 +96,18 @@ class Capacity:
         async with httpx.AsyncClient() as client:
             return await discover(neurons, self.netuid, mechid, client, catalog_digests)
 
-    def update_slots(self, miners: list[DiscoveredMiner]) -> None:
-        slots = capacity_slots(miners, self.netuid)
-        (self.auditor or self.holds).update_slots(slots)
+    def update_slots(self, miners: list[DiscoveredMiner], neurons: list[Neuron]) -> None:
+        """Replace the audit's slots with the discovered ones. A hotkey whose manifest could not be fetched this
+        time keeps its last slots while its commitment is unchanged, so a failed fetch never makes the auditor and
+        the miner disagree on a draft."""
+        commitments = {n.hotkey: n.commitment for n in neurons}
+        known = {m.hotkey: (commitments.get(m.hotkey), capacity_slots([m], self.netuid)) for m in miners}
+        with self._known_lock:
+            for hotkey, (commitment, slots) in self._known.items():
+                if hotkey not in known and commitment is not None and commitments.get(hotkey) == commitment:
+                    known[hotkey] = (commitment, slots)
+            self._known = known
+        (self.auditor or self.holds).update_slots([s for _, slots in known.values() for s in slots])
 
     def drained(self, hotkey: str, endpoint_id: str) -> bool:
         return (self.auditor or self.holds).drained(hotkey, endpoint_id)

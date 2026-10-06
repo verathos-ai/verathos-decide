@@ -49,7 +49,10 @@ messages:
   tempo. Two endpoints of one hotkey behind one IP are drafted together in about 12% of windows, two hotkeys behind
   one IP in about 9%, and two unrelated endpoints in about 2%.
 - A slot drafted in a window stays out of the cohorts until `payload_cooldown_blocks` after that window's `B_proof`;
-  miners and the auditor apply the same rule.
+  miners and the auditor apply the same rule. Both replay the recent blocks when they start, so slots drafted
+  before a restart still count as busy; a window whose `B_start` has passed by the time a miner processes it only
+  marks the slot busy. The auditor keeps a hotkey's last slots while a manifest fetch fails and its commitment is
+  unchanged.
 
 ## One audit
 
@@ -60,10 +63,12 @@ messages:
 | timed work | runs the workload row of its GPU class, committing a Merkle root per round; when done, sends a final receipt with the combined transcript root and the `B_start` hash it used | final receipt on time if it arrives within `deadline_s + transport_grace_s` of its own `B_start` observation, and before it has observed `B_proof` |
 | `B_proof` | challenge `H(transcript root, B_proof hash, lease, slot_id)`; builds the sampled proof; sends it with the `B_proof` hash it used | proof must arrive within `payload_deadline_s` of `B_proof`; verified against the slot's scheduled workload, the proof seed and the challenge |
 
-All artifacts are signed by the miner hotkey (sr25519) and sent to the auditor's axon. Final receipts are retried
-until the deadline, and never after the miner has seen `B_proof`; proofs travel on a separate lane, so a proof
-upload never delays another endpoint's receipt. The auditor takes the arrival time when a request arrives, and
-refuses a proof upload by its slot headers before reading the body unless that slot is waiting for a proof.
+All artifacts are signed by the miner hotkey (sr25519), bind the slot's lease and the digest of its workload row,
+and are sent to the auditor's axon. Final receipts are retried until the deadline, and never after the miner has
+seen `B_proof`; proofs travel on a separate lane, so a proof upload never delays another endpoint's receipt. The
+auditor takes the arrival time when a request arrives. A proof upload names its slot in headers signed by the
+slot's hotkey; the auditor refuses it before reading the body unless that slot is waiting for a proof and has no
+other upload in progress.
 
 ### The workload
 
@@ -100,8 +105,9 @@ gaps never count against a miner; the slot is neutral when:
 - the auditor observed `B_start` only after the next block (its timing would be off);
 - the auditor could not follow the window from its selection block: it started or restarted (it replays recent
   blocks, so the slots still count as busy, as on the miners), or its block feed stalled past `B_start`;
-- the window opened while a newly committed policy propagates (two catalog checks plus one hold), since miners may
-  still derive windows with the previous policy;
+- the slot was still open when the auditor restarted (artifacts were refused while it was down);
+- the window opened while a newly committed policy propagates, from one catalog check before the auditor adopted
+  it until two checks plus one hold after, since miners adopt it up to a check apart;
 - verification failed on the auditor's side, or the window blocks did not finalize unchanged.
 
 ## Gating
@@ -112,9 +118,16 @@ E:
 - `missing_proof` + `no_show` >= `hard_proof_misses_for_zero_score` (default 2), or
 - `timing_miss` >= `timing_misses_for_zero_score` (default 2).
 
-Only closed epochs count, so every validator asking during E gets the same set. Epochs here are `block // tempo`.
-A gated endpoint scores zero and enters probation like an endpoint that failed answer verification; new endpoints
-of the same hotkey inherit that probation. Evidence ages out of the window; nothing else clears it.
+The same rules apply to each hotkey over the evidence of all its endpoints, including ones it renamed or removed,
+with the miss thresholds multiplied by its current number of endpoints (`invalid` is not scaled); when they fire,
+every current endpoint of the hotkey is gated. Renaming an endpoint therefore never clears evidence, while a few
+honest misses spread over a large hotkey do not gate it.
+
+Only closed epochs count. The last windows of an epoch settle (proof, verification, finality) within a few
+minutes of its end, and validators ask after their canary phase, so they all get the same set. Epochs here are
+`block // tempo`. A gated endpoint scores zero and enters probation like an endpoint that failed answer
+verification; new endpoints of the same hotkey inherit that probation. Evidence ages out of the window; nothing
+else clears it.
 
 The auditor serves the gated endpoints of an epoch at `GET /capacity/v1/verdicts?epoch=N` (epochs that have
 started only), signed by its hotkey. Other validators fetch them from the auditor's axon each epoch, after their

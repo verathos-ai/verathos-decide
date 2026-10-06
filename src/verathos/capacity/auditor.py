@@ -33,6 +33,7 @@ from typing import Any, Protocol
 
 from verathos.capacity import core
 from verathos.capacity.proof.combined import COMBINED_PROOF_FORMAT, verify_combined_proof
+from verathos.protocol import signing
 
 log = logging.getLogger(__name__)
 
@@ -95,7 +96,11 @@ class Auditor:
             self._db.executescript("DROP TABLE IF EXISTS slots; DROP TABLE IF EXISTS windows;")
             self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._db.executescript(_SCHEMA)
+        # Artifacts were refused while the auditor was down, so nothing still open can be judged.
+        self._db.execute(f"UPDATE slots SET outcome = ?, reason = 'auditor_restarted' WHERE outcome IN "
+                         f"({','.join('?' * len(OPEN_OUTCOMES))})", (NEUTRAL, *OPEN_OUTCOMES))
         self._lock = threading.RLock()
+        self._uploading: set[tuple[str, str]] = set()
         self._slots: list[core.Slot] | None = None
         self._verifier = ThreadPoolExecutor(max_workers=verify_workers, thread_name_prefix="capacity-verify")
         self._last_block = 0
@@ -105,16 +110,22 @@ class Auditor:
     # ---- inputs ----
 
     def set_policy(self, policy: core.AuditPolicy) -> None:
-        """Adopt a newly committed policy. Windows opened until every miner can have adopted it are void."""
+        """Adopt a newly committed policy. Miners adopt it within ``POLICY_WATCH_S`` of the commit, before or after
+        the auditor, so windows opened from one check interval before this point until every miner can have
+        adopted it (plus one hold) are void."""
         if policy == self.policy:
             return
         policy.validate(self.block_time_s)
-        propagation = math.ceil(2 * core.POLICY_WATCH_S / self.block_time_s)
+        interval = math.ceil(core.POLICY_WATCH_S / self.block_time_s)
         with self._lock:
-            self._transition_until = self._last_block + propagation + max(self._hold_blocks(self.policy),
-                                                                          self._hold_blocks(policy))
+            since = self._last_block - interval - 1
+            self._db.execute("UPDATE windows SET chain_status = 'void' WHERE selection_block >= ?", (since,))
+            self._db.execute("UPDATE slots SET outcome = ?, reason = 'policy_transition' WHERE audit_id IN "
+                             "(SELECT audit_id FROM windows WHERE selection_block >= ?)", (NEUTRAL, since))
+            self._transition_until = self._last_block + 2 * interval + max(self._hold_blocks(self.policy),
+                                                                           self._hold_blocks(policy))
             self.policy = policy
-        log.info("capacity policy changed; windows until block %d are void", self._transition_until)
+        log.info("capacity policy changed; windows from block %d to %d are void", since, self._transition_until)
 
     def _hold_blocks(self, policy: core.AuditPolicy) -> int:
         """Blocks from a window's selection until its slots may be drafted again."""
@@ -230,10 +241,12 @@ class Auditor:
             "(SELECT audit_id FROM windows WHERE start_observed_at IS NOT NULL) AND ? > deadline_s + ? + "
             "(SELECT start_observed_at FROM windows w WHERE w.audit_id = slots.audit_id)",
             (NO_SHOW, PENDING, now, grace))
-        self._db.execute(
-            "UPDATE slots SET outcome = ?, reason = 'missing_proof_payload' WHERE outcome = ? AND proof_at IS NULL "
-            "AND ? > ? + (SELECT proof_observed_at FROM windows w WHERE w.audit_id = slots.audit_id)",
-            (MISSING_PROOF, TIMING_PASS, now, self.policy.payload_deadline_s))
+        for r in self._db.execute(
+                "SELECT audit_id, slot_id FROM slots WHERE outcome = ? AND proof_at IS NULL AND ? > ? + "
+                "(SELECT proof_observed_at FROM windows w WHERE w.audit_id = slots.audit_id)",
+                (TIMING_PASS, now, self.policy.payload_deadline_s)).fetchall():
+            if (r["audit_id"], r["slot_id"]) not in self._uploading:  # an upload that began in time is judged
+                self._set_outcome(r["audit_id"], r["slot_id"], MISSING_PROOF, "missing_proof_payload")
 
     def _check_finality(self) -> None:
         """Confirm or void windows whose blocks are final. Chain reads happen outside the lock, so ingest is never
@@ -260,13 +273,28 @@ class Auditor:
 
     # ---- ingest ----
 
-    def proof_precheck(self, audit_id: Any, slot_id: Any) -> Response | None:
-        """The answer to a proof upload that can be given before its body is read, or None to read it."""
+    def begin_upload(self, audit_id: Any, slot_id: Any, signature: Any) -> Response | None:
+        """Admit a proof upload before its body is read: the slot must be waiting for its proof, the upload signed
+        by the slot's hotkey, and no other upload for the slot in progress. None admits it; call ``end_upload``
+        when done."""
         with self._lock:
             row = self._row(audit_id, slot_id)
             if row is None:
                 return Response(400, {"error": UNKNOWN_SLOT_ERROR})
-            return self._proof_state(row)
+            if not signing.verify(row["hotkey"], core.UPLOAD_DOMAIN, core.upload_claim(audit_id, slot_id),
+                                  signature):
+                return Response(401, {"error": "upload not signed by the slot's hotkey"})
+            early = self._proof_state(row)
+            if early is not None:
+                return early
+            if (audit_id, slot_id) in self._uploading:
+                return Response(409, {"error": "an upload for this slot is in progress"})
+            self._uploading.add((audit_id, slot_id))
+            return None
+
+    def end_upload(self, audit_id: str, slot_id: str) -> None:
+        with self._lock:
+            self._uploading.discard((audit_id, slot_id))
 
     def receive(self, path_kind: str, artifact: Any, received_at: float | None = None) -> Response:
         """Ingest one signed artifact. ``path_kind`` is ``receipt`` or ``proof``."""
@@ -303,7 +331,8 @@ class Auditor:
     def _binding_mismatch(self, row: sqlite3.Row, artifact: dict[str, Any]) -> str:
         expected = {"netuid": self.netuid, "endpoint_id": row["endpoint_id"], "claimed_gpu_class": row["gpu_class"],
                     "gpu_index": 0, "lease_id": row["lease_id"], "B_select": row["selection_block"],
-                    "B_start": row["start_block"], "B_proof": row["proof_block"], "pass_count": row["pass_count"]}
+                    "B_start": row["start_block"], "B_proof": row["proof_block"], "pass_count": row["pass_count"],
+                    "workload_sha256": core.workload_digest(json.loads(row["workload_spec"]))}
         return next((k for k, v in expected.items() if artifact.get(k) != v), "")
 
     def _final(self, row: sqlite3.Row, artifact: dict[str, Any], received_at: float) -> Response:
@@ -440,18 +469,42 @@ class Auditor:
         return counts
 
     def gated(self, epoch: int) -> dict[tuple[str, str], str]:
-        """Endpoints whose evidence crosses a gate threshold, with the rule that fired. Empty in observe mode."""
+        """Endpoints whose evidence crosses a gate threshold, with the rule that fired. Empty in observe mode.
+
+        Each endpoint is judged on its own evidence. A hotkey is also judged on the evidence of all its endpoints,
+        including ones it has renamed or removed, against the thresholds times its current number of endpoints; if
+        that fires, every current endpoint of the hotkey is gated, so renaming an endpoint never clears evidence.
+        """
         if self.policy.mode != "score_gate":
             return {}
-        p, out = self.policy, {}
-        for key, c in self.evidence(epoch).items():
-            if c.get(INVALID, 0) >= p.invalid_proof_misses_for_zero_score:
-                out[key] = "invalid_proof"
-            elif c.get(MISSING_PROOF, 0) + c.get(NO_SHOW, 0) >= p.hard_proof_misses_for_zero_score:
-                out[key] = "missing_evidence"
-            elif c.get(TIMING_MISS, 0) >= p.timing_misses_for_zero_score:
-                out[key] = "timing"
+        evidence = self.evidence(epoch)
+        out = {key: rule for key, c in evidence.items() if (rule := self._rule(c, 1))}
+        with self._lock:
+            current: dict[str, list[str]] = {}
+            for slot in self._slots or []:
+                current.setdefault(slot.hotkey, []).append(slot.endpoint_id)
+        totals: dict[str, dict[str, int]] = {}
+        for (hotkey, _endpoint), counts in evidence.items():
+            t = totals.setdefault(hotkey, {})
+            for outcome, n in counts.items():
+                t[outcome] = t.get(outcome, 0) + n
+        for hotkey, counts in totals.items():
+            endpoints = current.get(hotkey, [])
+            rule = self._rule(counts, max(1, len(endpoints)))
+            if rule:
+                for endpoint_id in endpoints:
+                    out.setdefault((hotkey, endpoint_id), f"hotkey_{rule}")
         return out
+
+    def _rule(self, counts: dict[str, int], scale: int) -> str:
+        p = self.policy
+        if counts.get(INVALID, 0) >= p.invalid_proof_misses_for_zero_score:
+            return "invalid_proof"
+        if counts.get(MISSING_PROOF, 0) + counts.get(NO_SHOW, 0) >= p.hard_proof_misses_for_zero_score * scale:
+            return "missing_evidence"
+        if counts.get(TIMING_MISS, 0) >= p.timing_misses_for_zero_score * scale:
+            return "timing"
+        return ""
 
     def prune(self, epoch: int) -> None:
         """Drop windows that can no longer contribute evidence."""

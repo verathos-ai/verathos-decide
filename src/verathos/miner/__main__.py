@@ -67,24 +67,25 @@ class Publisher:
     def __init__(self, config: MinerConfig, wallet: bt.Wallet, cat: catalog.Catalog, *, publish_on_chain: bool,
                  subtensor: bt.Subtensor) -> None:
         self.config, self.wallet, self.publish_on_chain = config, wallet, publish_on_chain
-        self.catalog, self.signed = cat, self._build(cat, subtensor)
+        self.catalog, self.signed = cat, self._sign(cat)
+        if publish_on_chain:
+            publish(subtensor, self.wallet, self.config, self.signed)
+        self._published = True
         self.on_catalog: list[Callable[[catalog.Catalog, list[EndpointConfig]], None]] = []
 
-    def _build(self, cat: catalog.Catalog, subtensor: bt.Subtensor) -> SignedManifest:
+    def _sign(self, cat: catalog.Catalog) -> SignedManifest:
         endpoints = servable(self.config, cat)
         if not endpoints:
             raise SystemExit(f"no configured endpoint serves a model of catalog {cat.digest()[:12]}")
-        signed = build_manifest(self.config, endpoints, self.wallet.hotkey, cat.digest())
-        if self.publish_on_chain:
-            publish(subtensor, self.wallet, self.config, signed)
-        return signed
+        return build_manifest(self.config, endpoints, self.wallet.hotkey, cat.digest())
 
     def endpoints(self) -> list[EndpointConfig]:
         listed = {e.endpoint_id for e in self.signed.manifest.endpoints}
         return [e for e in self.config.endpoints if e.endpoint_id in listed]
 
     def watch(self, interval_s: float = POLICY_WATCH_S) -> None:
-        """Follow the owner's catalog commitment; a catalog that cannot be applied yet is retried."""
+        """Follow the owner's catalog commitment. A new catalog is adopted (manifest, audit policy) at once; its
+        on-chain publication is retried until it succeeds."""
 
         def run() -> None:
             st = bt.Subtensor(network=self.config.network)
@@ -92,20 +93,21 @@ class Publisher:
             while True:
                 time.sleep(interval_s)
                 try:
-                    if committed_catalog(st, self.config.netuid) == self.catalog.digest():
-                        continue
-                    cat = current_catalog(st, self.config.netuid, store, self.config.catalog_mirrors)
-                    signed = self._build(cat, st)
+                    if committed_catalog(st, self.config.netuid) != self.catalog.digest():
+                        cat = current_catalog(st, self.config.netuid, store, self.config.catalog_mirrors)
+                        self.catalog, self.signed, self._published = cat, self._sign(cat), False
+                        log.info("catalog %s committed; manifest rebuilt", cat.digest()[:12])
+                        for callback in self.on_catalog:
+                            callback(cat, self.endpoints())
+                    if self.publish_on_chain and not self._published:
+                        publish(st, self.wallet, self.config, self.signed)
+                        self._published = True
+                        log.info("manifest published")
                 except SystemExit as exc:
                     log.critical("%s; stopping", exc)
                     os._exit(1)
                 except Exception:
-                    log.exception("new catalog not applied; retrying")
-                    continue
-                self.catalog, self.signed = cat, signed
-                log.info("catalog %s committed; manifest re-published", cat.digest()[:12])
-                for callback in self.on_catalog:
-                    callback(cat, self.endpoints())
+                    log.exception("catalog follow failed; retrying")
 
         threading.Thread(target=run, name="catalog-watch", daemon=True).start()
 

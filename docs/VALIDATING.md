@@ -125,5 +125,6 @@ If the validator's hotkey is the auditor, it also:
 - in `score_gate` mode, gates endpoints on its own evidence.
 
 The audit database is `state_dir/capacity.sqlite`. Keep the auditor running continuously: windows it did not
-follow are void, and an outage voids evidence rather than counting misses. After a restart it replays the recent
-blocks so the slots of running windows stay busy, as they are on the miners.
+follow are void, slots still open when it restarts are neutral, and an outage voids evidence rather than counting
+misses. After a restart it replays the recent blocks so the slots of running windows stay busy, as they are on the
+miners.

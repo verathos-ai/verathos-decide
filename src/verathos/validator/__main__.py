@@ -61,7 +61,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     tolerances = {m.model_id: m.tolerance for m in cat.models}
     async with httpx.AsyncClient() as client:
         miners = await discover(neurons, cfg.netuid, cfg.mechid, client, current.accepted())
-        capacity.update_slots(miners)
+        capacity.update_slots(miners, neurons)
         endpoints = [e for m in miners for e in m.endpoints() if e.endpoint.tier == "open"
                      and cat.get(e.endpoint.model_id) is not None and cat.get(e.endpoint.model_id).status != "retired"]
         log.info("epoch %d: %d miners, %d open endpoints", epoch, len(miners), len(endpoints))
@@ -70,7 +70,11 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                                     references=references, tolerances=tolerances, client=client, netuid=cfg.netuid,
                                     mechid=cfg.mechid, pool_size=cfg.pool_size, per_endpoint=cfg.per_endpoint,
                                     spread_s=spread_s, drained=capacity.drained)
-        gated = await capacity.gated(client, capacity_epoch)
+        try:
+            gated = await capacity.gated(client, capacity_epoch)
+        except Exception:
+            log.exception("capacity verdicts unavailable this epoch")
+            gated = {}
     for e in references.values():
         await e.close()
     for (hotkey, endpoint_id), rule in sorted(gated.items()):
@@ -89,7 +93,16 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         log.info("  %s epoch_verdict=%s answered=%d/%d identity=%s mean_abs=%.4f score=%.3f%s",
                  key, r.tally.verdict().value, r.answered, r.sent, r.identity_ok, r.tally.mean_abs,
                  scores.get(key, 0.0), f" errors={sorted(set(r.errors))}" if r.errors else "")
-    w = weights(state, hotkey_of_uid, per_uid="sum" if gating else "max")
+    # The epoch is scored; a failure from here on must not run it again.
+    try:
+        set_weights(cfg, st, wallet, weights(state, hotkey_of_uid, per_uid="sum" if gating else "max"),
+                    hotkey_of_uid)
+    except Exception:
+        log.exception("setting weights failed this epoch")
+
+
+def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: dict[int, float],
+                hotkey_of_uid: dict[int, str]) -> None:
     if not w:
         owner = chain.owner_uid(st, cfg.netuid, hotkey_of_uid)
         if owner is None:

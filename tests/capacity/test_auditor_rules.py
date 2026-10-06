@@ -91,3 +91,84 @@ def test_unknown_slot_stops_only_that_slots_delivery() -> None:
     assert publisher.wait_idle(5)
     publisher.stop()
     assert delivered == ["b"]
+
+
+def test_renamed_endpoints_still_count_against_their_hotkey(tmp_path) -> None:
+    from verathos.capacity.auditor import TIMING_MISS
+
+    a, chain = auditor(tmp_path)
+    a.policy = dataclasses.replace(POLICY, mode="score_gate")
+    a._last_block = chain.n - 1
+    for i, endpoint_id in enumerate(("old-a", "old-b")):  # one miss each, under names no longer listed
+        a._db.execute("INSERT INTO windows (audit_id, epoch, selection_block, start_block, proof_block, "
+                      "selection_hash, chain_status) VALUES (?, 1, 0, 0, 0, '', 'confirmed')", (f"w{i}",))
+        a._db.execute("INSERT INTO slots (audit_id, slot_id, hotkey, endpoint_id, gpu_class, lease_id, workload_spec, "
+                      "pass_count, deadline_s, outcome) VALUES (?, ?, 'hk0', ?, 'Test GPU', '', '{}', 2, 30, ?)",
+                      (f"w{i}", f"s{i}", endpoint_id, TIMING_MISS))
+    assert a.gated(2) == {("hk0", "gpu0"): "hotkey_timing"}
+
+
+def test_restart_neutralises_slots_that_were_still_open(tmp_path) -> None:
+    a, chain = auditor(tmp_path)
+    a._last_block = chain.n - 1
+    a.poll_once()
+    assert {o for _, o, _ in windows(a)} == {PENDING}
+    again = Auditor(netuid=405, policy=POLICY, chain=chain, db_path=tmp_path / "a.sqlite")
+    assert {(o, r) for _, o, r in windows(again)} == {(NEUTRAL, "auditor_restarted")}
+
+
+def test_policy_change_also_voids_windows_opened_just_before_it(tmp_path) -> None:
+    a, chain = auditor(tmp_path)
+    a._last_block = chain.n - 1
+    a.poll_once()
+    a.set_policy(dataclasses.replace(POLICY, deadline_s=20.0))
+    assert set(windows(a)) == {("void", NEUTRAL, "policy_transition")}
+
+
+def test_proof_uploads_must_be_signed_by_the_slot_hotkey(tmp_path) -> None:
+    from bittensor_wallet import Keypair
+
+    from verathos.capacity.auditor import TIMING_PASS
+    from verathos.protocol import signing
+
+    owner, other = (Keypair.create_from_mnemonic(Keypair.generate_mnemonic()) for _ in range(2))
+    a, chain = auditor(tmp_path)
+    a.update_slots([core.Slot(405, owner.ss58_address, "gpu0", "http://203.0.113.9:8091/e/gpu0", "kev-4b",
+                              "Test GPU", 8)])
+    a._last_block = chain.n - 1
+    a.poll_once()
+    row = a._db.execute("SELECT audit_id, slot_id FROM slots").fetchone()
+    a._db.execute("UPDATE slots SET outcome = ?", (TIMING_PASS,))
+    a._db.execute("UPDATE windows SET proof_hash = 'aa', proof_observed_at = 0")
+    claim = core.upload_claim(row["audit_id"], row["slot_id"])
+    forged = signing.sign(other, core.UPLOAD_DOMAIN, claim)
+    assert a.begin_upload(row["audit_id"], row["slot_id"], forged).status == 401
+    signed = signing.sign(owner, core.UPLOAD_DOMAIN, claim)
+    assert a.begin_upload(row["audit_id"], row["slot_id"], signed) is None
+    assert a.begin_upload(row["audit_id"], row["slot_id"], signed).status == 409  # one upload at a time
+    a.end_upload(row["audit_id"], row["slot_id"])
+    assert a.begin_upload(row["audit_id"], row["slot_id"], signed) is None
+
+
+def test_a_failed_manifest_fetch_keeps_the_last_slots() -> None:
+    from verathos.protocol.manifest import Manifest
+    from verathos.validator.capacity import Capacity
+    from verathos.validator.discovery import DiscoveredMiner, Neuron
+
+    class Sink:
+        slots: list = []
+
+        def update_slots(self, slots) -> None:
+            self.slots = slots
+
+    sink = Sink()
+    cap = Capacity(netuid=405, policy=POLICY, auditor_hotkey="", chain=None, holds=sink)
+    manifest = Manifest(netuid=405, mechid=1, hotkey="hkA", catalog_digest="0" * 64, endpoints=[{
+        "endpoint_id": "gpu0", "url": "http://203.0.113.5:80/e/gpu0", "model_id": "kev-4b", "max_concurrency": 1,
+        "hardware": {"kind": "cuda", "device_id": "GPU-a", "gpu_name": "Test GPU", "vram_gb": 8}}])
+    miner = DiscoveredMiner(1, "hkA", "http://203.0.113.5:80", manifest)
+    cap.update_slots([miner], [Neuron(1, "hkA", "203.0.113.5", 80, "c1")])
+    cap.update_slots([], [Neuron(1, "hkA", "203.0.113.5", 80, "c1")])  # fetch failed, same commitment
+    assert [s.hotkey for s in sink.slots] == ["hkA"]
+    cap.update_slots([], [Neuron(1, "hkA", "203.0.113.5", 80, "c2")])  # new commitment not fetched: dropped
+    assert sink.slots == []

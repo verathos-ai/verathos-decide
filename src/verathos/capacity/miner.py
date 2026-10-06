@@ -38,6 +38,7 @@ from bittensor_wallet import Keypair
 
 from verathos.capacity import core
 from verathos.capacity.proof.combined import COMBINED_PROOF_FORMAT, final_commitment
+from verathos.protocol import signing
 
 log = logging.getLogger(__name__)
 
@@ -138,13 +139,14 @@ class _Lane:
                  lock: threading.Lock) -> None:
         self._name, self._chain, self._client = name, chain, client
         self._rejected, self._rejected_lock = rejected, lock
-        self._queue: queue.Queue[tuple[str, dict, float, float]] = queue.Queue(maxsize=64)
+        self._queue: queue.Queue[tuple[str, dict, float, float, dict[str, str]]] = queue.Queue(maxsize=64)
         self._stop = threading.Event()
         threading.Thread(target=self._run, name=f"capacity-{name}", daemon=True).start()
 
-    def publish(self, path: str, artifact: dict, *, until: float, retry_delay_s: float) -> None:
+    def publish(self, path: str, artifact: dict, *, until: float, retry_delay_s: float,
+                headers: dict[str, str] | None = None) -> None:
         try:
-            self._queue.put_nowait((path, artifact, until, retry_delay_s))
+            self._queue.put_nowait((path, artifact, until, retry_delay_s, headers or {}))
         except queue.Full:
             log.warning("capacity %s queue full; dropping audit %s", self._name, str(artifact.get("audit_id"))[:12])
 
@@ -157,19 +159,19 @@ class _Lane:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                path, artifact, until, delay = self._queue.get(timeout=0.1)
+                path, artifact, until, delay, headers = self._queue.get(timeout=0.1)
             except queue.Empty:
                 continue
             try:
-                self._deliver(path, artifact, until, delay)
+                self._deliver(path, artifact, until, delay, headers)
             except Exception:
                 log.exception("capacity %s delivery failed", self._name)
             finally:
                 self._queue.task_done()
 
-    def _deliver(self, path: str, artifact: dict, until: float, delay: float) -> None:
+    def _deliver(self, path: str, artifact: dict, until: float, delay: float, extra: dict[str, str]) -> None:
         key = (str(artifact.get("audit_id") or ""), str(artifact.get("slot_id") or ""))
-        headers = {core.HDR_AUDIT_ID: key[0], core.HDR_SLOT_ID: key[1]}
+        headers = {core.HDR_AUDIT_ID: key[0], core.HDR_SLOT_ID: key[1], **extra}
         while True:
             with self._rejected_lock:
                 if key in self._rejected:
@@ -285,12 +287,15 @@ class AuditWorker:
             time.sleep(self.poll_s)
 
     def poll_once(self) -> None:
-        """Process every block from the last seen one up to the current head, in order."""
+        """Process every block from the last processed one up to the current head, in order. On start-up the recent
+        blocks are replayed, so slots drafted before the start count as busy, as they do on the auditor."""
         head, head_hash = self.chain.head()
         if head <= 0:
             return
         if self._last_block <= 0:
-            self._last_block = head - 1
+            p = self.policy
+            self._last_block = head - (p.lead_blocks + max(1, p.proof_challenge_delay_blocks)
+                                       + core.payload_cooldown_blocks(p, self.block_time_s)) - 1
         for n in range(self._last_block + 1, head + 1):
             h = head_hash if n == head and head_hash else self.chain.block_hash(n)
             if h is None:
@@ -300,7 +305,7 @@ class AuditWorker:
                 for old in [b for b in self._hashes if b < n - 255]:
                     del self._hashes[old]
                 self._hash_cond.notify_all()
-            self.on_block(n, h)
+            self.on_block(n, h, head)
             self._last_block = n
 
     def _wait_hash(self, block_number: int, timeout_s: float) -> bytes | None:
@@ -318,7 +323,9 @@ class AuditWorker:
 
     # ---- selection ----
 
-    def on_block(self, block_number: int, block_hash: bytes) -> None:
+    def on_block(self, block_number: int, block_hash: bytes, head: int) -> None:
+        """Draft this block's window. A window whose B_start has already passed (start-up replay, a stalled block
+        feed) only marks its slots busy: its timed work can no longer start on time."""
         window = core.open_window(self.netuid, block_number, block_hash, self.chain.epoch_blocks(), self.policy)
         if window is None:
             return
@@ -332,6 +339,10 @@ class AuditWorker:
                                   proof_block, core.lease_id(slot, window.epoch))
             self._busy_until_block[ep.endpoint_id] = proof_block + core.payload_cooldown_blocks(self.policy,
                                                                                                 self.block_time_s)
+            if head >= audit_block:
+                log.warning("endpoint %s was drafted at block %d, which this miner processed only after B_start",
+                            ep.endpoint_id, block_number)
+                continue
             self.drain.set(ep.endpoint_id, time.time() + core.active_hold_seconds(self.policy, self.block_time_s))
             t = threading.Thread(target=self._run_audit, args=(audit,), name=f"audit-{audit_id[:8]}-{ep.endpoint_id}",
                                  daemon=True)
@@ -352,7 +363,7 @@ class AuditWorker:
             "netuid": self.netuid, "hotkey": self.keypair.ss58_address, "endpoint_id": audit.endpoint.endpoint_id,
             "claimed_gpu_class": audit.gpu_class.gpu_name, "gpu_index": 0, "lease_id": audit.lease,
             "B_select": audit.selection_block, "B_start": audit.audit_block, "B_proof": audit.proof_block,
-            "pass_count": audit.passes, **fields,
+            "pass_count": audit.passes, "workload_sha256": core.workload_digest(audit.workload_spec), **fields,
         }
         artifact["miner_signature"] = core.sign_artifact(artifact, self.keypair)
         return artifact
@@ -443,8 +454,10 @@ class AuditWorker:
         if not isinstance(payload, dict) or payload.get("format") != COMBINED_PROOF_FORMAT:
             log.warning("audit %s: bench produced no proof payload", audit.audit_id[:12])
             return proc
+        upload = signing.sign(self.keypair, core.UPLOAD_DOMAIN, core.upload_claim(audit.audit_id, audit.slot.slot_id))
         self.publisher.proofs.publish(core.PROOF_PATH, self._artifact(
             audit, artifact_type="capacity_audit_proof_payload", sampled_pass_proof=payload,
-            B_proof_hash=proof_hash.hex()), until=proof_seen + p.payload_deadline_s, retry_delay_s=5.0)
+            B_proof_hash=proof_hash.hex()), until=proof_seen + p.payload_deadline_s, retry_delay_s=5.0,
+            headers={core.HDR_UPLOAD_SIGNATURE: upload})
         log.info("audit %s: proof published", audit.audit_id[:12])
         return proc
