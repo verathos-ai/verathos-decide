@@ -24,7 +24,8 @@ policy lives in the catalog (`capacity_audit`), so the subnet owner commits it o
 ## Slots
 
 A slot is one endpoint of one hotkey listed in an accepted manifest: `slot_id = H(netuid, hotkey, endpoint_id)`.
-The auditor drafts from every open CUDA endpoint that declares `gpu_name` and `vram_gb`. An endpoint whose declared
+The auditor drafts from every open CUDA endpoint that declares `gpu_name` and `vram_gb`. Validators re-discover
+miners every 10 minutes for this list, so a new endpoint joins the audit within minutes. An endpoint whose declared
 GPU is not a calibrated class cannot be drafted; in `score_gate` mode it scores zero.
 
 ## Windows and cohorts

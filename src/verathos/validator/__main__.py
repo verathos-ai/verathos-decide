@@ -107,6 +107,7 @@ def main() -> None:
     capacity = Capacity.start(network=cfg.network, netuid=cfg.netuid, policy=catalog.load().audit_policy(), st=st,
                               wallet=wallet, state_dir=state_dir, public_host=cfg.capacity_public_host,
                               port=cfg.capacity_port)
+    capacity.start_slot_refresh(cfg.network, catalog.load().digest())
 
     done: int | None = None
     while True:

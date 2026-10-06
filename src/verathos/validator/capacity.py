@@ -8,8 +8,10 @@ applies the auditor's signed verdicts.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
+import time
 from pathlib import Path
 
 import bittensor as bt
@@ -23,7 +25,8 @@ from verathos.capacity.holds import HoldTracker
 from verathos.capacity.ingest import create_ingest_app
 from verathos.capacity.verdicts import fetch_verdicts
 from verathos.chain import serve_axon
-from verathos.validator.discovery import DiscoveredMiner
+from verathos.validator import chain as validator_chain
+from verathos.validator.discovery import DiscoveredMiner, discover
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +71,26 @@ class Capacity:
         serve_axon(st, wallet, netuid, public_host, port)
         log.info("capacity auditor running (%s mode) on port %d", policy.mode, port)
         return cls(netuid=netuid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain, auditor=auditor)
+
+    def start_slot_refresh(self, network: str, catalog_digest: str, interval_s: float = 600.0) -> None:
+        """Re-discover miners every ``interval_s`` so new or changed endpoints join the audit within minutes rather
+        than at the next epoch."""
+
+        def run() -> None:
+            st = bt.Subtensor(network=network)
+            while True:
+                time.sleep(interval_s)
+                try:
+                    neurons, _ = validator_chain.snapshot(st, self.netuid)
+                    self.update_slots(asyncio.run(self._discover(neurons, catalog_digest)))
+                except Exception:
+                    log.exception("capacity slot refresh failed")
+
+        threading.Thread(target=run, name="capacity-slots", daemon=True).start()
+
+    async def _discover(self, neurons: list, catalog_digest: str) -> list[DiscoveredMiner]:
+        async with httpx.AsyncClient() as client:
+            return await discover(neurons, self.netuid, client, catalog_digest)
 
     def update_slots(self, miners: list[DiscoveredMiner]) -> None:
         slots = capacity_slots(miners, self.netuid)
