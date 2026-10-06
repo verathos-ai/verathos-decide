@@ -55,7 +55,8 @@ class AuditPolicy:
     test_s: float = 16.0
     request_timeout_s: float = 20.0
     pass_fraction: float = 0.95
-    samples_per_test: int = 10
+    samples_per_test: int = 10  # responses whose receipts are checked
+    answer_checks_per_test: int = 2  # of those, answers the reference recomputes
     capacity_margin: float = 0.95
     qualification_tests: int = 1
     credit_ttl_epochs: int = 2
@@ -73,9 +74,12 @@ class AuditPolicy:
             raise ValueError("warmup_s must be at least max_latency_s")
         if self.session_s > MAX_SESSION_S:
             raise ValueError(f"warmup_s + test_s + request_timeout_s must stay under {MAX_SESSION_S - 5:.0f} s")
-        if min(self.lead_blocks, self.samples_per_test, self.qualification_tests, self.credit_ttl_epochs) < 1:
-            raise ValueError("lead_blocks, samples_per_test, qualification_tests and credit_ttl_epochs must be at "
-                             "least 1")
+        if min(self.lead_blocks, self.samples_per_test, self.answer_checks_per_test, self.qualification_tests,
+               self.credit_ttl_epochs) < 1:
+            raise ValueError("lead_blocks, samples_per_test, answer_checks_per_test, qualification_tests and "
+                             "credit_ttl_epochs must be at least 1")
+        if self.answer_checks_per_test > self.samples_per_test:
+            raise ValueError("answer_checks_per_test cannot exceed samples_per_test")
         if self.rate_growth < 1:
             raise ValueError("rate_growth must be at least 1")
         if not 0 < self.min_test_share <= 1:

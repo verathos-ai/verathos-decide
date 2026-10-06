@@ -200,6 +200,7 @@
     "request_timeout_s": 20.0,
     "pass_fraction": 0.95,
     "samples_per_test": 10,
+    "answer_checks_per_test": 2,
     "capacity_margin": 0.95,
     "qualification_tests": 1,
     "credit_ttl_epochs": 2,

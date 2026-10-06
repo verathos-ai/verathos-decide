@@ -9,11 +9,12 @@ Per test:
 2. When the start block appears, the load generator drives all targets at once: ``warmup_s`` unmeasured, then
    ``test_s`` measured. Endpoints sharing hardware, or a pool behind several endpoints, must deliver the sum of their
    rates at the same time.
-3. Per endpoint: delivered = requests sent in the measured window and answered by its end plus ``max_latency_s``,
-   per second, scaled by the share of sampled responses whose receipt is valid. Credit = delivered (up to the tested
-   rate); below ``pass_fraction`` of the tested rate it is scaled by delivered / tested once more, so declaring more
-   than an endpoint serves costs credit. A sampled answer the miner signed and the reference proves wrong makes the
-   result invalid; the evidence is kept for the verdicts.
+3. Per endpoint: delivered = requests sent in the measured window and answered by its end plus ``max_latency_s``, per
+   second, scaled by the share of sampled responses whose receipt is valid. The reference recomputes
+   ``answer_checks_per_test`` of the signed answers (the expensive check; a wrong model is wrong on every request).
+   Credit = delivered (up to the tested rate); below ``pass_fraction`` of the tested rate it is scaled by delivered /
+   tested once more, so declaring more than an endpoint serves costs credit. A sampled answer the miner signed and
+   the reference proves wrong makes the result invalid; the evidence is kept for the verdicts.
 4. Once the selection block is final with the hash it was selected by, the test is confirmed; otherwise void. A test
    is also void when the load generator fails or falls behind its schedule (for one endpoint: that endpoint's
    result).
@@ -27,6 +28,7 @@ import asyncio
 import json
 import logging
 import math
+import random
 import secrets
 import sqlite3
 import threading
@@ -382,29 +384,32 @@ class Auditor:
         if r.late_sends > LATE_SEND_SHARE * max(r.sent, 1):
             return Result(target, "void", "the auditor's load generator fell behind", **latency)
         slot, model = target.slot, self.catalog().get(target.slot.model_id)
-        valid, evidence = 0, None
+        signed = []  # (sample, response, answers) whose receipt is valid
         for sample in r.samples:
             response = parse_response(sample.response)
             answers = None if response is None else signed_answers(
                 response, sample.request, request_id=sample.request_id, hotkey=slot.hotkey,
                 endpoint_id=slot.endpoint_id, model_id=slot.model_id, auditor=self.hotkey, netuid=self.netuid,
                 mechid=self.mechid)
-            if answers is None:
-                continue
-            valid += 1
-            if evidence is None and model is not None:
-                try:
-                    fault = await answer_fault(sample.request, answers, references.get(slot.model_id),
-                                               model.tolerance)
-                except ReferenceUnavailable as exc:
-                    log.warning("reference for %s unavailable, a sample of %s is unchecked: %s", slot.model_id,
-                                slot.key, exc)
-                    fault = None
-                if fault:
-                    evidence = Evidence(hotkey=slot.hotkey, endpoint_id=slot.endpoint_id, model_id=slot.model_id,
-                                        test_id=test.test_id, reason=fault, request_id=sample.request_id,
-                                        request=sample.request,
-                                        response={"answers": answers, "receipt": response["receipt"]})
+            if answers is not None:
+                signed.append((sample, response, answers))
+        valid, evidence = len(signed), None
+        # Every signed answer is checked for form; the reference recomputes a few of them.
+        recomputed = {id(s) for s, _, _ in random.sample(signed, min(policy.answer_checks_per_test, len(signed)))}
+        for sample, response, answers in signed if model is not None else []:
+            reference = references.get(slot.model_id) if id(sample) in recomputed else None
+            try:
+                fault = await answer_fault(sample.request, answers, reference, model.tolerance)
+            except ReferenceUnavailable as exc:
+                log.warning("reference for %s unavailable, a sample of %s is unchecked: %s", slot.model_id,
+                            slot.key, exc)
+                fault = None
+            if fault:
+                evidence = Evidence(hotkey=slot.hotkey, endpoint_id=slot.endpoint_id, model_id=slot.model_id,
+                                    test_id=test.test_id, reason=fault, request_id=sample.request_id,
+                                    request=sample.request,
+                                    response={"answers": answers, "receipt": response["receipt"]})
+                break
         delivered = round(r.completed / policy.test_s * (valid / len(r.samples) if r.samples else 1.0), 2)
         if evidence is not None:
             return Result(target, "invalid", evidence.reason, delivered, 0.0, evidence=evidence, **latency)

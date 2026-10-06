@@ -83,9 +83,11 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
    up answers the window's requests late and delivers less.
 4. **Samples.** For `samples_per_test` (10) random delivered responses per endpoint the auditor checks the receipt:
    signed by the miner, binding the request and the answers, naming the auditor and the request id. Delivered is
-   scaled by the share of valid receipts. The answers of every valid sample are recomputed by the auditor's
-   reference engine; an answer that fails the hard check (`SCORING.md`) is a wrong answer, proven by the miner's own
-   signature. The request, the answers and the receipt are kept as evidence.
+   scaled by the share of valid receipts. Every signed answer must be well formed, and the auditor's reference
+   engine recomputes `answer_checks_per_test` (2) of them, picked at random: an answer that fails the hard check
+   (`SCORING.md`) is a wrong answer, proven by the miner's own signature. The request, the answers and the receipt
+   are kept as evidence. Recomputing is the expensive check (about 2 per second for Kev-4B in fp32 on an A100), and
+   a wrong model is wrong on every request.
 5. **Credit.** What was delivered, up to the tested rate. If delivered falls short of `pass_fraction` (0.95) of the
    tested rate, the credit is scaled by delivered / tested once more: an endpoint that declares twice what it serves
    is credited a quarter of its declaration, so declaring more than an endpoint serves never pays. A result with a
@@ -153,7 +155,8 @@ recognisable by its session, so hardware used for other work between tests could
 | `warmup_s`, `test_s` | 3, 16 | unmeasured and measured traffic, seconds; `warmup_s` is at least `max_latency_s` |
 | `request_timeout_s` | 20 | per-request timeout of the load generator |
 | `pass_fraction` | 0.95 | share of the tested rate below which the credit is scaled down once more |
-| `samples_per_test` | 10 | responses per endpoint whose receipts and answers are checked |
+| `samples_per_test` | 10 | responses per endpoint whose receipts are checked |
+| `answer_checks_per_test` | 2 | of those, answers the reference recomputes |
 | `capacity_margin` | 0.95 | share of the measured median a miner declares |
 | `qualification_tests` | 1 | confirmed tests with a credit before an endpoint is scored |
 | `credit_ttl_epochs` | 2 | how many closed epochs back a test still counts |
@@ -166,8 +169,8 @@ Per model: `workload` (the request mix), `score_per_rps` and `first_test_rps`.
 
 The auditor needs:
 - the load generator: `verathos-build-loadgen` (Rust) builds `native/loadgen` and installs it next to the code;
-- a reference engine per model on a GPU: about 10 checks per endpoint and test, and a reference GPU checks Kev-4B
-  in fp32 at 10-16 requests/s (24 CPU cores: about 0.13/s);
+- a reference engine per model on a GPU: `answer_checks_per_test` recomputes per endpoint and test, at about 2 per
+  second for Kev-4B's request mix in fp32 on an A100, so one GPU checks about 1,000 endpoints in under 20 minutes;
 - a public IP and port for its service, and a steady connection: one machine sends the whole network's test
   traffic in one burst.
 

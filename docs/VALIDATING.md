@@ -16,7 +16,8 @@ the auditor's signed verdicts. Each validator finds its role at startup from the
   canary is computed once per epoch and reused for every endpoint. Measured on a rented server CPU: Kev-4B 3.4 s and
   Kev-9B 6.6 s per request; the fp32 weights alone take about 16 GB and 36 GB of RAM. A GPU in fp32 is faster.
 - The auditor additionally needs Rust (rustup) and `build-essential` for the load generator, a reference engine
-  per model on a GPU (it checks about 10 answers per endpoint and test), a public IP and one open TCP port.
+  per model on a GPU (it recomputes 2 answers per endpoint and test, about 2 per second on an A100), a public IP
+  and one open TCP port.
 - A public IP of its own: behind most NATs a machine cannot reach other machines that share its public IP through
   that IP, so a validator next to miners on one NAT cannot send them canaries.
 

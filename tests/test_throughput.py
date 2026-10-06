@@ -109,7 +109,7 @@ def test_a_policy_change_never_selects_a_second_test_in_an_epoch() -> None:
 def test_policy_comes_from_the_catalog_and_is_checked() -> None:
     assert policy_from({"pass_fraction": 0.9, "samples_per_test": 20}, 360).samples_per_test == 20
     for bad in ({"unknown": 1}, {"epoch_blocks": 100}, {"pass_fraction": 1.5}, {"rate_growth": 0.5},
-                {"test_s": 400.0}):
+                {"test_s": 400.0}, {"answer_checks_per_test": 11}):
         with pytest.raises(ValueError):
             policy_from(bad, 180)
     with pytest.raises(ValueError, match="too short"):
@@ -289,8 +289,15 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
     policy = dataclasses.replace(AuditPolicy(), max_latency_s=0.5, warmup_s=0.5, test_s=2.0, samples_per_test=5)
     chain = FakeChain(head=3 * 180 + 40)
 
+    class CountingReference(MockEngine):
+        calls = 0
+
+        async def answer(self, request):
+            CountingReference.calls += 1
+            return await super().answer(request)
+
     async def run():
-        reference = MockEngine("kev-4b")
+        reference = CountingReference("kev-4b")
         shared = CapacityEngine(MockEngine("kev-4b"), rps=40)
         engines = {"honest": {"gpu0": CapacityEngine(MockEngine("kev-4b"), rps=80)},
                    "over": {"gpu0": CapacityEngine(MockEngine("kev-4b"), rps=20)},
@@ -308,6 +315,8 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
         test = ScheduledTest(3, selection, block_hash(selection).hex(), chain.head_block)
         auditor.follower.poll()
         await auditor.run_test(test, {"kev-4b": reference})
+        # two recomputed answers per endpoint at most (the wrong one stops at its first)
+        assert 4 <= CountingReference.calls <= 2 * 5
         auditor.settle()
         chain.head_block = 4 * 180 + 1
         assert auditor.verdicts(5) is None  # epoch 5 has not started
