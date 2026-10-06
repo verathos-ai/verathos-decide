@@ -7,7 +7,7 @@ name = "verathos"
 version = "0.0.1"
 description = "Decision-model network on Bittensor: typed answers with calibrated probabilities, verified by reference recomputation"
 requires-python = ">=3.12"
-license = "Apache-2.0"
+license = "MIT"
 dependencies = [
     "pydantic>=2.9",
     "bittensor-wallet>=4.0",

@@ -17,6 +17,8 @@ class EndpointConfig(BaseModel):
     engine_url: str = Field(description="Local decision engine serving POST /v1/systemone, e.g. http://127.0.0.1:8008")
     engine_api_key: str | None = None
     hardware: Hardware
+    cuda_device: int | None = Field(None, ge=0, description="CUDA device index of this endpoint's GPU; the capacity "
+                                    "audit bench runs on it")
     max_concurrency: int = Field(64, ge=1, le=4096)
     tier: Literal["open", "private"] = "open"
 

@@ -48,6 +48,7 @@ def create_app(
     engines: dict[str, Engine],
     authorized: Callable[[str], bool],
     catalog_digest: str,
+    drained: Callable[[str], bool] = lambda endpoint_id: False,
 ) -> FastAPI:
     app = FastAPI(title="Verathos miner")
     nonces = NonceCache()
@@ -107,6 +108,8 @@ def create_app(
             return error(422, f"invalid request: {e}")
         if parsed.model != endpoint.model_id:
             return error(422, f"endpoint serves {endpoint.model_id}, not {parsed.model}")
+        if drained(endpoint_id):
+            return error(503, "endpoint is running a capacity audit")
         slot = slots[endpoint_id]
         if slot.locked():
             return error(503, "endpoint at capacity")

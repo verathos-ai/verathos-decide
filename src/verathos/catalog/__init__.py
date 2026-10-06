@@ -1,4 +1,4 @@
-"""Model catalog: the models the network serves and how their answers are verified.
+"""Subnet catalog: the models the network serves, how their answers are verified, and the capacity-audit policy.
 
 The catalog file ships with the code. The subnet owner commits its digest on chain; validators and miners use a
 catalog only when its digest equals the owner's current commitment.
@@ -6,14 +6,16 @@ catalog only when its digest equals the owner's current commitment.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from importlib import resources
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from verathos.capacity.core import AuditPolicy
 from verathos.protocol.canonical import digest
 from verathos.validator.compare import Tolerance
 
@@ -34,17 +36,29 @@ class CatalogModel(BaseModel):
     tolerance: Tolerance = Tolerance()
 
 
+_AUDIT_FIELDS = {f.name for f in dataclasses.fields(AuditPolicy)} - {"gpu_classes"}
+
+
 class Catalog(BaseModel):
     version: Literal[1] = 1
     revision: str
     models: list[CatalogModel]
+    capacity_audit: dict[str, Any] = Field(default_factory=dict, description="Overrides of the capacity-audit policy")
 
     @model_validator(mode="after")
-    def _unique(self) -> Catalog:
+    def _check(self) -> Catalog:
         ids = [m.model_id for m in self.models]
         if len(ids) != len(set(ids)):
             raise ValueError("model ids must be unique")
+        unknown = set(self.capacity_audit) - _AUDIT_FIELDS
+        if unknown:
+            raise ValueError(f"unknown capacity_audit settings: {sorted(unknown)}")
+        self.audit_policy().validate()
         return self
+
+    def audit_policy(self) -> AuditPolicy:
+        """The capacity-audit policy: code defaults (live-calibrated values) with this catalog's overrides."""
+        return dataclasses.replace(AuditPolicy(), **self.capacity_audit)
 
     def digest(self) -> str:
         return digest(self.model_dump(mode="json"))

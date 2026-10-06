@@ -1,0 +1,134 @@
+"""Capacity-audit miner worker against a simulated chain, a fake bench speaking the real bench's file protocol, and a
+recording auditor endpoint."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+import threading
+import time
+from pathlib import Path
+
+import httpx
+from bittensor_wallet import Keypair
+
+from verathos.capacity import core
+from verathos.capacity.miner import AuditEndpoint, AuditWorker, DrainState
+
+BLOCK_S = 0.05
+
+FAKE_BENCH = r'''
+import json, sys, time, pathlib
+out, lease, challenge_file, start_file, ready_file = sys.argv[1:6]
+out = pathlib.Path(out)
+pathlib.Path(ready_file).write_text("{}")
+while not pathlib.Path(start_file).exists():
+    time.sleep(0.005)
+seed = json.loads(pathlib.Path(start_file).read_text())["seed_hex"]
+(out / f"{lease}_pass0.json").write_text(json.dumps({"root": "aa" * 32}))
+time.sleep(0.02)
+(out / f"{lease}_final_timing.json").write_text(json.dumps({
+    "root": "bb" * 32, "transcript_root": "cc" * 32, "proof_format": "hot_capacity_combined_proof_v2",
+    "proof_protocol_version": 2, "workload_version": "hot_capacity_combined", "pass_count": 337}))
+while not pathlib.Path(challenge_file).exists():
+    time.sleep(0.005)
+challenge = pathlib.Path(challenge_file).read_text()
+(out / f"{lease}_final.json").write_text(json.dumps({"proof_payload": {
+    "format": "hot_capacity_combined_proof_v2", "proof_protocol_version": 2,
+    "capacity_proof": {"sampled": {"pass_index": 3}}, "seed_seen": seed, "challenge_seen": challenge}}))
+'''
+
+
+def block_hash(n: int) -> bytes:
+    return hashlib.sha256(f"block-{n}".encode()).digest()
+
+
+class FakeChain:
+    def __init__(self, start: int) -> None:
+        self.n = start
+        self.lock = threading.Lock()
+
+    def tick(self) -> None:
+        with self.lock:
+            self.n += 1
+
+    def head(self):
+        with self.lock:
+            return self.n, block_hash(self.n)
+
+    def block_hash(self, n):
+        with self.lock:
+            return block_hash(n) if n <= self.n else None
+
+    def epoch_blocks(self) -> int:
+        return 360
+
+    def auditor_url(self) -> str:
+        return "http://auditor"
+
+
+def test_drafted_endpoint_runs_audit_and_publishes_signed_artifacts(tmp_path: Path) -> None:
+    script = tmp_path / "fake_bench.py"
+    script.write_text(FAKE_BENCH)
+    received: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.append({"path": request.url.path, **json.loads(request.content)})
+        return httpx.Response(200, json={"ok": True})
+
+    def bench_command(audit, *, out_dir, challenge_file, ready_file, start_file, start_timeout_s, challenge_timeout_s):
+        return [sys.executable, str(script), str(out_dir), audit.lease, str(challenge_file), str(start_file), str(ready_file)]
+
+    # Policy forcing every window to trigger and every slot to be drafted, on a fast clock.
+    policy = core.AuditPolicy(auditor_hotkey="5Auditor", windows_per_epoch=360, cohort_fraction=360.0,
+                              max_drain_fraction=1.0, group_stress_fraction=0.0, lead_blocks=2,
+                              proof_challenge_delay_blocks=3, deadline_s=0.05, transport_grace_s=0.05,
+                              payload_deadline_s=2.0)
+    kp = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
+    endpoints = [
+        AuditEndpoint("gpu0", "http://203.0.113.5:8091/e/gpu0", "kev-4b", "NVIDIA GeForce RTX 5090", 32, 0),
+        AuditEndpoint("gpu1", "http://203.0.113.5:8091/e/gpu1", "kev-4b", "Some Unknown GPU", 16, 1),
+    ]
+    chain, drain = FakeChain(start=1000), DrainState()
+    worker = AuditWorker(netuid=405, keypair=kp, endpoints=endpoints, policy=policy, chain=chain, drain=drain,
+                         client=httpx.Client(transport=httpx.MockTransport(handler)), bench_command=bench_command,
+                         poll_s=0.005, block_time_s=BLOCK_S, work_dir=tmp_path)
+    worker.start()
+    saw_drain = False
+    deadline = time.time() + 30
+    while time.time() < deadline and not any(r["artifact_type"] == "capacity_audit_proof_payload" for r in received):
+        chain.tick()
+        saw_drain = saw_drain or drain.drained("gpu0")
+        time.sleep(BLOCK_S)
+    worker.stop()
+    worker.join_audits(10)
+    worker.publisher.wait_idle(5)
+
+    first = [r for r in received if r["audit_id"] == received[0]["audit_id"]]
+    assert [r["artifact_type"] for r in first] == [
+        "capacity_audit_pass0_receipt", "capacity_audit_final_receipt", "capacity_audit_proof_payload"]
+    assert {r["path"] for r in first} == {"/capacity/v1/receipt", "/capacity/v1/proof"}
+    assert all(r["endpoint_id"] == "gpu0" for r in received), "uncalibrated endpoint must never be audited"
+    for r in first:
+        assert core.verify_artifact_signature({k: v for k, v in r.items() if k != "path"}, kp.ss58_address)
+
+    final, proof = first[1], first[2]
+    slot = core.Slot(405, kp.ss58_address, "gpu0", endpoints[0].url, "kev-4b", "NVIDIA GeForce RTX 5090", 32)
+    assert final["slot_id"] == slot.slot_id
+    assert final["combined"]["format"] == "hot_capacity_combined_proof_v2"
+    lease = proof["sampled_opening"]["lease_id"]
+    payload = proof["sampled_pass_proof"]
+    assert payload["seed_seen"] == core.derive_proof_seed(block_hash(final["B_start"]), slot.slot_id, 0)
+    assert payload["challenge_seen"] == core.derive_proof_challenge_seed(
+        "cc" * 32, block_hash(final["B_proof"]), lease, slot.slot_id, 0)
+    assert proof["sampled_pass_index"] == 3
+    assert saw_drain and not drain.drained("gpu0")
+
+
+def test_drain_state_expires() -> None:
+    drain = DrainState()
+    drain.set("gpu0", time.time() + 0.05)
+    assert drain.drained("gpu0")
+    time.sleep(0.06)
+    assert not drain.drained("gpu0")

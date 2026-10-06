@@ -150,7 +150,8 @@ DEFAULT_GPU_CLASSES: tuple[GpuClass, ...] = (
 
 @dataclass(frozen=True)
 class AuditPolicy:
-    """Published audit policy. Only ``auditor_hotkey`` (the owner validator) runs and evaluates audits."""
+    """Published audit policy. Only the auditor runs and evaluates audits: ``auditor_hotkey`` if set, otherwise the
+    subnet owner's hotkey read from chain."""
 
     auditor_hotkey: str = ""
     mode: str = "observe"  # observe | score_gate
