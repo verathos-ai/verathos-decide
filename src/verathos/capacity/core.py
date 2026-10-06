@@ -122,7 +122,7 @@ class AuditPolicy:
     mode: str = "score_gate"  # score_gate | observe (records outcomes, gates nothing)
     epoch_blocks: int = 180  # the subnet's scoring epoch (catalog ``epoch_blocks``)
     windows_per_epoch: int = 4
-    draft_probability: float = 0.25  # per window and draw; see slot_selected
+    draft_probability: float = 0.5  # per window and draw; see slot_selected
     group_stress_fraction: float = 0.35
     qualification_epochs: int = 4
     lead_blocks: int = 5
