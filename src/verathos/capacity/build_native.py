@@ -1,7 +1,7 @@
 """Build the native code of the capacity audit in place: ``verathos-build-native``.
 
 - ``verathos/capacity/bench/_workspace_cuda``: capacity and FP64 workload kernels (CUDA; miners).
-- ``verathos/capacity/zk/native/_block_prover``: Q-block sumcheck prover (C++, CPU; miners).
+- ``verathos/capacity/zk/native/_block_prover``: Q-block sumcheck prover (C++, CPU; miners, and tests).
 - ``verathos/capacity/zk/libverathos_gemm.so``: GEMM sumcheck prover and int8 MLE evaluator (Rust; miners, and the
   audit validator for fast verification), built from ``native/gemm``.
 
@@ -75,13 +75,13 @@ def build_gemm() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--validator", action="store_true", help="build only the GEMM library (audit validator)")
+    parser.add_argument("--validator", action="store_true", help="skip the CUDA workload kernels (no GPU needed)")
     args = parser.parse_args()
     if not args.validator and not _cuda_toolkit():
         raise SystemExit("no CUDA toolkit found (CUDA_HOME); miners need it, validators pass --validator")
     build_gemm()
+    build_block_prover()
     if not args.validator:
-        build_block_prover()
         build_workspace()
 
 

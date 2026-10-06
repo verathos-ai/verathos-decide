@@ -1,36 +1,55 @@
 # Verathos
 
-Decision-model network on Bittensor. Miners serve open decision models (typed questions in, calibrated
-probabilities out, SystemOne-compatible API); validators verify answers against reference computations and run
-the capacity audit against sybil endpoints.
+A Bittensor subnet for decision models: models that read a state (a ticket, a code change, a document) and answer
+typed questions with calibrated probabilities in one forward pass. Miners serve catalog models on their GPUs behind a
+SystemOne-compatible API; validators recompute a hidden sample of requests in fp32 and compare the full probability
+vectors, which fingerprint the exact weights; a capacity audit drafts endpoints at random to run a calibrated GPU
+workload, so one GPU cannot pose as many.
 
-Status: development on testnet.
+Discovery, the model catalog and the audit policy live in native chain state (axons and commitments); there is no
+EVM and no central registry.
+
+## Documentation
+
+| | |
+|---|---|
+| [Mining](docs/MINING.md) | hardware, install, engines, configuration, running a miner |
+| [Validating](docs/VALIDATING.md) | reference engines, configuration, running a validator and the auditor |
+| [Scoring](docs/SCORING.md) | how answers are verified and scored |
+| [Capacity audit](docs/CAPACITY_AUDIT.md) | the hardware audit: windows, workload, proofs, gating, policy |
+| [Discovery](docs/DISCOVERY.md) | manifests, commitments and the catalog on chain |
+| [Owner operations](docs/OWNER.md) | mechanisms, catalog releases, audit rollout |
+| [Testnet runs](docs/TESTNET_RUNS.md) | measured results |
+
+## Layout
 
 ```
 src/verathos/
   protocol/    wire types: SystemOne API, signed manifests, receipts, request signing
-  catalog/     model catalog and its owner commitment
+  catalog/     the model catalog and audit policy committed by the owner
   miner/       miner service: manifest and endpoints behind one public port
   validator/   discovery, canaries, answer comparison, scoring, weights
-  capacity/    capacity audit: protocol core, proofs, GPU bench, zk primitives
+  capacity/    capacity audit: public derivations, miner worker, GPU bench, auditor, proofs
+  chain.py     chain helpers shared by miners and validators
+  owner.py     verathos-owner
 native/gemm/   Rust GEMM sumcheck prover used by the capacity proofs
-scripts/       operator and test tools
-docs/          design notes and testnet results
+scripts/       miner probe and capacity-bench round trip
+docs/
 ```
 
+## Development
+
 ```bash
-uv venv -p 3.12 .venv && VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,test]"
+uv venv -p 3.12 .venv
+VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,capacity,test]"
+.venv/bin/verathos-build-native --validator     # CPU parts; without --validator (CUDA_HOME set) also the GPU kernels
 .venv/bin/python -m pytest
-verathos-miner --config miner.json
-verathos-validator --config validator.json
+.venv/bin/ruff check src tests scripts
 ```
 
-Capacity-audit native code is built from source on the machine that runs it:
+The test suite runs on CPU. It includes an end-to-end capacity audit (miner workers, ingest, auditor) on a CPU
+reference of the GPU bench.
 
-```bash
-VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[capacity]"
-verathos-build-native               # miners: CUDA toolkit, Rust (rustup), libssl-dev
-verathos-build-native --validator   # audit validator: Rust, libssl-dev
-```
+## License
 
-Docs: `docs/DISCOVERY.md` (chain-native discovery), `docs/TESTNET_RUNS.md` (testnet results).
+MIT
