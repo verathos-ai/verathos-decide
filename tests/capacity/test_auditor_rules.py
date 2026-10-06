@@ -14,8 +14,8 @@ from verathos.capacity.auditor import NEUTRAL, PENDING, Auditor
 from verathos.capacity.miner import _Publisher
 
 GPU = core.GpuClass("Test GPU", 8, capacity_passes=2)
-POLICY = core.AuditPolicy(windows_per_epoch=360, cohort_fraction=360.0, max_drain_fraction=1.0,
-                          group_stress_fraction=0.0, gpu_classes=(GPU,))
+POLICY = core.AuditPolicy(epoch_blocks=360, windows_per_epoch=360, draft_probability=1.0, group_stress_fraction=0.0,
+                          gpu_classes=(GPU,))
 
 
 class Chain:
@@ -28,8 +28,6 @@ class Chain:
     def block_hash(self, n):
         return hashlib.sha256(f"block-{n}".encode()).digest() if n <= self.n else None
 
-    def epoch_blocks(self) -> int:
-        return 360
 
     def finalized_block(self) -> int:
         return self.n - 2

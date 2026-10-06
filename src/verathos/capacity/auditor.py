@@ -70,8 +70,6 @@ class AuditorChain(Protocol):
 
     def block_hash(self, block_number: int) -> bytes | None: ...
 
-    def epoch_blocks(self) -> int: ...
-
     def finalized_block(self) -> int: ...
 
 
@@ -122,12 +120,12 @@ class Auditor:
             self._db.execute("UPDATE windows SET chain_status = 'void' WHERE selection_block >= ?", (since,))
             self._db.execute("UPDATE slots SET outcome = ?, reason = 'policy_transition' WHERE audit_id IN "
                              "(SELECT audit_id FROM windows WHERE selection_block >= ?)", (NEUTRAL, since))
-            self._transition_until = self._last_block + 2 * interval + max(self._hold_blocks(self.policy),
-                                                                           self._hold_blocks(policy))
+            self._transition_until = self._last_block + 2 * interval + max(self._busy_blocks(self.policy),
+                                                                           self._busy_blocks(policy))
             self.policy = policy
         log.info("capacity policy changed; windows from block %d to %d are void", since, self._transition_until)
 
-    def _hold_blocks(self, policy: core.AuditPolicy) -> int:
+    def _busy_blocks(self, policy: core.AuditPolicy) -> int:
         """Blocks from a window's selection until its slots may be drafted again."""
         return (policy.lead_blocks + max(1, policy.proof_challenge_delay_blocks)
                 + core.payload_cooldown_blocks(policy, self.block_time_s))
@@ -163,7 +161,7 @@ class Auditor:
         if head <= 0:
             return
         if self._last_block <= 0:
-            self._last_block = head - self._hold_blocks(self.policy) - 1
+            self._last_block = head - self._busy_blocks(self.policy) - 1
         for n in range(self._last_block + 1, head + 1):
             h = head_hash if n == head and head_hash else self.chain.block_hash(n)
             if h is None:
@@ -172,20 +170,19 @@ class Auditor:
             self._last_block = n
 
     def current_epoch(self) -> int:
-        return self._last_block // self.chain.epoch_blocks()
+        return self._last_block // self.policy.epoch_blocks
 
     # ---- blocks ----
 
     def on_block(self, block_number: int, block_hash: bytes, head: int) -> None:
         now = self.clock()
-        epoch_blocks = self.chain.epoch_blocks()
         if block_number % FINALITY_CHECK_BLOCKS == 0:
             self._check_finality()
         with self._lock:
             self._observe_start(block_number, block_hash, head, now)
             self._observe_proof_block(block_number, block_hash, now)
             self._expire(now)
-            window = core.open_window(self.netuid, block_number, block_hash, epoch_blocks, self.policy)
+            window = core.open_window(self.netuid, block_number, block_hash, self.policy)
             if window is not None:
                 late = head >= window.start_block
                 self._schedule(window, block_hash, "auditor_late" if late else
@@ -444,14 +441,13 @@ class Auditor:
     # ---- outputs ----
 
     def drained(self, hotkey: str, endpoint_id: str) -> bool:
-        """Whether the endpoint is inside an audit hold (by time since its last drafting, like the miner's own
-        drain); its canaries wait until the hold ends."""
-        hold_blocks = core.active_hold_seconds(self.policy, self.block_time_s) / self.block_time_s
+        """Whether the endpoint is inside the hold of a window it was drafted into (``core.in_hold``); its canaries
+        wait until the hold ends."""
         with self._lock:
-            row = self._db.execute(
-                "SELECT MAX(w.selection_block) AS b FROM slots s JOIN windows w USING (audit_id) "
-                "WHERE s.hotkey = ? AND s.endpoint_id = ?", (hotkey, endpoint_id)).fetchone()
-        return row["b"] is not None and self._last_block - row["b"] <= hold_blocks
+            starts = [r["start_block"] for r in self._db.execute(
+                "SELECT w.start_block FROM slots s JOIN windows w USING (audit_id) WHERE s.hotkey = ? AND "
+                "s.endpoint_id = ? AND w.start_block >= ?", (hotkey, endpoint_id, self._last_block - 10))]
+        return any(core.in_hold(start, self._last_block, self.policy, self.block_time_s) for start in starts)
 
     def evidence(self, epoch: int) -> dict[tuple[str, str], dict[str, int]]:
         """Final outcomes per endpoint from confirmed windows of the ``repeat_window_epochs`` epochs before

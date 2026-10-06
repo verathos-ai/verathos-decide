@@ -3,12 +3,12 @@
 The worker is non-interactive. It follows current-head blocks, derives every audit window and cohort locally from
 public chain data and this miner's committed manifest, and when one of its endpoints is drafted it:
 
-1. drains that endpoint (the miner service answers 503 for it until the audit ends),
-2. prelaunches the bench on that endpoint's GPU so it is hot before B_start,
-3. releases the bench at B_start with proof_seed = H(B_start hash, slot) and publishes a final receipt, naming the
-   B_start hash it used, when the timed work commits its transcript,
-4. derives the challenge seed from the B_proof hash once it exists, lets the bench build the sampled proof, and
-5. publishes the proof payload, naming the B_proof hash it used.
+1. prelaunches the bench on that endpoint's GPU so it is hot before B_start,
+2. at B_start drains the endpoint (the miner service answers 503 for it), releases the bench with
+   proof_seed = H(B_start hash, slot), and when the timed work commits its transcript publishes a final receipt
+   naming the B_start hash it used and serves again,
+3. derives the challenge seed from the B_proof hash once it exists, lets the bench build the sampled proof, and
+4. publishes the proof payload, naming the B_proof hash it used.
 
 All artifacts are signed by the miner hotkey and sent only to the audit validator (the policy's ``auditor_hotkey``),
 found through its axon. Final receipts and proofs travel on separate delivery lanes, so a proof upload never delays
@@ -52,8 +52,6 @@ class ChainView(Protocol):
     def head(self) -> tuple[int, bytes | None]: ...
 
     def block_hash(self, block_number: int) -> bytes | None: ...
-
-    def epoch_blocks(self) -> int: ...
 
     def auditor_url(self) -> str | None: ...
 
@@ -326,7 +324,7 @@ class AuditWorker:
     def on_block(self, block_number: int, block_hash: bytes, head: int) -> None:
         """Draft this block's window. A window whose B_start has already passed (start-up replay, a stalled block
         feed) only marks its slots busy: its timed work can no longer start on time."""
-        window = core.open_window(self.netuid, block_number, block_hash, self.chain.epoch_blocks(), self.policy)
+        window = core.open_window(self.netuid, block_number, block_hash, self.policy)
         if window is None:
             return
         endpoint_of = {self._slot(ep).slot_id: ep for ep in self.endpoints}
@@ -343,7 +341,6 @@ class AuditWorker:
                 log.warning("endpoint %s was drafted at block %d, which this miner processed only after B_start",
                             ep.endpoint_id, block_number)
                 continue
-            self.drain.set(ep.endpoint_id, time.time() + core.active_hold_seconds(self.policy, self.block_time_s))
             t = threading.Thread(target=self._run_audit, args=(audit,), name=f"audit-{audit_id[:8]}-{ep.endpoint_id}",
                                  daemon=True)
             self._threads.append(t)
@@ -401,6 +398,8 @@ class AuditWorker:
             log.warning("audit %s: bench exited before B_start: %s", audit.audit_id[:12], proc.stderr.read()[-500:])
             return proc
         started = time.time()
+        # the endpoint stops serving only while the timed work runs
+        self.drain.set(audit.endpoint.endpoint_id, started + p.deadline_s + p.transport_grace_s)
         proof_seed = core.derive_proof_seed(start_hash, audit.slot.slot_id, 0)
         tmp = files["start.json"].with_suffix(".tmp")
         tmp.write_text(json.dumps({"seed_hex": proof_seed, "audit_id": audit.audit_id, "B_start": audit.audit_block,
@@ -424,6 +423,7 @@ class AuditWorker:
                     audit, artifact_type="capacity_audit_final_receipt", final_transcript_commit=transcript,
                     combined=final_commitment(timing), B_start_hash=start_hash.hex()),
                     until=started + p.deadline_s + p.transport_grace_s, retry_delay_s=0.25)
+                self.drain.clear(audit.endpoint.endpoint_id)
                 break
             if proc.poll() is not None:
                 log.warning("audit %s: bench ended without final receipt: %s", audit.audit_id[:12],

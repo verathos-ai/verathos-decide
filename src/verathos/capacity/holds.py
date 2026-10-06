@@ -1,6 +1,6 @@
 """Audit holds as seen by validators that do not run the audit.
 
-An endpoint drafted into an audit window answers 503 while its bench runs. A validator that is not the auditor
+An endpoint drafted into an audit window answers 503 while its timed work runs. A validator that is not the auditor
 derives the same windows and cohorts from public chain data, like the miners do, and holds its canaries for that
 endpoint until the hold ends, so an audit is never counted as unavailability.
 """
@@ -25,7 +25,7 @@ class HoldTracker:
         self.netuid, self.policy, self.chain, self.block_time_s = netuid, policy, chain, block_time_s
         self._lock = threading.Lock()
         self._slots: list[core.Slot] | None = None
-        self._drafted_at: dict[str, int] = {}
+        self._starts: dict[str, int] = {}
         self._busy_until: dict[str, int] = {}
         self._last_block = 0
         self._running = False
@@ -68,19 +68,18 @@ class HoldTracker:
             h = head_hash if n == head and head_hash else self.chain.block_hash(n)
             if h is None:
                 return
-            window = core.open_window(self.netuid, n, h, self.chain.epoch_blocks(), self.policy)
+            window = core.open_window(self.netuid, n, h, self.policy)
             if window is not None:
                 with self._lock:
                     busy = {s for s, until in self._busy_until.items() if n <= until}
                     cooldown = core.payload_cooldown_blocks(self.policy, self.block_time_s)
                     for slot, _row in core.draft(window, self._slots, self.policy, busy):
-                        self._drafted_at[slot.slot_id] = n
+                        self._starts[slot.slot_id] = window.start_block
                         self._busy_until[slot.slot_id] = window.proof_block + cooldown
             self._last_block = n
 
     def drained(self, hotkey: str, endpoint_id: str) -> bool:
         slot_id = core.Slot(self.netuid, hotkey, endpoint_id, "", "").slot_id
-        hold_blocks = core.active_hold_seconds(self.policy, self.block_time_s) / self.block_time_s
         with self._lock:
-            drafted = self._drafted_at.get(slot_id)
-        return drafted is not None and self._last_block - drafted <= hold_blocks
+            start = self._starts.get(slot_id)
+        return start is not None and core.in_hold(start, self._last_block, self.policy, self.block_time_s)

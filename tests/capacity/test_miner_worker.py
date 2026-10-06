@@ -61,8 +61,6 @@ class FakeChain:
         with self.lock:
             return block_hash(n) if n <= self.n else None
 
-    def epoch_blocks(self) -> int:
-        return 360
 
     def auditor_url(self) -> str:
         return "http://auditor"
@@ -83,8 +81,8 @@ def test_drafted_endpoint_runs_audit_and_publishes_signed_artifacts(tmp_path: Pa
         return [sys.executable, str(script), str(out_dir), audit.lease, str(challenge_file), str(start_file)]
 
     # Policy forcing every window to trigger and every slot to be drafted, on a fast clock.
-    policy = core.AuditPolicy(auditor_hotkey="5Auditor", windows_per_epoch=360, cohort_fraction=360.0,
-                              max_drain_fraction=1.0, group_stress_fraction=0.0, lead_blocks=2,
+    policy = core.AuditPolicy(auditor_hotkey="5Auditor", epoch_blocks=360, windows_per_epoch=360,
+                              draft_probability=1.0, group_stress_fraction=0.0, lead_blocks=2,
                               proof_challenge_delay_blocks=3, deadline_s=0.05, transport_grace_s=0.05,
                               payload_deadline_s=2.0, gpu_classes=catalog.load().audit_policy().gpu_classes)
     kp = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
@@ -92,16 +90,21 @@ def test_drafted_endpoint_runs_audit_and_publishes_signed_artifacts(tmp_path: Pa
         AuditEndpoint("gpu0", "http://203.0.113.5:8091/e/gpu0", "kev-4b", "NVIDIA GeForce RTX 5090", 32, 0),
         AuditEndpoint("gpu1", "http://203.0.113.5:8091/e/gpu1", "kev-4b", "Some Unknown GPU", 16, 1),
     ]
-    chain, drain = FakeChain(start=1000), DrainState()
+    class RecordingDrain(DrainState):
+        drained_at: list[float] = []
+
+        def set(self, endpoint_id: str, until_ts: float) -> None:
+            self.drained_at.append(time.time())
+            super().set(endpoint_id, until_ts)
+
+    chain, drain = FakeChain(start=1000), RecordingDrain()
     worker = AuditWorker(netuid=405, keypair=kp, endpoints=endpoints, policy=policy, chain=chain, drain=drain,
                          client=httpx.Client(transport=httpx.MockTransport(handler)), bench_command=bench_command,
                          poll_s=0.005, block_time_s=BLOCK_S, work_dir=tmp_path)
     worker.start()
-    saw_drain = False
     deadline = time.time() + 30
     while time.time() < deadline and not any(r["artifact_type"] == "capacity_audit_proof_payload" for r in received):
         chain.tick()
-        saw_drain = saw_drain or drain.drained("gpu0")
         time.sleep(BLOCK_S)
     worker.stop()
     worker.join_audits(10)
@@ -126,7 +129,7 @@ def test_drafted_endpoint_runs_audit_and_publishes_signed_artifacts(tmp_path: Pa
     assert payload["seed_seen"] == core.derive_proof_seed(block_hash(final["B_start"]), slot.slot_id, 0)
     assert payload["challenge_seen"] == core.derive_proof_challenge_seed(
         "cc" * 32, block_hash(final["B_proof"]), proof["lease_id"], slot.slot_id, 0)
-    assert saw_drain and not drain.drained("gpu0")
+    assert drain.drained_at and not drain.drained("gpu0")  # drained during the timed work only
 
 
 def test_drain_state_expires() -> None:

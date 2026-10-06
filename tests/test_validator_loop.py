@@ -227,12 +227,24 @@ def test_renamed_endpoint_inherits_probation() -> None:
     assert state.ema["hkA/renamed"] == 0.0 and state.probation["hkA/renamed"] == 4
 
 
-def test_uid_value_is_its_best_endpoint_until_capacity_gates() -> None:
-    state = ScoreState(ema={"hkA/gpu0": 0.5, "hkA/gpu1": 0.5, "hkB/gpu0": 0.5},
-                       uid_of={"hkA/gpu0": 1, "hkA/gpu1": 1, "hkB/gpu0": 2})
-    hotkeys = {1: "hkA", 2: "hkB"}
-    assert weights(state, hotkeys, per_uid="max") == {1: pytest.approx(0.5), 2: pytest.approx(0.5)}
-    assert weights(state, hotkeys, per_uid="sum") == {1: pytest.approx(2 / 3), 2: pytest.approx(1 / 3)}
+def test_new_endpoints_are_checked_but_not_scored_while_they_qualify() -> None:
+    from verathos.validator.audit import EndpointResult
+    from verathos.validator.discovery import DiscoveredEndpoint
+    from verathos.validator.scoring import note_seen
+
+    ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id="gpu0", url="http://x/e/gpu0", model_id="kev-4b",
+                            hardware={"kind": "cuda", "device_id": "GPU-a"}, max_concurrency=1))
+    state = ScoreState()
+    note_seen(state, ["hkA/gpu0"], 10)
+    note_seen(state, ["hkA/gpu0"], 12)
+    assert state.first_seen == {"hkA/gpu0": 10}
+    r = EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4,
+                       latencies_ms=[40.0] * 4)
+    record_window(state, {"hkA/gpu0": r}, 3)
+    scores, failed = epoch_scores({"hkA/gpu0": r}, {"kev-4b": 1.0}, state, qualifying={"hkA/gpu0"})
+    assert scores == {"hkA/gpu0": 0.0} and not failed
+    scores, _ = epoch_scores({"hkA/gpu0": r}, {"kev-4b": 1.0}, state)
+    assert scores["hkA/gpu0"] == pytest.approx(1.0)
 
 
 def test_gone_endpoints_are_forgotten() -> None:

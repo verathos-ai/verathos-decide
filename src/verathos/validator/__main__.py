@@ -1,7 +1,8 @@
 """Run a validator: ``verathos-validator --config validator.json``.
 
-Per epoch: snapshot chain, discover miners, audit every endpoint with the epoch's canaries spread over the first part
-of the epoch, score, and set weights on the configured mechanism (dry run until that mechanism exists).
+Per epoch (``epoch_blocks`` from the catalog, independent of the subnet tempo): snapshot chain, discover miners, audit
+every endpoint with the epoch's canaries spread over the first part of the epoch, score, and set weights on the
+configured mechanism (dry run until that mechanism exists).
 
 Every validator takes part in the capacity audit (see ``validator.capacity``): the auditor runs it, the others apply
 its signed verdicts; gated endpoints score zero.
@@ -28,7 +29,7 @@ from verathos.validator.capacity import Capacity, unauditable_endpoints
 from verathos.validator.config import ValidatorConfig
 from verathos.validator.discovery import discover
 from verathos.validator.follow import CatalogFollower
-from verathos.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
+from verathos.validator.scoring import ScoreState, epoch_scores, note_seen, record_window, update, weights
 from verathos.validator.service import start_service
 
 log = logging.getLogger("verathos.validator")
@@ -54,7 +55,6 @@ def load_secret(state_dir: Path) -> bytes:
 async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, secret: bytes, state: ScoreState,
                     epoch: int, blocks_left: int, capacity: Capacity, current: CatalogFollower) -> None:
     cat = current.catalog
-    capacity_epoch = capacity.tempo_epoch()
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
     references = {m: HttpEngine(url) for m, url in cfg.references.items()
                   if cat.get(m) is not None and cat.get(m).status != "retired"}
@@ -71,7 +71,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                                     mechid=cfg.mechid, pool_size=cfg.pool_size, per_endpoint=cfg.per_endpoint,
                                     spread_s=spread_s, drained=capacity.drained)
         try:
-            gated = await capacity.gated(client, capacity_epoch)
+            gated = await capacity.gated(client, epoch)
         except Exception:
             log.exception("capacity verdicts unavailable this epoch")
             gated = {}
@@ -81,10 +81,15 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         log.info("  %s/%s capacity gated: %s", hotkey, endpoint_id, rule)
     gating = capacity.policy.mode == "score_gate"
     unauditable = unauditable_endpoints(miners, capacity.policy) if gating else set()
+    note_seen(state, [e.key for e in endpoints], epoch)
+    qualifying = {key for key in results if epoch - state.first_seen[key] < capacity.policy.qualification_epochs} \
+        if gating else set()
+    if qualifying:
+        log.info("  %d endpoints in their qualification epochs (checked, not scored yet)", len(qualifying))
     record_window(state, results, cfg.window_epochs)
     model_weight = {m.model_id: m.score_weight if m.status == "active" else 0.0 for m in cat.models}
     scores, failed = epoch_scores(results, model_weight, state,
-                                  {f"{hk}/{ep}" for hk, ep in gated}, unauditable)
+                                  {f"{hk}/{ep}" for hk, ep in gated}, unauditable, qualifying)
     held = {e.key for e in endpoints} - set(results)
     if held:
         log.info("  %d endpoints not audited this epoch (no usable reference answers); scores held", len(held))
@@ -95,8 +100,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                  scores.get(key, 0.0), f" errors={sorted(set(r.errors))}" if r.errors else "")
     # The epoch is scored; a failure from here on must not run it again.
     try:
-        set_weights(cfg, st, wallet, weights(state, hotkey_of_uid, per_uid="sum" if gating else "max"),
-                    hotkey_of_uid)
+        set_weights(cfg, st, wallet, weights(state, hotkey_of_uid), hotkey_of_uid)
     except Exception:
         log.exception("setting weights failed this epoch")
 
@@ -106,7 +110,7 @@ def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: di
     if not w:
         owner = chain.owner_uid(st, cfg.netuid, hotkey_of_uid)
         if owner is None:
-            log.warning("no miner earned weight and the subnet owner hotkey holds no UID; no weights set")
+            log.warning("no miner has a positive score and the subnet owner hotkey holds no UID; no weights set")
         w = {owner: 1.0} if owner is not None else {}
     if cfg.dry_run or not chain.mechanism_ready(st, cfg.netuid, cfg.mechid):
         log.info("dry run (mechanism %d %s): weights %s", cfg.mechid,
@@ -130,8 +134,7 @@ def main() -> None:
     state = ScoreState.load(state_path)
     wallet = bt.Wallet(name=cfg.wallet_name, hotkey=cfg.hotkey_name)
     st = bt.Subtensor(network=cfg.network)
-    current = CatalogFollower(st, cfg.network, cfg.netuid, catalog.CatalogStore(cfg.catalog_dir), cfg.catalog_mirrors,
-                              grace_s=(st.tempo(cfg.netuid) + 1) * BLOCK_S)
+    current = CatalogFollower(st, cfg.network, cfg.netuid, catalog.CatalogStore(cfg.catalog_dir), cfg.catalog_mirrors)
     capacity = Capacity.start(network=cfg.network, netuid=cfg.netuid, policy=current.catalog.audit_policy(), st=st,
                               wallet=wallet, state_dir=state_dir)
     is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)
@@ -150,8 +153,9 @@ def main() -> None:
     while True:
         try:
             block = st.get_current_block()
-            next_start = st.get_next_epoch_start_block(cfg.netuid) or block + 360
-            epoch = next_start  # an epoch is identified by the block it ends at
+            epoch_blocks = current.catalog.epoch_blocks
+            epoch = block // epoch_blocks
+            next_start = (epoch + 1) * epoch_blocks
             if epoch != done:
                 blocks_left = max(next_start - block, 1)
                 asyncio.run(run_epoch(cfg, st, wallet, secret, state, epoch, 1 if args.once else blocks_left,

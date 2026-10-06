@@ -1,7 +1,7 @@
 # Mining
 
 A miner serves decision models from the catalog (the model list the subnet owner commits on chain; see
-`DISCOVERY.md`) on NVIDIA GPUs, one model per GPU. Only `active` catalog models earn score; `candidate` models can be
+`DISCOVERY.md`) on NVIDIA GPUs, one model per GPU. Only `active` catalog models are scored; `candidate` models can be
 served and are checked by validators but score zero. Each GPU runs a decision engine; the miner service in front of them publishes a signed manifest, answers
 signed requests, and runs the capacity audit when one of its endpoints is drafted.
 
@@ -51,7 +51,7 @@ kernels, the block prover and the Rust GEMM prover. Run it again after every upd
 ## 3. Start one engine per GPU
 
 Validators check answers, not engines: any engine that serves `POST /v1/systemone` and returns the reference
-probabilities within the model's tolerances passes, and a faster engine earns more through the latency factor.
+probabilities within the model's tolerances passes, and a faster engine scores higher through the latency factor.
 Each catalog model names a known-good engine and revision (`engine.source` at `engine.revision`); a different
 engine or version is the miner's risk, since answers that drift past the tolerances fail like a wrong model.
 
@@ -142,8 +142,9 @@ callers are refused before their request body is read, and bodies are capped at 
 
 ## Capacity audit duty
 
-When an endpoint is drafted, the miner answers `503` for that endpoint for a few minutes, runs the calibrated GPU
-workload beside the resident model, and sends a signed final receipt and a proof to the auditor. Nothing needs to
+When an endpoint is drafted, the miner warms the bench up while still serving, answers `503` for that endpoint only
+while the timed GPU work runs (about 20 s, beside the resident model), and sends a signed final receipt and a proof
+to the auditor. A new endpoint is checked for its first `qualification_epochs` epochs before it is scored. Nothing needs to
 be done by hand, but:
 - do not run other GPU work on an endpoint's GPU;
 - declare the GPU each endpoint really has: an endpoint that shares a GPU with another, or claims a faster class,

@@ -5,7 +5,7 @@ whose digest equals the owner's current commitment, whatever its source: the cop
 cache, the owner's axon, or a mirror. A new catalog therefore takes effect without a code release. The digest covers
 the JSON document as published, so nodes whose code knows fewer fields still agree on it.
 
-Only ``active`` models are scored. ``candidate`` models may be served and checked on the network but earn nothing;
+Only ``active`` models are scored. ``candidate`` models may be served and checked on the network but are not scored;
 ``retired`` models are ignored.
 """
 
@@ -54,16 +54,18 @@ class CatalogModel(BaseModel):
     base_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     license: str
     max_state_tokens: int = Field(ge=1)
-    score_weight: float = Field(1.0, gt=0, description="Relative reward per verified answer")
+    score_weight: float = Field(1.0, gt=0, description="Relative score per verified answer")
     tolerance: Tolerance = Tolerance()
 
 
-_AUDIT_FIELDS = {f.name for f in dataclasses.fields(AuditPolicy)}
+_AUDIT_FIELDS = {f.name for f in dataclasses.fields(AuditPolicy)} - {"epoch_blocks"}
 
 
 class Catalog(BaseModel):
     version: Literal[1] = 1
     revision: str
+    epoch_blocks: int = Field(180, ge=50, description="Length of the subnet's scoring epoch in blocks; validators "
+                              "score, set weights and evaluate capacity evidence once per epoch")
     models: list[CatalogModel]
     capacity_audit: dict[str, Any] = Field(default_factory=dict, description="Capacity-audit policy settings over "
                                            "the code defaults, including the calibrated GPU classes")
@@ -102,7 +104,7 @@ class Catalog(BaseModel):
     def audit_policy(self) -> AuditPolicy:
         """The capacity-audit policy: code defaults with this catalog's settings. GPU classes come only from the
         catalog; an endpoint whose GPU has no class here cannot be audited."""
-        settings = dict(self.capacity_audit)
+        settings = {**self.capacity_audit, "epoch_blocks": self.epoch_blocks}
         if "gpu_classes" in settings:
             settings["gpu_classes"] = tuple(GpuClass.from_dict(row) for row in settings["gpu_classes"])
         return dataclasses.replace(AuditPolicy(), **settings)

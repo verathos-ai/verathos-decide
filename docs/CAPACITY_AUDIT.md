@@ -1,7 +1,7 @@
 # Capacity audit
 
 Answer verification proves an endpoint serves the right model, not that it has its own GPU. Without a hardware
-check one GPU could back many hotkeys or endpoints (sybils) and collect several rewards for one machine. The capacity
+check one GPU could back many hotkeys or endpoints (sybils) and be scored several times for one machine. The capacity
 audit closes that gap: endpoints are drafted at random, together with endpoints that share their hotkey or IP, and
 each drafted endpoint must run a GPU workload calibrated for its declared GPU class inside a deadline, beside its
 resident model, and then prove the work. Endpoints that share hardware cannot all finish in time; their misses
@@ -37,17 +37,14 @@ come from chain data a miner cannot choose per endpoint. A slot's bench lease bi
 Miners and the auditor follow the chain head and derive everything from public data, so they agree without
 messages:
 
-- A block `B_select` opens a window if `H(block hash, block, tempo, windows_per_epoch)` falls below
-  `windows_per_epoch / tempo`, and `B_proof` still falls in the same tempo.
+- Epochs are the subnet's scoring epochs: `epoch = block // epoch_blocks` (catalog, default 180 blocks).
+- A block `B_select` opens a window if `H(block hash, block, epoch_blocks, windows_per_epoch)` falls below
+  `windows_per_epoch / epoch_blocks`, and `B_proof` still falls in the same epoch.
 - `B_start = B_select + lead_blocks`, `B_proof = B_start + proof_challenge_delay_blocks`.
-- Cohort seed `H(B_select hash, epoch)`. With `t = min(cohort_fraction / windows_per_epoch, max_drain_fraction)`,
-  a slot is drafted if its own id draws a hit with probability `t x (1 - group_stress_fraction)`, or if any of its
-  group tokens does, each with probability `t x group_stress_fraction`. The tokens are the hotkey, the axon IP and
-  its /24, each alone and with the model; a token hit drafts every slot that carries it, so endpoints of one hotkey
-  or behind one IP are drafted together.
-- With the defaults (`t` = 0.06, six tokens) a slot is drafted in about 15% of windows, so about 0.75 times per
-  tempo. Two endpoints of one hotkey behind one IP are drafted together in about 12% of windows, two hotkeys behind
-  one IP in about 9%, and two unrelated endpoints in about 2%.
+- Cohort seed `H(B_select hash, epoch)`. With `t = draft_probability`, a slot is drafted if its own id draws a hit
+  with probability `t x (1 - group_stress_fraction)`, or if any of its group tokens does, each with probability
+  `t x group_stress_fraction`. The tokens are the hotkey, the axon IP and its /24, each alone and with the model;
+  a token hit drafts every slot that carries it, so endpoints of one hotkey or behind one IP are drafted together.
 - A slot drafted in a window stays out of the cohorts until `payload_cooldown_blocks` after that window's `B_proof`;
   miners and the auditor apply the same rule. Both replay the recent blocks when they start, so slots drafted
   before a restart still count as busy; a window whose `B_start` has passed by the time a miner processes it only
@@ -58,9 +55,9 @@ messages:
 
 | Step | Miner | Auditor |
 |---|---|---|
-| `B_select` | drafts its slot, marks the endpoint busy (`503`) for the hold, prelaunches the bench on the endpoint's GPU | drafts the same slots, records the window |
-| `B_start` | releases the bench with `proof_seed = H(B_start hash, slot_id)` | records when it observed `B_start` |
-| timed work | runs the workload row of its GPU class, committing a Merkle root per round; when done, sends a final receipt with the combined transcript root and the `B_start` hash it used | final receipt on time if it arrives within `deadline_s + transport_grace_s` of its own `B_start` observation, and before it has observed `B_proof` |
+| `B_select` | drafts its slot, prelaunches the bench on the endpoint's GPU (the endpoint keeps serving) | drafts the same slots, records the window |
+| `B_start` | stops serving the endpoint (`503`) and releases the bench with `proof_seed = H(B_start hash, slot_id)` | records when it observed `B_start` |
+| timed work | runs the workload row of its GPU class, committing a Merkle root per round; when done, sends a final receipt with the combined transcript root and the `B_start` hash it used, and serves again | final receipt on time if it arrives within `deadline_s + transport_grace_s` of its own `B_start` observation, and before it has observed `B_proof` |
 | `B_proof` | challenge `H(transcript root, B_proof hash, lease, slot_id)`; builds the sampled proof; sends it with the `B_proof` hash it used | proof must arrive within `payload_deadline_s` of `B_proof`; verified against the slot's scheduled workload, the proof seed and the challenge |
 
 All artifacts are signed by the miner hotkey (sr25519), bind the slot's lease and the digest of its workload row,
@@ -124,8 +121,7 @@ every current endpoint of the hotkey is gated. Renaming an endpoint therefore ne
 honest misses spread over a large hotkey do not gate it.
 
 Only closed epochs count. The last windows of an epoch settle (proof, verification, finality) within a few
-minutes of its end, and validators ask after their canary phase, so they all get the same set. Epochs here are
-`block // tempo`. A gated endpoint scores zero and enters probation like an endpoint that failed answer
+minutes of its end, and validators ask after their canary phase, so they all get the same set. A gated endpoint scores zero and enters probation like an endpoint that failed answer
 verification; new endpoints of the same hotkey inherit that probation. Evidence ages out of the window; nothing
 else clears it.
 
@@ -134,18 +130,47 @@ started only), signed by its hotkey. Other validators fetch them from the audito
 canary phase, verify the signature, and gate the same endpoints; if the feed is unreachable or invalid they gate
 nothing that epoch.
 
-In `observe` mode (the initial setting) the audit runs and records outcomes but gates nothing.
+In `observe` mode the audit runs and records outcomes but gates nothing, and endpoints need no qualification; it is
+a switch for the subnet owner if the audit misbehaves, not a normal operating mode.
+
+## Downtime, detection and qualification
+
+An endpoint stops serving only during its timed work: from `B_start` until its final receipt, about 20 s on a
+calibrated GPU and at most `deadline_s + transport_grace_s`. Validators hold their canaries for a drafted endpoint
+during those blocks (one block before `B_start` to one after the deadline), so an audit never costs an endpoint
+score.
+
+A sybil is caught only when two endpoints sharing one GPU are drafted into the same window: both then need about
+40 s and miss the deadline. Gating takes two such windows (the timing threshold), and verdicts count closed epochs
+only, so add one epoch. A new endpoint is therefore scored only after `qualification_epochs` epochs; most sybils are
+gated before they are ever scored. Renaming an endpoint restarts its qualification, and new endpoints of a hotkey on
+probation inherit the probation.
+
+Measured with the selection code (20,000 windows per row), 180-block epochs and `windows_per_epoch` 4, for the
+hardest case of two endpoints on one GPU: endpoints of different hotkeys on different IPs (no shared grouping
+token), plus the cheaper shapes:
+
+| `draft_probability` | drafted per window | downtime | 2 hotkeys, 2 IPs: epochs to gate, median / 90% | 2 hotkeys, 1 IP | 1 hotkey, 1 IP |
+|---|---|---|---|---|---|
+| 0.15 | 35% | 2.3% | 3.5 / 7.8 | 2.0 / 4.2 | 1.5 / 3.2 |
+| **0.25 (default)** | 52% | 3.3% | 1.5 / 3.2 | 1.2 / 2.5 | 1.0 / 2.0 |
+| 0.35 | 64% | 4.1% | 1.0 / 2.0 | 1.0 / 1.8 | 0.8 / 1.5 |
+
+Downtime is the share of time an endpoint does not serve (about 35 s per audit). With the default, an endpoint is
+audited about twice per epoch and a two-endpoint sybil is gated within 3.2 epochs in 90% of cases (4.2 with the
+closed-epoch lag), hence the default of 4 qualification epochs (about 2.4 hours). More endpoints per GPU are caught
+faster.
 
 ## Policy
 
 | Setting | Default | |
 |---|---|---|
-| `mode` | `observe` | `observe` or `score_gate` |
+| `mode` | `score_gate` | `score_gate` or `observe` |
 | `auditor_hotkey` | subnet owner | hotkey that evaluates audits |
-| `windows_per_epoch` | 5 | expected windows per tempo |
-| `cohort_fraction` | 0.3 | expected share of slots audited per tempo |
-| `max_drain_fraction` | 0.1 | cap on `t`, the per-draw probability (not on the total draft probability) |
-| `group_stress_fraction` | 0.35 | share of the draft probability drawn from group tokens |
+| `windows_per_epoch` | 4 | expected windows per epoch |
+| `draft_probability` | 0.25 | `t`, the probability of each draw (slot id, each grouping token) per window |
+| `group_stress_fraction` | 0.35 | share of `t` drawn on grouping tokens instead of the slot id |
+| `qualification_epochs` | 4 | epochs a new endpoint is checked before it is scored |
 | `lead_blocks`, `proof_challenge_delay_blocks` | 5, 4 | `B_select` to `B_start` to `B_proof` |
 | `deadline_s`, `transport_grace_s` | 30, 3 | must be shorter than `proof_challenge_delay_blocks` blocks |
 | `payload_deadline_s` | 90 | proof delivery after `B_proof` |
@@ -153,6 +178,7 @@ In `observe` mode (the initial setting) the audit runs and records outcomes but 
 | `repeat_window_epochs` | 10 | evidence window |
 | `gpu_classes` | none | calibrated workload rows; only these GPU classes can be audited |
 
-Settings go in the catalog's `capacity_audit` object; the catalog rejects unknown settings, duplicate GPU classes
-and inconsistent timing. A GPU class row needs `gpu_name`, `vram_gb` and `capacity_passes`; datacenter rows also set
+Settings go in the catalog's `capacity_audit` object (the epoch length is the catalog's `epoch_blocks`); the catalog
+rejects unknown settings, duplicate GPU classes and inconsistent timing. Changing `epoch_blocks` renumbers epochs,
+which starts the capacity evidence afresh. A GPU class row needs `gpu_name`, `vram_gb` and `capacity_passes`; datacenter rows also set
 the tail, FP64 and transition settings (see the shipped catalog).

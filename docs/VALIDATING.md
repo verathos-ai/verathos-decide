@@ -50,7 +50,9 @@ CUDA_VISIBLE_DEVICES="" KEV_DTYPE=fp32 .venv/bin/python -m kev.serve --run model
 ```
 
 Run them on CPU without `flash-linear-attention` installed.
-Clef models use `verathos-engine` in float32 (see `MINING.md` for the install):
+Clef models use `verathos-engine` in float32 (see `MINING.md` for the install). `clef-flash` is a `candidate`:
+its endpoints are checked but not scored, which lets the network measure it before the owner activates it; it
+needs about 36 GB of RAM in fp32.
 
 ```bash
 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8103 --device cpu --dtype float32
@@ -92,13 +94,13 @@ Clef models use `verathos-engine` in float32 (see `MINING.md` for the install):
 .venv/bin/verathos-validator --config validator.json
 ```
 
-Per epoch (one subnet tempo) the validator:
+Per epoch (`epoch_blocks` from the catalog, default 180 blocks) the validator:
 1. uses the catalog the subnet owner commits (shipped copy, local store, owner's axon, mirrors; any copy is
    checked against the committed digest). The validator checks the commitment every minute in the background and
-   applies a new audit policy at once; models and tolerances apply from the next epoch;
+   applies a new audit policy at once; models, tolerances and the epoch length apply from the next epoch;
 2. reads axons and commitments and accepts each miner's manifest if it is signed by the hotkey, matches the
    committed digest, lists its endpoints on the hotkey's axon and was built for the current catalog (or, for one
-   tempo after a change, the previous one);
+   epoch after a change, the previous one);
 3. challenges each endpoint to sign a nonce with the listing hotkey;
 4. derives the epoch's canaries from its secret, computes the references, sends each endpoint its subset spread over
    the first `audit_fraction` of the epoch, and checks every signed receipt;

@@ -9,12 +9,12 @@ Per endpoint and epoch:
   failing one included, regardless of later results. An endpoint a hotkey adds while one of its endpoints is on
   probation inherits the remaining probation, so renaming an endpoint does not escape it;
 - zero while the capacity audit gates scores, for open endpoints it cannot audit (not CUDA, or no calibrated GPU
-  class declared);
+  class declared), and for endpoints still in their first ``qualification_epochs`` epochs, so a new endpoint is
+  scored only once the audit has had time to draft it together with any endpoint it shares a GPU with;
 - otherwise model weight x availability (answered / sent) x latency factor, where the latency factor compares the
   endpoint's median latency with the median over the passing endpoints serving the same model, capped to
   [0.7, 1.3].
-Per UID: the sum of its endpoints' EMAs while the capacity audit gates scores (each endpoint then proves its own
-GPU), otherwise its best endpoint's EMA. Weights: UID values normalised to 1.
+Per UID: the sum of its endpoints' EMAs. Weights: UID values normalised to 1.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ import statistics
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
 
 from verathos.validator.audit import EndpointResult
 from verathos.validator.compare import Verdict
@@ -40,6 +39,7 @@ class ScoreState:
     probation: dict[str, int] = field(default_factory=dict)
     uid_of: dict[str, int] = field(default_factory=dict)
     window: dict[str, list[list[float]]] = field(default_factory=dict)  # key -> [[sum_abs, count], ...] newest last
+    first_seen: dict[str, int] = field(default_factory=dict)  # key -> epoch the endpoint was first discovered
 
     @classmethod
     def load(cls, path: Path) -> ScoreState:
@@ -49,6 +49,12 @@ class ScoreState:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.__dict__, indent=1, sort_keys=True))
         tmp.replace(path)
+
+
+def note_seen(state: ScoreState, keys: Collection[str], epoch: int) -> None:
+    """Record the epoch each discovered endpoint was first seen; renaming an endpoint makes it new."""
+    for key in keys:
+        state.first_seen.setdefault(key, epoch)
 
 
 def record_window(state: ScoreState, results: dict[str, EndpointResult], window_epochs: int) -> None:
@@ -71,12 +77,13 @@ def windowed_verdict(state: ScoreState, key: str, result: EndpointResult) -> Ver
 
 
 def epoch_scores(results: dict[str, EndpointResult], model_weight: dict[str, float], state: ScoreState,
-                 capacity_gated: Collection[str] = (), unauditable: Collection[str] = ()) -> tuple[dict[str, float],
-                                                                                                     set[str]]:
+                 capacity_gated: Collection[str] = (), unauditable: Collection[str] = (),
+                 qualifying: Collection[str] = ()) -> tuple[dict[str, float], set[str]]:
     """-> (score per endpoint key, keys that failed verification this epoch). Call after ``record_window``.
 
     ``capacity_gated`` holds endpoint keys the capacity audit gated this epoch (a verification failure);
-    ``unauditable`` holds open endpoints the audit cannot cover, which score zero.
+    ``unauditable`` holds open endpoints the audit cannot cover and ``qualifying`` endpoints still in their
+    qualification epochs; both are checked but score zero.
     """
     scores, failed = dict.fromkeys(capacity_gated, 0.0), set(capacity_gated)
     eligible: dict[str, EndpointResult] = {}
@@ -86,7 +93,7 @@ def epoch_scores(results: dict[str, EndpointResult], model_weight: dict[str, flo
         if windowed_verdict(state, key, r) in (Verdict.FAIL_HARD, Verdict.FAIL_STATISTICAL):
             failed.add(key)
             scores[key] = 0.0
-        elif key in unauditable or not r.identity_ok or r.answered == 0 or r.sent == 0:
+        elif key in unauditable or key in qualifying or not r.identity_ok or r.answered == 0 or r.sent == 0:
             scores[key] = 0.0
         else:
             eligible[key] = r
@@ -133,18 +140,19 @@ def update(state: ScoreState, results: dict[str, EndpointResult], scores: dict[s
         del state.ema[key]
         state.uid_of.pop(key, None)
         state.window.pop(key, None)
+    for key in [k for k in state.first_seen if k not in state.ema and k not in held]:
+        del state.first_seen[key]
 
 
-def weights(state: ScoreState, hotkey_of_uid: dict[int, str], *,
-            per_uid: Literal["sum", "max"] = "sum") -> dict[int, float]:
-    """Normalised weight per UID from its endpoints' EMAs (summed, or the best one). Endpoints whose UID now belongs
-    to another hotkey are ignored."""
+def weights(state: ScoreState, hotkey_of_uid: dict[int, str]) -> dict[int, float]:
+    """Normalised weight per UID from the sum of its endpoints' EMAs. Endpoints whose UID now belongs to another
+    hotkey are ignored."""
     values: dict[int, float] = {}
     for key, value in state.ema.items():
         uid = state.uid_of.get(key)
         hotkey = key.split("/", 1)[0]
         if uid is None or hotkey_of_uid.get(uid) != hotkey or value <= 0:
             continue
-        values[uid] = values.get(uid, 0.0) + value if per_uid == "sum" else max(values.get(uid, 0.0), value)
+        values[uid] = values.get(uid, 0.0) + value
     total = sum(values.values())
     return {uid: v / total for uid, v in values.items()} if total > 0 else {}

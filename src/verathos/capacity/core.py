@@ -119,14 +119,14 @@ class AuditPolicy:
     subnet owner's hotkey read from chain."""
 
     auditor_hotkey: str = ""
-    mode: str = "observe"  # observe | score_gate
-    cohort_fraction: float = 0.3
-    windows_per_epoch: int = 5
-    max_drain_fraction: float = 0.1
+    mode: str = "score_gate"  # score_gate | observe (records outcomes, gates nothing)
+    epoch_blocks: int = 180  # the subnet's scoring epoch (catalog ``epoch_blocks``)
+    windows_per_epoch: int = 4
+    draft_probability: float = 0.25  # per window and draw; see slot_selected
     group_stress_fraction: float = 0.35
+    qualification_epochs: int = 4
     lead_blocks: int = 5
     proof_challenge_delay_blocks: int = 4
-    drain_seconds: float = 30.0
     deadline_s: float = 30.0
     transport_grace_s: float = 3.0
     payload_deadline_s: float = 90.0
@@ -138,6 +138,12 @@ class AuditPolicy:
     gpu_classes: tuple[GpuClass, ...] = ()
 
     def validate(self, block_time_s: float = DEFAULT_BLOCK_TIME_S) -> None:
+        if not 0.0 < self.draft_probability <= 1.0:
+            raise ValueError("draft_probability must be in (0, 1]")
+        if self.lead_blocks + max(1, self.proof_challenge_delay_blocks) >= self.epoch_blocks:
+            raise ValueError("an audit window must fit in one epoch")
+        if self.windows_per_epoch < 0 or self.qualification_epochs < 0:
+            raise ValueError("windows_per_epoch and qualification_epochs must not be negative")
         if not 0.0 <= self.group_stress_fraction <= 0.5:
             raise ValueError("group_stress_fraction must be between 0.0 and 0.5")
         proof_delay_s = max(1, self.proof_challenge_delay_blocks) * block_time_s
@@ -156,18 +162,19 @@ class AuditPolicy:
             raise ValueError("every GPU class needs a positive pass count")
 
 
-def active_hold_seconds(policy: AuditPolicy, block_time_s: float = DEFAULT_BLOCK_TIME_S) -> float:
-    """The miner's complete busy hold from B_select."""
-    pre_challenge_blocks = max(0, policy.lead_blocks) + max(1, policy.proof_challenge_delay_blocks)
-    evidence_s = policy.deadline_s + policy.transport_grace_s + policy.payload_deadline_s + ACTIVE_STATE_MARGIN_S
-    return max(policy.drain_seconds, pre_challenge_blocks * block_time_s + evidence_s, 60.0)
-
-
 def payload_cooldown_blocks(policy: AuditPolicy, block_time_s: float = DEFAULT_BLOCK_TIME_S) -> int:
-    """Post-B_proof cooldown before a slot may be selected again."""
-    pre_challenge_blocks = max(0, policy.lead_blocks) + max(1, policy.proof_challenge_delay_blocks)
-    post_s = max(0.0, active_hold_seconds(policy, block_time_s) - pre_challenge_blocks * block_time_s)
-    return int(math.ceil(post_s / block_time_s)) + SELECTION_COOLDOWN_MARGIN_BLOCKS
+    """Blocks after B_proof during which a slot stays busy (its bench builds and delivers the proof) and cannot be
+    drafted again."""
+    return int(math.ceil((policy.payload_deadline_s + ACTIVE_STATE_MARGIN_S) / block_time_s)) \
+        + SELECTION_COOLDOWN_MARGIN_BLOCKS
+
+
+def in_hold(start_block: int, block: int, policy: AuditPolicy, block_time_s: float = DEFAULT_BLOCK_TIME_S) -> bool:
+    """Whether ``block`` falls in the hold of a window starting at ``start_block``: the drafted endpoint runs its
+    timed work and answers 503 from B_start until the deadline and grace have passed; one block on each side covers
+    differing block observation. Validators hold their canaries for the endpoint during these blocks."""
+    timed_blocks = int(math.ceil((policy.deadline_s + policy.transport_grace_s) / block_time_s))
+    return start_block - 1 <= block <= start_block + timed_blocks + 1
 
 
 @dataclass(frozen=True)
@@ -307,13 +314,6 @@ def group_keys(slot: Slot) -> tuple[str, ...]:
     return tuple(sorted(t for t in tokens if t))
 
 
-def _selection_probability(policy: AuditPolicy) -> float:
-    target = max(0.0, policy.cohort_fraction) / max(1, policy.windows_per_epoch)
-    if policy.max_drain_fraction > 0:
-        target = min(target, policy.max_drain_fraction)
-    return min(1.0, max(0.0, target))
-
-
 def _selection_hit(audit_seed_hex: str, namespace: str, key: str, probability: float) -> bool:
     p = min(1.0, max(0.0, probability))
     if p <= 0.0:
@@ -329,8 +329,10 @@ def _selection_hit(audit_seed_hex: str, namespace: str, key: str, probability: f
 
 
 def slot_selected(slot: Slot, audit_seed_hex: str, policy: AuditPolicy) -> bool:
-    """Per-slot public predicate: base draw on the slot id, plus group-stress draws on its grouping tokens."""
-    target = _selection_probability(policy)
+    """Per-slot public predicate. With ``t = draft_probability`` and ``g = group_stress_fraction``, the slot id draws
+    a hit with probability ``t * (1 - g)`` and each grouping token with probability ``t * g``; any hit drafts the
+    slot, and a token hit drafts every slot that carries the token."""
+    target = min(1.0, max(0.0, policy.draft_probability))
     if target <= 0.0:
         return False
     group_fraction = min(1.0, max(0.0, policy.group_stress_fraction))
@@ -362,9 +364,9 @@ class Window:
     proof_block: int
 
 
-def open_window(netuid: int, block_number: int, block_hash: bytes, epoch_blocks: int,
-                policy: AuditPolicy) -> Window | None:
+def open_window(netuid: int, block_number: int, block_hash: bytes, policy: AuditPolicy) -> Window | None:
     """The window this current-head block opens, if any."""
+    epoch_blocks = policy.epoch_blocks
     if not window_triggered(block_number, block_hash, epoch_blocks, policy) \
             or not window_fits_epoch(block_number, epoch_blocks, policy):
         return None

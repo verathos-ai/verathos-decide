@@ -63,7 +63,7 @@ def test_grouping_tokens_come_from_hotkey_and_axon_ip() -> None:
 
 
 def test_selection_is_reproducible_by_each_miner() -> None:
-    policy = dataclasses.replace(POLICY, cohort_fraction=0.5, windows_per_epoch=5)
+    policy = dataclasses.replace(POLICY, draft_probability=0.1)
     slots = [slot(f"hk{i}", url=f"http://198.51.{i // 50}.{i % 50}:8091/e/gpu0") for i in range(200)]
     for i in range(30):
         seed = core.derive_audit_seed(h(i), 1)
@@ -75,7 +75,7 @@ def test_co_hosted_slots_are_drafted_together() -> None:
     """Group stress: endpoints behind one IP share grouping tokens and are selected together about twice as often
     as independent endpoints, on top of the base draw. Over repeated windows this drafts co-hosted slots into the
     same window, which is what lets the sieve catch several endpoints on one machine."""
-    policy = dataclasses.replace(POLICY, cohort_fraction=0.5, windows_per_epoch=5)
+    policy = dataclasses.replace(POLICY, draft_probability=0.1)
     co_a, co_b = slot("hkX", "gpu0", "http://203.0.113.9:8091/e/gpu0"), slot("hkY", "gpu0", "http://203.0.113.9:8092/e/gpu0")
     far_a, far_b = slot("hkP", "gpu0", "http://192.0.2.1:8091/e/gpu0"), slot("hkQ", "gpu0", "http://198.51.100.7:8091/e/gpu0")
     together_co = together_far = 0

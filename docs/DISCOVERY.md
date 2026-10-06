@@ -32,7 +32,7 @@ Rules:
   A miner therefore cannot show different endpoint lists to different validators, nor claim hosts other than its
   own axon. The manifest depends only on the miner's configuration and the catalog, so a restart does not change
   the commitment.
-- A manifest names the catalog it was built for. Validators accept the current catalog and, for one tempo after a
+- A manifest names the catalog it was built for. Validators accept the current catalog and, for one epoch after a
   change, the previous one, while miners re-publish (they check every minute).
 - A catalog is accepted only if its digest equals the subnet owner hotkey's current commitment. A copy ships with
   the code; newer ones come from the owner's axon (`GET /v1/catalog/{digest}`) or any mirror, since the digest

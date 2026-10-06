@@ -27,8 +27,8 @@ AUDITOR_KEY = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
 BLOCK_S = 0.4
 TEST_GPU = core.GpuClass("Test GPU", 8, matrix_dim=8, capacity_passes=2, capacity_rounds=2, capacity_block_size=4,
                          fp64_matrix_dim=4, fp64_passes=1, fp64_block_size=2, spot_checks=2)
-POLICY = core.AuditPolicy(auditor_hotkey="5Auditor", mode="score_gate", windows_per_epoch=360, cohort_fraction=360.0,
-                          max_drain_fraction=1.0, group_stress_fraction=0.0, lead_blocks=15,
+POLICY = core.AuditPolicy(auditor_hotkey="5Auditor", mode="score_gate", epoch_blocks=360, windows_per_epoch=360,
+                          draft_probability=1.0, group_stress_fraction=0.0, lead_blocks=15,
                           proof_challenge_delay_blocks=4, deadline_s=0.6, transport_grace_s=0.2, payload_deadline_s=4.0,
                           gpu_classes=(TEST_GPU,))
 
@@ -74,8 +74,6 @@ class Chain:
         with self.lock:
             return block_hash(n) if n <= self.n else None
 
-    def epoch_blocks(self) -> int:
-        return 360
 
     def finalized_block(self) -> int:
         with self.lock:

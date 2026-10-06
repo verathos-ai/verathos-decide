@@ -30,7 +30,7 @@ The catalog lists the served models (pinned weights, engine and engine revision,
 hotkey commits; publishing a new one needs no code release.
 
 Model status: `active` models are scored; `candidate` models can be served and are checked but weighted zero, which
-lets a new model run on the network before it earns; `retired` models are skipped, and miners withdraw endpoints
+lets a new model run on the network before it is scored; `retired` models are skipped, and miners withdraw endpoints
 serving them from their manifests (a miner with no other endpoint stops).
 
 To publish a catalog:
@@ -51,16 +51,17 @@ To publish a catalog:
 
 Miners and validators check the commitment every minute: miners re-publish their manifests, the auditor applies a
 new audit policy at once (windows opened while it propagates are void), and validators use the new models and
-tolerances from their next epoch, accepting manifests built for the previous catalog for one more tempo. Announce
+tolerances from their next epoch, accepting manifests built for the previous catalog for one more epoch. Announce
 model changes before committing so validators can start a reference engine for a new model and miners can deploy
 it. A model family whose engine needs new code, or a protocol change, still goes out as a code release.
 
 ## Capacity audit rollout
 
-The audit starts in `observe` mode: it runs and records outcomes but gates nothing. Before switching to
-`score_gate`, check the outcomes in the auditor's database (`state_dir/capacity.sqlite`, table `slots`): honest
-endpoints should be `passed`, and misses should come from identifiable causes. Then set
-`"capacity_audit": {"mode": "score_gate"}` in the catalog and publish it as above.
+The shipped catalog runs the audit in `score_gate` mode. Check outcomes in the auditor's database
+(`state_dir/capacity.sqlite`, table `slots`): honest endpoints should be `passed`, and misses should come from
+identifiable causes. If the audit misbehaves (for example a GPU class whose pass count is wrong), publish a catalog
+with `"mode": "observe"`: outcomes are still recorded, nothing is gated and endpoints need no qualification.
+`docs/CAPACITY_AUDIT.md` gives the trade-off between audit rate, downtime and detection time behind the defaults.
 
 GPU classes are rows of `capacity_audit.gpu_classes` in the catalog. To add one, run
 `scripts/capacity_roundtrip.py "<nvidia-smi name>" <vram> --passes N` on an unshared GPU of that class, choose the

@@ -1,8 +1,9 @@
 """The catalog the subnet owner commits, followed in the background.
 
 The validator checks the owner's commitment every ``POLICY_WATCH_S``, like the miners, so a new capacity-audit
-policy reaches the audit within a minute of the miners. Models and tolerances apply from the next epoch. Manifests
-built for the previous catalog stay acceptable for one tempo after a change, while miners re-publish.
+policy reaches the audit within a minute of the miners. Models, tolerances and the epoch length apply from the next
+epoch. Manifests built for the previous catalog stay acceptable for one epoch after a change, while miners
+re-publish.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from collections.abc import Callable
 import bittensor as bt
 
 from verathos import catalog
-from verathos.capacity.core import POLICY_WATCH_S
+from verathos.capacity.core import DEFAULT_BLOCK_TIME_S, POLICY_WATCH_S
 from verathos.subnet.chain import current_catalog
 
 log = logging.getLogger(__name__)
@@ -23,8 +24,8 @@ log = logging.getLogger(__name__)
 
 class CatalogFollower:
     def __init__(self, st: bt.Subtensor, network: str, netuid: int, store: catalog.CatalogStore,
-                 mirrors: list[str], *, grace_s: float) -> None:
-        self.network, self.netuid, self.store, self.mirrors, self.grace_s = network, netuid, store, mirrors, grace_s
+                 mirrors: list[str]) -> None:
+        self.network, self.netuid, self.store, self.mirrors = network, netuid, store, mirrors
         self.catalog = self._wait(st)
         self.on_change: list[Callable[[catalog.Catalog], None]] = []
         self._previous: tuple[str, float] | None = None
@@ -57,7 +58,8 @@ class CatalogFollower:
         if new.digest() == self.catalog.digest():
             return False
         with self._lock:
-            self._previous = (self.catalog.digest(), time.time() + self.grace_s)
+            grace_s = self.catalog.epoch_blocks * DEFAULT_BLOCK_TIME_S
+            self._previous = (self.catalog.digest(), time.time() + grace_s)
             self.catalog = new
         log.info("catalog %s committed", new.digest()[:12])
         for callback in self.on_change:

@@ -22,14 +22,13 @@ def _hash_bytes(raw: object) -> bytes | None:
 
 
 class SubtensorChainView:
-    """Head blocks, block hashes, tempo and the auditor's axon, read through one dedicated connection."""
+    """Head blocks, block hashes and the auditor's axon, read through one dedicated connection."""
 
     def __init__(self, network: str, netuid: int, auditor_hotkey: str = "", *, cache_s: float = 600.0) -> None:
         self._network, self._netuid, self._auditor_override = network, netuid, auditor_hotkey
         self._cache_s = cache_s
         self._lock = threading.Lock()
         self._subtensor: bt.Subtensor | None = None
-        self._tempo: tuple[float, int] | None = None
         self._auditor: tuple[float, str] | None = None
 
     def set_auditor_hotkey(self, auditor_hotkey: str) -> None:
@@ -78,14 +77,6 @@ class SubtensorChainView:
         header = self._rpc("chain_getHeader", [self._rpc("chain_getFinalizedHead", [])])
         number = header.get("number") if isinstance(header, dict) else None
         return int(number, 0) if isinstance(number, str) else int(number or 0)
-
-    def epoch_blocks(self) -> int:
-        now = time.monotonic()
-        if self._tempo is None or now - self._tempo[0] > self._cache_s:
-            with self._lock:
-                tempo = int(self._st().tempo(self._netuid) or 360)
-            self._tempo = (now, tempo)
-        return self._tempo[1]
 
     def auditor_url(self) -> str | None:
         """The auditor's axon URL, cached once resolved; an unresolved auditor is looked up again on each call."""

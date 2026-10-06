@@ -1,5 +1,8 @@
 # Answer verification and scoring
 
+An epoch is `epoch_blocks` blocks (catalog, default 180, about 36 minutes), independent of the subnet tempo: every
+validator scores and sets weights once per epoch, within the chain's weight rate limit (100 blocks on SN96).
+
 ## Why answers can be checked
 
 A decision model answers a typed request (a state and a set of questions) with a probability distribution per
@@ -46,7 +49,9 @@ Per endpoint and epoch:
 - zero, with probation, if a request failed the hard check, the statistical check failed, or the capacity audit
   gated the endpoint;
 - zero if the endpoint failed the identity challenge or answered nothing, and, while the capacity audit gates
-  (`score_gate`), if the audit cannot cover it (not CUDA, or its GPU has no class in the catalog);
+  (`score_gate`), if the audit cannot cover it (not CUDA, or its GPU has no class in the catalog) or the endpoint
+  is in its first `qualification_epochs` epochs (see `CAPACITY_AUDIT.md`: the audit needs that time to catch an
+  endpoint sharing a GPU);
 - otherwise `score_weight(model) x answered / sent x latency factor`, where the latency factor is
   `sqrt(median latency of the model's passing endpoints / own median latency)`, capped to [0.7, 1.3]. Only
   endpoints that passed this epoch set the median.
@@ -58,8 +63,6 @@ endpoints that disappear decay toward zero and are forgotten once negligible.
 
 ## Weights
 
-While the capacity audit gates scores, a UID's value is the sum of its endpoints' EMAs: each endpoint has proven
-its own GPU. While it only observes, a UID's value is its best endpoint's EMA, since one machine could otherwise list
-many endpoints and answer them all from one cache. Values are normalised over all UIDs and set on mechanism 1.
+A UID's value is the sum of its endpoints' EMAs, normalised over all UIDs and set on mechanism 1 once per epoch.
 Endpoints whose UID now belongs to another hotkey are ignored. If no endpoint has a positive score, the weight goes
 to the subnet owner's UID.

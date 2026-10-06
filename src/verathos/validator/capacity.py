@@ -112,13 +112,6 @@ class Capacity:
     def drained(self, hotkey: str, endpoint_id: str) -> bool:
         return (self.auditor or self.holds).drained(hotkey, endpoint_id)
 
-    def tempo_epoch(self) -> int:
-        """The audit's epoch number at the current head (the epoch audit windows are filed under)."""
-        head = self.chain.head()[0]
-        if head <= 0:
-            raise RuntimeError("chain head unavailable")
-        return head // self.chain.epoch_blocks()
-
     async def gated(self, client: httpx.AsyncClient, epoch: int) -> dict[tuple[str, str], str]:
         """Endpoints gated in audit epoch ``epoch``: the auditor's own evaluation, or its signed verdicts."""
         if self.auditor is not None:
