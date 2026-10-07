@@ -60,19 +60,21 @@ Per endpoint and epoch:
   endpoints in proportion to `proven capacity x answered / sent x availability to users x latency factor`. The
   proven capacity is the auditor's credit in requests/s of the model's standard mix, at most what the endpoint
   declares now (in `observe` mode the declaration itself, up to the model's `first_test_rps`). Availability to users
-  is `1 - refused / offered` over the times the gateways considered the endpoint for a user request in the epoch
-  before (refused: not ready then, being busy, failing, or with its latest answer slower than twice the latency
-  bound, plus requests it answered busy or failed; see `GATEWAY.md`), once it was considered
-  `user_refusals_min_offers` (20) times, else 1: capacity shown in tests but kept from users does not count, and
-  neither does keeping users waiting. The latency factor is `sqrt(median /
-  own latency)`, capped to [0.7, 1.3]. An endpoint's latency is the median latency of its answers to users once it
-  gave `user_latency_min_answers` (50) of them in the epoch before, compared with the median over the model's scored
-  endpoints measured the same way; else its median latency in its throughput test, compared with those measured so.
-  Tests are known shortly ahead and their requests are recognisable, so what users get is measured on users. Every
-  validator reads the same figures from the auditor's verdicts. Each endpoint weighs in a median by its proven
-  capacity, so splitting capacity over more endpoints does not move it. In `observe` mode there is no latency factor
-  and no availability to users. An epoch's scores sum to 1 when every active model has scored
-  endpoints.
+  is `(ready + 20) / (offered + 20)` over the times the gateways considered the hotkey's endpoints of the model for a
+  user request in the epoch before (not ready: busy, failing, or with the latest answer or timed-out attempt at
+  least twice the latency bound; requests it answered busy or failed, or refused while another miner answered,
+  count as not ready too; see `GATEWAY.md`), with `user_offers_prior` (20) ready offers to start from, so a few
+  offers move it little: capacity shown in tests but kept from users does not count, and neither does keeping users
+  waiting. The latency factor is `sqrt(median / own latency)`, capped to [0.7, 1.3]. An endpoint's latency is the
+  median latency of its hotkey's answers to the model's users once they gave `user_latency_min_answers` (50) in the
+  epoch before, compared with the median over the model's scored endpoints measured the same way; else its median
+  latency in its throughput test, compared with those measured so, and then at most 1 while users measure others of
+  the model. Tests are known shortly ahead and their requests are recognisable, so what users get is measured on
+  users, per hotkey and model, so splitting capacity over endpoints hides none of it. Every validator reads the same
+  figures from the auditor's verdicts. Each endpoint weighs in a median by its proven capacity, so splitting capacity
+  over more endpoints does not move it. In `observe` mode there is no latency factor and no availability to users.
+  An epoch's scores sum to 1 when every active model has scored endpoints; a model whose endpoints all score zero
+  leaves its share unused.
 
 ## Models
 
@@ -84,7 +86,7 @@ have none. The pools follow what users pay for each model through the subnet's g
 - share: the model's revenue share, blended toward the catalog's `anchor_share` while the total demand is below
   `demand_full_tokens_s` (10,000 input tokens/s), and at least `min_model_share` (0.1) for every active model.
 
-Without demand the pools are the anchor shares. Miners choose which models to serve: a model with few endpoints
+Without demand the pools are the anchor shares, each at least `min_model_share`. Miners choose which models to serve: a model with few endpoints
 splits its pool among few, and a crowded one among many, so capacity moves to where users pay. No conversion between
 models is needed: what a request costs on a given GPU is the miner's to weigh.
 

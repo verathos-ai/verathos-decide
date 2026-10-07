@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import logging
 import os
 import secrets
@@ -23,7 +24,7 @@ import bittensor as bt
 import httpx
 
 from verathos import catalog
-from verathos.throughput.feed import Verdicts
+from verathos.throughput.feed import Credit, Verdicts
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator import chain, status
 from verathos.validator.audit import audit_epoch
@@ -37,6 +38,7 @@ from verathos.validator.scoring import (
     new_evidence,
     record_window,
     update,
+    weighted_median,
     weights,
 )
 from verathos.validator.service import start_service
@@ -68,8 +70,8 @@ class Proven(NamedTuple):
 
     credited: dict[str, float]  # proven capacity, requests/s
     latency_ms: dict[str, float]  # median latency in its throughput test
-    user_latency_ms: dict[str, float]  # median latency of its answers to users, where there were enough of them
-    user_availability: dict[str, float]  # share of the times it was considered for users that it was ready
+    user_latency_ms: dict[str, float]  # median latency of its hotkey's answers to users of the model, if enough
+    user_availability: dict[str, float]  # share of the times its hotkey's endpoints of the model were ready
 
 
 def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | None, cat: catalog.Catalog,
@@ -82,15 +84,23 @@ def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | 
                       {}, {}, {})
     credits = {(c.hotkey, c.endpoint_id, c.model_id): c for c in (verdicts.credits if verdicts else []) if c.qualified}
     sc, proven = cat.scoring, Proven({}, {}, {}, {})
+    groups: dict[tuple[str, str], list[tuple[str, Credit]]] = {}
     for e in endpoints:
         c = credits.get((e.hotkey, e.endpoint.endpoint_id, e.endpoint.model_id))
         if c is None:
             continue
         proven.credited[e.key], proven.latency_ms[e.key] = min(c.credited_rps, e.endpoint.capacity_rps), c.latency_ms
-        if c.user_answers >= sc.user_latency_min_answers and c.user_latency_ms > 0:
-            proven.user_latency_ms[e.key] = c.user_latency_ms
-        if c.user_offers >= sc.user_refusals_min_offers:
-            proven.user_availability[e.key] = max(0.0, 1.0 - c.user_refusals / c.user_offers)
+        groups.setdefault((e.hotkey, e.endpoint.model_id), []).append((e.key, c))
+    # What users got counts per hotkey and model: splitting capacity over endpoints hides none of it.
+    for members in groups.values():
+        offers = sum(c.user_offers for _, c in members)
+        ready = max(offers - sum(c.user_refusals for _, c in members), 0)
+        answers = sum(c.user_answers for _, c in members)
+        latencies = [(c.user_latency_ms, c.user_answers) for _, c in members if c.user_answers and c.user_latency_ms]
+        for key, _ in members:
+            proven.user_availability[key] = (ready + sc.user_offers_prior) / (offers + sc.user_offers_prior)
+            if answers >= sc.user_latency_min_answers and latencies:
+                proven.user_latency_ms[key] = weighted_median(latencies)
     return proven
 
 
@@ -200,7 +210,8 @@ def main() -> None:
     state = ScoreState.load(state_path)
     wallet = bt.Wallet(name=cfg.wallet_name, hotkey=cfg.hotkey_name)
     st = bt.Subtensor(network=cfg.network)
-    current = CatalogFollower(st, cfg.network, cfg.netuid, catalog.CatalogStore(cfg.catalog_dir), cfg.catalog_mirrors)
+    current = CatalogFollower(st, cfg.network, cfg.netuid, catalog.CatalogStore(cfg.catalog_dir), cfg.catalog_mirrors,
+                              state_path=cfg.state_dir.expanduser() / "catalog_followed.json")
     if missing := missing_references(cfg, current.catalog):
         raise SystemExit(f"no reference engine configured for the active models {missing}")
     throughput = Throughput.start(network=cfg.network, netuid=cfg.netuid, mechid=cfg.mechid,
@@ -238,8 +249,10 @@ def main() -> None:
             next_start = (epoch + 1) * epoch_blocks
             if epoch != done:
                 blocks_left = max(next_start - block, 1)
-                asyncio.run(run_epoch(cfg, st, wallet, secret, state, epoch, 1 if args.once else blocks_left,
+                trial = copy.deepcopy(state)  # an epoch that fails part way leaves no trace for its retry
+                asyncio.run(run_epoch(cfg, st, wallet, secret, trial, epoch, 1 if args.once else blocks_left,
                                       throughput, current, board))
+                state = trial
                 done = state.last_epoch = epoch
                 state.save(state_path)
                 if args.once:

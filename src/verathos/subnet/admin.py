@@ -100,6 +100,8 @@ def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path 
         raise SystemExit(f"{wallet.hotkey.ss58_address} is not the subnet owner hotkey")
     cat = catalog.load(path)
     cat.audit_policy(strict=True)  # nodes ignore settings their code does not know; a publisher must not mistype one
+    if unknown := cat.unknown_settings():
+        raise SystemExit(f"settings this code does not know: {', '.join(unknown)}")
     cat.anchor_shares(strict=True)
     stored = catalog.CatalogStore(store_dir).put(cat)
     print(f"catalog {cat.digest()} stored at {stored}; active models: "

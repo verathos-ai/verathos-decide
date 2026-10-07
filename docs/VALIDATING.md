@@ -108,13 +108,17 @@ Per epoch (`epoch_blocks` from the catalog, default 180 blocks) the validator:
 4. derives the epoch's canaries from its secret, computes the references, sends each endpoint its subset spread over
    the first `canary_spread_fraction` of the epoch (holding them while a throughput test runs), and checks every
    signed receipt;
-5. reads the auditor's verdicts for the epoch: each endpoint's proven capacity and any proven wrong answers;
+5. reads the auditor's verdicts for the epoch: each endpoint's proven capacity, what users got from it (readiness
+   and latency), each model's user demand, and any proven wrong answers;
 6. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
    probation, and sets weights on `mechid` (retried once per block, up to 10 times).
 
 Nothing a miner returns can stop the epoch: replies are size- and time-bounded and every malformed reply is
-recorded against that endpoint. Chain errors are retried every block. `--once` runs one epoch immediately and exits. Keep `state_dir` across restarts: it holds the canary secret and the
-score history, including the last epoch scored, so a restart does not score an epoch twice.
+recorded against that endpoint. Chain errors are retried every block, and an epoch that fails part way leaves no
+trace in the score history for its retry. `--once` runs one epoch immediately and exits. Keep `state_dir` across
+restarts: it holds the canary secret, the score history (including the last epoch scored, so a restart does not
+score an epoch twice) and the catalog followed (so manifests built for the previous catalog stay accepted for the
+rest of their epoch).
 
 ## Throughput audit
 

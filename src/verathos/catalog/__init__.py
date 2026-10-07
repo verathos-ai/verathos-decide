@@ -80,8 +80,8 @@ class Scoring(BaseModel):
                                         "the anchor shares")
     min_model_share: float = Field(0.1, ge=0, le=1, description="Emission share every active model keeps, whatever "
                                    "its demand")
-    user_refusals_min_offers: int = Field(20, ge=1, description="Times an endpoint must have been considered for "
-                                          "user requests in an epoch for its readiness to count")
+    user_offers_prior: int = Field(20, ge=1, description="Ready offers every hotkey's endpoints of a model start an "
+                                   "epoch with, so a few offers move its availability to users little")
     user_latency_min_answers: int = Field(50, ge=1, description="Answers to users an endpoint needs in an epoch for "
                                           "its latency factor to come from them; with fewer, from its test")
 
@@ -140,6 +140,16 @@ class Catalog(BaseModel):
         if total <= 0:
             return {m.model_id: 1.0 / len(active) for m in active}
         return {m.model_id: m.anchor_share / total for m in active}
+
+    def unknown_settings(self) -> list[str]:
+        """Keys of the document this code does not know (the catalog's own, its scoring's, its models'): nodes ignore
+        them, so a publisher must not mistype one."""
+        doc = self._document or {}
+        unknown = [k for k in doc if k not in type(self).model_fields]
+        unknown += [f"scoring.{k}" for k in doc.get("scoring") or {} if k not in Scoring.model_fields]
+        for m in doc.get("models") or []:
+            unknown += [f"models.{m.get('model_id', '?')}.{k}" for k in m if k not in CatalogModel.model_fields]
+        return unknown
 
     def audit_policy(self, *, strict: bool = False) -> AuditPolicy:
         """The throughput-audit policy: code defaults with this catalog's settings (``strict``: settings this code

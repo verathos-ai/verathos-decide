@@ -31,10 +31,11 @@ settings
 (`scoring`) and the throughput-audit policy (`throughput_audit`). Miners and validators use whichever catalog the
 owner hotkey commits; publishing a new one needs no code release.
 
-`price` is what users pay for the model, in USD per million input tokens; the gateway bills with it, and the
-model's share of the emission follows what its users pay (`SCORING.md`). `anchor_share` is the model's share while
+`price` is what users pay for the model, in USD per million input tokens, and the model's share of the emission
+follows what its users pay (`SCORING.md`). `anchor_share` is the model's share while
 there is no user demand; the active models' anchors must sum to 1 (`commit-catalog` refuses a catalog whose do not).
-Activating a model means giving it an anchor and lowering the others'. `first_test_rps` caps the rate of an endpoint's first test, and of all a new hotkey's
+Activating a model means giving it an anchor and lowering the others'; every active model keeps at least
+`min_model_share`, whatever its anchor. `commit-catalog` also refuses settings this code does not know. `first_test_rps` caps the rate of an endpoint's first test, and of all a new hotkey's
 endpoints together; later tests grow from what was delivered.
 
 `gateways` lists the hotkeys of the subnet's gateways (`GATEWAY.md`): miners serve them like validators, without

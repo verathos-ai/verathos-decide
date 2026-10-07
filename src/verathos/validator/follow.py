@@ -14,6 +14,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import bittensor as bt
 
@@ -26,13 +27,13 @@ log = logging.getLogger(__name__)
 
 class CatalogFollower:
     def __init__(self, st: bt.Subtensor, network: str, netuid: int, store: catalog.CatalogStore,
-                 mirrors: list[str]) -> None:
+                 mirrors: list[str], *, state_path: Path) -> None:
         self.network, self.netuid, self.store, self.mirrors = network, netuid, store, mirrors
         self.catalog = self._wait(st)
         self.on_change: list[Callable[[catalog.Catalog], None]] = []
         self._previous: tuple[str, float] | None = None
         self._lock = threading.Lock()
-        self._state_path = store.directory / "followed.json"
+        self._state_path = state_path  # this validator's own: a catalog store may be shared
         self._resume()
 
     def _grace_s(self) -> float:
@@ -56,11 +57,16 @@ class CatalogFollower:
         self._save()
 
     def _save(self) -> None:
+        """Keep the followed catalog and the grace on disk; a failure to keep them only costs the grace after a
+        restart."""
         previous, until = self._previous or (None, 0.0)
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"catalog": self.catalog.digest(), "previous": previous, "until": until}))
-        tmp.replace(self._state_path)
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"catalog": self.catalog.digest(), "previous": previous, "until": until}))
+            tmp.replace(self._state_path)
+        except OSError as exc:
+            log.warning("keeping the followed catalog in %s failed: %s", self._state_path, exc)
 
     def _wait(self, st: bt.Subtensor) -> catalog.Catalog:
         while True:

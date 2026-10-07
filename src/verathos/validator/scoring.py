@@ -18,8 +18,9 @@ Per endpoint and epoch:
   factor compares the endpoint's median latency with the median over the scored endpoints serving the same model,
   each weighted by its proven capacity (so splitting capacity over more endpoints does not move it), capped to
   [0.7, 1.3]: the latency of its answers to
-  users once it gave ``user_latency_min_answers`` of them, compared among endpoints measured the same way, else its
-  latency in its throughput test, compared among those. Every validator reads the same figures from the auditor's
+  users once its hotkey's endpoints serving the model gave ``user_latency_min_answers`` of them, compared among
+  endpoints measured the same way, else its latency in its throughput test, compared among those, and then at most 1
+  while users measure others of the model. Every validator reads the same figures from the auditor's
   verdicts. Candidate models score zero.
 An endpoint that could not be audited (no usable reference answers) keeps its average for at most ``MAX_HELD_EPOCHS``
 epochs in a row. Per UID: the sum of its endpoints' EMAs. Weights: UID values normalised to 1.
@@ -38,6 +39,7 @@ from verathos.validator.audit import EndpointResult
 from verathos.validator.compare import Verdict
 
 LATENCY_CAP = (0.7, 1.3)
+SCORE_SCALE = 2  # scores are shares of the emission (1: proven requests/s); averages of another scale start over
 PRUNE_BELOW = 1e-4  # EMA under which an endpoint that is gone is forgotten
 MAX_HELD_EPOCHS = 3
 
@@ -51,13 +53,19 @@ class ScoreState:
     evidence_seen: dict[str, int] = field(default_factory=dict)  # evidence id -> epoch it was applied
     held: dict[str, int] = field(default_factory=dict)  # key -> epochs in a row its average was held
     last_epoch: int | None = None  # the last epoch scored, so a restart does not score it again
+    scale: int = SCORE_SCALE
 
     @classmethod
     def load(cls, path: Path) -> ScoreState:
         if not path.exists():
             return cls()
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in json.loads(path.read_text()).items() if k in known})
+        data = {k: v for k, v in json.loads(path.read_text()).items() if k in known}
+        if data.get("scale") != SCORE_SCALE:  # averages on another scale would outweigh the new ones for hours
+            data.pop("ema", None)
+            data.pop("held", None)
+            data["scale"] = SCORE_SCALE
+        return cls(**data)
 
     def save(self, path: Path) -> None:
         tmp = path.with_suffix(".tmp")
@@ -179,12 +187,14 @@ def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, flo
         if ms > 0:
             latencies.setdefault((r.endpoint.endpoint.model_id, source), []).append((ms, credited[key]))
     median = {group: weighted_median(v) for group, v in latencies.items()}
+    by_users = {model for model, source in latencies if source == "users"}
     weight: dict[str, float] = {}
     for key, r in eligible.items():
-        (source, own), factor = latency(key), 1.0
+        (source, own), factor, model = latency(key), 1.0, r.endpoint.endpoint.model_id
         if own > 0:
-            factor = min(max(math.sqrt(median[(r.endpoint.endpoint.model_id, source)] / own), LATENCY_CAP[0]),
-                         LATENCY_CAP[1])
+            factor = min(max(math.sqrt(median[(model, source)] / own), LATENCY_CAP[0]), LATENCY_CAP[1])
+            if source == "test" and model in by_users:
+                factor = min(factor, 1.0)  # staying out of users' sight earns no bonus
         availability = (r.answered / r.sent) * min(max(user_availability.get(key, 1.0), 0.0), 1.0)
         weight[key] = credited[key] * availability * factor
     model_total: dict[str, float] = {}
@@ -193,7 +203,7 @@ def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, flo
         model_total[model] = model_total.get(model, 0.0) + w
     for key, w in weight.items():
         model = eligible[key].endpoint.endpoint.model_id
-        scores[key] = shares.get(model, 0.0) * w / model_total[model]
+        scores[key] = shares.get(model, 0.0) * w / model_total[model] if model_total[model] > 0 else 0.0
     return scores, failed
 
 

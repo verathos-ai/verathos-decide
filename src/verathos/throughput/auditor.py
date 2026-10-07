@@ -111,9 +111,9 @@ CREATE TABLE demand (epoch INTEGER NOT NULL, model_id TEXT NOT NULL, input_token
     ema REAL NOT NULL, PRIMARY KEY (epoch, model_id));
 """
 _USERS_SCHEMA = """
-CREATE TABLE users (epoch INTEGER NOT NULL, hotkey TEXT NOT NULL, endpoint_id TEXT NOT NULL,
+CREATE TABLE users (epoch INTEGER NOT NULL, hotkey TEXT NOT NULL, endpoint_id TEXT NOT NULL, model_id TEXT NOT NULL,
     offered INTEGER NOT NULL, refused INTEGER NOT NULL, answers INTEGER NOT NULL, latency TEXT NOT NULL,
-    PRIMARY KEY (epoch, hotkey, endpoint_id));
+    PRIMARY KEY (epoch, hotkey, endpoint_id, model_id));
 """
 _MIGRATIONS = {4: _DEMAND_SCHEMA, 5: _USERS_SCHEMA}  # from version -> the statements that bring it one version up
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
@@ -502,23 +502,24 @@ class Store:
 
     # ---- what users got ----
 
-    def close_users(self, epoch: int, tallies: dict[tuple[str, str], UserTally]) -> None:
-        rows = [(epoch, hk, ep, t.offered, t.refused, t.answers, json.dumps(t.latency, sort_keys=True))
-                for (hk, ep), t in tallies.items()]
+    def close_users(self, epoch: int, tallies: dict[tuple[str, str, str], UserTally]) -> None:
+        rows = [(epoch, hk, ep, model, t.offered, t.refused, t.answers, json.dumps(t.latency, sort_keys=True))
+                for (hk, ep, model), t in tallies.items()]
         with self._lock:
             self._db.execute("BEGIN")
-            self._db.executemany("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+            self._db.executemany("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
             self._db.execute("COMMIT")
 
     def users_closed(self, epoch: int) -> bool:
         return bool(self._query("SELECT 1 FROM users WHERE epoch = ? LIMIT 1", (epoch,)))
 
-    def users(self, epoch: int) -> dict[tuple[str, str], UserTally]:
-        """What each endpoint did for the gateways' users in ``epoch``."""
-        rows = self._query("SELECT hotkey, endpoint_id, offered, refused, answers, latency FROM users "
+    def users(self, epoch: int) -> dict[tuple[str, str, str], UserTally]:
+        """What each endpoint did for the gateways' users of each model in ``epoch``."""
+        rows = self._query("SELECT hotkey, endpoint_id, model_id, offered, refused, answers, latency FROM users "
                            "WHERE epoch = ?", (epoch,))
-        return {(hk, ep): UserTally(offered, refused, answers, {int(b): n for b, n in json.loads(latency).items()})
-                for hk, ep, offered, refused, answers, latency in rows}
+        return {(hk, ep, model): UserTally(offered, refused, answers,
+                                           {int(b): n for b, n in json.loads(latency).items()})
+                for hk, ep, model, offered, refused, answers, latency in rows}
 
     # ---- served verdicts ----
 
@@ -617,7 +618,8 @@ class Auditor:
         # (hotkey, endpoint) -> second -> [user requests answered, user requests sent]
         self._served: dict[tuple[str, str], dict[int, list[int]]] = {}
         self._demand: dict[int, dict[str, int]] = {}  # epoch -> model -> users' input tokens (not closed yet)
-        self._users: dict[int, dict[tuple[str, str], UserTally]] = {}  # epoch -> endpoint -> tally (not closed yet)
+        self._users: dict[int, dict[tuple[str, str, str], UserTally]] = {}  # epoch -> (hotkey, endpoint, model) ->
+        # tally, not closed yet
         self._reports: dict[str, float] = {}  # served reports taken lately -> when
         self._demand_lock = threading.Lock()
         self._rng = random.SystemRandom()
@@ -942,7 +944,7 @@ class Auditor:
                     second[0] += c.answered
                     second[1] += c.attempts
                 demand[model_of[key]] = demand.get(model_of[key], 0) + c.input_tokens
-                tally = users.setdefault(key, UserTally())
+                tally = users.setdefault((*key, model_of[key]), UserTally())
                 tally.offered += c.offered
                 tally.refused += c.refused
                 for bucket, n in c.latency.items():
@@ -1060,7 +1062,7 @@ class Auditor:
         users = self.store.users(epoch - 1)
 
         def with_users(c: Credit) -> Credit:
-            t = users.get((c.hotkey, c.endpoint_id))
+            t = users.get((c.hotkey, c.endpoint_id, c.model_id))  # measured on the model credited
             if t is None:
                 return c
             return c.model_copy(update={"user_offers": t.offered, "user_refusals": t.refused,

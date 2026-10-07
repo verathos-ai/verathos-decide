@@ -7,6 +7,7 @@ uses the reference engine's model; the cheater uses a different one behind the s
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -182,7 +183,8 @@ def test_credited_capacity() -> None:
         credit("hkA", "a"), credit("hkA", "b", qualified=False), credit("hkB", "a"), credit("hkA", "d")])
     cat = catalog.load()
     # capped at today's declaration; unqualified, untested and re-modelled endpoints have no credit
-    assert credited_capacity(endpoints, verdicts, cat, "enforce") == ({"hkA/a": 30.0}, {"hkA/a": 800.0}, {}, {})
+    assert credited_capacity(endpoints, verdicts, cat, "enforce") == ({"hkA/a": 30.0}, {"hkA/a": 800.0}, {},
+                                                                      {"hkA/a": 1.0})
     assert credited_capacity(endpoints, None, cat, "enforce") == ({}, {}, {}, {})
     # observe mode counts declarations, but no more than a model's first test
     assert credited_capacity(endpoints, None, cat, "observe") == ({"hkA/a": 30.0, "hkA/b": 50.0, "hkA/c": 50.0,
@@ -194,7 +196,9 @@ def test_credited_capacity() -> None:
         credit("hkA", "c").model_copy(update={"user_offers": 5, "user_refusals": 5, "user_answers": 10,
                                               "user_latency_ms": 900.0})])
     proven = credited_capacity(endpoints, users, cat, "enforce")
-    assert proven.user_availability == {"hkA/a": pytest.approx(0.6)} and proven.user_latency_ms == {"hkA/a": 300.0}
+    # per hotkey and model, splitting hides nothing: 60 of 105 offers ready, with 20 ready ones to start with
+    assert proven.user_availability == {k: pytest.approx(80 / 125) for k in ("hkA/a", "hkA/c")}
+    assert proven.user_latency_ms == {"hkA/a": 300.0, "hkA/c": 300.0}  # 70 answers, weighted by them
 
 
 def test_latency_factor_comes_from_the_test_latencies() -> None:
@@ -242,6 +246,33 @@ def test_what_users_got_from_an_endpoint_counts_once_there_is_enough_of_it() -> 
     # endpoint, measured by its test alone, is compared with no one
     weights_ = {"hkA/fast": 20 * 1.3, "hkA/hoarder": 20 * 0.5 * math.sqrt(500 / 800), "hkA/quiet": 20.0}
     assert scores == {k: pytest.approx(w / sum(weights_.values())) for k, w in weights_.items()}
+
+
+def test_a_model_whose_endpoints_all_refuse_users_scores_zero_and_stops_nothing() -> None:
+    from verathos.validator.audit import EndpointResult
+    from verathos.validator.discovery import DiscoveredEndpoint
+
+    def result(endpoint_id: str) -> EndpointResult:
+        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}",
+                                model_id="kev-4b", capacity_rps=20.0))
+        return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4)
+
+    results = {k: result(k.split("/")[1]) for k in ("hkA/a", "hkA/b")}
+    state = ScoreState()
+    record_window(state, results, 3)
+    scores, _ = epoch_scores(results, shares={"kev-4b": 1.0}, credited=dict.fromkeys(results, 20.0),
+                             latency_ms={}, state=state, user_availability=dict.fromkeys(results, 0.0))
+    assert scores == dict.fromkeys(results, 0.0)
+
+
+def test_averages_of_another_score_scale_start_over(tmp_path) -> None:
+    path = tmp_path / "scores.json"
+    path.write_text(json.dumps({"ema": {"hk/gpu0": 18.7}, "probation": {"hk/gpu1": 3}}))  # proven requests/s
+    state = ScoreState.load(path)
+    assert state.ema == {} and state.probation == {"hk/gpu1": 3}
+    state.ema = {"hk/gpu0": 0.4}
+    state.save(path)
+    assert ScoreState.load(path).ema == {"hk/gpu0": 0.4}
 
 
 def test_splitting_capacity_over_endpoints_does_not_move_the_latency_median() -> None:

@@ -108,7 +108,7 @@ def test_manifests_of_the_previous_catalog_stay_accepted_across_a_validator_rest
     store = catalog.CatalogStore(tmp_path)
 
     def start() -> follow.CatalogFollower:
-        return follow.CatalogFollower(None, "test", 405, store, [])
+        return follow.CatalogFollower(None, "test", 405, store, [], state_path=tmp_path / "followed.json")
 
     running = start()
     assert running.accepted() == {first.digest()}
@@ -120,3 +120,12 @@ def test_manifests_of_the_previous_catalog_stay_accepted_across_a_validator_rest
     state = json.loads((tmp_path / "followed.json").read_text())
     (tmp_path / "followed.json").write_text(json.dumps({**state, "until": 0}))
     assert start().accepted() == {first.digest()}  # the grace is over
+
+
+def test_settings_this_code_does_not_know_are_found_before_publishing() -> None:
+    document = catalog.load().document()
+    mistyped = {**document, "scoring": {**document.get("scoring", {}), "min_model_shares": 0.0},
+                "models": [{**document["models"][0], "prise": 1.0}] + document["models"][1:]}
+    assert catalog.load().unknown_settings() == []
+    unknown = catalog.Catalog.parse(mistyped).unknown_settings()
+    assert unknown == ["scoring.min_model_shares", f"models.{document['models'][0]['model_id']}.prise"]
