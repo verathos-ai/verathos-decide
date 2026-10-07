@@ -223,6 +223,29 @@ def test_what_an_endpoint_answers_the_gateway_during_a_test_counts_as_delivered(
     assert auditor.accept_served([ServedCount(hotkey="unknown", endpoint_id="gpu0", second=start, answered=5)]) == 0
 
 
+def test_a_test_leaves_room_for_the_users_an_endpoint_serves(tmp_path) -> None:
+    """Users go first: a test sends only what the endpoint's recent user traffic leaves of the tested rate, so the
+    endpoint is never asked for more than its tested rate."""
+    import time as time_module
+
+    from verathos.protocol.gateway import ServedCount
+    from verathos.throughput.auditor import USER_RATE_LAG_S, USER_RATE_S
+
+    auditor = _auditor(tmp_path)
+    busy, quiet = (Slot("hk", e, f"http://x/e/{e}", "kev-4b", 20.0) for e in ("gpu0", "gpu1"))
+    auditor.update_slots([busy, quiet])
+    now = time_module.time()
+    first = int(now - USER_RATE_LAG_S - USER_RATE_S)
+    assert auditor.accept_served([ServedCount(hotkey="hk", endpoint_id="gpu0", second=first + i, answered=12)
+                                  for i in range(int(USER_RATE_S) + 1)]) == int(USER_RATE_S) + 1
+    assert auditor.test_rate(Target(busy, 20.0), now, auditor.policy) == pytest.approx(8.0, abs=0.3)
+    assert auditor.test_rate(Target(busy, 10.0), now, auditor.policy) == pytest.approx(1.0)  # at least 10%
+    assert auditor.test_rate(Target(quiet, 20.0), now, auditor.policy) == 20.0
+    test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+    plan = auditor.plan(test, [Target(busy, 20.0), Target(quiet, 20.0)], int(now * 1000), auditor.policy)
+    assert [t["rate_rps"] for t in plan["targets"]] == [pytest.approx(8.0, abs=0.3), 20.0]
+
+
 def test_served_verdicts_are_the_same_after_a_restart(tmp_path) -> None:
     from verathos.throughput.auditor import Auditor
 

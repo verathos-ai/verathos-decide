@@ -88,6 +88,9 @@ KEPT_PER_ENDPOINT = 8  # gateway samples kept per endpoint and epoch, of which g
 MAX_CHECK_ATTEMPTS = 3
 SAMPLE_BUDGET_S = 40.0  # per round of sample checks, under the lead time of a test
 SERVED_WAIT_S = 12.0  # after a test's window, for the gateways' last served counts
+USER_RATE_S = 60.0  # a test leaves room for what the endpoint answered the gateways over this long ...
+USER_RATE_LAG_S = 10.0  # ... ending this long before the test (the gateways report every few seconds)
+MIN_TEST_SHARE = 0.1  # a test sends at least this share of the tested rate itself
 SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30
 SCHEMA_VERSION = 5
@@ -596,15 +599,24 @@ class Auditor:
                     if round(rate * scale, 2) > 0]
         return out
 
+    def test_rate(self, target: Target, now_s: float, policy: AuditPolicy) -> float:
+        """What the test itself sends the endpoint: the tested rate less its recent rate of user requests, which it
+        serves first and which count as delivered; at least ``MIN_TEST_SHARE`` of the tested rate, and enough for
+        the test's samples."""
+        end = now_s - USER_RATE_LAG_S
+        users = self.served_in(target.slot.hotkey, target.slot.endpoint_id, end - USER_RATE_S, end) / USER_RATE_S
+        floor = max(MIN_TEST_SHARE * target.tested_rps, policy.samples_per_test / policy.test_s)
+        return round(min(target.tested_rps, max(floor, target.tested_rps - users)), 3)
+
     def plan(self, test: ScheduledTest, targets: list[Target], start_ms: int, policy: AuditPolicy) -> dict[str, Any]:
-        cat, not_after_ms = self.catalog(), start_ms + int(policy.session_s * 1000)
+        cat, not_after_ms, now_s = self.catalog(), start_ms + int(policy.session_s * 1000), time.time()
         planned = []
         for t in targets:
             workload = cat.get(t.slot.model_id).workload
             session = Session(netuid=self.netuid, auditor=self.hotkey, miner_hotkey=t.slot.hotkey,
                               endpoint_id=t.slot.endpoint_id, test_id=test.test_id, not_after_ms=not_after_ms)
             planned.append({
-                "id": t.slot.key, "url": t.slot.url + "/v1/systemone", "rate_rps": t.tested_rps,
+                "id": t.slot.key, "url": t.slot.url + "/v1/systemone", "rate_rps": self.test_rate(t, now_s, policy),
                 "max_outstanding": math.ceil(t.tested_rps * policy.request_timeout_s) + 16,
                 "headers": session_headers(session, self.keypair), "model": t.slot.model_id,
                 "state_words": list(workload.state_words), "questions": workload.questions,
@@ -647,6 +659,9 @@ class Auditor:
             return
         start_ms = int(time.time() * 1000) + START_DELAY_MS
         plan = self.plan(test, targets, start_ms, policy)
+        log.info("throughput test of epoch %d sends %.1f requests/s itself, users fill the other %.1f", test.epoch,
+                 sum(t["rate_rps"] for t in plan["targets"]),
+                 sum(t.tested_rps for t in targets) - sum(t["rate_rps"] for t in plan["targets"]))
         try:
             result = await self.runner(plan, timeout_s=policy.session_s + 30.0)
         except loadgen.LoadgenError as exc:

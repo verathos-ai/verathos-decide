@@ -127,6 +127,12 @@ caller other than a gateway (the catalog's `gateways`, or one in the miner's own
 requests at once per endpoint, so a validator cannot crowd a competitor's test out with priority traffic. The miner
 signs only well-formed answers: an engine fault returns an error, never a signed wrong answer.
 
+A test also leaves room for users: it sends each endpoint its tested rate less what the endpoint answered the
+subnet's gateway over the last minute (ending 10 s before the test, as the gateway's counts arrive), at least 10% of
+the tested rate and enough for the test's samples. What the endpoint answers users inside the window counts as
+delivered (see Gateway answers), so in all it is asked for its tested rate, not more: a test runs every endpoint at
+its tested rate at once, but never beyond it, whatever the user traffic.
+
 ## Gateway answers
 
 The subnet's gateway (`GATEWAY.md`) sends the auditor sampled exchanges of its user traffic: one per endpoint and
@@ -141,7 +147,8 @@ it began.
 
 The gateway also reports, per second, how many requests each endpoint answered it. Miners serve the gateway before
 test traffic, so what an endpoint answered the gateway inside a test's measured window counts as delivered, next to
-the test's own replies: serving users never costs credit, and refusing them during a test gains nothing.
+the test's own replies: serving users never costs credit, and refusing them during a test costs what the test left
+room for.
 
 ## Verdicts
 
@@ -184,7 +191,7 @@ How credits and wrong answers enter the score is in `SCORING.md`.
 | Fast junk responses | receipts that do not bind scale delivered down; a signed wrong answer invalidates the hotkey |
 | Responses built to break the auditor | size and nesting limits; each endpoint is evaluated on its own |
 | Flooding a competitor's endpoint with validator traffic during its test | at most 4 requests at once per validator and endpoint |
-| Flooding it with gateway traffic during its test, or a miner refusing users then | what an endpoint answers the gateway inside the test's window counts as delivered |
+| Flooding it with gateway traffic during its test, or a miner refusing users then | what an endpoint answers the gateway inside the test's window counts as delivered; the test sends only the rest of the tested rate |
 | Caching or sharing answers | every request is unique |
 
 What a test proves is that an endpoint delivers its declared rate on about 60 s notice: test traffic is
