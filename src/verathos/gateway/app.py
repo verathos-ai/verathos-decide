@@ -11,13 +11,14 @@ Every response carries ``X-Request-Id`` (the client's, if it sent a valid one). 
 
     400 invalid_request     not JSON (NaN and infinities included), not a SystemOne request, or refused by the miners
     401 unauthorized        missing, unknown, revoked or expired key, or a suspended account
-    404 model_not_found     not a model the gateway serves
+    404 model_not_found     not an active model of the catalog
     413 too_large           body, state, or the answers the questions would need, over the limits
     429 rate_limited        over the key's rate (or too many invalid keys from one address)
     429 quota_exceeded      over the account's monthly quota
     500 internal            a fault of the gateway
     503 busy                no capacity free for the model right now
-    503 unavailable         the miners failed within the request's deadline, or accounts cannot be checked
+    503 unavailable         no miner serves the model right now, the miners failed within the request's deadline, or
+                            accounts cannot be checked
 """
 
 from __future__ import annotations
@@ -218,8 +219,11 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
             return reject(400, "invalid_request", f"not a SystemOne request: {exc}"[:2000], request_id)
         cat = g.catalog()
         model = cat.get(parsed.model) if cat is not None else None
-        if model is None or model.status != "active" or parsed.model not in g.router.models():
+        if model is None or model.status != "active":
             return reject(404, "model_not_found", f"{parsed.model} is not served", request_id)
+        if parsed.model not in g.router.models():
+            return reject(503, "unavailable", f"no miner serves {parsed.model} right now", request_id, 30,
+                          model=parsed.model)
         if len(state) > STATE_CHARS_PER_TOKEN * model.max_state_tokens:
             return reject(413, "too_large", f"the state exceeds what {model.model_id} accepts", request_id,
                           model=parsed.model)

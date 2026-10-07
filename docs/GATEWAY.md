@@ -177,13 +177,13 @@ Every response carries `X-Request-Id` (the client's, if it sent a valid one). Er
 |---|---|---|
 | 400 | `invalid_request` | not JSON (NaN and infinities included), not a SystemOne request, or refused by the miners |
 | 401 | `unauthorized` | missing, unknown, revoked or expired key, or a suspended account |
-| 404 | `model_not_found` | a model the gateway does not serve |
+| 404 | `model_not_found` | not an active model of the catalog |
 | 413 | `too_large` | body, state, or the answers the questions would need, over the limits |
 | 429 | `rate_limited` | over the key's rate, or too many invalid keys from the address; `Retry-After` |
 | 429 | `quota_exceeded` | the month's quota is used up |
 | 500 | `internal` | a fault of the gateway |
 | 503 | `busy` | no capacity free for the model now; `Retry-After` |
-| 503 | `unavailable` | no miner answered in time, or accounts cannot be checked; `Retry-After` |
+| 503 | `unavailable` | no miner serves the model right now, none answered in time, or accounts cannot be checked; `Retry-After` |
 
 ## Accounts and keys
 

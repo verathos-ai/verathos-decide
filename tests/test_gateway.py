@@ -183,7 +183,9 @@ def test_monthly_quota_and_bad_requests(tmp_path) -> None:
 
     t = Setup(tmp_path / "other", {"10.0.0.1": MockEngine("kev-4b")})
     assert asyncio.run(t.post({"model": "kev-4b"})).json()["error"]["type"] == "invalid_request"
-    assert asyncio.run(t.post({**REQUEST, "model": "kev-9b"})).json()["error"]["type"] == "model_not_found"
+    assert asyncio.run(t.post({**REQUEST, "model": "clef-flash"})).json()["error"]["type"] == "model_not_found"
+    gone = asyncio.run(t.post({**REQUEST, "model": "kev-9b"}))  # active, but nobody serves it now: try again later
+    assert gone.status_code == 503 and gone.json()["error"]["type"] == "unavailable" and "Retry-After" in gone.headers
     too_long = {**REQUEST, "state": "x" * (4 * catalog.load().get("kev-4b").max_state_tokens + 1)}
     assert asyncio.run(t.post(too_long)).json()["error"]["type"] == "too_large"
 
