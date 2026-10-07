@@ -36,7 +36,7 @@ from verathos import catalog as catalog_module
 from verathos.gateway import db
 from verathos.gateway.accounts import Accounts
 from verathos.gateway.admin import ByPort, admin_app, read_token
-from verathos.gateway.app import Gateway, create_app
+from verathos.gateway.app import Gateway, create_app, mark_states_forever
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.router import Router
@@ -109,7 +109,8 @@ async def serve(config: GatewayConfig) -> None:
         """The background work runs with the server; on shutdown (SIGTERM included) usage, samples and served
         counts are written before the process ends."""
         await routes.load()
-        tasks = [asyncio.create_task(t) for t in (routes.run(), meter.run(), sampler.run(), served.run())]
+        tasks = [asyncio.create_task(t) for t in (routes.run(), meter.run(), sampler.run(), served.run(),
+                                                     mark_states_forever(gateway))]
         log.info("gateway %s on %s:%d (auditor %s, %d instance(s))", keypair.ss58_address, config.listen_host,
                  config.port, auditor_hotkey, config.instances)
         try:

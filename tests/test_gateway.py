@@ -220,6 +220,29 @@ def test_a_model_whose_every_miner_fails_is_unavailable_not_busy(tmp_path) -> No
     assert down.headers["Retry-After"] == "30"
 
 
+def test_the_status_says_per_model_what_users_get(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": MockEngine("kev-4b")})
+
+    async def status():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=s.app), base_url="http://gw") as c:
+            r = await c.get("/v1/status")
+            return r, {m["id"]: m for m in r.json()["models"]}
+    assert all(r.status_code == 200 for r in s.many(5))
+    response, models = asyncio.run(status())
+    kev4 = models["kev-4b"]
+    assert response.headers["cache-control"] == "public, max-age=15"
+    assert (kev4["state"], kev4["endpoints"], kev4["capacity_rps"]) == ("operational", 2, 40.0)
+    assert kev4["latency_ms"]["p50"] >= 0 and kev4["latency_ms"]["window_s"] == 900
+    assert kev4["success_rate_1h"] is None  # under 20 requests: no rate yet
+    assert models["kev-9b"]["state"] == "unavailable" and models["kev-9b"]["latency_ms"] is None
+    for host in ("10.0.0.1", "10.0.0.2"):  # the miners' host dies
+        s.client._transport._t[host] = Unreachable()
+    for _ in range(BREAKER_FAILURES + 1):
+        s.many(1)
+    _, models = asyncio.run(status())
+    assert models["kev-4b"]["state"] == "unavailable" and models["kev-4b"]["availability_24h"] == 0.0
+
+
 def test_an_answer_without_a_binding_receipt_is_not_returned(tmp_path) -> None:
     gateway = kp()
     forger = FastAPI()
@@ -731,8 +754,10 @@ def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
     async def models():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=s.app), base_url="http://gw") as c:
             return (await c.get("/v1/models")).json()["data"]
-    (listed,) = asyncio.run(models())
-    assert listed["id"] == "kev-4b" and listed["price"] == {"usd_per_million_input_tokens": price}
+    listed = {m["id"]: m for m in asyncio.run(models())}
+    assert listed["kev-4b"]["price"] == {"usd_per_million_input_tokens": price, "usd_per_million_output_tokens": 0}
+    assert listed["kev-4b"]["available"] and listed["kev-4b"]["weights"]["repo"]
+    assert not listed["kev-9b"]["available"]  # active in the catalog, listed, but no miner routed
 
     asyncio.run(s.accounts.set_account("acme", prepaid=True))
     refused = asyncio.run(s.post(long))

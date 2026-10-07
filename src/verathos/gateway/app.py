@@ -2,7 +2,8 @@
 
     POST /v1/systemone   a SystemOne request with ``Authorization: Bearer <key>`` -> the answers, the usage, the
                          miner's signed receipt and the request id
-    GET  /v1/models      the models served now, with their state limit and price
+    GET  /v1/models      the catalog's active models: state limit, price, weights, and whether available now
+    GET  /v1/status      per model: operational, degraded or unavailable; endpoints, capacity, latency, success
     GET  /health         the process is up
     GET  /ready          routes are loaded and the gateway is in the catalog (503 otherwise)
 
@@ -24,7 +25,9 @@ Every response carries ``X-Request-Id`` (the client's, if it sent a valid one). 
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import datetime as dt
 import ipaddress
 import json
 import logging
@@ -33,7 +36,7 @@ import re
 import secrets
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -48,6 +51,7 @@ from verathos.gateway.limits import RateLimiter
 from verathos.gateway.router import Endpoint, Outcome, Router
 from verathos.gateway.sampler import Sampler
 from verathos.gateway.served import ServedCounter
+from verathos.gateway.stats import DEGRADED_SUCCESS, ModelStats
 from verathos.gateway.upstream import Exchange, Upstream, UpstreamFailure
 from verathos.gateway.usage import UsageMeter
 from verathos.protocol.api import MAX_RESPONSE_BYTES, Choice, SystemOneRequest, question_keys
@@ -77,6 +81,7 @@ class Gateway:
     routes: Callable[[], Routes | None]
     limiter: RateLimiter
     clock: Callable[[], float] = time.monotonic
+    stats: ModelStats = field(default_factory=ModelStats)
 
     def routes_state(self) -> dict[str, Any] | None:
         table = self.routes()
@@ -255,6 +260,36 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
     return result
 
 
+def model_state(g: Gateway, model_id: str) -> str:
+    """unavailable: no routable endpoint, or every one failing; degraded: under DEGRADED_SUCCESS of the last 15
+    minutes' requests answered, or more than half the endpoints failing; else operational."""
+    health = g.router.health(model_id)
+    if not health["endpoints"] or g.router.down(model_id):
+        return "unavailable"
+    recent = g.stats.success_rate(model_id, 15)
+    if (recent is not None and recent < DEGRADED_SUCCESS) or 2 * health["failing"] > health["endpoints"]:
+        return "degraded"
+    return "operational"
+
+
+def mark_states(g: Gateway) -> dict[str, str]:
+    """The active models' states now, recorded for their availability."""
+    cat = g.catalog()
+    states: dict[str, str] = {}
+    for m in cat.models if cat is not None else []:
+        if m.status == "active":
+            states[m.model_id] = state = model_state(g, m.model_id)
+            g.stats.mark(m.model_id, unavailable=state == "unavailable")
+    return states
+
+
+async def mark_states_forever(g: Gateway, every_s: float = 60.0) -> None:
+    """Each minute's state, also in minutes nobody asks for the status."""
+    while True:
+        mark_states(g)
+        await asyncio.sleep(every_s)
+
+
 def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
     app = FastAPI(title="Verathos gateway", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     trusted = [ipaddress.ip_network(n, strict=False) for n in g.config.trusted_proxies]
@@ -295,11 +330,27 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
         cat = g.catalog()
-        served = g.router.models()
-        data = [] if cat is None else [{"id": m.model_id, "object": "model", "max_state_tokens": m.max_state_tokens,
-                                        "price": {"usd_per_million_input_tokens": m.price}}
-                                       for m in cat.models if m.status == "active" and m.model_id in served]
+        states = mark_states(g)
+        data = [] if cat is None else [{
+            "id": m.model_id, "object": "model", "max_state_tokens": m.max_state_tokens,
+            "price": {"usd_per_million_input_tokens": m.price, "usd_per_million_output_tokens": 0},
+            "available": states[m.model_id] != "unavailable", "license": m.license,
+            "weights": {"repo": m.hf_repo, "revision": m.hf_revision},
+            "base_model": {"repo": m.base_repo, "revision": m.base_revision} if m.base_repo else None,
+        } for m in cat.models if m.status == "active"]
         return {"object": "list", "data": data}
+
+    @app.get("/v1/status")
+    async def status():
+        models = []
+        for model_id, state in mark_states(g).items():
+            health = g.router.health(model_id)
+            models.append({"id": model_id, "state": state, "endpoints": health["endpoints"],
+                           "capacity_rps": health["capacity_rps"], **g.stats.summary(model_id)})
+        utc = dt.UTC
+        return JSONResponse({"updated_at": dt.datetime.now(utc).isoformat(timespec="seconds"),
+                             "since": dt.datetime.fromtimestamp(g.stats.since, utc).isoformat(timespec="seconds"),
+                             "models": models}, headers={"Cache-Control": "public, max-age=15"})
 
     @app.post("/v1/systemone")
     async def systemone(request: Request):
@@ -355,6 +406,10 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         model = checked.parsed.model
         outcome = await forward(g, checked, started)
         metrics.REQUEST_SECONDS.labels(model).observe(g.clock() - started)
+        if isinstance(outcome, Exchange):
+            g.stats.record(model, answered=True, seconds=g.clock() - started)
+        elif outcome != "rejected":  # the request's own fault says nothing about the model
+            g.stats.record(model, answered=False)
         if isinstance(outcome, Exchange):
             g.meter.record(principal, model, answered=True, input_tokens=outcome.input_tokens, price=checked.price)
             g.sampler.offer(outcome)

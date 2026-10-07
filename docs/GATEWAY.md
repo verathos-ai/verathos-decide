@@ -216,8 +216,27 @@ curl -s https://<gateway>/v1/systemone -H "Authorization: Bearer $KEY" -H "Conte
              "signature": "..."}}
 ```
 
-`GET /v1/models` lists the models served now, each with its state limit (`max_state_tokens`) and price
-(`price.usd_per_million_input_tokens`); `GET /health` answers while the process runs.
+`GET /v1/models` lists the catalog's active models, each with its state limit (`max_state_tokens`), price
+(`price.usd_per_million_input_tokens`; `usd_per_million_output_tokens` is 0), license, weights (`weights.repo`,
+`weights.revision`, `base_model`) and whether it is `available` now (a routable endpoint that is not failing).
+`GET /health` answers while the process runs.
+
+`GET /v1/status` (public, cacheable for 15 s) says per model what users get from this gateway process:
+
+```json
+{"updated_at": "2026-10-07T17:40:00+00:00", "since": "2026-10-07T16:15:00+00:00",
+ "models": [{"id": "kev-4b", "state": "operational", "endpoints": 3, "capacity_rps": 42.0,
+             "latency_ms": {"p50": 251, "p95": 410, "window_s": 900},
+             "success_rate_1h": 0.998, "availability_24h": 0.999}]}
+```
+
+- `state`: `unavailable` without a routable endpoint or with every endpoint failing; `degraded` when under 98% of the
+  last 15 minutes' user requests were answered or more than half the endpoints are failing; else `operational`.
+- `latency_ms`: of the answers to users in the last 15 minutes, retries included (null without answers).
+- `success_rate_1h`: answered among answered and failed user requests of the last hour (null under 20 requests);
+  requests the miners refused as invalid do not count.
+- `availability_24h`: the share of minutes the model was not unavailable, of the minutes recorded.
+- In memory: the figures cover `since` (the process start) until now.
 
 Every response carries `X-Request-Id` (the client's, if it sent a valid one). Errors are
 `{"error": {"type": ..., "message": ...}}`:

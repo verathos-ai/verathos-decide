@@ -155,6 +155,13 @@ class Router:
                              else 0.0}}
                 for model, pool in sorted(self._pools.items()) for e in pool.endpoints]
 
+    def health(self, model_id: str) -> dict[str, float]:
+        """The model's routable endpoints, their credited capacity, and how many are failing (breaker open)."""
+        pool = self._pools.get(model_id)
+        endpoints = pool.endpoints if pool else []
+        return {"endpoints": len(endpoints), "capacity_rps": round(sum(e.route.credited_rps for e in endpoints), 2),
+                "failing": sum(e.breaker.is_open for e in endpoints)}
+
     def capacity(self, model_id: str) -> float:
         pool = self._pools.get(model_id)
         return sum(e.route.credited_rps for e in pool.endpoints) * self.share if pool else 0.0
