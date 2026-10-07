@@ -20,7 +20,8 @@ The validator therefore recomputes a sample of requests itself, in fp32, and com
 Each epoch the validator derives a pool of `canary_pool_size` (16) requests per model from a private secret, the
 epoch and the model (support tickets and code-review requests with generated details and a varying subset of questions). Miners
 cannot predict them. Canaries are signed by the validator's hotkey, so a miner can tell validator traffic from
-gateway traffic; the checks here cover what validators are served, and answers to other callers are not verified.
+gateway traffic; the checks here cover what validators are served, and the throughput auditor checks a sample of the
+answers the subnet's gateway receives (`GATEWAY.md`).
 The reference engine answers each canary once; every endpoint of that model receives its own random subset of
 `canaries_per_endpoint` (10) canaries, spread over the first `canary_spread_fraction` (0.6) of the epoch. Canaries
 wait while a throughput test runs (`THROUGHPUT_AUDIT.md`). If the reference engine cannot answer, the model's
@@ -52,7 +53,7 @@ Tolerances are per model and set in the catalog.
 Per endpoint and epoch:
 - zero, with probation for every endpoint of the hotkey and their averages reset to zero, if a request failed the
   hard check, the statistical check failed, or the throughput auditor proved a wrong answer the hotkey signed in a
-  test (see `THROUGHPUT_AUDIT.md`);
+  test or to the subnet's gateway (see `THROUGHPUT_AUDIT.md`);
 - zero if the endpoint failed the identity challenge, answered nothing, or has not yet proven capacity in a
   throughput test;
 - otherwise `score_per_rps(model) x proven capacity x answered / sent x latency factor`. The proven capacity is the

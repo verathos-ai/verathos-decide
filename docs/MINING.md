@@ -123,12 +123,13 @@ On start the miner:
    measurement that a throughput test interrupts is retried later.
 
 Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted from
-hotkeys holding a validator permit, from `gateway_hotkeys`, and as test traffic under a session the auditor signed.
-Other callers are refused before their request body is read; bodies are capped at 1 MiB and must arrive within 10 s,
-and a state
-may hold at most 4 characters per token of the model's `max_state_tokens`. A validator gets at most 4 requests at
-once per endpoint (HTTP 429 beyond that); gateways are not limited. The miner signs only well-formed answers: an
-engine that returns anything else gets an error back to the caller, never a signed receipt.
+hotkeys holding a validator permit, from the subnet's gateways (the catalog's `gateways`) and the miner's own
+`gateway_hotkeys`, and as test traffic under a session the auditor signed. Other callers are refused before their
+request body is read; bodies are capped at 1 MiB and must arrive within 10 s, and a state may hold at most 4
+characters per token of the model's `max_state_tokens`. A validator gets at most 4 requests at once per endpoint
+(HTTP 429 beyond that); gateways are not limited. The miner signs only well-formed answers: an engine that returns
+anything else gets an error back to the caller, never a signed receipt. The auditor recomputes a sample of the
+answers given to the subnet's gateway, as it does test answers: serve users the same model, at the same precision.
 
 ## Reading the log
 

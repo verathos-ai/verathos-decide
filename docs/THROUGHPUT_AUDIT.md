@@ -122,9 +122,18 @@ The miner admits requests from validators and gateways ahead of test requests: a
 other request waits, and a request that finds the queue full takes the place of the newest waiting test request. A
 test request is dropped once its session expires, or when the load generator has given up on it. A test never
 delays other traffic; test requests beyond the endpoint's spare capacity are not delivered, and the credit shows
-it. A caller other than the miner's own gateways gets at most 4 requests at once per endpoint, so a validator cannot
-crowd a competitor's test out with priority traffic. The miner signs only well-formed answers: an engine fault
+it. A caller other than a gateway (the catalog's `gateways`, or one in the miner's own `gateway_hotkeys`) gets at
+most 4 requests at once per endpoint, so a validator cannot crowd a competitor's test out with priority traffic. The miner signs only well-formed answers: an engine fault
 returns an error, never a signed wrong answer.
+
+## Gateway answers
+
+The subnet's gateway (`GATEWAY.md`) sends the auditor sampled exchanges of its user traffic: one per endpoint and
+sampling window, drawn after the answers are in, signed by a gateway the catalog lists. The auditor keeps those whose
+receipt binds the request and the answers and names that gateway, up to `gateway_checks_per_epoch` per endpoint and
+epoch, and recomputes them between tests (screen and fp32 reference as above). A wrong answer is evidence like one in
+a test. The differences form a drift tally of their own over the last `drift_window_tests` epochs: an endpoint whose
+answers to users drift beyond the model's `mean_abs` loses its credit, however correct its test answers are.
 
 ## Verdicts
 
@@ -135,7 +144,8 @@ For scoring epoch `E` the auditor publishes, signed by its hotkey, at `GET /v1/t
   median latency in that test, whether its answers drifted, and whether it has qualified (at least
   `qualification_tests` confirmed tests with a credit). An endpoint the latest test did not target has no credit,
   so leaving a test out does not keep an older credit;
-- for every hotkey with a wrong answer in those tests, the evidence of one.
+- for every hotkey with a wrong answer in those tests or in the gateway answers it checked in those epochs, the
+  evidence of one.
 
 The verdicts for the current epoch and the two before are served once their tests are settled (404 otherwise);
 once served, an epoch's verdicts do not change.
@@ -186,6 +196,7 @@ recognisable by its session, so hardware used for other work between tests could
 | `rate_growth` | 2.0 | tested rate at most this times the last delivered rate |
 | `min_test_share` | 0.125 | ... but at least this share of the model's `first_test_rps` |
 | `drift_window_tests` | 8 | tests over which an endpoint's recomputed answers must stay within the model's `mean_abs` |
+| `gateway_checks_per_epoch` | 2 | sampled gateway answers the auditor recomputes per endpoint and epoch (0: none) |
 
 Per model: `workload` (the request mix), `score_per_rps` and `first_test_rps`.
 

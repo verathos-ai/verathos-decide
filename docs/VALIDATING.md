@@ -121,8 +121,9 @@ score history, including the last epoch scored, so a restart does not score an e
 Every validator follows the test schedule from chain data and holds its canaries while a test's traffic runs. It
 fetches the auditor's verdicts for the epoch from the auditor's axon (`GET /v1/throughput/<epoch>`), checks they are
 signed by the auditor hotkey, and scores each endpoint by the capacity credited there for the model it serves now.
-It applies a proven wrong answer only after checking the miner's receipt in the evidence and, if it runs a reference
-engine for the model, recomputing the answer (if that engine does not answer, it applies the auditor's verdict). If the verdicts stay unavailable it uses the last ones it holds while they still cover a
+It applies a proven wrong answer only after checking the miner's receipt in the evidence (issued to the auditor in
+a test, or to a catalog gateway for a sampled user request) and, if it runs a reference engine for the model,
+recomputing the answer (if that engine does not answer, it applies the auditor's verdict). If the verdicts stay unavailable it uses the last ones it holds while they still cover a
 recent test; without any, no endpoint has proven capacity that epoch. In `observe` mode it counts declared
 capacities, up to the model's `first_test_rps`, and fetches nothing.
 
@@ -135,7 +136,9 @@ If the validator's hotkey is the auditor, it also:
 - serves the verdicts on `port` and points its axon at `public_host:port`, where miners and validators find it;
 - re-discovers miners every 2 minutes, so new endpoints join the next test;
 - runs every scheduled test with the load generator, checks the sampled answers on its reference engines, and
-  confirms tests once their selection block is final.
+  confirms tests once their selection block is final;
+- serves the subnet's gateway its routes (`GET /v1/routes`) and takes its sampled exchanges
+  (`POST /v1/gateway/samples`, signed by a catalog gateway), which it checks between tests (`GATEWAY.md`).
 
 The auditor database is `state_dir/throughput.sqlite`. Keep the auditor running continuously: a test it misses is
 not run, and endpoints keep the credit of their last test for `credit_ttl_epochs`. A test running when it restarts

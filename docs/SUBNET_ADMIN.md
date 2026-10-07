@@ -34,6 +34,10 @@ owner hotkey commits; publishing a new one needs no code release.
 per request score fairly. `first_test_rps` caps the rate of an endpoint's first test, and of all a new hotkey's
 endpoints together; later tests grow from what was delivered.
 
+`gateways` lists the hotkeys of the subnet's gateways (`GATEWAY.md`): miners serve them like validators, without
+the per-caller limit, and the auditor checks a sample of their answers. Rotating a gateway hotkey is a catalog
+commit.
+
 Model status: `active` models are scored; `candidate` models can be served and are checked but weighted zero, which
 lets a new model run on the network before it is scored; `retired` models are skipped, and miners withdraw endpoints
 serving them from their manifests (a miner with no other endpoint stops).

@@ -4,7 +4,8 @@ A Bittensor subnet for decision models: models that read a state (a ticket, a co
 typed questions with calibrated probabilities in one forward pass. Miners serve catalog models on their GPUs behind a
 SystemOne-compatible API; validators recompute a hidden sample of requests in fp32 and compare the full probability
 vectors, which fingerprint the exact weights; a throughput audit sends every endpoint its declared request rate at
-the same moment, so endpoints score by the capacity they prove and one machine cannot pose as many.
+the same moment, so endpoints score by the capacity they prove and one machine cannot pose as many. The subnet's
+gateway serves users from that proven capacity, and a sample of the answers users get is recomputed too.
 
 Discovery, the model catalog and the audit policy live in native chain state (axons and commitments); there is no
 EVM and no central registry.
@@ -17,6 +18,7 @@ EVM and no central registry.
 | [Validating](docs/VALIDATING.md) | reference engines, configuration, running a validator and the auditor |
 | [Scoring](docs/SCORING.md) | how answers are verified and scored |
 | [Throughput audit](docs/THROUGHPUT_AUDIT.md) | declared capacity, the network-wide tests, verdicts, policy |
+| [Gateway](docs/GATEWAY.md) | user traffic: keys, limits, routing, answer checks, running it |
 | [Discovery](docs/DISCOVERY.md) | manifests, commitments and the catalog on chain |
 | [Subnet administration](docs/SUBNET_ADMIN.md) | mechanisms, catalog releases, audit rollout |
 
@@ -29,6 +31,7 @@ src/verathos/
   miner/       miner service: manifest and endpoints behind one public port
   validator/   discovery, canaries, answer comparison, scoring, weights
   throughput/  throughput audit: schedule, sessions, request mix, miner measurement, auditor, verdicts
+  gateway/     verathos-gateway: user traffic to the proven capacity
   engine/      verathos-engine for model families served from their repository code (Clef)
   subnet/      chain helpers miners and validators share, and the verathos-subnet admin CLI
 native/loadgen/  Rust load generator the auditor drives the tests with
@@ -40,7 +43,7 @@ docs/
 
 ```bash
 uv venv -p 3.12 .venv
-VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,test]"
+VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway,test]"
 .venv/bin/python -m pytest
 .venv/bin/ruff check src tests scripts
 (cd native/loadgen && cargo test)
