@@ -132,7 +132,45 @@ credited.
 6. Schema: `verathos-gateway --config gateway.json db upgrade` (after every update; the gateway does not start on
    an older schema).
 7. Run `verathos-gateway --config gateway.json serve` under a supervisor, behind a reverse proxy that terminates
-   TLS. `GET /ready` answers 200 once the gateway has routes and finds its hotkey among the catalog's gateways.
+   TLS, as an active and a standby process (below). `GET /ready` answers 200 once the gateway has routes and finds
+   its hotkey among the catalog's gateways.
+
+### Restarts without downtime
+
+Run two processes with the same configuration except `port`, `admin_port`, `metrics_port` and `state_dir`: the
+active one, and a standby the reverse proxy uses only while the active one is down. Both keep `instances: 1`, since
+only one of them serves at a time.
+
+```nginx
+upstream gateway {
+    server 127.0.0.1:8080 max_fails=1 fail_timeout=5s;
+    server 127.0.0.1:8081 backup;
+    keepalive 64;
+}
+# in the server block that terminates TLS
+location / {
+    proxy_pass http://gateway;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_next_upstream error timeout non_idempotent;
+    proxy_next_upstream_tries 2;
+    proxy_connect_timeout 1s;
+}
+```
+
+Restart (and update) the standby first, then the active one, each once the other is ready:
+
+```bash
+systemctl restart verathos-gateway-standby; until curl -sf http://127.0.0.1:8081/ready; do sleep 1; done
+systemctl restart verathos-gateway;         until curl -sf http://127.0.0.1:8080/ready; do sleep 1; done
+```
+
+On SIGTERM a process stops accepting connections, so the proxy sends new requests to the other one; it finishes
+the requests in flight (at most `request_timeout_s`), writes usage, samples and served counts, and exits. A request
+whose process fails before answering goes to the other process once. A process is ready as soon as it has started:
+it serves the routes it kept on disk while it fetches new ones. A restart of the auditor does not reach users: the
+gateways keep their routes until it serves new ones. A key's rate limit starts afresh on the other process.
 
 ### More than one process
 
@@ -145,7 +183,8 @@ upstream gateway { hash $http_authorization consistent; server 127.0.0.1:8080; s
 ```
 
 Each process then uses `1 / instances` of every endpoint's capacity, and each key's rate holds exactly (an account's
-keys may land on different processes). A monthly quota is enforced from the database's usage plus each process's own
+keys may land on different processes). Restart them one at a time; with `proxy_next_upstream` as above, the proxy
+moves a stopped process's keys to the others meanwhile. A monthly quota is enforced from the database's usage plus each process's own
 counts, so it can be exceeded by what other processes served in the last few seconds.
 
 ## API

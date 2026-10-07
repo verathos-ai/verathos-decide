@@ -131,7 +131,9 @@ async def serve(config: GatewayConfig) -> None:
         add_admin_routes(app, gateway, port=config.admin_port, token=read_token(config.admin_token_file))
         sockets.append(listen(config.admin_host, config.admin_port))
         log.info("admin API on %s:%d", config.admin_host, config.admin_port)
-    server = uvicorn.Server(uvicorn.Config(app, log_level="warning", access_log=False, server_header=False))
+    # On SIGTERM: stop accepting (the reverse proxy turns to the standby), finish what is in flight, write usage.
+    server = uvicorn.Server(uvicorn.Config(app, log_level="warning", access_log=False, server_header=False,
+                                           timeout_graceful_shutdown=config.request_timeout_s + 2))
     await server.serve(sockets=sockets)
 
 
