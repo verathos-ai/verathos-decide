@@ -248,6 +248,38 @@ def test_a_test_leaves_room_for_the_users_an_endpoint_serves(tmp_path) -> None:
     assert [t["rate_rps"] for t in plan["targets"]] == [pytest.approx(8.0, abs=0.3), 20.0]
 
 
+def test_what_users_got_from_an_endpoint_is_published_with_its_credit(tmp_path) -> None:
+    import time as time_module
+
+    from pydantic import ValidationError
+
+    from verathos.protocol.gateway import ServedCount, latency_bucket
+
+    auditor = _auditor(tmp_path)
+    slot = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 30.0)
+    test = ScheduledTest(3, 560, block_hash(560).hex(), 565)
+    auditor.store.add_test(test)
+    auditor.store.add_results(test.test_id, [Result(Target(slot, 30.0), "passed", "", 30.0, 25.0, 350.0)])
+    auditor.store.set_state(test.test_id, "confirmed")
+    auditor.update_slots([slot])
+    auditor.chain.head_block = 3 * 180 + 1
+    auditor.follower.poll()
+    now = int(time_module.time())
+    counts = [ServedCount(hotkey="hk", endpoint_id="gpu0", second=now - 1, answered=3, offered=8, refused=2,
+                          latency={latency_bucket(0.2): 2, latency_bucket(0.9): 1}),
+              ServedCount(hotkey="hk", endpoint_id="gpu0", second=now, offered=2, refused=1)]  # refused, no answer
+    assert auditor.accept_served(counts) == 2
+    auditor.chain.head_block = 4 * 180 + 1
+    auditor.follower.poll()
+    (credit,) = auditor.verdicts(4).verdicts.credits
+    assert (credit.users_offered, credit.users_refused, credit.user_answers) == (10, 3, 3)
+    assert credit.user_latency_ms == pytest.approx(200, rel=0.06)
+    assert auditor.store.users(3)[("hk", "gpu0")].offered == 10  # kept across a restart
+    for bad in ({}, {"answered": 1, "latency": {latency_bucket(0.2): 2}}, {"answered": 1, "latency": {500: 1}}):
+        with pytest.raises(ValidationError):
+            ServedCount(hotkey="hk", endpoint_id="gpu0", second=now, **bad)
+
+
 def test_served_verdicts_are_the_same_after_a_restart(tmp_path) -> None:
     from verathos.throughput.auditor import Auditor
 
@@ -347,9 +379,10 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
 
     from verathos.throughput.auditor import SCHEMA_VERSION, Store
 
-    Store(tmp_path / "old.sqlite")  # a version 4 database: today's without the demand table
+    Store(tmp_path / "old.sqlite")  # a version 4 database: today's without the demand and users tables
     db = sqlite3.connect(tmp_path / "old.sqlite")
-    db.executescript("DROP TABLE demand; INSERT INTO tests VALUES ('kept', 3, 560, 'h', 565, 'confirmed', ''); "
+    db.executescript("DROP TABLE demand; DROP TABLE users; "
+                     "INSERT INTO tests VALUES ('kept', 3, 560, 'h', 565, 'confirmed', ''); "
                      "PRAGMA user_version = 4;")
     db.close()
     store = Store(tmp_path / "old.sqlite")

@@ -219,6 +219,8 @@
     "canary_spread_fraction": 0.6,
     "statistical_window_epochs": 3,
     "ema_alpha": 0.2,
-    "probation_epochs": 6
+    "probation_epochs": 6,
+    "user_refusals_min_offers": 20,
+    "user_latency_min_answers": 50
   }
 }

@@ -94,7 +94,7 @@ def add_admin_routes(app: FastAPI, g: Gateway, *, port: int, token: str) -> None
         if target:
             outcome = await _to_target(g, checked, target, attempts)
         else:
-            outcome = await forward(g, checked, started, attempts)
+            outcome = await forward(g, checked, started, attempts, counted=count)
         log.info("admin request %s target=%s count=%s -> %s", checked.parsed.model,
                  f"{target.get('hotkey')}/{target.get('endpoint_id')}" if target else "router", count,
                  "answered" if isinstance(outcome, Exchange) else outcome)
@@ -104,7 +104,7 @@ def add_admin_routes(app: FastAPI, g: Gateway, *, port: int, token: str) -> None
             return JSONResponse({**reply, "error": outcome}, status_code=502)
         if count:
             g.sampler.offer(outcome)
-            g.served.record(outcome.route, outcome.input_tokens)
+            g.served.record(outcome.route, outcome.input_tokens, outcome.seconds)
             reply["counted"] = True
         return {**reply, "endpoint": f"{outcome.route.hotkey}/{outcome.route.endpoint_id}", "url": outcome.route.url,
                 "answers": outcome.answers, "input_tokens": outcome.input_tokens, "receipt": outcome.receipt,

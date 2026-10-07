@@ -186,7 +186,10 @@ needs to be done by hand, but:
   reference over several tests loses its credit;
 - an engine that just restarted runs slow for its first minutes, and a test then credits less;
 - requests from validators and gateways are always served before test requests, so a busy endpoint delivers less
-  of the test rate.
+  of the test rate;
+- users count between tests too: the share of the gateway's requests an endpoint refuses (busy, slower than
+  `max_latency_s`, failing) comes off its score, and its latency factor comes from the latency its users see. An
+  endpoint that declares more than it serves is tested at about what it serves, and credited less than that.
 
 ## Updating
 

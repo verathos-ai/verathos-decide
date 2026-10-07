@@ -41,10 +41,17 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    receipt, a compressed or oversized response, a refusal of the gateway) counts against it at once; one that the
    request itself may cause (a timeout, an error status) counts only if another miner then answers the same request.
    A miner that answers busy (429, 503) is skipped for one second, and a refusal of the request (another 4xx) counts
-   against nobody. After 3 failures in a row an endpoint's circuit breaker opens for 5 s; one probe request then
+   against nobody. One whose answer took longer than the latency bound it declared its capacity at
+   (`max_latency_s`, 2 s) is skipped for one second while another endpoint can take the request (a slow answer
+   still beats none). After 3 failures in a row an endpoint's circuit breaker opens for 5 s; one probe request then
    decides, and each failed probe doubles the time (up to 120 s).
 7. **Response.** The answers, the input tokens the miner signed in its receipt, the receipt itself and the request
    id. Usage is counted per account, key, model and day, and written every 5 s.
+8. **Report.** Every 5 s the gateway tells the auditor, per endpoint and second, what it answered (with input tokens
+   and durations), how often it was drawn for a request, and how often it refused one: drawn while busy, slow or
+   behind an open breaker, or answering busy or failing. Requests that are not user traffic (admin requests not
+   counted) are left out. The auditor publishes each endpoint's tally with its credit, and validators score it
+   (`SCORING.md`).
 
 ## Answer checks
 
@@ -253,7 +260,7 @@ with the caller's address.
 | Call | Returns |
 |---|---|
 | `GET /admin/v1/state` | the routes in use (epoch, age, endpoints, catalog), active models, limits, and what waits to be written or sent (usage rows, samples, served counts) |
-| `GET /admin/v1/routes` | every routable endpoint as the router sees it: credited rate, latency, cap, in flight, busy time, breaker |
+| `GET /admin/v1/routes` | every routable endpoint as the router sees it: credited rate, latency, cap, in flight, busy and slow time, breaker |
 | `POST /admin/v1/systemone` | a SystemOne request, served as described below |
 
 ```bash

@@ -38,6 +38,11 @@ class Credit(BaseModel):
     test_epoch: int
     qualified: bool
     drift: bool = False  # its test answers drifted beyond the model's statistical tolerance: no credit
+    # What the gateways' users got from it in the epoch before the verdicts' (see protocol.gateway.ServedCount):
+    users_offered: int = Field(0, ge=0)
+    users_refused: int = Field(0, ge=0)
+    user_answers: int = Field(0, ge=0)  # answers with a measured duration
+    user_latency_ms: float = Field(0.0, ge=0)  # their median
 
 
 GATEWAY_EVIDENCE = "gateway"  # evidence from a sampled gateway answer: test_id "gateway-<request nonce>"

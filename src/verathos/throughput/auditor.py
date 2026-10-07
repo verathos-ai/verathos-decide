@@ -45,7 +45,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +54,14 @@ from bittensor_wallet import Keypair
 from verathos import catalog as catalog_module
 from verathos.miner.engine import Engine
 from verathos.protocol.api import MAX_RESPONSE_BYTES
-from verathos.protocol.gateway import GatewaySample, Route, Routes, ServedCount, SignedRoutes
+from verathos.protocol.gateway import (
+    GatewaySample,
+    Route,
+    Routes,
+    ServedCount,
+    SignedRoutes,
+    latency_median_ms,
+)
 from verathos.protocol.receipts import parse_response, signed_answers
 from verathos.protocol.status import ThroughputOutcome
 from verathos.throughput import loadgen
@@ -95,13 +102,29 @@ USER_RATE_LAG_S = 10.0  # ... ending this long before the test (the gateways rep
 MIN_TEST_SHARE = 0.1  # a test sends at least this share of the tested rate itself
 SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _DEMAND_SCHEMA = """
 CREATE TABLE demand (epoch INTEGER NOT NULL, model_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
     ema REAL NOT NULL, PRIMARY KEY (epoch, model_id));
 """
-_MIGRATIONS = {4: _DEMAND_SCHEMA}  # from version -> the statements that bring it one version up
+_USERS_SCHEMA = """
+CREATE TABLE users (epoch INTEGER NOT NULL, hotkey TEXT NOT NULL, endpoint_id TEXT NOT NULL,
+    offered INTEGER NOT NULL, refused INTEGER NOT NULL, answers INTEGER NOT NULL, latency TEXT NOT NULL,
+    PRIMARY KEY (epoch, hotkey, endpoint_id));
+"""
+_MIGRATIONS = {4: _DEMAND_SCHEMA, 5: _USERS_SCHEMA}  # from version -> the statements that bring it one version up
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
+
+
+@dataclass
+class UserTally:
+    """What one endpoint did for the gateways' users in one epoch: times it was offered a request, refusals (see
+    ``gateway.router``), answers with a known duration, and those durations (``protocol.gateway`` buckets)."""
+
+    offered: int = 0
+    refused: int = 0
+    answers: int = 0
+    latency: dict[int, int] = field(default_factory=dict)
 
 
 class BoundedEngine:
@@ -232,7 +255,7 @@ CREATE TABLE samples (
 CREATE INDEX samples_by_state ON samples (state, epoch);
 CREATE INDEX samples_by_endpoint ON samples (hotkey, endpoint_id, epoch);
 CREATE TABLE verdicts (epoch INTEGER PRIMARY KEY, document TEXT NOT NULL);
-""" + _DEMAND_SCHEMA
+""" + _DEMAND_SCHEMA + _USERS_SCHEMA
 # test states: running -> unconfirmed -> confirmed | void
 _SCRUB = "request = '{}', response = ''"  # a user's request and answers are kept only until their check
 # sample states: pending -> checked | skipped (its endpoint's checks for the epoch were done) | unchecked (no
@@ -466,6 +489,24 @@ class Store:
                            "epoch <= ?)", (epoch,))
         return dict(rows)
 
+    # ---- what users got ----
+
+    def close_users(self, epoch: int, tallies: dict[tuple[str, str], UserTally]) -> None:
+        rows = [(epoch, hk, ep, t.offered, t.refused, t.answers, json.dumps(t.latency, sort_keys=True))
+                for (hk, ep), t in tallies.items()]
+        with self._lock:
+            self._db.executemany("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+
+    def users_closed(self, epoch: int) -> bool:
+        return bool(self._query("SELECT 1 FROM users WHERE epoch = ? LIMIT 1", (epoch,)))
+
+    def users(self, epoch: int) -> dict[tuple[str, str], UserTally]:
+        """What each endpoint did for the gateways' users in ``epoch``."""
+        rows = self._query("SELECT hotkey, endpoint_id, offered, refused, answers, latency FROM users WHERE epoch = ?",
+                           (epoch,))
+        return {(hk, ep): UserTally(offered, refused, answers, {int(b): n for b, n in json.loads(latency).items()})
+                for hk, ep, offered, refused, answers, latency in rows}
+
     # ---- served verdicts ----
 
     def served_verdicts(self, epoch: int) -> str | None:
@@ -494,6 +535,7 @@ class Store:
             self._db.execute("DELETE FROM samples WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM verdicts WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM demand WHERE epoch < ?", (before_epoch,))
+            self._db.execute("DELETE FROM users WHERE epoch < ?", (before_epoch,))
 
 
 def _beyond(total: float, count: int, tolerance: Tolerance) -> bool:
@@ -545,6 +587,7 @@ class Auditor:
         self._verdicts_lock = threading.Lock()
         self._served: dict[tuple[str, str], dict[int, int]] = {}  # (hotkey, endpoint) -> second -> answered
         self._demand: dict[int, dict[str, int]] = {}  # epoch -> model -> users' input tokens (not closed yet)
+        self._users: dict[int, dict[tuple[str, str], UserTally]] = {}  # epoch -> endpoint -> tally (not closed yet)
         self._demand_lock = threading.Lock()
         self._rng = random.SystemRandom()
 
@@ -838,19 +881,28 @@ class Auditor:
     # ---- gateway served counts ----
 
     def accept_served(self, counts: list[ServedCount]) -> int:
-        """Add what the gateway's endpoints answered per second (known endpoints, recent seconds), and their input
-        tokens to the epoch's demand per model; -> counts taken."""
+        """Add what the gateway's endpoints answered per second (known endpoints, recent seconds), their input tokens
+        to the epoch's demand per model, and their offers, refusals and durations to the epoch's user tallies;
+        -> counts taken."""
         now, taken = time.time(), 0
         model_of = {(s.hotkey, s.endpoint_id): s.model_id for s in self._slots}
         with self._demand_lock:
-            demand = self._demand.setdefault(self.follower.head // self.policy.epoch_blocks, {})
+            epoch = self.follower.head // self.policy.epoch_blocks
+            demand, users = self._demand.setdefault(epoch, {}), self._users.setdefault(epoch, {})
             for c in counts:
                 key = (c.hotkey, c.endpoint_id)
                 if key not in model_of or not now - SERVED_KEEP_S <= c.second <= now + 5:
                     continue
-                per = self._served.setdefault(key, {})
-                per[c.second] = per.get(c.second, 0) + c.answered
+                if c.answered:
+                    per = self._served.setdefault(key, {})
+                    per[c.second] = per.get(c.second, 0) + c.answered
                 demand[model_of[key]] = demand.get(model_of[key], 0) + c.input_tokens
+                tally = users.setdefault(key, UserTally())
+                tally.offered += c.offered
+                tally.refused += c.refused
+                for bucket, n in c.latency.items():
+                    tally.answers += n
+                    tally.latency[bucket] = tally.latency.get(bucket, 0) + n
                 taken += 1
             cutoff = int(now) - SERVED_KEEP_S
             for key in list(self._served):
@@ -888,6 +940,22 @@ class Auditor:
             log.info("user demand after epoch %d: %s", last,
                      ", ".join(f"{m} {v:.0f} input tokens/s" for m, v in sorted(ema.items())))
 
+    def close_users(self, current: int) -> None:
+        """Record what the endpoints did for users in the epoch before ``current`` (once)."""
+        last = current - 1
+        with self._demand_lock:
+            for epoch in [e for e in self._users if e < last]:
+                del self._users[epoch]  # too late to count
+            if last < 0 or self.store.users_closed(last):
+                return
+            tallies = self._users.pop(last, {})
+            if tallies:
+                self.store.close_users(last, tallies)
+
+    def close_epoch(self, current: int) -> None:
+        self.close_demand(current)
+        self.close_users(current)
+
     def settle(self) -> None:
         """Confirm tests whose selection block is final with the hash they were selected by; void the others. Close
         the users' demand of finished epochs."""
@@ -896,7 +964,7 @@ class Auditor:
             self.store.prune(epoch - KEEP_EPOCHS)
             self._pruned_epoch = epoch
         if self.follower.head > 0:
-            self.close_demand(epoch)
+            self.close_epoch(epoch)
         unconfirmed = self.store.unconfirmed()
         if not unconfirmed:
             return
@@ -937,14 +1005,24 @@ class Auditor:
             return signed
         if self.store.pending(first, epoch - 1):
             return None
-        self.close_demand(current)
+        self.close_epoch(current)
 
         def tolerance_of(model_id: str) -> Tolerance | None:
             model = cat.get(model_id)
             return model.tolerance if model is not None else None
 
+        users = self.store.users(epoch - 1)
+
+        def with_users(c: Credit) -> Credit:
+            t = users.get((c.hotkey, c.endpoint_id))
+            if t is None:
+                return c
+            return c.model_copy(update={"users_offered": t.offered, "users_refused": t.refused,
+                                        "user_answers": t.answers,
+                                        "user_latency_ms": round(latency_median_ms(t.latency) or 0.0, 1)})
+
         verdicts = Verdicts(netuid=self.netuid, auditor=self.hotkey, epoch=epoch,
-                            credits=self.store.credits(first, epoch - 1, policy, tolerance_of),
+                            credits=[with_users(c) for c in self.store.credits(first, epoch - 1, policy, tolerance_of)],
                             invalid=self.store.evidence(first, epoch - 1), demand=self.store.demand_ema(epoch - 1))
         signed = SignedVerdicts.create(verdicts, self.keypair)
         self.store.serve_verdicts(epoch, signed.model_dump_json())

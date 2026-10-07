@@ -17,6 +17,7 @@ import os
 import secrets
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import bittensor as bt
 import httpx
@@ -62,21 +63,35 @@ def load_secret(state_dir: Path) -> bytes:
     return secret
 
 
+class Proven(NamedTuple):
+    """Per endpoint key, from the auditor's verdicts."""
+
+    credited: dict[str, float]  # proven capacity, requests/s
+    latency_ms: dict[str, float]  # median latency in its throughput test
+    user_latency_ms: dict[str, float]  # median latency of its answers to users, where there were enough of them
+    user_availability: dict[str, float]  # share of the user requests offered to it it did not refuse, where enough
+
+
 def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | None, cat: catalog.Catalog,
-                      mode: str) -> tuple[dict[str, float], dict[str, float]]:
-    """-> (proven capacity, test latency) per endpoint key, for the model the endpoint serves now and at most what it
-    declares now. In observe mode an endpoint's declaration counts, up to its model's ``first_test_rps``, and there
-    are no latencies."""
+                      mode: str) -> Proven:
+    """What the verdicts prove, for the model each endpoint serves now and at most what it declares now. In observe
+    mode an endpoint's declaration counts, up to its model's ``first_test_rps``, and nothing else does."""
     if mode == "observe":
         first = {m.model_id: m.first_test_rps for m in cat.models}
-        return {e.key: min(e.endpoint.capacity_rps, first.get(e.endpoint.model_id, 0.0)) for e in endpoints}, {}
+        return Proven({e.key: min(e.endpoint.capacity_rps, first.get(e.endpoint.model_id, 0.0)) for e in endpoints},
+                      {}, {}, {})
     credits = {(c.hotkey, c.endpoint_id, c.model_id): c for c in (verdicts.credits if verdicts else []) if c.qualified}
-    credited, latency = {}, {}
+    sc, proven = cat.scoring, Proven({}, {}, {}, {})
     for e in endpoints:
         c = credits.get((e.hotkey, e.endpoint.endpoint_id, e.endpoint.model_id))
-        if c is not None:
-            credited[e.key], latency[e.key] = min(c.credited_rps, e.endpoint.capacity_rps), c.latency_ms
-    return credited, latency
+        if c is None:
+            continue
+        proven.credited[e.key], proven.latency_ms[e.key] = min(c.credited_rps, e.endpoint.capacity_rps), c.latency_ms
+        if c.user_answers >= sc.user_latency_min_answers and c.user_latency_ms > 0:
+            proven.user_latency_ms[e.key] = c.user_latency_ms
+        if c.users_offered >= sc.user_refusals_min_offers:
+            proven.user_availability[e.key] = max(0.0, 1.0 - c.users_refused / c.users_offered)
+    return proven
 
 
 def missing_references(cfg: ValidatorConfig, cat: catalog.Catalog) -> list[str]:
@@ -121,21 +136,25 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         where = "gateway traffic" if e.from_gateway else f"throughput test {e.test_id[:12]}"
         log.info("  %s/%s gave a wrong answer in %s: %s", e.hotkey, e.endpoint_id, where, e.reason)
     invalid_hotkeys = {e.hotkey for e in evidence}
-    credited, latency_ms = credited_capacity(endpoints, verdicts, cat, policy.mode)
+    proven = credited_capacity(endpoints, verdicts, cat, policy.mode)
+    credited = proven.credited
     record_window(state, results, sc.statistical_window_epochs)
     shares = model_shares(verdicts.demand if verdicts is not None else {}, cat)
     log.info("  emission shares: %s", ", ".join(f"{m} {s:.1%}" for m, s in sorted(shares.items())))
-    scores, failed = epoch_scores(results, shares=shares, credited=credited, latency_ms=latency_ms, state=state,
-                                  failed_hotkeys=invalid_hotkeys)
+    scores, failed = epoch_scores(results, shares=shares, credited=credited, latency_ms=proven.latency_ms, state=state,
+                                  failed_hotkeys=invalid_hotkeys, user_latency_ms=proven.user_latency_ms,
+                                  user_availability=proven.user_availability)
     held = {e.key for e in endpoints} - set(results)
     if held:
         log.info("  %d endpoints not audited this epoch (no usable reference answers); scores held", len(held))
     update(state, results, scores, failed, alpha=sc.ema_alpha, probation_epochs=sc.probation_epochs, held=held,
            reset_hotkeys=invalid_hotkeys)
     for key, r in sorted(results.items()):
-        log.info("  %s epoch_verdict=%s answered=%d/%d identity=%s mean_abs=%.4f proven_rps=%.1f score=%.3f%s",
+        log.info("  %s epoch_verdict=%s answered=%d/%d identity=%s mean_abs=%.4f proven_rps=%.1f users=%.2f "
+                 "score=%.3f%s",
                  key, r.tally.verdict().value, r.answered, r.sent, r.identity_ok, r.tally.mean_abs,
-                 credited.get(key, 0.0), scores.get(key, 0.0), f" errors={sorted(set(r.errors))}" if r.errors else "")
+                 credited.get(key, 0.0), proven.user_availability.get(key, 1.0), scores.get(key, 0.0),
+                 f" errors={sorted(set(r.errors))}" if r.errors else "")
     board.publish(status.build(
         epoch=epoch, epoch_blocks=cat.epoch_blocks, endpoints=endpoints, results=results, scores=scores, failed=failed,
         invalid_hotkeys=invalid_hotkeys, credited=credited,

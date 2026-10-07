@@ -153,6 +153,11 @@ test traffic, so what an endpoint answered the gateway inside a test's measured 
 the test's own replies: serving users never costs credit, and refusing them during a test costs what the test left
 room for.
 
+Tests alone cannot show what users get between them: a test is known shortly before it starts (its selection block
+is public) and its requests carry the auditor's session. So the gateway also reports, per endpoint and second, how
+often it drew the endpoint for a user request, how often the endpoint refused (busy, slower than `max_latency_s`,
+failing), and how long its answers took. The auditor sums these per epoch and keeps them in its database.
+
 ## Verdicts
 
 For scoring epoch `E` the auditor publishes, signed by its hotkey, at `GET /v1/throughput/{E}` on its axon:
@@ -160,8 +165,9 @@ For scoring epoch `E` the auditor publishes, signed by its hotkey, at `GET /v1/t
 - the credit of every endpoint the latest confirmed test of epochs `E - credit_ttl_epochs` to `E - 1` targeted (an
   endpoint whose result there is void keeps its latest counted result from those epochs), with its model, its
   median latency in that test, whether its answers drifted, and whether it has qualified (at least
-  `qualification_tests` confirmed tests with a credit). An endpoint the latest test did not target has no credit,
-  so leaving a test out does not keep an older credit;
+  `qualification_tests` confirmed tests with a credit), and what users got from it in epoch `E - 1`: times it was
+  offered a user request, refusals, answers and their median latency. An endpoint the latest test did not target
+  has no credit, so leaving a test out does not keep an older credit;
 - for every hotkey with a wrong answer in those tests or in the gateway answers it checked in those epochs, the
   evidence of one: from a test, the request and the response as received; from a user request, only the miner's
   signed receipt (user requests are not published).

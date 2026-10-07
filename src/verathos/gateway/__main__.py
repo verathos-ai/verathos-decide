@@ -64,7 +64,7 @@ async def serve(config: GatewayConfig) -> None:
     client = httpx.AsyncClient(limits=httpx.Limits(max_connections=None, max_keepalive_connections=4096),
                                timeout=httpx.Timeout(30.0, connect=3.0))
     state_dir = config.state_dir.expanduser()
-    router = Router(share=1 / config.instances, max_latency_s=2.0)
+
     routes = RouteTable(client=client, auditor_url=auditor_url, auditor_hotkey=auditor_hotkey, netuid=config.netuid,
                         path=state_dir / "routes.json")
     store = catalog_module.CatalogStore(config.catalog_dir)
@@ -95,6 +95,7 @@ async def serve(config: GatewayConfig) -> None:
     sampler = Sampler(keypair, client, auditor_url=auditor_url, auditor_hotkey=auditor_hotkey,
                       window_s=config.sample_window_s, rng=random.SystemRandom())
     served = ServedCounter(keypair, client, auditor_url=auditor_url, auditor_hotkey=auditor_hotkey)
+    router = Router(share=1 / config.instances, max_latency_s=2.0, observer=served)
     gateway = Gateway(config=config, hotkey=keypair.ss58_address, catalog=lambda: current[0], accounts=accounts,
                       meter=meter, router=router, sampler=sampler, served=served, routes=lambda: routes.table,
                       upstream=Upstream(keypair, client, netuid=config.netuid, mechid=config.mechid),

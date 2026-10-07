@@ -23,7 +23,7 @@ from verathos.gateway.accounts import Accounts
 from verathos.gateway.app import Gateway, client_address, create_app
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
-from verathos.gateway.router import BREAKER_FAILURES, OPEN_S, Outcome, Router
+from verathos.gateway.router import BREAKER_FAILURES, BUSY_S, OPEN_S, SLOW_S, Outcome, Router
 from verathos.gateway.routes import RouteTable
 from verathos.gateway.sampler import Sampler
 from verathos.gateway.served import ServedCounter
@@ -121,6 +121,7 @@ class Setup:
                                auditor_hotkey=self.auditor.hotkey, window_s=600, rng=random.Random(2))
         self.served = ServedCounter(self.gateway_kp, self.client, auditor_url=auditor_url,
                                     auditor_hotkey=self.auditor.hotkey)
+        self.router.observer = self.served
         cat = catalog.Catalog.parse({**catalog.load().document(), "gateways": [self.gateway_kp.ss58_address]})
         self.gateway = Gateway(
             config=self.config, hotkey=self.gateway_kp.ss58_address, catalog=lambda: cat, accounts=self.accounts,
@@ -286,6 +287,59 @@ def test_the_router_spreads_by_capacity_and_respects_caps_and_breakers() -> None
     router.update(Routes(netuid=405, auditor="a", epoch=4, issued_ms=2, catalog_digest="0" * 64,
                          routes=[route(big, "b", 30.0)]))
     assert router._pools["kev-4b"].endpoints == [b]  # kept with its state
+
+
+class Observer:
+    def __init__(self) -> None:
+        self.offers: dict[str, int] = {}
+        self.refusals: dict[str, int] = {}
+
+    def offered(self, route: Route, refused: bool) -> None:
+        self.offers[route.hotkey] = self.offers.get(route.hotkey, 0) + 1
+        self.refusals[route.hotkey] = self.refusals.get(route.hotkey, 0) + refused
+
+    def refused(self, route: Route) -> None:
+        self.refusals[route.hotkey] = self.refusals.get(route.hotkey, 0) + 1
+
+
+def test_an_endpoint_that_keeps_users_waiting_or_refuses_them_is_skipped_and_reported() -> None:
+    clock, observer = Clock(), Observer()
+    router = Router(share=1.0, max_latency_s=2.0, rng=random.Random(3), clock=clock, observer=observer)
+    fast, slow = kp().ss58_address, kp().ss58_address
+    router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=1, catalog_digest="0" * 64, routes=[
+        Route(hotkey=h, endpoint_id="gpu0", model_id="kev-4b", url=f"http://{h}/e/gpu0", credited_rps=20.0,
+              latency_ms=300.0) for h in (fast, slow)]))
+    f, s = router._pools["kev-4b"].endpoints
+    router.started(s)
+    router.finished(s, Outcome.ANSWERED, 2.5)  # slower than the bound it declared its capacity at
+    assert all(router.pick("kev-4b") is f for _ in range(50))
+    assert 0 < observer.refusals[slow] == observer.offers[slow]  # every time it was drawn it was not available
+    for _ in range(f.cap):
+        router.started(f)
+    assert router.pick("kev-4b") is s  # with no one else free, a slow answer beats none
+    for _ in range(f.cap):
+        router.finished(f, Outcome.ANSWERED, 0.1)
+    clock.now += SLOW_S
+    assert any(router.pick("kev-4b") is s for _ in range(50))
+    refusals = observer.refusals[slow]
+    router.started(s)
+    router.finished(s, Outcome.BUSY, 0.1)
+    assert observer.refusals[slow] == refusals + 1 and s.busy_until == clock.now + BUSY_S
+    for _ in range(f.cap):
+        router.started(f)
+    assert router.pick("kev-4b") is None  # busy is busy
+    for _ in range(f.cap):
+        router.finished(f, Outcome.ANSWERED, 0.1)
+    # requests that are not user traffic are not reported
+    clock.now += BUSY_S
+    offers, refusals = dict(observer.offers), dict(observer.refusals)
+    for _ in range(20):
+        router.pick("kev-4b", observe=False)
+    router.started(f)
+    router.finished(f, Outcome.FAILED, 0.1, observe=False)
+    router.penalize(f, observe=False)
+    assert (observer.offers, observer.refusals) == (offers, refusals)
+    assert observer.refusals.get(fast, 0) == 0
 
 
 def test_gcra_allows_the_burst_then_the_rate() -> None:
@@ -474,6 +528,24 @@ def test_what_miners_answer_the_gateway_reaches_the_auditor(tmp_path) -> None:
     keypair = s.miners["10.0.0.1"][0]
     now = time_module.time()
     assert s.auditor.served_in(keypair.ss58_address, "gpu0", now - 60, now + 1) == pytest.approx(3.0)
+
+
+def test_what_users_get_from_each_endpoint_reaches_the_auditor(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": MockEngine("kev-4b")})
+    s.router.max_latency_s = 1e-9  # every answer is slower than this bound
+    first = asyncio.run(s.post()).json()["receipt"]["receipt"]["miner_hotkey"]
+    second = asyncio.run(s.post()).json()["receipt"]["receipt"]["miner_hotkey"]
+    assert first != second  # the slow one is skipped while the other can take the request
+    s.router.max_latency_s = 2.0
+    for _ in range(4):
+        assert asyncio.run(s.post()).status_code == 200
+    import time as time_module
+    now = int(time_module.time())
+    s.served._counts = {(hk, ep, now - 1): n for (hk, ep, _), n in s.served._counts.items()}
+    asyncio.run(s.served.report())
+    tallies = s.auditor._users[s.auditor.follower.head // 180]
+    assert sum(t.answers for t in tallies.values()) == 6 and sum(t.refused for t in tallies.values()) >= 1
+    assert all(t.offered >= t.refused for t in tallies.values())
 
 
 # ---- the admin API ----

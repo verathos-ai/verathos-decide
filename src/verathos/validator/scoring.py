@@ -10,11 +10,15 @@ Per endpoint and epoch:
   while on probation inherits the remaining probation, so moving hardware to another endpoint does not escape it;
 - zero until the endpoint has proven capacity in a throughput test;
 - otherwise its model's share of the epoch's emission (``model_shares``), split among the model's scored endpoints in
-  proportion to proven capacity (requests/s) x availability (answered / sent) x latency factor. The latency factor
-  compares the endpoint's median latency in its throughput test with the median over the scored endpoints serving
-  the same model, each weighted by its proven capacity (so splitting capacity over more endpoints does not move it),
-  capped to [0.7, 1.3]; every validator reads the same latencies from the auditor's verdicts. Candidate models score
-  zero.
+  proportion to proven capacity (requests/s) x availability (answered / sent) x availability to users x latency
+  factor. Availability to users is the share of the gateways' user requests the endpoint was offered that it did not
+  refuse (busy, slower than the latency bound, failing), once it was offered ``user_refusals_min_offers`` of them:
+  capacity shown in tests but kept from users does not count. The latency factor compares the endpoint's median
+  latency with the median over the scored endpoints serving the same model, each weighted by its proven capacity (so
+  splitting capacity over more endpoints does not move it), capped to [0.7, 1.3]: the latency of its answers to
+  users once it gave ``user_latency_min_answers`` of them, compared among endpoints measured the same way, else its
+  latency in its throughput test, compared among those. Every validator reads the same figures from the auditor's
+  verdicts. Candidate models score zero.
 An endpoint that could not be audited (no usable reference answers) keeps its average for at most ``MAX_HELD_EPOCHS``
 epochs in a row. Per UID: the sum of its endpoints' EMAs. Weights: UID values normalised to 1.
 """
@@ -135,15 +139,19 @@ def _with_floor(shares: dict[str, float], floor: float) -> dict[str, float]:
 
 
 def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, float], credited: dict[str, float],
-                 latency_ms: dict[str, float], state: ScoreState,
-                 failed_hotkeys: Collection[str] = ()) -> tuple[dict[str, float], set[str]]:
+                 latency_ms: dict[str, float], state: ScoreState, failed_hotkeys: Collection[str] = (),
+                 user_latency_ms: Mapping[str, float] | None = None,
+                 user_availability: Mapping[str, float] | None = None) -> tuple[dict[str, float], set[str]]:
     """-> (score per endpoint key, keys that failed verification this epoch). Call after ``record_window``.
 
     ``shares`` holds each model's share of the emission (``model_shares``; missing: none); ``credited`` each
     endpoint's proven capacity in requests/s (missing: none proven yet), ``latency_ms`` its median latency in that
     test (missing: no latency factor); ``failed_hotkeys`` the hotkeys with a wrong answer proven by the throughput
-    auditor.
+    auditor; ``user_latency_ms`` the median latency of its answers to users, where there were enough (it takes the
+    place of the test's); ``user_availability`` the share of user requests offered to it it did not refuse (missing:
+    1).
     """
+    user_latency_ms, user_availability = user_latency_ms or {}, user_availability or {}
     scores: dict[str, float] = {}
     failed: set[str] = set()
     eligible: dict[str, EndpointResult] = {}
@@ -157,18 +165,26 @@ def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, flo
         else:
             eligible[key] = r
 
-    latencies_by_model: dict[str, list[tuple[float, float]]] = {}
+    def latency(key: str) -> tuple[str, float]:
+        """-> (how it was measured, the endpoint's median latency; 0: unknown)"""
+        if user_latency_ms.get(key, 0.0) > 0:
+            return "users", user_latency_ms[key]
+        return "test", latency_ms.get(key, 0.0)
+
+    latencies: dict[tuple[str, str], list[tuple[float, float]]] = {}  # (model, measured by) -> [(ms, capacity)]
     for key, r in eligible.items():
-        if latency_ms.get(key, 0.0) > 0:
-            latencies_by_model.setdefault(r.endpoint.endpoint.model_id, []).append((latency_ms[key], credited[key]))
-    model_median = {m: weighted_median(v) for m, v in latencies_by_model.items()}
+        source, ms = latency(key)
+        if ms > 0:
+            latencies.setdefault((r.endpoint.endpoint.model_id, source), []).append((ms, credited[key]))
+    median = {group: weighted_median(v) for group, v in latencies.items()}
     weight: dict[str, float] = {}
     for key, r in eligible.items():
-        model, own = r.endpoint.endpoint.model_id, latency_ms.get(key, 0.0)
-        factor = 1.0
+        (source, own), factor = latency(key), 1.0
         if own > 0:
-            factor = min(max(math.sqrt(model_median[model] / own), LATENCY_CAP[0]), LATENCY_CAP[1])
-        weight[key] = credited[key] * (r.answered / r.sent) * factor
+            factor = min(max(math.sqrt(median[(r.endpoint.endpoint.model_id, source)] / own), LATENCY_CAP[0]),
+                         LATENCY_CAP[1])
+        availability = (r.answered / r.sent) * min(max(user_availability.get(key, 1.0), 0.0), 1.0)
+        weight[key] = credited[key] * availability * factor
     model_total: dict[str, float] = {}
     for key, w in weight.items():
         model = eligible[key].endpoint.endpoint.model_id

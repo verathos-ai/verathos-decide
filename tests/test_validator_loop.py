@@ -182,11 +182,19 @@ def test_credited_capacity() -> None:
         credit("hkA", "a"), credit("hkA", "b", qualified=False), credit("hkB", "a"), credit("hkA", "d")])
     cat = catalog.load()
     # capped at today's declaration; unqualified, untested and re-modelled endpoints have no credit
-    assert credited_capacity(endpoints, verdicts, cat, "enforce") == ({"hkA/a": 30.0}, {"hkA/a": 800.0})
-    assert credited_capacity(endpoints, None, cat, "enforce") == ({}, {})
+    assert credited_capacity(endpoints, verdicts, cat, "enforce") == ({"hkA/a": 30.0}, {"hkA/a": 800.0}, {}, {})
+    assert credited_capacity(endpoints, None, cat, "enforce") == ({}, {}, {}, {})
     # observe mode counts declarations, but no more than a model's first test
     assert credited_capacity(endpoints, None, cat, "observe") == ({"hkA/a": 30.0, "hkA/b": 50.0, "hkA/c": 50.0,
-                                                                   "hkA/d": 25.0}, {})
+                                                                   "hkA/d": 25.0}, {}, {}, {})
+    # what users got counts once there is enough of it
+    users = Verdicts(netuid=405, auditor="aud", epoch=9, invalid=[], credits=[
+        credit("hkA", "a").model_copy(update={"users_offered": 100, "users_refused": 40, "user_answers": 60,
+                                              "user_latency_ms": 300.0}),
+        credit("hkA", "c").model_copy(update={"users_offered": 5, "users_refused": 5, "user_answers": 10,
+                                              "user_latency_ms": 900.0})])
+    proven = credited_capacity(endpoints, users, cat, "enforce")
+    assert proven.user_availability == {"hkA/a": pytest.approx(0.6)} and proven.user_latency_ms == {"hkA/a": 300.0}
 
 
 def test_latency_factor_comes_from_the_test_latencies() -> None:
@@ -207,6 +215,33 @@ def test_latency_factor_comes_from_the_test_latencies() -> None:
                              latency_ms={"hkA/fast": 250.0, "hkA/mid": 1000.0, "hkA/slow": 4000.0}, state=state)
     assert scores == {"hkA/fast": pytest.approx(26 / 60), "hkA/mid": pytest.approx(20 / 60),
                       "hkA/slow": pytest.approx(14 / 60)}  # the pool split by capacity x latency factor
+
+
+def test_what_users_got_from_an_endpoint_counts_once_there_is_enough_of_it() -> None:
+    """An endpoint that refuses users loses that share of its score, and the latency its users saw replaces its test
+    latency, compared among endpoints measured the same way: tests alone cannot show either (they are known shortly
+    ahead and recognisable)."""
+    import math
+
+    from verathos.validator.audit import EndpointResult
+    from verathos.validator.discovery import DiscoveredEndpoint
+
+    def result(endpoint_id: str) -> EndpointResult:
+        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}",
+                                model_id="kev-4b", capacity_rps=20.0))
+        return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4)
+
+    results = {k: result(k.split("/")[1]) for k in ("hkA/fast", "hkA/hoarder", "hkA/quiet")}
+    state = ScoreState()
+    record_window(state, results, 3)
+    scores, _ = epoch_scores(results, shares={"kev-4b": 1.0}, credited=dict.fromkeys(results, 20.0),
+                             latency_ms=dict.fromkeys(results, 400.0), state=state,
+                             user_latency_ms={"hkA/fast": 200.0, "hkA/hoarder": 800.0},
+                             user_availability={"hkA/hoarder": 0.5})
+    # users' median 500 ms: fast at the 1.3 cap, the hoarder sqrt(500 / 800) and half its offers refused; the quiet
+    # endpoint, measured by its test alone, is compared with no one
+    weights_ = {"hkA/fast": 20 * 1.3, "hkA/hoarder": 20 * 0.5 * math.sqrt(500 / 800), "hkA/quiet": 20.0}
+    assert scores == {k: pytest.approx(w / sum(weights_.values())) for k, w in weights_.items()}
 
 
 def test_splitting_capacity_over_endpoints_does_not_move_the_latency_median() -> None:

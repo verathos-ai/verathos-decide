@@ -57,13 +57,19 @@ Per endpoint and epoch:
 - zero if the endpoint failed the identity challenge, answered nothing, or has not yet proven capacity in a
   throughput test;
 - otherwise its share of its model's pool (see Models): the model's emission share, split among the model's scored
-  endpoints in proportion to `proven capacity x answered / sent x latency factor`. The proven capacity is the
-  auditor's credit in requests/s of the model's standard mix, at most what the endpoint declares now (in `observe`
-  mode the declaration itself, up to the model's `first_test_rps`). The latency factor is `sqrt(median of the
-  model's scored endpoints / own latency)`, capped to [0.7, 1.3], where an endpoint's latency is its median latency
-  in its throughput test, as the auditor's verdicts state it, so every validator applies the same factor. Each
-  endpoint weighs in the median by its proven capacity, so splitting capacity over more endpoints does not move it.
-  In `observe` mode there is no latency factor. An epoch's scores sum to 1 when every active model has scored
+  endpoints in proportion to `proven capacity x answered / sent x availability to users x latency factor`. The
+  proven capacity is the auditor's credit in requests/s of the model's standard mix, at most what the endpoint
+  declares now (in `observe` mode the declaration itself, up to the model's `first_test_rps`). Availability to users
+  is `1 - refused / offered` over the user requests the gateway offered the endpoint in the epoch before (busy,
+  slower than the latency bound, failing; see `GATEWAY.md`), once it was offered `user_refusals_min_offers` (20) of
+  them, else 1: capacity shown in tests but kept from users does not count. The latency factor is `sqrt(median /
+  own latency)`, capped to [0.7, 1.3]. An endpoint's latency is the median latency of its answers to users once it
+  gave `user_latency_min_answers` (50) of them in the epoch before, compared with the median over the model's scored
+  endpoints measured the same way; else its median latency in its throughput test, compared with those measured so.
+  Tests are known shortly ahead and their requests are recognisable, so what users get is measured on users. Every
+  validator reads the same figures from the auditor's verdicts. Each endpoint weighs in a median by its proven
+  capacity, so splitting capacity over more endpoints does not move it. In `observe` mode there is no latency factor
+  and no availability to users. An epoch's scores sum to 1 when every active model has scored
   endpoints.
 
 ## Models

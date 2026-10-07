@@ -23,6 +23,7 @@ Every response carries ``X-Request-Id`` (the client's, if it sent a valid one). 
 
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
 import json
 import logging
@@ -184,12 +185,13 @@ def check_request(g: Gateway, body: bytes) -> Checked:
     return Checked(raw, body, parsed, request_sha256)
 
 
-async def forward(g: Gateway, checked: Checked, started: float,
-                  attempts: list[dict[str, Any]] | None = None) -> Exchange | str:
-    """Up to ``max_attempts`` attempts, each at another miner, within the request's deadline. -> the exchange, or
-    why there is none: busy (no endpoint could take it), rejected (the miners refused the request itself) or failed.
-    A failure whose cause is unclear counts against a miner only once another miner has answered. ``attempts``
-    collects what each attempt did."""
+async def forward(g: Gateway, checked: Checked, started: float, attempts: list[dict[str, Any]] | None = None, *,
+                  counted: bool = True) -> Exchange | str:
+    """Up to ``max_attempts`` attempts, each at another miner, within the request's deadline. -> the exchange (with
+    its attempt's duration), or why there is none: busy (no endpoint could take it), rejected (the miners refused the
+    request itself) or failed. A failure whose cause is unclear counts against a miner only once another miner has
+    answered. ``attempts`` collects what each attempt did; ``counted``: the request is user traffic, so the miners'
+    refusals of it are reported."""
     model_id, deadline = checked.parsed.model, started + g.config.request_timeout_s
     tried: set[str] = set()
     unclear: list[Endpoint] = []
@@ -198,7 +200,7 @@ async def forward(g: Gateway, checked: Checked, started: float,
         remaining = deadline - g.clock()
         if remaining <= 0.05:
             break
-        endpoint = g.router.pick(model_id, tried)
+        endpoint = g.router.pick(model_id, tried, observe=counted)
         if endpoint is None:
             break
         if attempt:
@@ -235,14 +237,15 @@ async def forward(g: Gateway, checked: Checked, started: float,
             outcome, result = Outcome.FAILED, "failed"
             continue
         finally:
-            g.router.finished(endpoint, outcome)
-            note["ms"] = round(1000 * (g.clock() - attempt_started), 1)
+            seconds = g.clock() - attempt_started
+            g.router.finished(endpoint, outcome, seconds, observe=counted)
+            note["ms"] = round(1000 * seconds, 1)
             if attempts is not None:
                 attempts.append(note)
         for other in unclear:
-            g.router.penalize(other)
-        metrics.UPSTREAM_SECONDS.labels(model_id).observe(g.clock() - attempt_started)
-        return exchange
+            g.router.penalize(other, observe=counted)
+        metrics.UPSTREAM_SECONDS.labels(model_id).observe(seconds)
+        return dataclasses.replace(exchange, seconds=seconds)
     return result
 
 
@@ -341,7 +344,7 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         if isinstance(outcome, Exchange):
             g.meter.record(principal, model, answered=True, input_tokens=outcome.input_tokens)
             g.sampler.offer(outcome)
-            g.served.record(outcome.route, outcome.input_tokens)
+            g.served.record(outcome.route, outcome.input_tokens, outcome.seconds)
             metrics.REQUESTS.labels(model, "answered").inc()
             return JSONResponse({"id": request_id, "model": model, "answers": outcome.answers,
                                  "usage": {"input_tokens": outcome.input_tokens}, "receipt": outcome.receipt},

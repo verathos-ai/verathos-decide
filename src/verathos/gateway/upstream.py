@@ -37,6 +37,7 @@ class Exchange:
     answers: dict[str, Any]
     receipt: dict[str, Any]
     input_tokens: int  # as the miner signed it
+    seconds: float = 0.0  # the attempt's duration, set by the caller
 
 
 class UpstreamFailure(Exception):
