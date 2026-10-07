@@ -12,27 +12,45 @@ the public port none of its routes exist. Every call is logged.
                                no effect on its breaker); never billed; ``count``: whether it counts as user traffic
                                (demand, test windows, sampling). Returns the answers, the receipt, the miner's
                                response as received and every attempt.
+
+Accounts, for the service that signs users up (amounts in micro-USD; ``name``: ``[A-Za-z0-9_.:@-]{1,128}``):
+
+    POST   /admin/v1/accounts                       {"name", "rate_rps", "burst", "monthly_quota", "prepaid"} -> 201
+    GET    /admin/v1/accounts/{name}                the account and its balance as written
+    PATCH  /admin/v1/accounts/{name}                {"status", "rate_rps", "burst", "monthly_quota", "prepaid"}
+    POST   /admin/v1/accounts/{name}/keys           {"name", "expires_at"} -> 201 with the key, shown only here
+    GET    /admin/v1/accounts/{name}/keys
+    DELETE /admin/v1/accounts/{name}/keys/{prefix}  revokes the key
+    GET    /admin/v1/accounts/{name}/usage?since=   per day and model: requests, failed, input tokens, cost
+    POST   /admin/v1/accounts/{name}/credits        {"amount", "kind", "reference", "note"} -> 201, or 200 with the
+                                                    entry already recorded under ``reference``; 409 if it records
+                                                    another one
+    GET    /admin/v1/accounts/{name}/credits?limit= the ledger, newest first, and the balance
 """
 
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import hmac
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
 
+from verathos.gateway.accounts import Conflict
 from verathos.gateway.app import Checked, Gateway, Rejected, check_request, forward
 from verathos.gateway.upstream import Exchange, UpstreamFailure
 
 log = logging.getLogger("verathos.gateway.admin")
 MIN_TOKEN_CHARS = 32
+NAME = r"^[A-Za-z0-9_.:@-]{1,128}$"
 
 
 def read_token(path: Path) -> str:
@@ -57,6 +75,50 @@ class Command(BaseModel):
     request: dict[str, Any]
     target: Target | None = None
     count: StrictBool = False
+
+
+class NewAccount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: Annotated[str, Field(pattern=NAME)]
+    rate_rps: Annotated[float, Field(gt=0)]
+    burst: Annotated[StrictInt, Field(ge=1)]
+    monthly_quota: Annotated[StrictInt, Field(ge=1)] | None = None
+    prepaid: StrictBool = False
+
+
+class AccountChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["active", "suspended"] | None = None
+    rate_rps: Annotated[float, Field(gt=0)] | None = None
+    burst: Annotated[StrictInt, Field(ge=1)] | None = None
+    monthly_quota: Annotated[StrictInt, Field(ge=1)] | None = None  # null: unlimited
+    prepaid: StrictBool | None = None
+
+
+class NewKey(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: Annotated[str, Field(min_length=1, max_length=128)]
+    expires_at: AwareDatetime | None = None
+
+
+class NewCredit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    amount: StrictInt
+    kind: Literal["grant", "topup", "adjust"]
+    reference: Annotated[str, Field(min_length=1, max_length=128)]
+    note: Annotated[str, Field(max_length=256)] | None = None
+
+
+def error(status: int, kind: str, message: str) -> JSONResponse:
+    return JSONResponse({"error": {"type": kind, "message": message}}, status_code=status)
+
+
+async def parse(request: Request, model: type[BaseModel]) -> BaseModel | JSONResponse:
+    try:
+        return model.model_validate_json(await request.body())
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        return error(400, "invalid_request", f"{'.'.join(map(str, first['loc'])) or 'body'}: {first['msg']}")
 
 
 class ByPort:
@@ -104,11 +166,9 @@ def admin_app(g: Gateway, *, token: str) -> FastAPI:
 
     @app.post("/admin/v1/systemone")
     async def debug_request(request: Request):
-        try:
-            command = Command.model_validate_json(await request.body())
-        except ValidationError as exc:
-            return JSONResponse({"error": {"type": "invalid_request", "message": str(exc).splitlines()[0]}},
-                                status_code=400)
+        command = await parse(request, Command)
+        if isinstance(command, JSONResponse):
+            return command
         try:
             checked = check_request(g, json.dumps(command.request).encode())
         except Rejected as r:
@@ -132,6 +192,99 @@ def admin_app(g: Gateway, *, token: str) -> FastAPI:
         return {**reply, "endpoint": f"{outcome.route.hotkey}/{outcome.route.endpoint_id}", "url": outcome.route.url,
                 "answers": outcome.answers, "input_tokens": outcome.input_tokens, "receipt": outcome.receipt,
                 "response": outcome.response}
+
+    accounts = g.accounts
+
+    async def lookup(name: str) -> dict[str, Any] | JSONResponse:
+        account = await accounts.account(name)
+        return error(404, "not_found", f"no account {name!r}") if account is None else account
+
+    @app.post("/admin/v1/accounts")
+    async def create_account(request: Request):
+        new = await parse(request, NewAccount)
+        if isinstance(new, JSONResponse):
+            return new
+        try:
+            await accounts.create_account(new.name, rate_rps=new.rate_rps, burst=new.burst,
+                                          monthly_quota=new.monthly_quota, prepaid=new.prepaid)
+        except Conflict as exc:
+            return error(409, "conflict", str(exc))
+        return JSONResponse(jsonable_encoder(await accounts.account(new.name)), status_code=201)
+
+    @app.get("/admin/v1/accounts/{name}")
+    async def get_account(name: str):
+        return await lookup(name)
+
+    @app.patch("/admin/v1/accounts/{name}")
+    async def change_account(name: str, request: Request):
+        change = await parse(request, AccountChange)
+        if isinstance(change, JSONResponse):
+            return change
+        values = change.model_dump(exclude_unset=True)
+        if any(v is None for k, v in values.items() if k != "monthly_quota"):
+            return error(400, "invalid_request", "only monthly_quota may be null")
+        if values and not await accounts.set_account(name, **values):
+            return error(404, "not_found", f"no account {name!r}")
+        return await lookup(name)
+
+    @app.post("/admin/v1/accounts/{name}/keys")
+    async def create_key(name: str, request: Request):
+        new = await parse(request, NewKey)
+        if isinstance(new, JSONResponse):
+            return new
+        try:
+            key = await accounts.create_key(name, new.name, new.expires_at)
+        except LookupError as exc:
+            return error(404, "not_found", str(exc))
+        listed = next(k for k in await accounts.list_keys(name) if key.startswith(k["prefix"]))
+        return JSONResponse(jsonable_encoder({**listed, "key": key}), status_code=201)
+
+    @app.get("/admin/v1/accounts/{name}/keys")
+    async def keys(name: str):
+        account = await lookup(name)
+        return account if isinstance(account, JSONResponse) else {"keys": await accounts.list_keys(name)}
+
+    @app.delete("/admin/v1/accounts/{name}/keys/{prefix}")
+    async def revoke_key(name: str, prefix: str):
+        if not await accounts.revoke_key(name, prefix):
+            return error(404, "not_found", f"no active key {prefix!r} of account {name!r}")
+        return {"revoked": prefix}
+
+    @app.get("/admin/v1/accounts/{name}/usage")
+    async def usage(name: str, since: str | None = None):
+        account = await lookup(name)
+        if isinstance(account, JSONResponse):
+            return account
+        try:
+            day = dt.date.fromisoformat(since) if since else dt.datetime.now(dt.UTC).date().replace(day=1)
+        except ValueError:
+            return error(400, "invalid_request", "since is an ISO date")
+        return {"since": day, "usage": await accounts.usage(name, day)}
+
+    @app.post("/admin/v1/accounts/{name}/credits")
+    async def add_credit(name: str, request: Request):
+        new = await parse(request, NewCredit)
+        if isinstance(new, JSONResponse):
+            return new
+        try:
+            entry, created = await accounts.add_credit(name, new.amount, kind=new.kind, reference=new.reference,
+                                                       note=new.note)
+        except LookupError as exc:
+            return error(404, "not_found", str(exc))
+        except ValueError as exc:
+            return error(400, "invalid_request", str(exc))
+        except Conflict as exc:
+            return error(409, "conflict", str(exc))
+        account = await accounts.account(name)
+        return JSONResponse(jsonable_encoder({"credit": entry, "created": created, "balance": account["balance"]}),
+                            status_code=201 if created else 200)
+
+    @app.get("/admin/v1/accounts/{name}/credits")
+    async def ledger(name: str, limit: int = 100):
+        account = await lookup(name)
+        if isinstance(account, JSONResponse):
+            return account
+        return {"balance": account["balance"], "credits": await accounts.credits(name, max(1, min(limit, 1000)))}
 
     return app
 

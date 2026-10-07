@@ -11,6 +11,7 @@ Every response carries ``X-Request-Id`` (the client's, if it sent a valid one). 
 
     400 invalid_request     not JSON (NaN and infinities included), not a SystemOne request, or refused by the miners
     401 unauthorized        missing, unknown, revoked or expired key, or a suspended account
+    402 insufficient_credit a prepaid account's balance is used up
     404 model_not_found     not an active model of the catalog
     413 too_large           body, state, or the answers the questions would need, over the limits
     429 rate_limited        over the key's rate (or too many invalid keys from one address)
@@ -152,6 +153,7 @@ class Checked:
     body: bytes
     parsed: SystemOneRequest
     request_sha256: str
+    price: float  # the model's, USD per million input tokens
 
 
 NO_ANSWER = {  # why a forwarded request got no answer -> the API error
@@ -182,7 +184,7 @@ def check_request(g: Gateway, body: bytes) -> Checked:
     if answer_bytes(parsed) > MAX_RESPONSE_BYTES:
         raise Rejected(413, "too_large", "the answers to these questions would exceed a response's size limit",
                        model=parsed.model)
-    return Checked(raw, body, parsed, request_sha256)
+    return Checked(raw, body, parsed, request_sha256, model.price)
 
 
 async def forward(g: Gateway, checked: Checked, started: float, attempts: list[dict[str, Any]] | None = None, *,
@@ -330,6 +332,13 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
             return reject(429, "rate_limited", "over the key's request rate", request_id, wait)
         if not g.meter.within_quota(principal):
             return reject(429, "quota_exceeded", "the account's monthly quota is used up", request_id)
+        try:
+            funded = await g.meter.has_credit(principal)
+        except Exception:
+            log.exception("balance lookup failed")
+            return reject(503, "unavailable", "accounts cannot be checked right now", request_id, 5)
+        if not funded:
+            return reject(402, "insufficient_credit", "the account's credit is used up", request_id)
         body = bytearray()
         async for chunk in request.stream():
             body += chunk
@@ -343,7 +352,7 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         outcome = await forward(g, checked, started)
         metrics.REQUEST_SECONDS.labels(model).observe(g.clock() - started)
         if isinstance(outcome, Exchange):
-            g.meter.record(principal, model, answered=True, input_tokens=outcome.input_tokens)
+            g.meter.record(principal, model, answered=True, input_tokens=outcome.input_tokens, price=checked.price)
             g.sampler.offer(outcome)
             g.served.record(outcome.route, outcome.input_tokens, outcome.seconds)
             metrics.REQUESTS.labels(model, "answered").inc()

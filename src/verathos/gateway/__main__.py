@@ -2,13 +2,16 @@
 
     verathos-gateway serve --config gateway.json
     verathos-gateway db upgrade --config gateway.json
-    verathos-gateway accounts create --name acme --rate 50 --burst 100 [--monthly-quota 1000000]
+    verathos-gateway accounts create --name acme --rate 50 --burst 100 [--monthly-quota 1000000] [--prepaid yes]
     verathos-gateway accounts set --name acme [--rate R] [--burst B] [--monthly-quota Q] [--status suspended]
+                                              [--prepaid yes|no]
     verathos-gateway accounts list
     verathos-gateway keys create --account acme --name prod [--expires 2027-01-01]
     verathos-gateway keys list --account acme
     verathos-gateway keys revoke --account acme --prefix vd_1a2b3c4d5e6f7
     verathos-gateway usage --account acme [--since 2026-10-01]
+    verathos-gateway credits add --account acme --usd 5 --kind topup --reference <payment id> [--note N]
+    verathos-gateway credits list --account acme
 """
 
 from __future__ import annotations
@@ -157,11 +160,13 @@ async def admin(config: GatewayConfig, args: argparse.Namespace) -> Any:
         if args.command == "accounts":
             if args.action == "create":
                 return {"id": await accounts.create_account(args.name, rate_rps=args.rate, burst=args.burst,
-                                                            monthly_quota=args.monthly_quota)}
+                                                            monthly_quota=args.monthly_quota,
+                                                            prepaid=args.prepaid == "yes")}
             if args.action == "set":
+                prepaid = None if args.prepaid is None else args.prepaid == "yes"
                 values = {k: v for k, v in (("rate_rps", args.rate), ("burst", args.burst),
-                                            ("monthly_quota", args.monthly_quota), ("status", args.status))
-                          if v is not None}
+                                            ("monthly_quota", args.monthly_quota), ("status", args.status),
+                                            ("prepaid", prepaid)) if v is not None}
                 return {"updated": await accounts.set_account(args.name, **values)}
             return await accounts.list_accounts()
         if args.command == "keys":
@@ -175,6 +180,13 @@ async def admin(config: GatewayConfig, args: argparse.Namespace) -> Any:
             if args.action == "revoke":
                 return {"revoked": await accounts.revoke_key(args.account, args.prefix)}
             return await accounts.list_keys(args.account)
+        if args.command == "credits":
+            if args.action == "add":
+                entry, created = await accounts.add_credit(args.account, round(args.usd * 1_000_000), kind=args.kind,
+                                                           reference=args.reference, note=args.note)
+                return {"credit": entry, "created": created}
+            return {"balance": (await accounts.account(args.account) or {}).get("balance"),
+                    "credits": await accounts.credits(args.account)}
         since = dt.date.fromisoformat(args.since) if args.since else dt.datetime.now(dt.UTC).date().replace(day=1)
         return await accounts.usage(args.account, since)
     finally:
@@ -197,6 +209,7 @@ def main() -> None:
     acc.add_argument("--burst", type=int)
     acc.add_argument("--monthly-quota", type=int)
     acc.add_argument("--status", choices=["active", "suspended"])
+    acc.add_argument("--prepaid", choices=["yes", "no"], help="served only while the balance is positive")
     keys = commands.add_parser("keys")
     keys.add_argument("action", choices=["create", "list", "revoke"])
     keys.add_argument("--account")
@@ -206,6 +219,13 @@ def main() -> None:
     usage = commands.add_parser("usage")
     usage.add_argument("--account", required=True)
     usage.add_argument("--since", help="ISO date; default: the first of this month")
+    credit = commands.add_parser("credits")
+    credit.add_argument("action", choices=["add", "list"])
+    credit.add_argument("--account", required=True)
+    credit.add_argument("--usd", type=float)
+    credit.add_argument("--kind", choices=["grant", "topup", "adjust"])
+    credit.add_argument("--reference", help="the payment or grant it records; recorded once")
+    credit.add_argument("--note")
     args = parser.parse_args()
     config = GatewayConfig.load(args.config)
     if args.command == "serve":
@@ -216,6 +236,8 @@ def main() -> None:
     else:
         if args.command == "accounts" and args.action == "create" and (args.rate is None or args.burst is None):
             parser.error("accounts create needs --name, --rate and --burst")
+        if args.command == "credits" and args.action == "add" and None in (args.usd, args.kind, args.reference):
+            parser.error("credits add needs --usd, --kind and --reference")
         print(json.dumps(run(admin(config, args)), indent=2, default=str))
 
 

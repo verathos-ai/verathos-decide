@@ -445,6 +445,15 @@ def test_the_admin_cli_manages_accounts_and_keys(tmp_path, capsys) -> None:
     assert cli("keys", "revoke", "--account", "other", "--prefix", key[:16]) == {"revoked": 0}
     assert cli("keys", "revoke", "--account", "acme", "--prefix", key[:16]) == {"revoked": 1}
     assert cli("accounts", "set", "--name", "acme", "--status", "suspended") == {"updated": True}
+    assert cli("accounts", "set", "--name", "acme", "--prepaid", "yes") == {"updated": True}
+    added = cli("credits", "add", "--account", "acme", "--usd", "2.5", "--kind", "topup", "--reference", "pay-7")
+    assert added["created"] and added["credit"]["amount"] == 2_500_000
+    again = cli("credits", "add", "--account", "acme", "--usd", "2.5", "--kind", "topup", "--reference", "pay-7")
+    assert not again["created"]
+    listed = cli("credits", "list", "--account", "acme")
+    assert listed["balance"] == 2_500_000 and [c["reference"] for c in listed["credits"]] == ["pay-7"]
+    (account,) = cli("accounts", "list")
+    assert account["prepaid"] is True and account["balance"] == 2_500_000
 
 
 # ---- requests and responses that must not hurt anyone ----
@@ -548,7 +557,8 @@ def test_what_miners_answer_the_gateway_reaches_the_auditor(tmp_path) -> None:
         assert asyncio.run(s.post()).status_code == 200
     s.served.clock = lambda: 4_000_000_000.0  # those seconds are over
     import time as time_module
-    s.served._counts = {(hk, ep, int(time_module.time())): n for (hk, ep, _), n in s.served._counts.items()}
+    shift = int(time_module.time()) - max(second for _, _, second in s.served._counts)
+    s.served._counts = {(hk, ep, second + shift): n for (hk, ep, second), n in s.served._counts.items()}
     asyncio.run(s.served.report())
     keypair = s.miners["10.0.0.1"][0]
     now = time_module.time()
@@ -592,8 +602,8 @@ def test_what_users_get_from_each_endpoint_reaches_the_auditor(tmp_path) -> None
     for _ in range(4):
         assert asyncio.run(s.post()).status_code == 200
     import time as time_module
-    now = int(time_module.time())
-    s.served._counts = {(hk, ep, now - 1): n for (hk, ep, _), n in s.served._counts.items()}
+    shift = int(time_module.time()) - 1 - max(second for _, _, second in s.served._counts)  # all seconds complete
+    s.served._counts = {(hk, ep, second + shift): n for (hk, ep, second), n in s.served._counts.items()}
     asyncio.run(s.served.report())
     tallies = s.auditor._users[s.auditor.follower.head // 180]
     assert sum(t.answers for t in tallies.values()) == 6 and sum(t.refused for t in tallies.values()) >= 1
@@ -681,3 +691,143 @@ def test_the_admin_api_is_never_public_and_needs_a_private_token(tmp_path) -> No
     token.write_text("short")
     with pytest.raises(SystemExit):
         read_token(token)
+
+
+def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
+    from verathos.gateway.accounts import Conflict
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    price = catalog.load().get("kev-4b").price
+    long = {**REQUEST, "state": "the customer asks about an invoice " * 40}  # costs whole micro-USD
+
+    def balance() -> int:
+        return asyncio.run(s.accounts.account("acme"))["balance"]
+
+    first = asyncio.run(s.post(long))  # not prepaid: served without credit, its usage still costs
+    assert first.status_code == 200
+    asyncio.run(s.meter.flush())
+    cost = round(first.json()["usage"]["input_tokens"] * price)
+    (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
+    assert cost > 0 and usage["cost"] == cost and balance() == -cost
+
+    asyncio.run(s.accounts.set_account("acme", prepaid=True))
+    refused = asyncio.run(s.post(long))
+    assert refused.status_code == 402 and refused.json()["error"]["type"] == "insufficient_credit"
+    entry, created = asyncio.run(s.accounts.add_credit("acme", cost + 1, kind="grant", reference="signup:acme"))
+    assert created and entry["amount"] == cost + 1 and balance() == 1
+    assert asyncio.run(s.post(long)).status_code == 200  # new credit applies at once in this process
+    assert asyncio.run(s.post(long)).status_code == 402  # charged, though not written yet
+    asyncio.run(s.meter.flush())
+    assert balance() == 1 - cost  # the answer in flight is charged: slightly below zero
+
+    again, created = asyncio.run(s.accounts.add_credit("acme", cost + 1, kind="grant", reference="signup:acme"))
+    assert not created and again["id"] == entry["id"] and balance() == 1 - cost  # recorded once
+    with pytest.raises(Conflict):
+        asyncio.run(s.accounts.add_credit("acme", 5, kind="grant", reference="signup:acme"))
+    for amount, kind in ((-5, "topup"), (0, "adjust"), (5, "gift")):
+        with pytest.raises(ValueError):
+            asyncio.run(s.accounts.add_credit("acme", amount, kind=kind, reference=f"x{amount}{kind}"))
+    with pytest.raises(LookupError):
+        asyncio.run(s.accounts.add_credit("nobody", 5, kind="grant", reference="y"))
+    asyncio.run(s.accounts.add_credit("acme", 1_000_000, kind="topup", reference="pay-1"))
+    assert asyncio.run(s.post(long)).status_code == 200
+    ledger = asyncio.run(s.accounts.credits("acme"))
+    assert [(c["kind"], c["reference"]) for c in ledger] == [("topup", "pay-1"), ("grant", "signup:acme")]
+
+
+def test_another_process_charges_and_credit_apply_within_the_balance_ttl(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    clock = Clock()
+    s.meter.clock = clock
+    asyncio.run(s.accounts.set_account("acme", prepaid=True))
+    asyncio.run(s.accounts.add_credit("acme", 1_000, kind="grant", reference="g"))
+    assert asyncio.run(s.post()).status_code == 200
+    other = Accounts(s.engine)  # another process: its credit and charges reach this one through the database
+    asyncio.run(other.add_credit("acme", -2_000, kind="adjust", reference="a"))
+    assert asyncio.run(s.post()).status_code == 200  # read less than BALANCE_TTL_S ago
+    clock.now += s.meter.balance_ttl_s
+    assert asyncio.run(s.post()).status_code == 402
+    asyncio.run(other.add_credit("acme", 5_000, kind="topup", reference="t"))
+    assert asyncio.run(s.post()).status_code == 402
+    clock.now += s.meter.balance_ttl_s
+    assert asyncio.run(s.post()).status_code == 200
+
+
+def test_the_admin_api_signs_users_up_with_keys_and_credit(tmp_path) -> None:
+    s = admin_setup(tmp_path)
+
+    def call(method: str, path: str, body=None) -> httpx.Response:
+        return asyncio.run(admin_call(s, method, path, json_=body))
+
+    new = {"name": "u_42", "rate_rps": 5, "burst": 10, "prepaid": True}
+    created = call("POST", "/admin/v1/accounts", new)
+    assert created.status_code == 201 and created.json()["balance"] == 0 and created.json()["prepaid"] is True
+    assert call("POST", "/admin/v1/accounts", new).status_code == 409
+    for bad in ({**new, "name": "a/b"}, {**new, "burst": "10"}, {**new, "admin": True}, {**new, "prepaid": "yes"}):
+        assert call("POST", "/admin/v1/accounts", bad).status_code == 400
+    made = call("POST", "/admin/v1/accounts/u_42/keys", {"name": "default"})
+    key = made.json()["key"]
+    assert made.status_code == 201 and key.startswith(made.json()["prefix"]) and made.json()["revoked_at"] is None
+    assert [k["prefix"] for k in call("GET", "/admin/v1/accounts/u_42/keys").json()["keys"]] == [key[:16]]
+    assert "key" not in call("GET", "/admin/v1/accounts/u_42/keys").json()["keys"][0]
+    assert asyncio.run(s.post(key=key)).status_code == 402
+
+    grant = {"amount": 1_000_000, "kind": "grant", "reference": "signup:u_42", "note": "welcome"}
+    first = call("POST", "/admin/v1/accounts/u_42/credits", grant)
+    assert first.status_code == 201 and first.json()["balance"] == 1_000_000 and first.json()["created"]
+    repeat = call("POST", "/admin/v1/accounts/u_42/credits", grant)
+    assert repeat.status_code == 200 and not repeat.json()["created"] and repeat.json()["balance"] == 1_000_000
+    assert call("POST", "/admin/v1/accounts/u_42/credits", {**grant, "amount": 2}).status_code == 409
+    for bad in ({**grant, "amount": "5"}, {**grant, "amount": -5, "reference": "n"}, {**grant, "kind": "gift"},
+                {"amount": 5, "kind": "grant"}):
+        assert call("POST", "/admin/v1/accounts/u_42/credits", bad).status_code == 400
+    answered = asyncio.run(s.post(key=key))
+    assert answered.status_code == 200
+    asyncio.run(s.meter.flush())
+    cost = round(answered.json()["usage"]["input_tokens"] * catalog.load().get("kev-4b").price)
+    (usage,) = call("GET", "/admin/v1/accounts/u_42/usage?since=2026-01-01").json()["usage"]
+    assert (usage["requests"], usage["cost"]) == (1, cost)
+    ledger = call("GET", "/admin/v1/accounts/u_42/credits").json()
+    assert ledger["balance"] == 1_000_000 - cost and [c["reference"] for c in ledger["credits"]] == ["signup:u_42"]
+    assert call("GET", "/admin/v1/accounts/u_42/usage?since=May").status_code == 400
+
+    changed = call("PATCH", "/admin/v1/accounts/u_42", {"rate_rps": 9, "monthly_quota": None}).json()
+    assert changed["rate_rps"] == 9 and changed["monthly_quota"] is None
+    assert call("PATCH", "/admin/v1/accounts/u_42", {"status": None}).status_code == 400
+    call("PATCH", "/admin/v1/accounts/u_42", {"status": "suspended"})
+    assert asyncio.run(s.post(key=key)).status_code == 401
+    call("PATCH", "/admin/v1/accounts/u_42", {"status": "active"})
+    assert call("DELETE", f"/admin/v1/accounts/u_42/keys/{key[:16]}").status_code == 200
+    assert call("DELETE", f"/admin/v1/accounts/u_42/keys/{key[:16]}").status_code == 404
+    assert asyncio.run(s.post(key=key)).status_code == 401
+    for method, path, body in (("GET", "/admin/v1/accounts/nope", None), ("PATCH", "/admin/v1/accounts/nope", {}),
+                               ("POST", "/admin/v1/accounts/nope/keys", {"name": "k"}),
+                               ("GET", "/admin/v1/accounts/nope/keys", None),
+                               ("GET", "/admin/v1/accounts/nope/usage", None),
+                               ("POST", "/admin/v1/accounts/nope/credits", grant),
+                               ("GET", "/admin/v1/accounts/nope/credits", None)):
+        assert call(method, path, body).status_code == 404, (method, path)
+    assert call("GET", "/admin/v1/accounts/u_42", None).status_code == 200
+    assert asyncio.run(admin_call(s, "GET", "/admin/v1/accounts/u_42", port=80)).status_code == 404
+
+
+def test_a_database_from_before_credit_is_upgraded_in_place(tmp_path) -> None:
+    from alembic import command
+    from sqlalchemy import text
+
+    url = f"sqlite+aiosqlite:///{tmp_path}/old.db"
+    command.upgrade(db.alembic_config(url), "0001")
+
+    async def old_rows():
+        engine = db.create_engine(url)
+        async with engine.begin() as conn:
+            await conn.execute(text("INSERT INTO accounts (name, rate_rps, burst) VALUES ('old', 1, 1)"))
+        await engine.dispose()
+
+    asyncio.run(old_rows())
+    db.upgrade(url)
+    engine = db.create_engine(url)
+    assert asyncio.run(db.schema_revision(engine)) == db.head_revision()
+    account = asyncio.run(Accounts(engine).account("old"))
+    assert (account["prepaid"], account["balance"]) == (False, 0)
+    asyncio.run(engine.dispose())

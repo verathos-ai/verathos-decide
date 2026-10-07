@@ -15,6 +15,7 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     Date,
     DateTime,
@@ -24,6 +25,7 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
+    false,
     func,
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -42,6 +44,8 @@ accounts = Table(
     Column("burst", Integer, nullable=False),
     Column("monthly_quota", BigInteger, nullable=True),  # requests per calendar month (UTC); None: unlimited
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("prepaid", Boolean, nullable=False, server_default=false()),  # served only while the balance is positive
+    Column("balance", BigInteger, nullable=False, server_default="0"),  # micro-USD: the credits minus the usage cost
 )
 
 api_keys = Table(
@@ -65,6 +69,18 @@ usage_daily = Table(
     Column("requests", BigInteger, nullable=False),  # answered
     Column("failed", BigInteger, nullable=False),  # accepted but not answered (no capacity, miners failed)
     Column("input_tokens", BigInteger, nullable=False),
+    Column("cost", BigInteger, nullable=False, server_default="0"),  # micro-USD charged
+)
+
+credits = Table(
+    "credits", metadata,
+    Column("id", ID, primary_key=True, autoincrement=True),
+    Column("account_id", ID, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("amount", BigInteger, nullable=False),  # micro-USD; negative only for an adjustment
+    Column("kind", String(16), nullable=False),  # grant | topup | adjust
+    Column("reference", String(128), nullable=False, unique=True),  # the payment or grant it records, once
+    Column("note", String(256), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 
 

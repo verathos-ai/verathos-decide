@@ -5,6 +5,9 @@ A key is ``vd_`` followed by 64 hex characters (32 random bytes). Only its SHA-2
 revoked key or a changed limit applies within that time), an unknown key for ``NEGATIVE_TTL_S`` in a cache of its
 own, so unknown keys never push valid ones out; concurrent lookups of one key share one query. For an account with
 a monthly quota, a lookup also has the usage meter read the account's month.
+
+Credit is a ledger (``credits``): each entry names the payment or grant it records (``reference``), so recording one
+twice adds it once. The account's balance is kept with it: the entries minus the cost of the usage written.
 """
 
 from __future__ import annotations
@@ -20,9 +23,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, insert, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from verathos.gateway.db import accounts, api_keys, usage_daily
+from verathos.gateway.db import accounts, api_keys, credits, usage_daily
 from verathos.gateway.usage import UsageMeter
 
 KEY_PREFIX = "vd_"
@@ -31,6 +35,11 @@ _KEY = re.compile(r"vd_[0-9a-f]{64}")
 CACHE_TTL_S = 60.0
 NEGATIVE_TTL_S = 10.0
 MAX_CACHED = 100_000
+CREDIT_KINDS = ("grant", "topup", "adjust")  # free credit, a payment, an operator's correction (either sign)
+
+
+class Conflict(Exception):
+    """The name or reference is taken by something else."""
 
 
 @dataclass(frozen=True)
@@ -41,6 +50,7 @@ class Principal:
     rate_rps: float
     burst: int
     monthly_quota: int | None
+    prepaid: bool = False
 
 
 def new_key() -> str:
@@ -106,30 +116,41 @@ class Accounts:
     async def _load(self, h: str) -> Principal | None:
         now = dt.datetime.now(dt.UTC)
         query = (select(api_keys.c.id, api_keys.c.expires_at, api_keys.c.revoked_at, accounts.c.id, accounts.c.name,
-                        accounts.c.status, accounts.c.rate_rps, accounts.c.burst, accounts.c.monthly_quota)
+                        accounts.c.status, accounts.c.rate_rps, accounts.c.burst, accounts.c.monthly_quota,
+                        accounts.c.prepaid)
                  .join(accounts, api_keys.c.account_id == accounts.c.id).where(api_keys.c.key_hash == h))
         async with self.engine.connect() as conn:
             row = (await conn.execute(query)).first()
             if row is None:
                 return None
-            key_id, expires_at, revoked_at, account_id, name, status, rate, burst, quota = row
+            key_id, expires_at, revoked_at, account_id, name, status, rate, burst, quota, prepaid = row
             if revoked_at is not None or status != "active" or (expires_at is not None and _utc(expires_at) <= now):
                 return None
         if quota is not None and self.meter is not None:
             await self.meter.read_month(account_id)
-        return Principal(account_id, key_id, name, rate, burst, quota)
+        return Principal(account_id, key_id, name, rate, burst, quota, bool(prepaid))
 
     # ---- administration ----
 
-    async def create_account(self, name: str, *, rate_rps: float, burst: int, monthly_quota: int | None = None) -> int:
-        async with self.engine.begin() as conn:
-            result = await conn.execute(insert(accounts).values(name=name, rate_rps=rate_rps, burst=burst,
-                                                                monthly_quota=monthly_quota))
-            return int(result.inserted_primary_key[0])
+    async def create_account(self, name: str, *, rate_rps: float, burst: int, monthly_quota: int | None = None,
+                             prepaid: bool = False) -> int:
+        """Raises Conflict if the name is taken."""
+        try:
+            async with self.engine.begin() as conn:
+                result = await conn.execute(insert(accounts).values(name=name, rate_rps=rate_rps, burst=burst,
+                                                                    monthly_quota=monthly_quota, prepaid=prepaid))
+                return int(result.inserted_primary_key[0])
+        except IntegrityError:
+            raise Conflict(f"account {name!r} exists") from None
+
+    async def account(self, name: str) -> dict[str, Any] | None:
+        async with self.engine.connect() as conn:
+            row = (await conn.execute(select(accounts).where(accounts.c.name == name))).first()
+        return None if row is None else dict(row._mapping)
 
     async def set_account(self, name: str, **values: Any) -> bool:
-        """Change an account's status (active | suspended), rate_rps, burst or monthly_quota."""
-        allowed = {"status", "rate_rps", "burst", "monthly_quota"}
+        """Change an account's status (active | suspended), rate_rps, burst, monthly_quota or prepaid."""
+        allowed = {"status", "rate_rps", "burst", "monthly_quota", "prepaid"}
         if set(values) - allowed:
             raise ValueError(f"unknown account settings: {sorted(set(values) - allowed)}")
         async with self.engine.begin() as conn:
@@ -169,10 +190,54 @@ class Accounts:
     async def usage(self, account: str, since: dt.date) -> list[dict[str, Any]]:
         query = (select(usage_daily.c.day, usage_daily.c.model_id, func.sum(usage_daily.c.requests).label("requests"),
                         func.sum(usage_daily.c.failed).label("failed"),
-                        func.sum(usage_daily.c.input_tokens).label("input_tokens"))
+                        func.sum(usage_daily.c.input_tokens).label("input_tokens"),
+                        func.sum(usage_daily.c.cost).label("cost"))
                  .join(accounts, usage_daily.c.account_id == accounts.c.id)
                  .where(accounts.c.name == account, usage_daily.c.day >= since)
                  .group_by(usage_daily.c.day, usage_daily.c.model_id).order_by(usage_daily.c.day))
+        async with self.engine.connect() as conn:
+            return [dict(r._mapping) for r in await conn.execute(query)]
+
+
+    async def add_credit(self, account: str, amount: int, *, kind: str, reference: str,
+                         note: str | None = None) -> tuple[dict[str, Any], bool]:
+        """Record ``amount`` micro-USD for ``account`` once per ``reference``. -> (the entry, whether it is new).
+        Recording the same entry again returns it unchanged; a reference used for another entry raises Conflict, an
+        unknown account LookupError."""
+        if kind not in CREDIT_KINDS:
+            raise ValueError(f"kind is one of {CREDIT_KINDS}")
+        if amount == 0 or (amount < 0 and kind != "adjust"):
+            raise ValueError("a grant or top-up is positive; only an adjustment may be negative")
+        try:
+            async with self.engine.begin() as conn:
+                account_id = (await conn.execute(select(accounts.c.id).where(accounts.c.name == account))).scalar()
+                if account_id is None:
+                    raise LookupError(f"no account {account!r}")
+                await conn.execute(insert(credits).values(account_id=account_id, amount=amount, kind=kind,
+                                                          reference=reference, note=note))
+                await conn.execute(update(accounts).where(accounts.c.id == account_id)
+                                   .values(balance=accounts.c.balance + amount))
+            created = True
+        except IntegrityError:
+            created = False
+        async with self.engine.connect() as conn:
+            row = (await conn.execute(select(credits, accounts.c.name.label("account"))
+                                      .join(accounts, credits.c.account_id == accounts.c.id)
+                                      .where(credits.c.reference == reference))).first()
+        if row is None:  # the insert failed for another reason than the reference
+            raise Conflict(f"credit {reference!r} could not be recorded")
+        entry = dict(row._mapping)
+        if not created and (entry["account"], entry["amount"], entry["kind"]) != (account, amount, kind):
+            raise Conflict(f"reference {reference!r} records another credit")
+        if self.meter is not None:
+            self.meter.forget_balance(entry["account_id"])
+        return entry, created
+
+    async def credits(self, account: str, limit: int = 100) -> list[dict[str, Any]]:
+        """The account's credit entries, newest first."""
+        query = (select(credits.c.id, credits.c.amount, credits.c.kind, credits.c.reference, credits.c.note,
+                        credits.c.created_at).join(accounts, credits.c.account_id == accounts.c.id)
+                 .where(accounts.c.name == account).order_by(credits.c.id.desc()).limit(limit))
         async with self.engine.connect() as conn:
             return [dict(r._mapping) for r in await conn.execute(query)]
 

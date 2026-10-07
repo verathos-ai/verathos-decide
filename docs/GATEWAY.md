@@ -225,6 +225,7 @@ Every response carries `X-Request-Id` (the client's, if it sent a valid one). Er
 |---|---|---|
 | 400 | `invalid_request` | not JSON (NaN and infinities included), not a SystemOne request, or refused by the miners |
 | 401 | `unauthorized` | missing, unknown, revoked or expired key, or a suspended account |
+| 402 | `insufficient_credit` | a prepaid account's balance is used up |
 | 404 | `model_not_found` | not an active model of the catalog |
 | 413 | `too_large` | body, state, or the answers the questions would need, over the limits |
 | 429 | `rate_limited` | over the key's rate, or too many invalid keys from the address; `Retry-After` |
@@ -236,17 +237,37 @@ Every response carries `X-Request-Id` (the client's, if it sent a valid one). Er
 ## Accounts and keys
 
 ```bash
-verathos-gateway accounts create --name acme --rate 50 --burst 100 [--monthly-quota 1000000]
-verathos-gateway accounts set --name acme --rate 100        # also --burst, --monthly-quota, --status suspended
+verathos-gateway accounts create --name acme --rate 50 --burst 100 [--monthly-quota 1000000] [--prepaid yes]
+verathos-gateway accounts set --name acme --rate 100        # also --burst, --monthly-quota, --status suspended, --prepaid
 verathos-gateway keys create --account acme --name prod     # prints the key once
 verathos-gateway keys list --account acme
 verathos-gateway keys revoke --account acme --prefix vd_1a2b3c4d5e6f7
 verathos-gateway usage --account acme --since 2026-10-01
+verathos-gateway credits add --account acme --usd 5 --kind topup --reference <payment id>
+verathos-gateway credits list --account acme
 ```
+
+### Credit
+
+An answer costs its input tokens times the model's catalog `price` (USD per million input tokens). The cost is
+written with the usage every 5 s, rounded to whole micro-USD per account, key, model and day, and taken from the
+account's balance in the same transaction. Every account has a balance: the credit recorded minus the cost of its
+usage. A prepaid account (`--prepaid yes`) is served only while its balance is positive; others are served
+regardless (their balance just goes negative).
+
+Credit is a ledger. Each entry has a `kind` (`grant`: free credit, `topup`: a payment, `adjust`: an operator's
+correction, the only kind that may be negative) and a `reference` naming the payment or grant it records. A
+reference is recorded once: adding the same entry again changes nothing, and a reference already used for another
+entry is refused. So a payment processor's retries never add a payment twice.
+
+Each process reads a prepaid account's balance at most 5 s before using it and subtracts what it charged since. New
+credit, and other processes' charges, therefore apply within 5 s; requests in flight when the balance runs out are
+still answered and charged, so a balance can end slightly below zero.
 
 ## Admin API
 
-For the operators only: inspection, and requests sent past the router or to one chosen endpoint. Off unless
+For the operators and the service that signs users up: inspection, requests sent past the router or to one chosen
+endpoint, and accounts, keys, usage and credit. Off unless
 `admin_port` is set. It listens on a socket of its own, `admin_host:admin_port` (loopback by default; a private
 address at most, never `0.0.0.0`), so the reverse proxy never reaches it, and on the public port its routes answer
 404. Every call needs `Authorization: Bearer <token>`, the token read from `admin_token_file` at start:
@@ -263,6 +284,19 @@ with the caller's address.
 | `GET /admin/v1/state` | the routes in use (epoch, age, endpoints, catalog), active models, limits, and what waits to be written or sent (usage rows, samples, served counts) |
 | `GET /admin/v1/routes` | every routable endpoint as the router sees it: credited rate, latency, cap, in flight, busy time, breaker |
 | `POST /admin/v1/systemone` | a SystemOne request, served as described below |
+| `POST /admin/v1/accounts` | `{"name", "rate_rps", "burst", "monthly_quota", "prepaid"}` -> 201 and the account; 409 if the name is taken. Names: `[A-Za-z0-9_.:@-]{1,128}` |
+| `GET /admin/v1/accounts/{name}` | the account: limits, status, `prepaid`, `balance` (micro-USD, as written) |
+| `PATCH /admin/v1/accounts/{name}` | any of `status` (`active`, `suspended`), `rate_rps`, `burst`, `monthly_quota` (null: unlimited), `prepaid` |
+| `POST /admin/v1/accounts/{name}/keys` | `{"name", "expires_at"}` -> 201 with `key`, returned only here |
+| `GET /admin/v1/accounts/{name}/keys` | the keys: prefix, name, created, expires, revoked |
+| `DELETE /admin/v1/accounts/{name}/keys/{prefix}` | revokes the key (within the key cache's minute) |
+| `GET /admin/v1/accounts/{name}/usage?since=YYYY-MM-DD` | per day and model: answered and failed requests, input tokens, cost (micro-USD); default since the first of the month |
+| `POST /admin/v1/accounts/{name}/credits` | `{"amount" (micro-USD), "kind", "reference", "note"}` -> 201 with the entry and the new balance; 200 if `reference` already records this entry; 409 if it records another |
+| `GET /admin/v1/accounts/{name}/credits?limit=100` | the balance and the ledger, newest first |
+
+Each gateway process serves the admin API on its own `admin_port`; with an active and a standby process, a client
+of the account calls tries the other one when one does not answer (a restart). Every write is in the shared
+database, so either process gives the same answers.
 
 ```bash
 curl -s http://127.0.0.1:8090/admin/v1/systemone -H "Authorization: Bearer $(cat ~/.verathos/gateway/admin.token)" \
