@@ -70,18 +70,20 @@ def create_app(
     serving: Callable[[], Collection[str]] | None = None,
     max_state_tokens: Callable[[str], int | None] = lambda model_id: None,
     on_test_traffic: Callable[[], None] = lambda: None,
+    gateways: Callable[[], Collection[str]] | None = None,
 ) -> FastAPI:
     """``auditors`` gives the hotkeys whose test sessions are accepted (besides the miner's own, for its
     measurement), and ``on_test_traffic`` is called for each of their requests; ``admissions`` the engine admission per
     endpoint (default: ``max_concurrency`` slots); ``serving`` the endpoints answered (default: those the manifest
-    lists); ``max_state_tokens`` a model's state limit."""
+    lists); ``max_state_tokens`` a model's state limit; ``gateways`` the callers exempt from the per-caller limit
+    (default: the configured ``gateway_hotkeys``)."""
     app = FastAPI(title="Verathos miner")
     nonces = NonceCache()
     endpoints = {e.endpoint_id: e for e in config.endpoints}
     admissions = admissions or {e.endpoint_id: Admission(e.max_concurrency) for e in config.endpoints}
     hotkey = keypair.ss58_address
     sessions = SessionGate(config.netuid, hotkey)
-    gateways = set(config.gateway_hotkeys)
+    gateways = gateways or (lambda: config.gateway_hotkeys)
     in_flight: dict[tuple[str, str], int] = {}  # (caller, endpoint) -> requests, for callers other than gateways
 
     def error(status: int, message: str) -> JSONResponse:
@@ -182,7 +184,7 @@ def create_app(
         if limit is not None and len(state) > STATE_CHARS_PER_TOKEN * limit:
             return error(413, "state longer than the model accepts")
         # Callers other than gateways (validators) send a few requests at a time; more would crowd out tests.
-        capped = (caller.hotkey, endpoint_id) if not test and caller.hotkey not in gateways else None
+        capped = (caller.hotkey, endpoint_id) if not test and caller.hotkey not in gateways() else None
         if capped is not None and in_flight.get(capped, 0) >= CALLER_CONCURRENCY:
             return error(429, "too many concurrent requests from this caller")
         if capped is not None:

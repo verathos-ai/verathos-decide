@@ -64,6 +64,7 @@ class AuditPolicy:
     rate_growth: float = 2.0  # an endpoint is tested at no more than this times what it last delivered
     min_test_share: float = 0.125  # ... but at least this share of the model's first_test_rps
     drift_window_tests: int = 8  # tests over which an endpoint's recomputed answers are held to mean_abs
+    gateway_checks_per_epoch: int = 2  # sampled gateway answers the auditor recomputes per endpoint and epoch
 
     def validate(self) -> None:
         if self.mode not in ("enforce", "observe"):
@@ -80,6 +81,8 @@ class AuditPolicy:
                self.credit_ttl_epochs, self.drift_window_tests) < 1:
             raise ValueError("lead_blocks, samples_per_test, answer_checks_per_test, qualification_tests, "
                              "credit_ttl_epochs and drift_window_tests must be at least 1")
+        if self.gateway_checks_per_epoch < 0:
+            raise ValueError("gateway_checks_per_epoch cannot be negative")
         if self.answer_checks_per_test > self.samples_per_test:
             raise ValueError("answer_checks_per_test cannot exceed samples_per_test")
         if self.rate_growth < 1:

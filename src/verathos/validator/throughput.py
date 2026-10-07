@@ -167,9 +167,11 @@ class Throughput:
         for e in evidence:
             model = cat.get(e.model_id)
             response = feed.parse_response(e.response)
+            # A test answer was issued to the auditor, a sampled gateway answer to one of the catalog's gateways.
+            callers = set(cat.gateways) if e.test_id == feed.GATEWAY_EVIDENCE else {self.auditor_hotkey}
             answers = None if response is None else feed.signed_answers(
                 response, e.request, request_id=e.request_id, hotkey=e.hotkey, endpoint_id=e.endpoint_id,
-                model_id=e.model_id, auditor=self.auditor_hotkey, netuid=self.netuid, mechid=self.mechid)
+                model_id=e.model_id, callers=callers, netuid=self.netuid, mechid=self.mechid)
             if answers is None or model is None:
                 log.warning("evidence against %s/%s rejected: %s", e.hotkey, e.endpoint_id,
                             "unknown model" if model is None else "the receipt does not bind it")

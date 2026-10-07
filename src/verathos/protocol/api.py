@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 JSONContent = str | dict | list | int | float | bool | None
 MAX_OPTIONS = 255
+MAX_RESPONSE_BYTES = 64 << 10  # a response (answers and receipt) larger than this is not a valid answer
 
 
 class Noul(BaseModel):

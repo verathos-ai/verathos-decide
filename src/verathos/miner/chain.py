@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable, Collection
 
 import bittensor as bt
 
@@ -44,12 +45,13 @@ def publish(subtensor: bt.Subtensor, wallet: bt.Wallet, config: MinerConfig, sig
 
 
 class PermitAuthorizer:
-    """Allows validators with a validator permit plus configured gateway hotkeys; refreshed in the background over
-    its own chain connection."""
+    """Allows validators with a validator permit (refreshed in the background over its own chain connection) and the
+    gateways ``gateways`` names at the time of the request."""
 
-    def __init__(self, network: str, netuid: int, extra: list[str], refresh_s: float = 600.0) -> None:
-        self._subtensor, self._netuid, self._extra = bt.Subtensor(network=network), netuid, set(extra)
-        self._allowed: set[str] = set(extra)
+    def __init__(self, network: str, netuid: int, gateways: Callable[[], Collection[str]],
+                 refresh_s: float = 600.0) -> None:
+        self._subtensor, self._netuid, self._gateways = bt.Subtensor(network=network), netuid, gateways
+        self._permitted: set[str] = set()
         self._logged = False
         self._refresh_s = refresh_s
         self.refresh()
@@ -58,11 +60,10 @@ class PermitAuthorizer:
     def refresh(self) -> None:
         mg = self._subtensor.metagraph(self._netuid, lite=True)
         permitted = {hk for hk, permit in zip(mg.hotkeys, mg.validator_permit) if bool(permit)}
-        allowed = permitted | self._extra
-        if allowed != self._allowed or not self._logged:
-            log.info("accepting requests from %d validators and %d gateway hotkeys", len(permitted), len(self._extra))
+        if permitted != self._permitted or not self._logged:
+            log.info("accepting requests from %d validators and %d gateways", len(permitted), len(self._gateways()))
             self._logged = True
-        self._allowed = allowed
+        self._permitted = permitted
 
     def _loop(self) -> None:
         while True:
@@ -73,4 +74,4 @@ class PermitAuthorizer:
                 log.exception("permit refresh failed; keeping the previous set")
 
     def __call__(self, hotkey: str) -> bool:
-        return hotkey in self._allowed
+        return hotkey in self._permitted or hotkey in self._gateways()

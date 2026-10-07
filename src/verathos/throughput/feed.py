@@ -10,6 +10,7 @@ reference.
 from __future__ import annotations
 
 import json
+from collections.abc import Collection
 from typing import Any
 
 import httpx
@@ -18,14 +19,13 @@ from pydantic import BaseModel, Field
 
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
-from verathos.protocol.api import Distribution, distributions
+from verathos.protocol.api import MAX_RESPONSE_BYTES, Distribution, distributions
 from verathos.protocol.http import request_json
 from verathos.protocol.receipts import SignedReceipt
 from verathos.validator.compare import RequestComparison, Tolerance, compare_request
 
 VERDICTS_PATH = "/v1/throughput/{epoch}"
 VERDICTS_DOMAIN = "verathos/throughput-verdicts/v1"
-MAX_EVIDENCE_BYTES = 64 << 10  # a response larger than this is not a valid answer
 MAX_JSON_DEPTH = 32  # nor one nested deeper
 MAX_VERDICTS_BYTES = 32 << 20  # at most one piece of evidence per hotkey
 MALFORMED = "malformed answers"
@@ -42,13 +42,16 @@ class Credit(BaseModel):
     drift: bool = False  # its test answers drifted beyond the model's statistical tolerance: no credit
 
 
+GATEWAY_EVIDENCE = "gateway"  # the test_id of evidence from a sampled gateway answer
+
+
 class Evidence(BaseModel):
     hotkey: str
     endpoint_id: str
     model_id: str
-    test_id: str
+    test_id: str  # the test, or GATEWAY_EVIDENCE for an answer the gateway sampled
     reason: str
-    request_id: str
+    request_id: str  # the receipt's nonce: the test request id, or the gateway's request nonce
     request: dict[str, Any]
     response: str  # the response body as received: the answers and the signed receipt
 
@@ -102,7 +105,7 @@ async def fetch(client: httpx.AsyncClient, auditor_url: str | None, *, auditor_h
 def parse_response(text: str) -> dict[str, Any] | None:
     """A response body as a JSON object, or None if it is not one, or too large or too deeply nested to be an
     answer."""
-    if len(text) > MAX_EVIDENCE_BYTES:
+    if len(text) > MAX_RESPONSE_BYTES:
         return None
     try:
         value = json.loads(text)
@@ -120,9 +123,9 @@ def _depth(value: Any) -> int:
 
 
 def signed_answers(response: dict[str, Any], request: dict[str, Any], *, request_id: str, hotkey: str,
-                   endpoint_id: str, model_id: str, auditor: str, netuid: int, mechid: int) -> Any:
-    """The answers of a test response if its receipt is the miner's signature over exactly this request and these
-    answers, issued for this test request; None otherwise."""
+                   endpoint_id: str, model_id: str, callers: Collection[str], netuid: int, mechid: int) -> Any:
+    """The answers of a response if its receipt is the miner's signature over exactly this request and these answers,
+    issued to one of ``callers`` for the request with nonce ``request_id``; None otherwise."""
     try:
         receipt = SignedReceipt.model_validate(response["receipt"])
         answers = response["answers"]
@@ -130,7 +133,7 @@ def signed_answers(response: dict[str, Any], request: dict[str, Any], *, request
         return None
     r = receipt.receipt
     bound = (receipt.signature_valid() and receipt.binds(request, answers) and r.miner_hotkey == hotkey
-             and r.endpoint_id == endpoint_id and r.model_id == model_id and r.caller_hotkey == auditor
+             and r.endpoint_id == endpoint_id and r.model_id == model_id and r.caller_hotkey in callers
              and r.request_nonce == request_id and r.netuid == netuid and r.mechid == mechid)
     return answers if bound else None
 

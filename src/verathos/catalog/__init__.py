@@ -18,6 +18,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
 
+from bittensor_wallet import Keypair
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from verathos.protocol.canonical import digest
@@ -81,6 +82,9 @@ class Catalog(BaseModel):
     throughput_audit: dict[str, Any] = Field(default_factory=dict, description="Throughput-audit settings over the "
                                              "code defaults")
     scoring: Scoring = Scoring()
+    gateways: list[str] = Field(default_factory=list, max_length=16, description="Hotkeys of the subnet's gateways: "
+                                "miners serve them like validators, without the per-caller limit, and the auditor "
+                                "checks a sample of their answers")
     _document: Any = PrivateAttr(None)
 
     @classmethod
@@ -107,6 +111,9 @@ class Catalog(BaseModel):
         ids = [m.model_id for m in self.models]
         if len(ids) != len(set(ids)):
             raise ValueError("model ids must be unique")
+        for hotkey in self.gateways:
+            if not is_ss58(hotkey):
+                raise ValueError(f"gateway {hotkey!r} is not an ss58 address")
         self.audit_policy()
         return self
 
@@ -120,6 +127,14 @@ class Catalog(BaseModel):
 
     def get(self, model_id: str) -> CatalogModel | None:
         return next((m for m in self.models if m.model_id == model_id), None)
+
+
+def is_ss58(value: str) -> bool:
+    try:
+        Keypair(ss58_address=value)
+    except Exception:
+        return False
+    return True
 
 
 class CatalogUnavailable(Exception):

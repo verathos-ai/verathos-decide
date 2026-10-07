@@ -291,7 +291,10 @@ def main() -> None:
     cat = catalog.load() if args.no_publish else resolve_catalog(subtensor, config)
     publisher = Publisher(config, wallet, cat, publish_on_chain=not args.no_publish, subtensor=subtensor)
 
-    authorizer = PermitAuthorizer(config.network, config.netuid, config.gateway_hotkeys)
+    def gateways() -> set[str]:
+        return {*config.gateway_hotkeys, *publisher.catalog.gateways}
+
+    authorizer = PermitAuthorizer(config.network, config.netuid, gateways)
     engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key, max_connections=e.max_concurrency)
                for e in config.endpoints}
 
@@ -302,7 +305,7 @@ def main() -> None:
     app = create_app(config=config, keypair=wallet.hotkey, manifest=lambda: publisher.signed, engines=engines,
                      authorized=authorizer, auditors=publisher.auditors, admissions=publisher.admissions,
                      serving=lambda: publisher.serving, max_state_tokens=max_state_tokens,
-                     on_test_traffic=publisher.note_test_traffic)
+                     on_test_traffic=publisher.note_test_traffic, gateways=gateways)
     # Connections beyond the descriptors left are refused, so a flood of idle connections cannot starve the rest.
     limit = max(256, raise_open_file_limit() - 256)
     server = uvicorn.Server(uvicorn.Config(app, host=config.listen_host, port=config.port, log_level="warning",
