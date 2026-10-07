@@ -46,7 +46,7 @@ def test_miner_logs_each_epoch_once_and_each_final_test_once() -> None:
     doc = HotkeyStatus(hotkey="hkA", epoch=13, epoch_blocks=180, endpoints=[
         {"endpoint_id": "gpu0", "model_id": "kev-4b", "state": "qualifying", "sent": 10, "answered": 10,
          "verdict": "pass", "mean_abs": 0.0014, "declared_rps": 50.0},
-        {"endpoint_id": "gpu1", "model_id": "kev-4b", "state": "scored", "score": 44.1, "ema": 30.2,
+        {"endpoint_id": "gpu1", "model_id": "kev-4b", "state": "scored", "score": 0.441, "ema": 0.302,
          "declared_rps": 50.0, "credited_rps": 45.0, "sent": 10, "answered": 10, "verdict": "pass"}],
         tests=[{"endpoint_id": "gpu1", "epoch": 12, "start_block": 2200, "state": "confirmed", "outcome": "passed",
                 "declared_rps": 50.0, "tested_rps": 45.0, "delivered_rps": 46.2, "credited_rps": 45.0,
@@ -57,8 +57,11 @@ def test_miner_logs_each_epoch_once_and_each_final_test_once() -> None:
     lines = watcher.lines(doc)
     assert lines[0] == "validator's epoch 13:"
     assert "qualifying, checked but not scored until it passes a throughput test" in lines[1]
-    assert "scored 44.10 this epoch, average 30.20; proven 45.0 of 50.0 requests/s declared" in lines[2]
+    assert ("scored 44.10% of the epoch's emission, average 30.20%; proven 45.0 of 50.0 requests/s declared"
+            in lines[2])
     assert "gpu2: not in that epoch" in lines[3]
+    shared = doc.model_copy(update={"epoch": 14, "model_shares": {"kev-4b": 0.6, "kev-9b": 0.4}})
+    assert watcher.lines(shared)[1] == "  emission shares: kev-4b 60.0%, kev-9b 40.0%"
     assert lines[4] == ("throughput test of epoch 12 (block 2200), gpu1: passed, delivered 46.2 of 45.0 requests/s, "
                         "p95 latency 830 ms; credited 45.0")
     assert watcher.lines(doc) == []  # nothing new; the unconfirmed test is not final yet

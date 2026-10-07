@@ -63,8 +63,9 @@
           }
         }
       },
-      "score_per_rps": 1.0,
-      "first_test_rps": 50.0
+      "first_test_rps": 50.0,
+      "price": 0.04,
+      "anchor_share": 0.5
     },
     {
       "model_id": "kev-9b",
@@ -126,8 +127,9 @@
           }
         }
       },
-      "score_per_rps": 2.0,
-      "first_test_rps": 25.0
+      "first_test_rps": 25.0,
+      "price": 0.09,
+      "anchor_share": 0.5
     },
     {
       "model_id": "clef-flash",
@@ -187,8 +189,9 @@
           }
         }
       },
-      "score_per_rps": 2.0,
-      "first_test_rps": 25.0
+      "first_test_rps": 25.0,
+      "price": 0.09,
+      "anchor_share": 0.0
     }
   ],
   "throughput_audit": {

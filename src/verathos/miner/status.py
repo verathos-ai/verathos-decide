@@ -30,7 +30,8 @@ def describe_endpoint(e: EndpointStatus) -> str:
     probation = f"zero score for {e.probation_epochs} more epochs"
     capacity = f"proven {e.credited_rps:.1f} of {e.declared_rps:.1f} requests/s declared"
     if e.state == "scored":
-        return f"{name}: scored {e.score:.2f} this epoch, average {e.ema:.2f}; {capacity}; {_answers(e)}"
+        return (f"{name}: scored {e.score:.2%} of the epoch's emission, average {e.ema:.2%}; {capacity}; "
+                f"{_answers(e)}")
     if e.state == "qualifying":
         return f"{name}: qualifying, checked but not scored until it passes a throughput test; {_answers(e)}"
     if e.state == "candidate":
@@ -93,6 +94,9 @@ class StatusWatcher:
         if status.epoch is not None and status.epoch != self._epoch:
             self._epoch = status.epoch
             out.append(f"validator's epoch {status.epoch}:")
+            if status.model_shares:
+                out.append("  emission shares: " + ", ".join(f"{m} {s:.1%}" for m, s in
+                                                              sorted(status.model_shares.items())))
             seen = set()
             for e in status.endpoints:
                 seen.add(e.endpoint_id)

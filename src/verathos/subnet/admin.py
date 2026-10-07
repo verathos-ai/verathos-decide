@@ -100,6 +100,7 @@ def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path 
         raise SystemExit(f"{wallet.hotkey.ss58_address} is not the subnet owner hotkey")
     cat = catalog.load(path)
     cat.audit_policy(strict=True)  # nodes ignore settings their code does not know; a publisher must not mistype one
+    cat.anchor_shares(strict=True)
     stored = catalog.CatalogStore(store_dir).put(cat)
     print(f"catalog {cat.digest()} stored at {stored}; active models: "
           f"{[m.model_id for m in cat.models if m.status == 'active']}", flush=True)

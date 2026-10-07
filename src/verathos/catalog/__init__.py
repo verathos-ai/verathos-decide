@@ -55,8 +55,10 @@ class CatalogModel(BaseModel):
     license: str
     max_state_tokens: int = Field(ge=1)
     workload: Workload = Field(description="Standard request mix capacity is declared and tested with")
-    score_per_rps: float = Field(gt=0, description="Score per request/s of proven capacity, so models of different "
-                                 "cost per request score fairly")
+    price: float = Field(gt=0, description="What users pay, in USD per million input tokens; the model's user "
+                         "demand is weighed by it")
+    anchor_share: float = Field(0.0, ge=0, le=1, description="The model's share of the miners' emission while there "
+                                "is no user demand; the active models' anchors sum to 1")
     first_test_rps: float = Field(gt=0, description="Highest rate an endpoint is tested at before its first test; "
                                   "later tests grow from what it delivered")
     tolerance: Tolerance = Tolerance()
@@ -71,6 +73,13 @@ class Scoring(BaseModel):
     statistical_window_epochs: int = Field(3, ge=1)
     ema_alpha: float = Field(0.2, gt=0, le=1)
     probation_epochs: int = Field(6, ge=1)
+    demand_ema_alpha: float = Field(0.1, gt=0, le=1, description="Weight of the latest epoch in each model's "
+                                    "user demand")
+    demand_full_tokens_s: float = Field(10_000.0, gt=0, description="Total user demand (input tokens/s) from which "
+                                        "the models' emission shares follow demand alone; below it they lean toward "
+                                        "the anchor shares")
+    min_model_share: float = Field(0.1, ge=0, le=1, description="Emission share every active model keeps, whatever "
+                                   "its demand")
 
 
 class Catalog(BaseModel):
@@ -116,6 +125,17 @@ class Catalog(BaseModel):
                 raise ValueError(f"gateway {hotkey!r} is not an ss58 address")
         self.audit_policy()
         return self
+
+    def anchor_shares(self, *, strict: bool = False) -> dict[str, float]:
+        """The active models' anchor shares, summing to 1 (equal if none is set). ``strict``: they must sum to 1 as
+        written, as when publishing a catalog."""
+        active = [m for m in self.models if m.status == "active"]
+        total = sum(m.anchor_share for m in active)
+        if strict and abs(total - 1.0) > 1e-6:
+            raise ValueError(f"the active models' anchor_share must sum to 1, not {total:g}")
+        if total <= 0:
+            return {m.model_id: 1.0 / len(active) for m in active}
+        return {m.model_id: m.anchor_share / total for m in active}
 
     def audit_policy(self, *, strict: bool = False) -> AuditPolicy:
         """The throughput-audit policy: code defaults with this catalog's settings (``strict``: settings this code

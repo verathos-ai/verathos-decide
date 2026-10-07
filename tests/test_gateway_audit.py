@@ -287,3 +287,45 @@ def test_nothing_is_served_before_the_chain_head_is_known(tmp_path) -> None:
     assert auditor.routes(list) is None and auditor.verdicts(0) is None
     auditor.follower.poll()
     assert auditor.routes(list) is not None
+
+
+def test_user_demand_per_model_is_published_with_the_verdicts(tmp_path) -> None:
+    import time as time_module
+
+    from verathos.protocol.gateway import ServedCount
+
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()  # epoch 3
+    auditor.update_slots([Slot("a", "gpu0", "http://a/e/gpu0", "kev-4b", 50.0),
+                          Slot("b", "gpu0", "http://b/e/gpu0", "kev-9b", 50.0)])
+    now = int(time_module.time())
+    epoch_s = 180 * 12.0
+    auditor.accept_served([ServedCount(hotkey="a", endpoint_id="gpu0", second=now, answered=1,
+                                       input_tokens=int(epoch_s * 20)),
+                           ServedCount(hotkey="b", endpoint_id="gpu0", second=now, answered=1,
+                                       input_tokens=int(epoch_s * 5))])
+    auditor.chain.head_block = 4 * 180 + 1
+    auditor.follower.poll()
+    auditor.close_demand(4)
+    verdicts = auditor.verdicts(4).verdicts
+    assert verdicts.demand == {"kev-4b": pytest.approx(0.1 * 20), "kev-9b": pytest.approx(0.1 * 5)}  # alpha 0.1
+    auditor.chain.head_block = 5 * 180 + 1  # an epoch without traffic: demand decays
+    auditor.follower.poll()
+    auditor.close_demand(5)
+    assert auditor.store.demand_ema(4) == {"kev-4b": pytest.approx(0.9 * 2.0), "kev-9b": pytest.approx(0.9 * 0.5)}
+
+
+def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -> None:
+    import sqlite3
+
+    from verathos.throughput.auditor import SCHEMA_VERSION, Store
+
+    Store(tmp_path / "old.sqlite")  # a version 4 database: today's without the demand table
+    db = sqlite3.connect(tmp_path / "old.sqlite")
+    db.executescript("DROP TABLE demand; INSERT INTO tests VALUES ('kept', 3, 560, 'h', 565, 'confirmed', ''); "
+                     "PRAGMA user_version = 4;")
+    db.close()
+    store = Store(tmp_path / "old.sqlite")
+    assert store._query("SELECT test_id FROM tests") == [("kept",)]
+    assert store._query("PRAGMA user_version")[0][0] == SCHEMA_VERSION
+    assert store.demand_ema(10) == {}

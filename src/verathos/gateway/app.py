@@ -232,7 +232,7 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         if isinstance(outcome, Exchange):
             g.meter.record(principal, parsed.model, answered=True, input_tokens=outcome.input_tokens)
             g.sampler.offer(outcome)
-            g.served.record(outcome.route)
+            g.served.record(outcome.route, outcome.input_tokens)
             metrics.REQUESTS.labels(parsed.model, "answered").inc()
             return JSONResponse({"id": request_id, "model": parsed.model, "answers": outcome.answers,
                                  "usage": {"input_tokens": outcome.input_tokens}, "receipt": outcome.receipt},

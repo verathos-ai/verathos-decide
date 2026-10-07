@@ -63,9 +63,11 @@ sends the window's picks to the auditor. The auditor keeps up to 8 per endpoint 
 Signed malformed answers are proof on their own: they always go to the auditor, and are kept for the next window if
 a post fails.
 
-The gateway also reports, every 5 s, how many requests each endpoint answered it per second. Miners serve the gateway
-before the auditor's test traffic; what an endpoint answers the gateway inside a test's measured window counts as
-delivered, so serving users never costs a miner credit (`THROUGHPUT_AUDIT.md`).
+The gateway also reports, every 5 s, how many requests each endpoint answered it per second, and their input tokens.
+Miners serve the gateway before the auditor's test traffic; what an endpoint answers the gateway inside a test's
+measured window counts as delivered, so serving users never costs a miner credit (`THROUGHPUT_AUDIT.md`). The input
+tokens per model are the users' demand, which, at each model's catalog `price`, sets the models' emission shares
+(`SCORING.md`).
 
 ## Privacy of user requests
 

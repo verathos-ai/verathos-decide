@@ -9,11 +9,12 @@ Per endpoint and epoch:
   ``probation_epochs`` epochs, the failing one included, regardless of later results. An endpoint the hotkey adds
   while on probation inherits the remaining probation, so moving hardware to another endpoint does not escape it;
 - zero until the endpoint has proven capacity in a throughput test;
-- otherwise score per request/s of the model x proven capacity (requests/s) x availability (answered / sent) x latency
-  factor. The latency factor compares the endpoint's median latency in its throughput test with the median over the
-  scored endpoints serving the same model, each weighted by its proven capacity (so splitting capacity over more
-  endpoints does not move it), capped to [0.7, 1.3]; every validator reads the same latencies from the auditor's
-  verdicts. Candidate models score zero.
+- otherwise its model's share of the epoch's emission (``model_shares``), split among the model's scored endpoints in
+  proportion to proven capacity (requests/s) x availability (answered / sent) x latency factor. The latency factor
+  compares the endpoint's median latency in its throughput test with the median over the scored endpoints serving
+  the same model, each weighted by its proven capacity (so splitting capacity over more endpoints does not move it),
+  capped to [0.7, 1.3]; every validator reads the same latencies from the auditor's verdicts. Candidate models score
+  zero.
 An endpoint that could not be audited (no usable reference answers) keeps its average for at most ``MAX_HELD_EPOCHS``
 epochs in a row. Per UID: the sum of its endpoints' EMAs. Weights: UID values normalised to 1.
 """
@@ -22,10 +23,11 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+from verathos.catalog import Catalog
 from verathos.validator.audit import EndpointResult
 from verathos.validator.compare import Verdict
 
@@ -99,14 +101,48 @@ def weighted_median(values: list[tuple[float, float]]) -> float:
     return ordered[-1][0]
 
 
-def epoch_scores(results: dict[str, EndpointResult], *, score_per_rps: dict[str, float], credited: dict[str, float],
+def model_shares(demand: Mapping[str, float], cat: Catalog) -> dict[str, float]:
+    """Each active model's share of the epoch's emission, summing to 1.
+
+    ``demand`` is each model's user demand in input tokens/s through the gateway, as the auditor publishes it. A
+    model's share follows what its users pay (demand x ``price``), blended toward the catalog's anchor shares while
+    the total demand is below ``scoring.demand_full_tokens_s``; every active model keeps at least
+    ``scoring.min_model_share``."""
+    anchors = cat.anchor_shares()
+    if not anchors:
+        return {}
+    price = {m.model_id: m.price for m in cat.models}
+    tokens = {m: max(float(demand.get(m, 0.0)), 0.0) for m in anchors}
+    revenue = {m: tokens[m] * price[m] for m in anchors}
+    paid = sum(revenue.values())
+    confidence = min(1.0, sum(tokens.values()) / cat.scoring.demand_full_tokens_s)
+    demanded = {m: revenue[m] / paid if paid > 0 else anchors[m] for m in anchors}
+    shares = {m: (1 - confidence) * anchors[m] + confidence * demanded[m] for m in anchors}
+    return _with_floor(shares, min(cat.scoring.min_model_share, 1.0 / len(anchors)))
+
+
+def _with_floor(shares: dict[str, float], floor: float) -> dict[str, float]:
+    """Shares summing to 1 with none below ``floor`` (at most an equal split): those below are raised to it, the
+    others scaled down in proportion, until none falls below."""
+    pinned: set[str] = set()
+    while True:
+        free = {k: v for k, v in shares.items() if k not in pinned}
+        scale = (1.0 - floor * len(pinned)) / sum(free.values()) if sum(free.values()) > 0 else 0.0
+        low = {k for k, v in free.items() if v * scale < floor}
+        if not low:
+            return {k: floor if k in pinned else v * scale for k, v in shares.items()}
+        pinned |= low
+
+
+def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, float], credited: dict[str, float],
                  latency_ms: dict[str, float], state: ScoreState,
                  failed_hotkeys: Collection[str] = ()) -> tuple[dict[str, float], set[str]]:
     """-> (score per endpoint key, keys that failed verification this epoch). Call after ``record_window``.
 
-    ``credited`` holds each endpoint's proven capacity in requests/s (missing: none proven yet), ``latency_ms`` its
-    median latency in that test (missing: no latency factor); ``failed_hotkeys`` the hotkeys with a wrong answer
-    proven by the throughput auditor.
+    ``shares`` holds each model's share of the emission (``model_shares``; missing: none); ``credited`` each
+    endpoint's proven capacity in requests/s (missing: none proven yet), ``latency_ms`` its median latency in that
+    test (missing: no latency factor); ``failed_hotkeys`` the hotkeys with a wrong answer proven by the throughput
+    auditor.
     """
     scores: dict[str, float] = {}
     failed: set[str] = set()
@@ -126,12 +162,20 @@ def epoch_scores(results: dict[str, EndpointResult], *, score_per_rps: dict[str,
         if latency_ms.get(key, 0.0) > 0:
             latencies_by_model.setdefault(r.endpoint.endpoint.model_id, []).append((latency_ms[key], credited[key]))
     model_median = {m: weighted_median(v) for m, v in latencies_by_model.items()}
+    weight: dict[str, float] = {}
     for key, r in eligible.items():
         model, own = r.endpoint.endpoint.model_id, latency_ms.get(key, 0.0)
         factor = 1.0
         if own > 0:
             factor = min(max(math.sqrt(model_median[model] / own), LATENCY_CAP[0]), LATENCY_CAP[1])
-        scores[key] = score_per_rps.get(model, 0.0) * credited[key] * (r.answered / r.sent) * factor
+        weight[key] = credited[key] * (r.answered / r.sent) * factor
+    model_total: dict[str, float] = {}
+    for key, w in weight.items():
+        model = eligible[key].endpoint.endpoint.model_id
+        model_total[model] = model_total.get(model, 0.0) + w
+    for key, w in weight.items():
+        model = eligible[key].endpoint.endpoint.model_id
+        scores[key] = shares.get(model, 0.0) * w / model_total[model]
     return scores, failed
 
 

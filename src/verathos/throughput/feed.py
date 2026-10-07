@@ -64,6 +64,7 @@ class Verdicts(BaseModel):
     epoch: int
     credits: list[Credit]
     invalid: list[Evidence]
+    demand: dict[str, float] = {}  # model -> the users' input tokens/s through the gateways (EMA over epochs)
 
 
 class SignedVerdicts(BaseModel):

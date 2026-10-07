@@ -50,3 +50,4 @@ class HotkeyStatus(BaseModel):
     epoch_blocks: int | None = None
     endpoints: list[EndpointStatus] = []
     tests: list[ThroughputOutcome] = []
+    model_shares: dict[str, float] = {}  # each active model's share of the epoch's emission

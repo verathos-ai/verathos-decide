@@ -19,7 +19,8 @@ from verathos.validator.scoring import ScoreState, windowed_verdict
 
 def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint], results: dict[str, EndpointResult],
           scores: dict[str, float], failed: Collection[str], invalid_hotkeys: Collection[str],
-          credited: dict[str, float], scored_models: Collection[str], state: ScoreState) -> dict[str, HotkeyStatus]:
+          credited: dict[str, float], scored_models: Collection[str], state: ScoreState,
+          model_shares: dict[str, float] | None = None) -> dict[str, HotkeyStatus]:
     """Status per hotkey after ``update`` has folded the epoch into ``state``."""
     out: dict[str, HotkeyStatus] = {}
     for ep in endpoints:
@@ -46,7 +47,7 @@ def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint],
         elif not r.identity_ok or not r.answered:
             status.state = "unanswered"
         out.setdefault(ep.hotkey, HotkeyStatus(hotkey=ep.hotkey, epoch=epoch, epoch_blocks=epoch_blocks,
-                                               endpoints=[])).endpoints.append(status)
+                                               endpoints=[], model_shares=model_shares or {})).endpoints.append(status)
     return out
 
 

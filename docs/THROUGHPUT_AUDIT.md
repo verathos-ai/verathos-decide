@@ -156,6 +156,9 @@ For scoring epoch `E` the auditor publishes, signed by its hotkey, at `GET /v1/t
   evidence of one: from a test, the request and the response as received; from a user request, only the miner's
   signed receipt (user requests are not published).
 
+They also state each model's user demand: the input tokens per second the gateways reported answered, averaged over
+epochs, which sets the models' emission shares (`SCORING.md`).
+
 The verdicts for the current epoch and the two before are served once their tests are settled (404 otherwise);
 once served, an epoch's verdicts do not change.
 Validators wait up to 5 minutes for them, then use the last verdicts they hold while those still cover a test in
@@ -209,7 +212,7 @@ recognisable by its session, so hardware used for other work between tests could
 | `drift_window_tests` | 8 | tests (and, for gateway answers, epochs) over which an endpoint's recomputed answers must stay within the model's `mean_abs` |
 | `gateway_checks_per_epoch` | 2 | sampled gateway answers the auditor recomputes per endpoint and epoch (0: none) |
 
-Per model: `workload` (the request mix), `score_per_rps` and `first_test_rps`.
+Per model: `workload` (the request mix) and `first_test_rps`.
 
 ## Running the auditor
 

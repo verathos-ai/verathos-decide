@@ -26,12 +26,15 @@ the emission split between mechanisms 0 and 1. Calls wait out the admin freeze w
 ## Catalog: models and policy
 
 The catalog lists the served models (pinned weights, engine and engine revision, verification tolerances, the
-standard request mix `workload`, `score_per_rps`, `first_test_rps`, status), the epoch length, the scoring settings
+standard request mix `workload`, `price`, `anchor_share`, `first_test_rps`, status), the epoch length, the scoring
+settings
 (`scoring`) and the throughput-audit policy (`throughput_audit`). Miners and validators use whichever catalog the
 owner hotkey commits; publishing a new one needs no code release.
 
-`score_per_rps` sets what one proven request per second of the model's mix is worth, so models of different cost
-per request score fairly. `first_test_rps` caps the rate of an endpoint's first test, and of all a new hotkey's
+`price` is what users pay for the model, in USD per million input tokens; the gateway bills with it, and the
+model's share of the emission follows what its users pay (`SCORING.md`). `anchor_share` is the model's share while
+there is no user demand; the active models' anchors must sum to 1 (`commit-catalog` refuses a catalog whose do not).
+Activating a model means giving it an anchor and lowering the others'. `first_test_rps` caps the rate of an endpoint's first test, and of all a new hotkey's
 endpoints together; later tests grow from what was delivered.
 
 `gateways` lists the hotkeys of the subnet's gateways (`GATEWAY.md`): miners serve them like validators, without

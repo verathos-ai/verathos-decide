@@ -79,6 +79,7 @@ class ServedCount(BaseModel):
     endpoint_id: str
     second: int  # unix time, whole seconds: answers completed in [second, second + 1)
     answered: int = Field(ge=1)
+    input_tokens: int = Field(0, ge=0)  # of those requests, as the miner signed them
 
 
 class ServedReport(BaseModel):

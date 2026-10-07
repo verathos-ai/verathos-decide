@@ -96,7 +96,7 @@ def test_epoch_scores_honest_and_zeroes_cheater() -> None:
 
     state = ScoreState()
     record_window(state, results, 3)
-    scores, failed = epoch_scores(results, score_per_rps={"kev-4b": 1.0}, credited=dict.fromkeys(results, 40.0),
+    scores, failed = epoch_scores(results, shares={"kev-4b": 1.0}, credited=dict.fromkeys(results, 40.0),
                                   latency_ms={}, state=state)
     update(state, results, scores, failed)
     w = weights(state, {1: honest_kp.ss58_address, 2: cheat_kp.ss58_address})
@@ -130,7 +130,7 @@ def test_window_catches_subtle_drift_no_single_epoch_shows() -> None:
         # mean 0.01, no hard fail
         r.tally.add(RequestComparison(max_abs=0.03, sum_abs=0.6, count=60, confident_flips=0))
         record_window(state, {"hkA/gpu0": r}, 3)
-        scores, failed = epoch_scores({"hkA/gpu0": r}, score_per_rps={"kev-4b": 1.0}, credited={"hkA/gpu0": 40.0},
+        scores, failed = epoch_scores({"hkA/gpu0": r}, shares={"kev-4b": 1.0}, credited={"hkA/gpu0": 40.0},
                                       latency_ms={}, state=state)
         verdicts.append(bool(failed))
     assert verdicts == [False, True, True]  # 60 probabilities: insufficient; 120 and 180: mean 0.01 > 0.005
@@ -153,12 +153,12 @@ def test_score_is_proven_capacity_and_a_proven_wrong_answer_resets_the_hotkey() 
     state = ScoreState(ema={"hkC/gpu0": 30.0, "hkC/gpu1": 30.0, "hkC/old": 30.0})
     record_window(state, results, 3)
     credited = {"hkA/gpu0": 50.0, "hkC/gpu0": 40.0, "hkC/gpu1": 40.0}
-    scores, failed = epoch_scores(results, score_per_rps={"kev-4b": 2.0}, credited=credited, latency_ms={},
+    scores, failed = epoch_scores(results, shares={"kev-4b": 1.0}, credited=credited, latency_ms={},
                                   state=state, failed_hotkeys={"hkC"})
-    assert scores == {"hkA/gpu0": pytest.approx(100.0), "hkB/gpu0": 0.0, "hkC/gpu0": 0.0, "hkC/gpu1": 0.0}
+    assert scores == {"hkA/gpu0": pytest.approx(1.0), "hkB/gpu0": 0.0, "hkC/gpu0": 0.0, "hkC/gpu1": 0.0}
     assert failed == {"hkC/gpu0", "hkC/gpu1"}
     update(state, results, scores, failed, alpha=0.2, probation_epochs=6, reset_hotkeys={"hkC"})
-    assert state.ema["hkA/gpu0"] == pytest.approx(20.0)
+    assert state.ema["hkA/gpu0"] == pytest.approx(0.2)
     assert {k: state.ema.get(k, 0.0) for k in ("hkC/gpu0", "hkC/gpu1", "hkC/old")} == dict.fromkeys(
         ("hkC/gpu0", "hkC/gpu1", "hkC/old"), 0.0)
     assert state.probation == {"hkC/gpu0": 5, "hkC/gpu1": 5, "hkC/old": 5}
@@ -203,9 +203,10 @@ def test_latency_factor_comes_from_the_test_latencies() -> None:
     results = {k: result(k.split("/")[1]) for k in ("hkA/fast", "hkA/mid", "hkA/slow")}
     state = ScoreState()
     record_window(state, results, 3)
-    scores, _ = epoch_scores(results, score_per_rps={"kev-4b": 1.0}, credited=dict.fromkeys(results, 20.0),
+    scores, _ = epoch_scores(results, shares={"kev-4b": 1.0}, credited=dict.fromkeys(results, 20.0),
                              latency_ms={"hkA/fast": 250.0, "hkA/mid": 1000.0, "hkA/slow": 4000.0}, state=state)
-    assert scores == {"hkA/fast": pytest.approx(26.0), "hkA/mid": pytest.approx(20.0), "hkA/slow": pytest.approx(14.0)}
+    assert scores == {"hkA/fast": pytest.approx(26 / 60), "hkA/mid": pytest.approx(20 / 60),
+                      "hkA/slow": pytest.approx(14 / 60)}  # the pool split by capacity x latency factor
 
 
 def test_splitting_capacity_over_endpoints_does_not_move_the_latency_median() -> None:
@@ -226,10 +227,12 @@ def test_splitting_capacity_over_endpoints_does_not_move_the_latency_median() ->
         latency = {"fast/gpu0": 362.0} | {f"slow/{e}": 5_960.0 for e in slow}
         state = ScoreState()
         record_window(state, results, 3)
-        scores, _ = epoch_scores(results, score_per_rps={"kev-4b": 1.0}, credited=credited, latency_ms=latency,
+        scores, _ = epoch_scores(results, shares={"kev-4b": 1.0}, credited=credited, latency_ms=latency,
                                  state=state)
-        assert scores["fast/gpu0"] == pytest.approx(17.1)
-        assert sum(v for k, v in scores.items() if k.startswith("slow/")) == pytest.approx(9.5 * 0.7)
+        weights_ = {"fast": 17.1, "slow": 9.5 * 0.7}  # the slow side at the 0.7 floor however it is split
+        assert scores["fast/gpu0"] == pytest.approx(weights_["fast"] / sum(weights_.values()))
+        assert sum(v for k, v in scores.items() if k.startswith("slow/")) == pytest.approx(
+            weights_["slow"] / sum(weights_.values()))
 
 
 def test_the_weighted_median_is_the_ordinary_median_for_equal_weights() -> None:
@@ -402,3 +405,39 @@ def test_chain_trouble_fetching_verdicts_is_an_unavailable_feed() -> None:
     t = Throughput(netuid=405, mechid=1, policy=AuditPolicy(), auditor_hotkey="aud", chain=BrokenChain())
     with pytest.raises(feed.VerdictsUnavailable, match="ConnectionError"):
         asyncio.run(t._fetch(None, 9))
+
+
+def test_models_share_the_emission_by_what_users_pay_with_the_anchors_as_the_fallback() -> None:
+    from verathos.validator.scoring import model_shares
+
+    cat = catalog.load()  # anchors 50/50; prices kev-4b 0.04, kev-9b 0.09; full at 10,000 tokens/s; floor 0.1
+    assert model_shares({}, cat) == {"kev-4b": pytest.approx(0.5), "kev-9b": pytest.approx(0.5)}
+    full = model_shares({"kev-4b": 30_000.0, "kev-9b": 10_000.0}, cat)  # revenue 1.2 against 0.9
+    assert full == {"kev-4b": pytest.approx(1.2 / 2.1), "kev-9b": pytest.approx(0.9 / 2.1)}
+    half = model_shares({"kev-4b": 5_000.0}, cat)  # half way: 0.5 x anchors + 0.5 x all to kev-4b
+    assert half == {"kev-4b": pytest.approx(0.75), "kev-9b": pytest.approx(0.25)}
+    lonely = model_shares({"kev-4b": 50_000.0}, cat)  # all demand on one model: the other keeps its floor
+    assert lonely == {"kev-4b": pytest.approx(0.9), "kev-9b": pytest.approx(0.1)}
+    assert set(model_shares({"clef-flash": 50_000.0}, cat)) == {"kev-4b", "kev-9b"}  # candidates: none
+    skewed = cat.model_copy(update={"models": [m.model_copy(update={"anchor_share": 0.6 if m.model_id == "kev-4b"
+                                                                    else 0.2}) for m in cat.models]})
+    assert model_shares({}, skewed) == {"kev-4b": pytest.approx(0.75), "kev-9b": pytest.approx(0.25)}  # normalized
+    with pytest.raises(ValueError):
+        skewed.anchor_shares(strict=True)  # a published catalog's anchors must sum to 1
+
+
+def test_each_model_pool_is_split_by_its_own_endpoints() -> None:
+    from verathos.validator.audit import EndpointResult
+    from verathos.validator.discovery import DiscoveredEndpoint
+
+    def result(hotkey: str, model: str) -> EndpointResult:
+        ep = DiscoveredEndpoint(1, hotkey, "http://x", Endpoint(endpoint_id="gpu0", url="http://x/e/gpu0",
+                                model_id=model, capacity_rps=50.0))
+        return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4)
+
+    results = {"a/gpu0": result("a", "kev-4b"), "b/gpu0": result("b", "kev-4b"), "c/gpu0": result("c", "kev-9b")}
+    state = ScoreState()
+    record_window(state, results, 3)
+    scores, _ = epoch_scores(results, shares={"kev-4b": 0.4, "kev-9b": 0.6},
+                             credited={"a/gpu0": 30.0, "b/gpu0": 10.0, "c/gpu0": 5.0}, latency_ms={}, state=state)
+    assert scores == {"a/gpu0": pytest.approx(0.3), "b/gpu0": pytest.approx(0.1), "c/gpu0": pytest.approx(0.6)}

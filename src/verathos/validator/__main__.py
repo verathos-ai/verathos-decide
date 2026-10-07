@@ -29,7 +29,15 @@ from verathos.validator.audit import audit_epoch
 from verathos.validator.config import ValidatorConfig
 from verathos.validator.discovery import DiscoveredEndpoint, discover
 from verathos.validator.follow import CatalogFollower
-from verathos.validator.scoring import ScoreState, epoch_scores, new_evidence, record_window, update, weights
+from verathos.validator.scoring import (
+    ScoreState,
+    epoch_scores,
+    model_shares,
+    new_evidence,
+    record_window,
+    update,
+    weights,
+)
 from verathos.validator.service import start_service
 from verathos.validator.status import StatusBoard
 from verathos.validator.throughput import Throughput
@@ -115,9 +123,10 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     invalid_hotkeys = {e.hotkey for e in evidence}
     credited, latency_ms = credited_capacity(endpoints, verdicts, cat, policy.mode)
     record_window(state, results, sc.statistical_window_epochs)
-    score_per_rps = {m.model_id: m.score_per_rps if m.status == "active" else 0.0 for m in cat.models}
-    scores, failed = epoch_scores(results, score_per_rps=score_per_rps, credited=credited, latency_ms=latency_ms,
-                                  state=state, failed_hotkeys=invalid_hotkeys)
+    shares = model_shares(verdicts.demand if verdicts is not None else {}, cat)
+    log.info("  emission shares: %s", ", ".join(f"{m} {s:.1%}" for m, s in sorted(shares.items())))
+    scores, failed = epoch_scores(results, shares=shares, credited=credited, latency_ms=latency_ms, state=state,
+                                  failed_hotkeys=invalid_hotkeys)
     held = {e.key for e in endpoints} - set(results)
     if held:
         log.info("  %d endpoints not audited this epoch (no usable reference answers); scores held", len(held))
@@ -130,7 +139,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     board.publish(status.build(
         epoch=epoch, epoch_blocks=cat.epoch_blocks, endpoints=endpoints, results=results, scores=scores, failed=failed,
         invalid_hotkeys=invalid_hotkeys, credited=credited,
-        scored_models={m.model_id for m in cat.models if m.status == "active"}, state=state))
+        scored_models={m.model_id for m in cat.models if m.status == "active"}, state=state, model_shares=shares))
     # The epoch is scored; a failure from here on must not run it again.
     try:
         set_weights(cfg, st, wallet, weights(state, hotkey_of_uid), hotkey_of_uid)

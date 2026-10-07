@@ -56,14 +56,29 @@ Per endpoint and epoch:
   test or to the subnet's gateway (see `THROUGHPUT_AUDIT.md`);
 - zero if the endpoint failed the identity challenge, answered nothing, or has not yet proven capacity in a
   throughput test;
-- otherwise `score_per_rps(model) x proven capacity x answered / sent x latency factor`. The proven capacity is the
+- otherwise its share of its model's pool (see Models): the model's emission share, split among the model's scored
+  endpoints in proportion to `proven capacity x answered / sent x latency factor`. The proven capacity is the
   auditor's credit in requests/s of the model's standard mix, at most what the endpoint declares now (in `observe`
-  mode the declaration itself, up to the model's `first_test_rps`). `score_per_rps` makes models of different cost
-  per request comparable; `candidate` models have none. The latency factor is `sqrt(median of the model's scored
-  endpoints / own latency)`, capped to [0.7, 1.3], where an endpoint's latency is its median latency in its
-  throughput test, as the auditor's verdicts state it, so every validator applies the same factor. Each endpoint
-  weighs in the median by its proven capacity, so splitting capacity over more endpoints does not move it. In
-  `observe` mode there is no latency factor.
+  mode the declaration itself, up to the model's `first_test_rps`). The latency factor is `sqrt(median of the
+  model's scored endpoints / own latency)`, capped to [0.7, 1.3], where an endpoint's latency is its median latency
+  in its throughput test, as the auditor's verdicts state it, so every validator applies the same factor. Each
+  endpoint weighs in the median by its proven capacity, so splitting capacity over more endpoints does not move it.
+  In `observe` mode there is no latency factor. An epoch's scores sum to 1 when every active model has scored
+  endpoints.
+
+## Models
+
+Each `active` model has a pool: a share of the epoch's emission. Its endpoints split it as above; `candidate` models
+have none. The pools follow what users pay for each model through the subnet's gateway:
+- demand: the input tokens of the users' requests per model (as the miners signed them), averaged over epochs
+  (`demand_ema_alpha`, 0.1: about six hours), published by the auditor with its verdicts;
+- revenue: demand x the model's `price` (USD per million input tokens, what users pay);
+- share: the model's revenue share, blended toward the catalog's `anchor_share` while the total demand is below
+  `demand_full_tokens_s` (10,000 input tokens/s), and at least `min_model_share` (0.1) for every active model.
+
+Without demand the pools are the anchor shares. Miners choose which models to serve: a model with few endpoints
+splits its pool among few, and a crowded one among many, so capacity moves to where users pay. No conversion between
+models is needed: what a request costs on a given GPU is the miner's to weigh.
 
 Probation lasts `probation_epochs` (6) epochs, the failing one included, whatever the later results; a new failure
 restarts the count, and the hotkey's statistical windows start over. An endpoint a hotkey adds while one of its

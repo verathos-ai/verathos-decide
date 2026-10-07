@@ -39,6 +39,12 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"
 
 ## 3. Start one engine per GPU
 
+Which model to serve is yours to choose. Each active model has its own share of the emission, split among the
+endpoints serving it by proven capacity (`SCORING.md`); the shares follow what users pay for each model through the
+subnet's gateway, and the miner logs them every epoch. What a request costs differs by GPU (the larger Kev model
+costs 1.1x the smaller on an H100 and 1.8x on an RTX 5090, for the same requests), so compare what your hardware
+proves on each model with how many others serve it.
+
 Validators check answers, not engines: any engine that serves `POST /v1/systemone` and returns the reference
 probabilities within the model's tolerances passes, and a faster engine proves more capacity. Each catalog model
 names a known-good engine and revision (`engine.source` at `engine.revision`); a different engine or version is the
@@ -146,7 +152,8 @@ validator's epoch 45351:
   gpu0 (kev-4b): qualifying, checked but not scored until it passes a throughput test; answers pass 10/10, mean diff 0.0014
 throughput test of epoch 45351 (block 8163045), gpu0: passed, delivered 18.9 of 18.9 requests/s, p95 latency 1630 ms; credited 18.9
 validator's epoch 45352:
-  gpu0 (kev-4b): scored 18.71 this epoch, average 3.74; proven 18.9 of 18.9 requests/s declared; answers pass 10/10, mean diff 0.0014
+  emission shares: kev-4b 50.0%, kev-9b 50.0%
+  gpu0 (kev-4b): scored 12.40% of the epoch's emission, average 2.48%; proven 18.9 of 18.9 requests/s declared; answers pass 10/10, mean diff 0.0014
 ```
 
 | Endpoint state | Meaning |

@@ -70,7 +70,7 @@ from verathos.throughput.feed import (
     recompute,
 )
 from verathos.throughput.follow import POLL_S, ScheduleFollower
-from verathos.throughput.policy import AuditPolicy, ScheduledTest, Session, session_headers
+from verathos.throughput.policy import BLOCK_TIME_S, AuditPolicy, ScheduledTest, Session, session_headers
 from verathos.throughput.workload import WORDS
 from verathos.validator.compare import RequestComparison, Tolerance
 from verathos.validator.config import ReferenceEngine
@@ -90,7 +90,12 @@ SAMPLE_BUDGET_S = 40.0  # per round of sample checks, under the lead time of a t
 SERVED_WAIT_S = 12.0  # after a test's window, for the gateways' last served counts
 SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+_DEMAND_SCHEMA = """
+CREATE TABLE demand (epoch INTEGER NOT NULL, model_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
+    ema REAL NOT NULL, PRIMARY KEY (epoch, model_id));
+"""
+_MIGRATIONS = {4: _DEMAND_SCHEMA}  # from version -> the statements that bring it one version up
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
 
 
@@ -222,7 +227,7 @@ CREATE TABLE samples (
 CREATE INDEX samples_by_state ON samples (state, epoch);
 CREATE INDEX samples_by_endpoint ON samples (hotkey, endpoint_id, epoch);
 CREATE TABLE verdicts (epoch INTEGER PRIMARY KEY, document TEXT NOT NULL);
-"""
+""" + _DEMAND_SCHEMA
 # test states: running -> unconfirmed -> confirmed | void
 _SCRUB = "request = '{}', response = ''"  # a user's request and answers are kept only until their check
 # sample states: pending -> checked | skipped (its endpoint's checks for the epoch were done) | unchecked (no
@@ -237,7 +242,11 @@ class Store:
     def __init__(self, path: Path) -> None:
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._lock = threading.Lock()
-        if self._db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+        version = self._db.execute("PRAGMA user_version").fetchone()[0]
+        while version in _MIGRATIONS:
+            self._db.executescript(_MIGRATIONS[version] + f"PRAGMA user_version = {version + 1};")
+            version += 1
+        if version != SCHEMA_VERSION:
             self._db.executescript("DROP TABLE IF EXISTS results; DROP TABLE IF EXISTS tests; "
                                    "DROP TABLE IF EXISTS samples; DROP TABLE IF EXISTS verdicts;" + _SCHEMA
                                    + f"PRAGMA user_version = {SCHEMA_VERSION};")
@@ -423,6 +432,27 @@ class Store:
             "AND checked_epoch >= ?", (since_epoch, since_epoch))
         return {r[0] for r in rows}
 
+    # ---- user demand ----
+
+    def demand_closed(self, epoch: int) -> bool:
+        return bool(self._query("SELECT 1 FROM demand WHERE epoch = ? LIMIT 1", (epoch,)))
+
+    def close_demand(self, epoch: int, tokens: dict[str, int], epoch_s: float, alpha: float) -> dict[str, float]:
+        """Record the epoch's input tokens per model; -> each model's demand EMA (input tokens/s) after it."""
+        before = self.demand_ema(epoch - 1)
+        ema = {m: alpha * tokens.get(m, 0) / epoch_s + (1 - alpha) * before.get(m, 0.0)
+               for m in set(before) | set(tokens)}
+        rows = [(epoch, m, tokens.get(m, 0), round(v, 6)) for m, v in ema.items() if v > 1e-6 or m in tokens]
+        with self._lock:
+            self._db.executemany("INSERT OR REPLACE INTO demand VALUES (?, ?, ?, ?)", rows)
+        return {m: v for _, m, _, v in rows}
+
+    def demand_ema(self, epoch: int) -> dict[str, float]:
+        """Each model's demand EMA as of the latest closed epoch up to ``epoch``."""
+        rows = self._query("SELECT model_id, ema FROM demand WHERE epoch = (SELECT MAX(epoch) FROM demand WHERE "
+                           "epoch <= ?)", (epoch,))
+        return dict(rows)
+
     # ---- served verdicts ----
 
     def served_verdicts(self, epoch: int) -> str | None:
@@ -450,6 +480,7 @@ class Store:
             self._db.execute("DELETE FROM tests WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM samples WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM verdicts WHERE epoch < ?", (before_epoch,))
+            self._db.execute("DELETE FROM demand WHERE epoch < ?", (before_epoch,))
 
 
 def _beyond(total: float, count: int, tolerance: Tolerance) -> bool:
@@ -496,6 +527,8 @@ class Auditor:
         self._routes: tuple[float, SignedRoutes] | None = None
         self._verdicts_lock = threading.Lock()
         self._served: dict[tuple[str, str], dict[int, int]] = {}  # (hotkey, endpoint) -> second -> answered
+        self._demand: dict[int, dict[str, int]] = {}  # epoch -> model -> users' input tokens (not closed yet)
+        self._demand_lock = threading.Lock()
         self._rng = random.SystemRandom()
 
     # ---- inputs ----
@@ -774,22 +807,27 @@ class Auditor:
     # ---- gateway served counts ----
 
     def accept_served(self, counts: list[ServedCount]) -> int:
-        """Add what the gateway's endpoints answered per second (known endpoints, recent seconds); -> counts taken."""
-        now, known, taken = time.time(), {(s.hotkey, s.endpoint_id) for s in self._slots}, 0
-        for c in counts:
-            key = (c.hotkey, c.endpoint_id)
-            if key not in known or not now - SERVED_KEEP_S <= c.second <= now + 5:
-                continue
-            per = self._served.setdefault(key, {})
-            per[c.second] = per.get(c.second, 0) + c.answered
-            taken += 1
-        cutoff = int(now) - SERVED_KEEP_S
-        for key in list(self._served):
-            per = self._served[key]
-            for second in [s for s in per if s < cutoff]:
-                del per[second]
-            if not per:
-                del self._served[key]
+        """Add what the gateway's endpoints answered per second (known endpoints, recent seconds), and their input
+        tokens to the epoch's demand per model; -> counts taken."""
+        now, taken = time.time(), 0
+        model_of = {(s.hotkey, s.endpoint_id): s.model_id for s in self._slots}
+        with self._demand_lock:
+            demand = self._demand.setdefault(self.follower.head // self.policy.epoch_blocks, {})
+            for c in counts:
+                key = (c.hotkey, c.endpoint_id)
+                if key not in model_of or not now - SERVED_KEEP_S <= c.second <= now + 5:
+                    continue
+                per = self._served.setdefault(key, {})
+                per[c.second] = per.get(c.second, 0) + c.answered
+                demand[model_of[key]] = demand.get(model_of[key], 0) + c.input_tokens
+                taken += 1
+            cutoff = int(now) - SERVED_KEEP_S
+            for key in list(self._served):
+                per = self._served[key]
+                for second in [s for s in per if s < cutoff]:
+                    del per[second]
+                if not per:
+                    del self._served[key]
         return taken
 
     def served_in(self, hotkey: str, endpoint_id: str, start_s: float, end_s: float) -> float:
@@ -803,12 +841,31 @@ class Auditor:
                 total += n * (min(end_s, second + 1) - max(start_s, second))
         return total
 
+    def close_demand(self, current: int) -> None:
+        """Record the demand of the epoch before ``current`` (once): the input tokens the gateways reported answered
+        per model, as tokens/s, folded into each model's EMA (``scoring.demand_ema_alpha``). An epoch the auditor saw no
+        reports for counts as no demand."""
+        last = current - 1
+        with self._demand_lock:
+            for epoch in [e for e in self._demand if e < last]:
+                del self._demand[epoch]  # too late to count
+            if last < 0 or self.store.demand_closed(last):
+                return
+            ema = self.store.close_demand(last, self._demand.pop(last, {}), self.policy.epoch_blocks * BLOCK_TIME_S,
+                                          self.catalog().scoring.demand_ema_alpha)
+        if ema:
+            log.info("user demand after epoch %d: %s", last,
+                     ", ".join(f"{m} {v:.0f} input tokens/s" for m, v in sorted(ema.items())))
+
     def settle(self) -> None:
-        """Confirm tests whose selection block is final with the hash they were selected by; void the others."""
+        """Confirm tests whose selection block is final with the hash they were selected by; void the others. Close
+        the users' demand of finished epochs."""
         epoch = self.follower.head // self.policy.epoch_blocks
         if epoch != self._pruned_epoch:
             self.store.prune(epoch - KEEP_EPOCHS)
             self._pruned_epoch = epoch
+        if self.follower.head > 0:
+            self.close_demand(epoch)
         unconfirmed = self.store.unconfirmed()
         if not unconfirmed:
             return
@@ -849,6 +906,7 @@ class Auditor:
             return signed
         if self.store.pending(first, epoch - 1):
             return None
+        self.close_demand(current)
 
         def tolerance_of(model_id: str) -> Tolerance | None:
             model = cat.get(model_id)
@@ -856,7 +914,7 @@ class Auditor:
 
         verdicts = Verdicts(netuid=self.netuid, auditor=self.hotkey, epoch=epoch,
                             credits=self.store.credits(first, epoch - 1, policy, tolerance_of),
-                            invalid=self.store.evidence(first, epoch - 1))
+                            invalid=self.store.evidence(first, epoch - 1), demand=self.store.demand_ema(epoch - 1))
         signed = SignedVerdicts.create(verdicts, self.keypair)
         self.store.serve_verdicts(epoch, signed.model_dump_json())
         self._verdicts = {e: v for e, v in self._verdicts.items() if e >= current - 2} | {epoch: signed}
