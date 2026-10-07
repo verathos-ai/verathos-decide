@@ -60,8 +60,9 @@ Per endpoint and epoch:
   mode the declaration itself, up to the model's `first_test_rps`). `score_per_rps` makes models of different cost
   per request comparable; `candidate` models have none. The latency factor is `sqrt(median of the model's scored
   endpoints / own latency)`, capped to [0.7, 1.3], where an endpoint's latency is its median latency in its
-  throughput test, as the auditor's verdicts state it, so every validator applies the same factor. In `observe`
-  mode there is no latency factor.
+  throughput test, as the auditor's verdicts state it, so every validator applies the same factor. Each endpoint
+  weighs in the median by its proven capacity, so splitting capacity over more endpoints does not move it. In
+  `observe` mode there is no latency factor.
 
 Probation lasts `probation_epochs` (6) epochs, the failing one included, whatever the later results; a new failure
 restarts the count, and the hotkey's statistical windows start over. An endpoint a hotkey adds while one of its

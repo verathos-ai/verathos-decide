@@ -11,8 +11,9 @@ Per endpoint and epoch:
 - zero until the endpoint has proven capacity in a throughput test;
 - otherwise score per request/s of the model x proven capacity (requests/s) x availability (answered / sent) x latency
   factor. The latency factor compares the endpoint's median latency in its throughput test with the median over the
-  scored endpoints serving the same model, capped to [0.7, 1.3]; every validator reads the same latencies from the
-  auditor's verdicts. Candidate models score zero.
+  scored endpoints serving the same model, each weighted by its proven capacity (so splitting capacity over more
+  endpoints does not move it), capped to [0.7, 1.3]; every validator reads the same latencies from the auditor's
+  verdicts. Candidate models score zero.
 An endpoint that could not be audited (no usable reference answers) keeps its average for at most ``MAX_HELD_EPOCHS``
 epochs in a row. Per UID: the sum of its endpoints' EMAs. Weights: UID values normalised to 1.
 """
@@ -21,7 +22,6 @@ from __future__ import annotations
 
 import json
 import math
-import statistics
 from collections.abc import Collection
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -85,6 +85,20 @@ def windowed_verdict(state: ScoreState, key: str, result: EndpointResult) -> Ver
     return Verdict.FAIL_STATISTICAL if sum(s for s, _ in entries) / count > tol.mean_abs else Verdict.PASS
 
 
+def weighted_median(values: list[tuple[float, float]]) -> float:
+    """The median of (value, weight) pairs: the value at which the cumulative weight reaches half the total (between
+    two values when it reaches exactly half, so equal weights give the ordinary median)."""
+    ordered = sorted(values)
+    half, total = sum(w for _, w in ordered) / 2, 0.0
+    for i, (value, weight) in enumerate(ordered):
+        total += weight
+        if math.isclose(total, half) and i + 1 < len(ordered):
+            return (value + ordered[i + 1][0]) / 2
+        if total >= half:
+            return value
+    return ordered[-1][0]
+
+
 def epoch_scores(results: dict[str, EndpointResult], *, score_per_rps: dict[str, float], credited: dict[str, float],
                  latency_ms: dict[str, float], state: ScoreState,
                  failed_hotkeys: Collection[str] = ()) -> tuple[dict[str, float], set[str]]:
@@ -107,11 +121,11 @@ def epoch_scores(results: dict[str, EndpointResult], *, score_per_rps: dict[str,
         else:
             eligible[key] = r
 
-    latencies_by_model: dict[str, list[float]] = {}
+    latencies_by_model: dict[str, list[tuple[float, float]]] = {}
     for key, r in eligible.items():
         if latency_ms.get(key, 0.0) > 0:
-            latencies_by_model.setdefault(r.endpoint.endpoint.model_id, []).append(latency_ms[key])
-    model_median = {m: statistics.median(v) for m, v in latencies_by_model.items()}
+            latencies_by_model.setdefault(r.endpoint.endpoint.model_id, []).append((latency_ms[key], credited[key]))
+    model_median = {m: weighted_median(v) for m, v in latencies_by_model.items()}
     for key, r in eligible.items():
         model, own = r.endpoint.endpoint.model_id, latency_ms.get(key, 0.0)
         factor = 1.0

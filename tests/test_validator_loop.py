@@ -208,6 +208,39 @@ def test_latency_factor_comes_from_the_test_latencies() -> None:
     assert scores == {"hkA/fast": pytest.approx(26.0), "hkA/mid": pytest.approx(20.0), "hkA/slow": pytest.approx(14.0)}
 
 
+def test_splitting_capacity_over_endpoints_does_not_move_the_latency_median() -> None:
+    """The typical latency follows proven capacity, not the number of endpoints: a slow miner listing its capacity
+    as many endpoints is still slow (testnet 405, epoch 45364: 17.1 rps at 362 ms against 9.5 rps at 6 s)."""
+    from verathos.validator.audit import EndpointResult
+    from verathos.validator.discovery import DiscoveredEndpoint
+
+    def result(hotkey: str, endpoint_id: str) -> EndpointResult:
+        ep = DiscoveredEndpoint(1, hotkey, "http://x", Endpoint(endpoint_id=endpoint_id,
+                                url=f"http://x/e/{endpoint_id}", model_id="kev-4b", capacity_rps=20.0))
+        return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4)
+
+    for parts in (2, 10):
+        slow = [f"gpu{i}" for i in range(parts)]
+        results = {"fast/gpu0": result("fast", "gpu0")} | {f"slow/{e}": result("slow", e) for e in slow}
+        credited = {"fast/gpu0": 17.1} | {f"slow/{e}": 9.5 / parts for e in slow}
+        latency = {"fast/gpu0": 362.0} | {f"slow/{e}": 5_960.0 for e in slow}
+        state = ScoreState()
+        record_window(state, results, 3)
+        scores, _ = epoch_scores(results, score_per_rps={"kev-4b": 1.0}, credited=credited, latency_ms=latency,
+                                 state=state)
+        assert scores["fast/gpu0"] == pytest.approx(17.1)
+        assert sum(v for k, v in scores.items() if k.startswith("slow/")) == pytest.approx(9.5 * 0.7)
+
+
+def test_the_weighted_median_is_the_ordinary_median_for_equal_weights() -> None:
+    from verathos.validator.scoring import weighted_median
+
+    assert weighted_median([(250.0, 1.0), (4000.0, 1.0)]) == 2125.0
+    assert weighted_median([(250.0, 1.0), (1000.0, 1.0), (4000.0, 1.0)]) == 1000.0
+    assert weighted_median([(250.0, 3.0), (1000.0, 1.0), (4000.0, 1.0)]) == 250.0
+    assert weighted_median([(4000.0, 2.0), (250.0, 1.0)]) == 4000.0
+
+
 def test_a_canary_failure_puts_the_whole_hotkey_on_probation() -> None:
     """Moving the hardware to a spare endpoint of the same hotkey does not escape probation."""
     from verathos.validator.audit import EndpointResult
