@@ -73,7 +73,7 @@ async def _fetch_manifest(n: Neuron, netuid: int, mechid: int, client: httpx.Asy
         manifest = accept(document, hotkey=n.hotkey, netuid=netuid, mechid=mechid, axon=base,
                           commitment=n.commitment, catalog_digests=catalog_digests)
     except Exception as e:  # whatever a neuron serves, it only costs that neuron its discovery
-        log.info("uid %d manifest not accepted: %s", n.uid, e or type(e).__name__)
+        log.info("uid %d manifest not accepted: %s", n.uid, str(e) or type(e).__name__)
         return None
     return DiscoveredMiner(n.uid, n.hotkey, base, manifest)
 
