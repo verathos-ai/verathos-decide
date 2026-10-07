@@ -103,6 +103,7 @@ SERVED_WAIT_S = 12.0  # after a test's window, for the gateways' last served cou
 USER_RATE_S = 60.0  # a test leaves room for what the endpoint answered the gateways over this long ...
 USER_RATE_LAG_S = 10.0  # ... ending this long before the test (the gateways report every few seconds)
 MIN_TEST_SHARE = 0.1  # a test sends at least this share of the tested rate itself
+USERS_BEFORE_S = (80.0, 20.0)  # an endpoint's usual user rate: [window start - 80 s, window start - 20 s)
 SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30
 SCHEMA_VERSION = 6
@@ -767,8 +768,9 @@ class Auditor:
         window_s = (result.started_at_ms / 1000 + plan["warmup_s"], result.started_at_ms / 1000 + plan["warmup_s"]
                     + policy.test_s)
         await asyncio.sleep(max(0.0, window_s[1] + SERVED_WAIT_S - time.time()))  # the gateways' last counts
-        recomputes = checks.for_test()
-        results = await asyncio.gather(*(self.evaluate(test, t, r, recomputes, policy, window_s)
+        recomputes, scales = checks.for_test(), self.user_scales(window_s)
+        results = await asyncio.gather(*(self.evaluate(test, t, r, recomputes, policy, window_s,
+                                                       scales.get(t.slot.model_id, 1.0))
                                          for t, r in zip(targets, result.targets)))
         self.store.add_results(test.test_id, results)
         counts = {o: sum(r.outcome == o for r in results) for o in ("passed", "partial", "invalid", "void")}
@@ -776,21 +778,40 @@ class Auditor:
                  ", ".join(f"{n} {o}" for o, n in counts.items() if n), sum(r.credited_rps for r in results),
                  sum(t.tested_rps for t in targets))
 
+    def user_scales(self, window_s: tuple[float, float]) -> dict[str, float]:
+        """Per model: the gateways' user answers in the window relative to before it; a dip of all users is no
+        endpoint's doing."""
+        before = (window_s[0] - USERS_BEFORE_S[0], window_s[0] - USERS_BEFORE_S[1])
+        totals: dict[str, list[float]] = {}
+        for s in self._slots:
+            t = totals.setdefault(s.model_id, [0.0, 0.0])
+            t[0] += self.served_in(s.hotkey, s.endpoint_id, *before) / (before[1] - before[0])
+            t[1] += self.served_in(s.hotkey, s.endpoint_id, *window_s) / max(window_s[1] - window_s[0], 1e-9)
+        return {m: (w / b if b > 0 else 1.0) for m, (b, w) in totals.items()}
+
     async def evaluate(self, test: ScheduledTest, target: Target, r: loadgen.TargetResult, recomputes: Recomputes,
-                       policy: AuditPolicy, window_s: tuple[float, float] = (0.0, 0.0)) -> Result:
+                       policy: AuditPolicy, window_s: tuple[float, float] = (0.0, 0.0),
+                       user_scale: float = 1.0) -> Result:
         """One endpoint's result; whatever its responses contain, a failure here voids only this endpoint.
         ``window_s``: the measured window (unix seconds), in which what the endpoint answered the gateways counts as
         delivered too."""
         try:
-            return await self._evaluate(test, target, r, recomputes, policy, window_s)
+            return await self._evaluate(test, target, r, recomputes, policy, window_s, user_scale)
         except Exception:
             log.exception("evaluating %s in the test of epoch %d failed", target.slot.key, test.epoch)
             return Result(target, "void", "the auditor could not evaluate this endpoint")
 
     async def _evaluate(self, test: ScheduledTest, target: Target, r: loadgen.TargetResult, recomputes: Recomputes,
-                        policy: AuditPolicy, window_s: tuple[float, float]) -> Result:
-        gateway = self.served_in(target.slot.hotkey, target.slot.endpoint_id, *window_s)
-        users = self.served_in(target.slot.hotkey, target.slot.endpoint_id, *window_s, attempts=True)
+                        policy: AuditPolicy, window_s: tuple[float, float], user_scale: float = 1.0) -> Result:
+        endpoint = (target.slot.hotkey, target.slot.endpoint_id)
+        gateway = self.served_in(*endpoint, *window_s)
+        users = self.served_in(*endpoint, *window_s, attempts=True)
+        # Users sending the endpoint less than usual in the window are excused within their random spread (scaled by
+        # the dip of all the model's users); fewer than that, it drove them off (slow, refusing): asked all the same.
+        before = (window_s[0] - USERS_BEFORE_S[0], window_s[0] - USERS_BEFORE_S[1])
+        usual = max(self.served_in(*endpoint, *before, attempts=True), self.served_in(*endpoint, *before))
+        expected = usual / (before[1] - before[0]) * user_scale * (window_s[1] - window_s[0])
+        users_asked = max(users, gateway, expected - 2 * math.sqrt(max(expected, 0.0)))
         detail = json.dumps({"sent": r.sent, "completed": r.completed, "skipped": r.skipped, "errors": r.errors,
                              "late_sends": r.late_sends, "samples": len(r.samples), "gateway_sent": round(users, 1),
                              "gateway_answered": round(gateway, 1)}, sort_keys=True)
@@ -825,7 +846,7 @@ class Auditor:
                 break
         drift = {"drift_sum": drift_sum, "drift_count": drift_count}
         delivered = round((r.completed * (valid / len(r.samples) if r.samples else 1.0) + gateway) / policy.test_s, 2)
-        asked = (r.sent + max(users, gateway)) / policy.test_s
+        asked = (r.sent + users_asked) / policy.test_s
         if evidence is not None:
             return Result(target, "invalid", evidence.reason, delivered, 0.0, evidence=evidence, **latency, **drift)
         credited = credit(target.tested_rps, delivered, policy, asked)

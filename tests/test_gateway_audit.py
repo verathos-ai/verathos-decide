@@ -314,34 +314,39 @@ def test_what_users_got_from_an_endpoint_is_published_with_its_credit(tmp_path) 
 
 
 def test_a_test_is_judged_against_what_the_endpoint_was_asked(tmp_path) -> None:
-    """Users sending less than the test left room for cost the endpoint nothing; users it refused count as asked. A
-    report posted again is taken once."""
+    """Users sending less than usual cost an endpoint nothing when all the model's users dipped; an endpoint whose
+    users went elsewhere (it was slow) and one refusing users are judged against what users usually send it. A report
+    posted again is taken once."""
     import time as time_module
 
     from tests.test_throughput import _result
     from verathos.protocol.gateway import ServedCount
 
     auditor = _auditor(tmp_path)
-    dip, refuser = (Slot("hk", e, f"http://x/e/{e}", "kev-4b", 20.0) for e in ("dip", "refuser"))
-    auditor.update_slots([dip, refuser])
+    names = ("dip", "other", "slow", "refuser")
+    slots = {n: Slot("hk", n, f"http://x/e/{n}", "kev-4b", 20.0) for n in names}
+    auditor.update_slots(list(slots.values()))
     start = int(time_module.time()) - 30
     window = (start + 0.5, start + 16.5)  # test_s 16; the test left 10/s for users and sent 10/s itself
-    assert auditor.accept_served([ServedCount(hotkey="hk", endpoint_id="dip", second=start + i, attempts=6,
-                                              answered=6) for i in range(17)], report_id="r1") == 17
-    assert auditor.accept_served([ServedCount(hotkey="hk", endpoint_id="dip", second=start, attempts=6,
-                                              answered=6)], report_id="r1") == 0  # the same report again
-    auditor.accept_served([ServedCount(hotkey="hk", endpoint_id="refuser", second=start + i, attempts=10,
-                                       answered=5) for i in range(17)], report_id="r2")
+    sent_answered = {"dip": (6, 6), "other": (6, 6), "slow": (2, 2), "refuser": (10, 5)}  # per second in the window
+    counts = [ServedCount(hotkey="hk", endpoint_id=n, second=start - 80 + i, attempts=10, answered=10)
+              for n in names for i in range(60)]  # before the test: 10/s each
+    counts += [ServedCount(hotkey="hk", endpoint_id=n, second=start + i, attempts=a, answered=b)
+               for n, (a, b) in sent_answered.items() for i in range(17)]
+    assert auditor.accept_served(counts, report_id="r1") == len(counts)
+    assert auditor.accept_served(counts[:1], report_id="r1") == 0  # the same report again
     test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+    scale = auditor.user_scales(window)["kev-4b"]
 
-    def evaluate(slot: Slot):
-        return asyncio.run(auditor.evaluate(test, Target(slot, 20.0), _result(slot.key, completed=160),
-                                            Checks({}, {}).for_test(), auditor.policy, window))
+    def evaluate(name: str):
+        return asyncio.run(auditor.evaluate(test, Target(slots[name], 20.0), _result(slots[name].key, completed=160),
+                                            Checks({}, {}).for_test(), auditor.policy, window, scale))
 
-    users_dipped = evaluate(dip)
+    users_dipped = evaluate("dip")
     assert users_dipped.outcome == "passed" and users_dipped.credited_rps == pytest.approx(20.0)
-    refused = evaluate(refuser)  # delivered 15 of the 20 requests/s it was asked
-    assert refused.outcome == "partial" and refused.credited_rps == pytest.approx(20 * 0.75 * 0.75)
+    assert evaluate("slow").outcome == "partial"  # 2/s while users of the model sent each endpoint about 6/s
+    refused = evaluate("refuser")
+    assert refused.outcome == "partial" and refused.credited_rps < 15
 
 
 def test_a_discovery_that_finds_no_miner_keeps_the_endpoints_known(tmp_path) -> None:

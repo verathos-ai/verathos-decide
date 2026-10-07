@@ -137,7 +137,9 @@ A test also leaves room for users: it sends each endpoint its tested rate less t
 subnet's gateway sent it over the last minute (ending 10 s before the test, as the gateway's counts arrive), at
 least 10% of the tested rate and enough for the test's samples. With users at their usual rate, an endpoint is asked
 for its tested rate in all, not more; it is judged against what it was asked (Credit above), so users sending less
-in the window cost it nothing, and users it refused count against it.
+in the window cost it nothing within their random spread (two standard deviations around its usual rate of the
+minute before, scaled by the dip of all the model's users), and users it refused count against it; an endpoint whose
+users went elsewhere beyond that spread (it was slow) is judged against their usual rate.
 
 ## Gateway answers
 
