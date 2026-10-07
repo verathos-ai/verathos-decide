@@ -202,6 +202,24 @@ def test_failing_miners_are_retried_elsewhere_and_their_breaker_opens(tmp_path) 
     assert failing.breaker.is_open
 
 
+class Unreachable(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("No route to host", request=request)
+
+
+def test_a_model_whose_every_miner_fails_is_unavailable_not_busy(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": MockEngine("kev-4b")})
+    for host in ("10.0.0.1", "10.0.0.2"):  # the miners' host died
+        s.client._transport._t[host] = Unreachable()
+    first = s.many(1)[0]
+    assert first.status_code == 503 and first.json()["error"]["type"] == "unavailable"
+    for _ in range(BREAKER_FAILURES):
+        s.many(1)
+    down = s.many(1)[0]  # every breaker open: none is answering, which is not a capacity limit
+    assert down.json()["error"] == {"type": "unavailable", "message": "no miner of kev-4b answers right now"}
+    assert down.headers["Retry-After"] == "30"
+
+
 def test_an_answer_without_a_binding_receipt_is_not_returned(tmp_path) -> None:
     gateway = kp()
     forger = FastAPI()

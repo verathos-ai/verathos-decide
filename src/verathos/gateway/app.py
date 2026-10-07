@@ -18,8 +18,8 @@ Every response carries ``X-Request-Id`` (the client's, if it sent a valid one). 
     429 quota_exceeded      over the account's monthly quota
     500 internal            a fault of the gateway
     503 busy                no capacity free for the model right now
-    503 unavailable         no miner serves the model right now, the miners failed within the request's deadline, or
-                            accounts cannot be checked
+    503 unavailable         no miner serves the model right now, the miners failed within the request's deadline, every
+                            miner of the model is failing, or accounts cannot be checked
 """
 
 from __future__ import annotations
@@ -160,6 +160,7 @@ NO_ANSWER = {  # why a forwarded request got no answer -> the API error
     "rejected": (400, "invalid_request", "the miners refused this request", None),
     "busy": (503, "busy", "no capacity free for {model} right now", 1),
     "failed": (503, "unavailable", "no miner answered {model} in time", 1),
+    "down": (503, "unavailable", "no miner of {model} answers right now", 30),
 }
 
 
@@ -204,6 +205,8 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
             break
         endpoint = g.router.pick(model_id, tried, observe=counted)
         if endpoint is None:
+            if not attempt and g.router.down(model_id):
+                result = "down"
             break
         if attempt:
             metrics.RETRIES.inc()

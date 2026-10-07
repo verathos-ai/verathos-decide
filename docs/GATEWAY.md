@@ -233,7 +233,7 @@ Every response carries `X-Request-Id` (the client's, if it sent a valid one). Er
 | 429 | `quota_exceeded` | the month's quota is used up |
 | 500 | `internal` | a fault of the gateway |
 | 503 | `busy` | no capacity free for the model now; `Retry-After` |
-| 503 | `unavailable` | no miner serves the model right now, none answered in time, or accounts cannot be checked; `Retry-After` |
+| 503 | `unavailable` | no miner serves the model right now, none answered in time, every miner of the model is failing (`Retry-After: 30`), or accounts cannot be checked; `Retry-After` |
 
 ## Accounts and keys
 

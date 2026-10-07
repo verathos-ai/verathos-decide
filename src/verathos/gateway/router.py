@@ -194,6 +194,11 @@ class Router:
             self.observer.offered(chosen.route, refused=chosen.slow)
         return chosen
 
+    def down(self, model_id: str) -> bool:
+        """Every endpoint of the model failed until its breaker opened: none is answering, as opposed to busy."""
+        pool = self._pools.get(model_id)
+        return pool is not None and bool(pool.endpoints) and all(e.breaker.is_open for e in pool.endpoints)
+
     def started(self, endpoint: Endpoint, *, observe: bool = True) -> None:
         """An attempt is sent; ``observe``: it is user traffic (the auditor judges a test against what was sent)."""
         endpoint.in_flight += 1
