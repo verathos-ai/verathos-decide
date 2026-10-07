@@ -1,7 +1,8 @@
 """The auditor's signed routes (``protocol.gateway``), polled every ``POLL_S``.
 
-A table is used only if the auditor signed it for this subnet and it is newer than the one in use. The last good
-table is kept on disk too, so a restarted gateway serves at once.
+A table is used only if the auditor signed it for this subnet, it is newer than the one in use, and everything that
+depends on it (its catalog) could be set up. The last good table is kept on disk too, so a restarted gateway serves
+at once.
 """
 
 from __future__ import annotations
@@ -38,21 +39,21 @@ class RouteTable:
         return self.table is None or signed.routes.issued_ms > self.table.issued_ms
 
     async def _adopt(self, signed: SignedRoutes) -> None:
-        self.table = signed.routes
         for callback in self.on_change:
             result = callback(signed.routes)
             if asyncio.iscoroutine(result):
                 await result
+        self.table = signed.routes
 
     async def load(self) -> None:
         """Adopt the table kept on disk, if any and valid."""
         try:
             signed = SignedRoutes.model_validate_json(self.path.read_text())
-        except (OSError, ValueError):
-            return
-        if self._accept(signed):
-            await self._adopt(signed)
-            log.info("routes from %s loaded: %d endpoints", self.path, len(signed.routes.routes))
+            if self._accept(signed):
+                await self._adopt(signed)
+                log.info("routes from %s loaded: %d endpoints", self.path, len(signed.routes.routes))
+        except Exception as exc:
+            log.warning("routes on disk not used: %s: %s", type(exc).__name__, exc)
 
     async def refresh(self) -> bool:
         """Fetch the auditor's table; True if a newer one was adopted."""

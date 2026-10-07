@@ -52,10 +52,12 @@ class SignedReceipt(BaseModel):
         return signing.verify(self.receipt.miner_hotkey, RECEIPT_DOMAIN, self.receipt.model_dump(mode="json"),
                               self.signature)
 
-    def binds(self, request: dict[str, Any], answers: dict[str, Any]) -> bool:
-        """Whether this receipt commits to exactly this request and these answers (False for non-JSON values)."""
+    def binds(self, request: dict[str, Any], answers: dict[str, Any], *, request_sha256: str | None = None) -> bool:
+        """Whether this receipt commits to exactly this request and these answers (False for non-JSON values);
+        ``request_sha256`` is the request's digest if already known."""
         try:
-            return self.receipt.request_sha256 == digest(request) and self.receipt.answers_sha256 == digest(answers)
+            return (self.receipt.request_sha256 == (request_sha256 or digest(request))
+                    and self.receipt.answers_sha256 == digest(answers))
         except (ValueError, TypeError):
             return False
 
@@ -69,28 +71,38 @@ def parse_response(text: str) -> dict[str, Any] | None:
         value = json.loads(text)
     except (ValueError, RecursionError):
         return None
-    return value if isinstance(value, dict) and _depth(value) <= MAX_JSON_DEPTH else None
+    return value if isinstance(value, dict) and not too_deep(value, MAX_JSON_DEPTH) else None
 
 
-def _depth(value: Any) -> int:
-    if isinstance(value, dict):
-        return 1 + max(map(_depth, value.values()), default=0)
-    if isinstance(value, list):
-        return 1 + max(map(_depth, value), default=0)
-    return 0
+def too_deep(value: Any, limit: int) -> bool:
+    """Whether containers nest deeper than ``limit`` (iterative: a hostile document can nest deeper than the
+    interpreter's stack)."""
+    stack = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        children = node.values() if isinstance(node, dict) else node if isinstance(node, list) else None
+        if children is None:
+            continue
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 def signed_answers(response: dict[str, Any], request: dict[str, Any], *, request_id: str, hotkey: str,
-                   endpoint_id: str, model_id: str, callers: Collection[str], netuid: int, mechid: int) -> Any:
+                   endpoint_id: str, model_id: str, callers: Collection[str], netuid: int, mechid: int,
+                   request_sha256: str | None = None) -> Any:
     """The answers of a response if its receipt is the miner's signature over exactly this request and these answers,
-    issued to one of ``callers`` for the request with nonce ``request_id``; None otherwise."""
+    issued to one of ``callers`` for the request with nonce ``request_id``; None otherwise. ``request_sha256`` is the
+    request's digest if already known."""
     try:
         receipt = SignedReceipt.model_validate(response["receipt"])
         answers = response["answers"]
     except (KeyError, TypeError, ValueError):
         return None
     r = receipt.receipt
-    bound = (receipt.signature_valid() and receipt.binds(request, answers) and r.miner_hotkey == hotkey
+    bound = (receipt.signature_valid() and receipt.binds(request, answers, request_sha256=request_sha256)
+             and r.miner_hotkey == hotkey
              and r.endpoint_id == endpoint_id and r.model_id == model_id and r.caller_hotkey in callers
              and r.request_nonce == request_id and r.netuid == netuid and r.mechid == mechid)
     return answers if bound else None

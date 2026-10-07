@@ -38,18 +38,22 @@ class Credit(BaseModel):
     drift: bool = False  # its test answers drifted beyond the model's statistical tolerance: no credit
 
 
-GATEWAY_EVIDENCE = "gateway"  # the test_id of evidence from a sampled gateway answer
+GATEWAY_EVIDENCE = "gateway"  # evidence from a sampled gateway answer: test_id "gateway-<request nonce>"
 
 
 class Evidence(BaseModel):
     hotkey: str
     endpoint_id: str
     model_id: str
-    test_id: str  # the test, or GATEWAY_EVIDENCE for an answer the gateway sampled
+    test_id: str  # the test, or "gateway-<request nonce>" for an answer the gateway sampled
     reason: str
     request_id: str  # the receipt's nonce: the test request id, or the gateway's request nonce
     request: dict[str, Any]
     response: str  # the response body as received: the answers and the signed receipt
+
+    @property
+    def from_gateway(self) -> bool:
+        return self.test_id.startswith(GATEWAY_EVIDENCE + "-")
 
 
 class Verdicts(BaseModel):

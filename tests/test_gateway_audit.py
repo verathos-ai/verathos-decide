@@ -7,6 +7,7 @@ import asyncio
 import json
 
 import httpx
+import pytest
 from bittensor_wallet import Keypair
 
 from tests.mock_engine import MockEngine
@@ -85,16 +86,21 @@ def test_sampled_gateway_answers_prove_wrong_answers(tmp_path) -> None:
     samples = asyncio.run(collect())
     auditor = _auditor(tmp_path, gateway_checks_per_epoch=2)
     auditor.follower.poll()
-    # only answers issued to the gateway that submits them count, and at most 2 per endpoint and epoch
-    assert auditor.accept_samples(kp().ss58_address, samples) == 0
-    assert auditor.accept_samples(gateway.ss58_address, samples) == 4
+    # only answers issued to the gateway that submits them count, for endpoints the auditor knows
     assert auditor.accept_samples(gateway.ss58_address, samples) == 0
+    auditor.update_slots([Slot(k.ss58_address, "gpu0", "http://x/e/gpu0", "kev-4b", 40.0)
+                          for k in (honest_kp, wrong_kp)])
+    assert auditor.accept_samples(kp().ss58_address, samples) == 0
+    assert auditor.accept_samples(gateway.ss58_address, samples) == 6
+    assert auditor.accept_samples(gateway.ss58_address, samples) == 0  # known already
     asyncio.run(auditor.check_samples(Checks({"kev-4b": MockEngine("kev-4b")}, {})))
+    states = auditor.store._query("SELECT hotkey, state FROM samples")
+    assert sorted(st for hk, st in states if hk == honest_kp.ss58_address) == ["checked", "checked", "skipped"]
 
     auditor.chain.head_block = 4 * 180 + 1
     auditor.follower.poll()
     (evidence,) = auditor.verdicts(4).verdicts.invalid
-    assert evidence.hotkey == wrong_kp.ss58_address and evidence.test_id == GATEWAY_EVIDENCE
+    assert evidence.hotkey == wrong_kp.ss58_address and evidence.from_gateway
 
     validator = Throughput(netuid=405, mechid=1, policy=AuditPolicy(), auditor_hotkey=auditor.hotkey,
                            chain=auditor.chain)
@@ -118,8 +124,9 @@ def test_drifted_gateway_answers_lose_the_credit_whatever_the_tests_show(tmp_pat
     assert not credit_.drift
     for i in range(3):
         auditor.store.add_sample(sample_id=f"s{i}", epoch=3, gateway="gw", hotkey="hk", endpoint_id="gpu0",
-                                 model_id="kev-4b", request_id=f"n{i}", request={}, response="{}", per_endpoint=4)
-        auditor.store.finish_sample(f"s{i}", "checked", drift_sum=40 * 2 * tol.mean_abs, drift_count=40)
+                                 model_id="kev-4b", request_id=f"n{i}", request={}, response="{}", proof=False)
+        auditor.store.finish_sample(f"s{i}", "checked", drift_sum=40 * 2 * tol.mean_abs, drift_count=40,
+                                    checked_epoch=3)
     (credit_,) = auditor.store.credits(2, 3, auditor.policy, lambda m: tol)
     assert credit_.drift and credit_.credited_rps == 0.0
 
@@ -134,16 +141,16 @@ def test_routes_list_the_credited_endpoints_a_gateway_may_use(tmp_path) -> None:
         Result(Target(slots[n], 30.0), "passed", "", 30.0, 25.0, 350.0) for n in ("good", "probation", "wrong")])
     auditor.store.set_state(test.test_id, "confirmed")
     auditor.store.add_sample(sample_id="s", epoch=3, gateway="gw", hotkey="hk-wrong", endpoint_id="gpu0",
-                             model_id="kev-4b", request_id="n", request={}, response="{}", per_endpoint=2)
+                             model_id="kev-4b", request_id="n", request={}, response="{}", proof=False)
     from verathos.throughput.feed import Evidence
     auditor.store.finish_sample("s", "checked", "wrong", Evidence(
-        hotkey="hk-wrong", endpoint_id="gpu0", model_id="kev-4b", test_id=GATEWAY_EVIDENCE, reason="wrong",
-        request_id="n", request={}, response="{}"))
+        hotkey="hk-wrong", endpoint_id="gpu0", model_id="kev-4b", test_id=f"{GATEWAY_EVIDENCE}-n", reason="wrong",
+        request_id="n", request={}, response="{}"), checked_epoch=3)
     auditor.update_slots(list(slots.values()))
     auditor.chain.head_block = 4 * 180 + 1
     auditor.follower.poll()
 
-    signed = auditor.routes(lambda: ["hk-probation/gpu0"])
+    signed = auditor.routes(lambda: ["hk-probation/other-endpoint"])  # probation covers the whole hotkey
     assert signed.verify(auditor.hotkey, 405) and not signed.verify(kp().ss58_address, 405)
     (route,) = signed.routes.routes
     assert (route.hotkey, route.url, route.credited_rps, route.latency_ms) == ("hk-good", "http://good/e/gpu0",
@@ -154,17 +161,18 @@ def test_the_auditor_service_takes_samples_only_from_catalog_gateways(tmp_path) 
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
-    from verathos.protocol.gateway import ROUTES_PATH, SAMPLES_PATH, GatewaySamples
+    from verathos.protocol.gateway import ROUTES_PATH, SAMPLES_PATH
     from verathos.validator.service import add_gateway_routes
 
     gateway, miner_kp = kp(), kp()
     honest = miner(miner_kp, MockEngine("kev-4b"), gateway)
     response = asyncio.run(exchange(honest, gateway, miner_kp, request(1)))
-    body = GatewaySamples(samples=[GatewaySample(hotkey=miner_kp.ss58_address, endpoint_id="gpu0",
-                                                 model_id="kev-4b", request=request(1), response=response.text)])
-    raw = body.model_dump_json().encode()
+    sample = GatewaySample(hotkey=miner_kp.ss58_address, endpoint_id="gpu0", model_id="kev-4b", request=request(1),
+                           response=response.text)
+    raw = ('{"samples": [' + sample.model_dump_json() + "]}").encode()
     auditor = _auditor(tmp_path)
     auditor.follower.poll()
+    auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "http://x/e/gpu0", "kev-4b", 40.0)])
     app = FastAPI()
     add_gateway_routes(app, auditor, probation=list, gateways=lambda: [gateway.ss58_address])
     client = TestClient(app)
@@ -175,6 +183,95 @@ def test_the_auditor_service_takes_samples_only_from_catalog_gateways(tmp_path) 
 
     assert post(kp(), raw).status_code == 403
     assert post(gateway, raw, signed=b"something else").status_code == 401
-    assert post(gateway, b'{"samples": []}').status_code == 422
+    assert post(gateway, b'{"samples": {}}').status_code == 422
+    assert post(gateway, b'{"samples": [{"not": "a sample"}]}').json() == {"kept": 0}  # judged one by one
     assert post(gateway, raw).json() == {"kept": 1}
+    unsized = client.post(SAMPLES_PATH, content=iter([raw]), headers=sign_request(gateway, "POST", SAMPLES_PATH, raw,
+                                                                                  auditor.hotkey))
+    assert unsized.status_code == 413  # a declared length is required
     assert client.get(ROUTES_PATH).json()["routes"]["routes"] == []  # nothing credited yet
+
+
+def test_what_an_endpoint_answers_the_gateway_during_a_test_counts_as_delivered(tmp_path) -> None:
+    """Miners serve users before test traffic: a busy endpoint loses nothing, refusing users gains nothing."""
+    import time as time_module
+
+    from tests.test_throughput import _result
+    from verathos.protocol.gateway import ServedCount
+
+    auditor = _auditor(tmp_path)
+    slot = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 20.0)
+    auditor.update_slots([slot])
+    start = int(time_module.time()) - 30
+    window = (start + 0.5, start + 16.5)  # test_s 16
+    counts = [ServedCount(hotkey="hk", endpoint_id="gpu0", second=start + i, answered=10) for i in range(17)]
+    assert auditor.accept_served(counts) == 17
+    test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+
+    async def evaluate(completed: int):
+        return await auditor.evaluate(test, Target(slot, 20.0), _result("hk/gpu0", completed=completed),
+                                      Checks({}, {}).for_test(), auditor.policy, window)
+
+    result = asyncio.run(evaluate(160))  # 10/s of the test's own and 10/s to the gateway
+    assert result.outcome == "passed" and result.delivered_rps == pytest.approx(20.0)
+    assert json.loads(result.detail)["gateway_answered"] == pytest.approx(160.0)
+    assert auditor.accept_served([ServedCount(hotkey="unknown", endpoint_id="gpu0", second=start, answered=5)]) == 0
+
+
+def test_served_verdicts_are_the_same_after_a_restart(tmp_path) -> None:
+    from verathos.throughput.auditor import Auditor
+
+    auditor = _auditor(tmp_path)
+    auditor.chain.head_block = 4 * 180 + 1
+    auditor.follower.poll()
+    first = auditor.verdicts(4)
+    auditor.store.add_sample(sample_id="late", epoch=3, gateway="gw", hotkey="hk", endpoint_id="gpu0",
+                             model_id="kev-4b", request_id="n", request={}, response="{}", proof=False)
+    restarted = Auditor(netuid=405, mechid=1, keypair=auditor.keypair, chain=auditor.chain, policy=auditor.policy,
+                        catalog=catalog.load, references={}, db_path=tmp_path / "t.sqlite")
+    restarted.follower.poll()
+    assert restarted.verdicts(4).model_dump_json() == first.model_dump_json()
+
+
+def test_samples_to_check_are_drawn_per_endpoint_and_proofs_always_go(tmp_path) -> None:
+    import random
+
+    auditor = _auditor(tmp_path)
+    store = auditor.store
+    for i in range(8):
+        store.add_sample(sample_id=f"a{i}", epoch=3, gateway="gw", hotkey="hk", endpoint_id="gpu0",
+                         model_id="kev-4b", request_id=f"n{i}", request={}, response="{}", proof=False)
+    assert not store.add_sample(sample_id="a9", epoch=3, gateway="gw", hotkey="hk", endpoint_id="gpu0",
+                                model_id="kev-4b", request_id="n9", request={}, response="{}", proof=False)
+    assert store.add_sample(sample_id="p", epoch=3, gateway="gw", hotkey="hk", endpoint_id="gpu0",
+                            model_id="kev-4b", request_id="np", request={}, response="{}", proof=True)
+    chosen = {row[0] for row in store.samples_to_check(3, 2, random.Random(1))}
+    assert "p" in chosen and len(chosen) == 3
+    skipped = store._query("SELECT COUNT(*) FROM samples WHERE state = 'skipped'")[0][0]
+    assert skipped == 6
+    picked = next(s for s in chosen if s != "p")
+    for _ in range(3):
+        store.failed_check(picked)
+    assert store._query("SELECT state FROM samples WHERE sample_id = ?", (picked,))[0][0] == "unchecked"
+    store.add_sample(sample_id="old", epoch=1, gateway="gw", hotkey="hk", endpoint_id="gpu1", model_id="kev-4b",
+                     request_id="no", request={}, response="{}", proof=False)
+    store.samples_to_check(3, 2, random.Random(1))
+    assert store._query("SELECT state FROM samples WHERE sample_id = 'old'")[0][0] == "unchecked"
+
+
+def test_sample_checks_wait_while_a_test_runs(tmp_path) -> None:
+    gateway, miner_kp = kp(), kp()
+    honest = miner(miner_kp, MockEngine("kev-4b"), gateway)
+    response = asyncio.run(exchange(honest, gateway, miner_kp, request(1)))
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "http://x/e/gpu0", "kev-4b", 40.0)])
+    sample = GatewaySample(hotkey=miner_kp.ss58_address, endpoint_id="gpu0", model_id="kev-4b", request=request(1),
+                           response=response.text)
+    assert auditor.accept_samples(gateway.ss58_address, [sample]) == 1
+    auditor._tests_running = 1
+    asyncio.run(auditor.check_samples(Checks({"kev-4b": MockEngine("kev-4b")}, {})))
+    assert auditor.store._query("SELECT state FROM samples")[0][0] == "pending"
+    auditor._tests_running = 0
+    asyncio.run(auditor.check_samples(Checks({"kev-4b": MockEngine("kev-4b")}, {})))
+    assert auditor.store._query("SELECT state FROM samples")[0][0] == "checked"

@@ -2,11 +2,14 @@
 
     GET  /v1/routes            the endpoints the gateway may send user traffic to, signed by the auditor
     POST /v1/gateway/samples   sampled gateway exchanges for the auditor to check, signed by a catalog gateway
+    POST /v1/gateway/served    what each endpoint answered the gateway, per second, signed by a catalog gateway
 
 A route is an endpoint listed in an accepted manifest that has qualified and is credited in the auditor's current
 verdicts, whose hotkey has no proven wrong answer there and is not on probation at the owner's validator. A sample is
 a request the gateway sent and the response it received, picked after the answer arrived; the miner's receipt binds
-the answers to the request and names the gateway as caller, so a wrong answer is proof against the miner.
+the answers to the request and names the gateway as caller, so a wrong answer is proof against the miner. Miners
+serve the gateway before the auditor's test traffic, so the auditor counts what an endpoint answered the gateway
+inside a test's measured window as delivered too.
 """
 
 from __future__ import annotations
@@ -22,8 +25,10 @@ from verathos.protocol.api import MAX_RESPONSE_BYTES
 ROUTES_PATH = "/v1/routes"
 ROUTES_DOMAIN = "verathos/routes/v1"
 SAMPLES_PATH = "/v1/gateway/samples"
+SERVED_PATH = "/v1/gateway/served"
 MAX_SAMPLES_PER_POST = 64
 MAX_SAMPLES_BYTES = 8 << 20
+MAX_SERVED_COUNTS = 50_000
 
 
 class Route(BaseModel):
@@ -59,6 +64,9 @@ class SignedRoutes(BaseModel):
 
 
 class GatewaySample(BaseModel):
+    """One sampled exchange; a post is ``{"samples": [...]}`` with up to ``MAX_SAMPLES_PER_POST`` of them within
+    ``MAX_SAMPLES_BYTES``, each judged on its own."""
+
     hotkey: str
     endpoint_id: str
     model_id: str
@@ -66,5 +74,12 @@ class GatewaySample(BaseModel):
     response: str = Field(max_length=MAX_RESPONSE_BYTES)  # the response body as received: answers and receipt
 
 
-class GatewaySamples(BaseModel):
-    samples: list[GatewaySample] = Field(min_length=1, max_length=MAX_SAMPLES_PER_POST)
+class ServedCount(BaseModel):
+    hotkey: str
+    endpoint_id: str
+    second: int  # unix time, whole seconds: answers completed in [second, second + 1)
+    answered: int = Field(ge=1)
+
+
+class ServedReport(BaseModel):
+    counts: list[ServedCount] = Field(min_length=1, max_length=MAX_SERVED_COUNTS)

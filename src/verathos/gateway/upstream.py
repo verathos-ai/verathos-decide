@@ -1,9 +1,14 @@
 """Signed requests to miners, and the checks on their responses.
 
 The request is signed with the gateway's hotkey for the endpoint's miner (``protocol.requests``). A response counts
-only as a JSON object within ``MAX_RESPONSE_BYTES`` whose receipt is the miner's signature over this request and
-these answers, issued to this gateway for this request's nonce, with well-formed answers. Well-formed answers the
-miner signed are what the auditor can recompute; signed malformed answers are proof on their own.
+only as an uncompressed JSON object within ``MAX_RESPONSE_BYTES`` whose receipt is the miner's signature over this
+request and these answers, issued to this gateway for this request's nonce, with well-formed answers. Signed
+malformed answers are proof on their own.
+
+A failed attempt says whose fault it is: ``miner`` failures (no connection, an invalid or unsigned response, a refusal
+of this gateway) count against the miner at once; ``unclear`` ones (a timeout, an error status) could be caused by
+the request itself, and count only if another miner then answers the same request; a ``busy`` miner and a request
+the miner ``rejected`` (4xx) count against nobody.
 """
 
 from __future__ import annotations
@@ -21,6 +26,8 @@ from verathos.protocol.gateway import Route
 from verathos.protocol.receipts import parse_response, signed_answers
 from verathos.protocol.requests import HDR_NONCE, sign_request
 
+MAX_INPUT_TOKENS = 10_000_000  # a receipt claiming more is clamped
+
 
 @dataclass(frozen=True)
 class Exchange:
@@ -28,21 +35,17 @@ class Exchange:
     request: dict[str, Any]
     response: str  # the response body as received
     answers: dict[str, Any]
-    usage: dict[str, Any] | None
     receipt: dict[str, Any]
+    input_tokens: int  # as the miner signed it
 
 
 class UpstreamFailure(Exception):
-    """An attempt at a miner that produced no usable answer. ``busy``: the miner refused for capacity (not its
-    fault); ``exchange``: signed malformed answers, proof against the miner."""
+    """An attempt at a miner without a usable answer; ``blame`` is miner, unclear, busy or rejected (see the module
+    docstring); ``exchange`` holds signed malformed answers, proof against the miner."""
 
-    def __init__(self, kind: str, detail: str = "", *, exchange: Exchange | None = None) -> None:
+    def __init__(self, kind: str, blame: str, detail: str = "", *, exchange: Exchange | None = None) -> None:
         super().__init__(f"{kind}: {detail}" if detail else kind)
-        self.kind, self.exchange = kind, exchange
-
-    @property
-    def busy(self) -> bool:
-        return self.kind == "busy"
+        self.kind, self.blame, self.exchange = kind, blame, exchange
 
 
 class Upstream:
@@ -50,36 +53,45 @@ class Upstream:
         self.keypair, self.client, self.netuid, self.mechid = keypair, client, netuid, mechid
         self.hotkey = keypair.ss58_address
 
-    async def call(self, route: Route, request: dict[str, Any], body: bytes, parsed: SystemOneRequest,
-                   timeout_s: float) -> Exchange:
+    async def call(self, route: Route, request: dict[str, Any], body: bytes, request_sha256: str,
+                   parsed: SystemOneRequest, timeout_s: float) -> Exchange:
         """One attempt at ``route``. Raises UpstreamFailure."""
         url = route.url + "/v1/systemone"
-        headers = {"Content-Type": "application/json",
+        headers = {"Content-Type": "application/json", "Accept-Encoding": "identity",
                    **sign_request(self.keypair, "POST", urlsplit(url).path, body, route.hotkey)}
         try:
             async with asyncio.timeout(timeout_s):
                 async with self.client.stream("POST", url, content=body, headers=headers) as r:
                     if r.status_code in (429, 503):
-                        raise UpstreamFailure("busy", str(r.status_code))
+                        raise UpstreamFailure("busy", "busy", str(r.status_code))
+                    if r.status_code in (401, 403):
+                        raise UpstreamFailure("refused", "miner", str(r.status_code))
+                    if 400 <= r.status_code < 500:
+                        raise UpstreamFailure("rejected", "rejected", str(r.status_code))
                     if r.status_code != 200:
-                        raise UpstreamFailure("status", str(r.status_code))
+                        raise UpstreamFailure("status", "unclear", str(r.status_code))
+                    if r.headers.get("content-encoding", "identity").lower() != "identity":
+                        raise UpstreamFailure("encoding", "miner", r.headers["content-encoding"])
                     raw = bytearray()
-                    async for chunk in r.aiter_bytes():
+                    async for chunk in r.aiter_raw():
                         raw += chunk
                         if len(raw) > MAX_RESPONSE_BYTES:
-                            raise UpstreamFailure("too_large")
+                            raise UpstreamFailure("too_large", "miner")
         except TimeoutError:
-            raise UpstreamFailure("timeout") from None
+            raise UpstreamFailure("timeout", "unclear") from None
         except httpx.HTTPError as exc:
-            raise UpstreamFailure("connect", type(exc).__name__) from None
+            raise UpstreamFailure("connect", "miner", type(exc).__name__) from None
         text = raw.decode("utf-8", errors="replace")
         response = parse_response(text)
         answers = None if response is None else signed_answers(
             response, request, request_id=headers[HDR_NONCE], hotkey=route.hotkey, endpoint_id=route.endpoint_id,
-            model_id=route.model_id, callers={self.hotkey}, netuid=self.netuid, mechid=self.mechid)
+            model_id=route.model_id, callers={self.hotkey}, netuid=self.netuid, mechid=self.mechid,
+            request_sha256=request_sha256)
         if answers is None:
-            raise UpstreamFailure("receipt", "no receipt binding this request and these answers")
-        exchange = Exchange(route, request, text, answers, response.get("usage"), response["receipt"])
+            raise UpstreamFailure("receipt", "miner", "no receipt binding this request and these answers")
+        receipt = response["receipt"]
+        tokens = min(max(int(receipt["receipt"].get("input_tokens", 0)), 0), MAX_INPUT_TOKENS)
+        exchange = Exchange(route, request, text, answers, receipt, tokens)
         if not well_formed(parsed, answers):
-            raise UpstreamFailure("malformed", "signed malformed answers", exchange=exchange)
+            raise UpstreamFailure("malformed", "miner", "signed malformed answers", exchange=exchange)
         return exchange

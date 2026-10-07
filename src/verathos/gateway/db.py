@@ -49,7 +49,7 @@ api_keys = Table(
     Column("id", ID, primary_key=True, autoincrement=True),
     Column("account_id", ID, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True),
     Column("key_hash", String(64), nullable=False, unique=True),  # SHA-256 of the key; the key is never stored
-    Column("prefix", String(16), nullable=False),  # the key's first characters, to recognise it
+    Column("prefix", String(16), nullable=False, unique=True),  # the key's first characters, to recognise it
     Column("name", String(128), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("expires_at", DateTime(timezone=True), nullable=True),
@@ -77,7 +77,7 @@ def create_engine(url: str) -> AsyncEngine:
 def alembic_config(url: str) -> Config:
     config = Config()
     config.set_main_option("script_location", str(MIGRATIONS))
-    config.set_main_option("sqlalchemy.url", url)
+    config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))  # the config parser interpolates %
     return config
 
 

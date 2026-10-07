@@ -31,7 +31,7 @@ def upgrade() -> None:
         sa.Column("id", ID, primary_key=True, autoincrement=True),
         sa.Column("account_id", ID, sa.ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True),
         sa.Column("key_hash", sa.String(64), nullable=False, unique=True),
-        sa.Column("prefix", sa.String(16), nullable=False),
+        sa.Column("prefix", sa.String(16), nullable=False, unique=True),
         sa.Column("name", sa.String(128), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),

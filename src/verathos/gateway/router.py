@@ -7,7 +7,7 @@ what it serves within the latency bound (Little's law), for this process's share
 
 A circuit breaker per endpoint stops traffic after ``BREAKER_FAILURES`` failures in a row, for ``OPEN_S``; then one
 probe request decides, and each failed probe doubles the time, up to ``MAX_OPEN_S``. A miner refusing work because it
-is busy is not a failure: it is skipped for that request only.
+is busy is not a failure: it gets no requests for ``BUSY_S``.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from verathos.protocol.gateway import Route, Routes
 BREAKER_FAILURES = 3
 OPEN_S = 5.0
 MAX_OPEN_S = 120.0
+BUSY_S = 1.0
 DRAWS = 8  # weighted draws before every endpoint is scanned
 
 
@@ -69,6 +70,7 @@ class Endpoint:
     cap: int  # requests at once in this process
     breaker: Breaker = field(default_factory=Breaker)
     in_flight: int = 0
+    busy_until: float = 0.0
 
     @property
     def key(self) -> str:
@@ -96,6 +98,7 @@ class Router:
         self.share, self.max_latency_s = share, max_latency_s
         self.rng, self.clock = rng or random.Random(), clock
         self._pools: dict[str, Pool] = {}
+        self._current: set[int] = set()
 
     def update(self, routes: Routes) -> None:
         """Adopt a new table; endpoints that stay keep their load and breaker."""
@@ -110,6 +113,7 @@ class Router:
                 endpoint.route, endpoint.cap = route, cap
             grouped.setdefault(route.model_id, []).append(endpoint)
         self._pools = {model: Pool(endpoints) for model, endpoints in grouped.items()}
+        self._current = {id(e) for endpoints in grouped.values() for e in endpoints}
         metrics.BREAKERS_OPEN.set(sum(e.breaker.is_open for pool in self._pools.values() for e in pool.endpoints))
         metrics.ROUTES.clear()
         for model, pool in self._pools.items():
@@ -130,7 +134,8 @@ class Router:
         now = self.clock()
 
         def usable(e: Endpoint) -> bool:
-            return e.in_flight < e.cap and e.route.hotkey not in exclude and e.breaker.allows(now)
+            return (e.in_flight < e.cap and e.busy_until <= now and e.route.hotkey not in exclude
+                    and e.breaker.allows(now))
 
         picks: list[Endpoint] = []
         for _ in range(DRAWS):
@@ -150,14 +155,24 @@ class Router:
         endpoint.in_flight += 1
         endpoint.breaker.started()
 
-    def finished(self, endpoint: Endpoint, outcome: Outcome) -> None:
+    def finished(self, endpoint: Endpoint, outcome: Outcome | None) -> None:
+        """One attempt is over; ``outcome`` None: it counts neither way (yet, see ``penalize``)."""
         endpoint.in_flight -= 1
-        was_open = endpoint.breaker.is_open
         if outcome is Outcome.ANSWERED:
-            endpoint.breaker.succeeded()
+            self._breaker(endpoint, endpoint.breaker.succeeded)
         elif outcome is Outcome.FAILED:
-            endpoint.breaker.failed(self.clock())
+            self._breaker(endpoint, lambda: endpoint.breaker.failed(self.clock()))
         else:
             endpoint.breaker.probing = False
-        if endpoint.breaker.is_open != was_open:
+            if outcome is Outcome.BUSY:
+                endpoint.busy_until = self.clock() + BUSY_S
+
+    def penalize(self, endpoint: Endpoint) -> None:
+        """Count a failure whose cause was unclear, once another miner has answered the same request."""
+        self._breaker(endpoint, lambda: endpoint.breaker.failed(self.clock()))
+
+    def _breaker(self, endpoint: Endpoint, change: Callable[[], None]) -> None:
+        was_open = endpoint.breaker.is_open
+        change()
+        if endpoint.breaker.is_open != was_open and id(endpoint) in self._current:
             metrics.BREAKERS_OPEN.inc() if endpoint.breaker.is_open else metrics.BREAKERS_OPEN.dec()

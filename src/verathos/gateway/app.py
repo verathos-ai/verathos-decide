@@ -9,14 +9,15 @@
 Every response carries ``X-Request-Id`` (the client's, if it sent a valid one). Errors are
 ``{"error": {"type": ..., "message": ...}}``; 429 and 503 carry ``Retry-After``.
 
-    400 invalid_request     not JSON, or not a SystemOne request
-    401 unauthorized        missing, unknown, revoked or expired key
+    400 invalid_request     not JSON (NaN and infinities included), not a SystemOne request, or refused by the miners
+    401 unauthorized        missing, unknown, revoked or expired key, or a suspended account
     404 model_not_found     not a model the gateway serves
-    413 too_large           body or state over the limits
-    429 rate_limited        over the account's rate (or too many failed keys from one address)
+    413 too_large           body, state, or the answers the questions would need, over the limits
+    429 rate_limited        over the key's rate (or too many invalid keys from one address)
     429 quota_exceeded      over the account's monthly quota
+    500 internal            a fault of the gateway
     503 busy                no capacity free for the model right now
-    503 unavailable         the miners failed within the request's deadline, or the gateway cannot serve yet
+    503 unavailable         the miners failed within the request's deadline, or accounts cannot be checked
 """
 
 from __future__ import annotations
@@ -38,19 +39,21 @@ from pydantic import ValidationError
 
 from verathos import catalog as catalog_module
 from verathos.gateway import metrics
-from verathos.gateway.accounts import Accounts
+from verathos.gateway.accounts import Accounts, well_formed_key
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
-from verathos.gateway.router import Outcome, Router
+from verathos.gateway.router import Endpoint, Outcome, Router
 from verathos.gateway.sampler import Sampler
+from verathos.gateway.served import ServedCounter
 from verathos.gateway.upstream import Exchange, Upstream, UpstreamFailure
 from verathos.gateway.usage import UsageMeter
-from verathos.protocol.api import SystemOneRequest
-from verathos.protocol.canonical import canonical_json
+from verathos.protocol.api import MAX_RESPONSE_BYTES, Choice, SystemOneRequest, question_keys
+from verathos.protocol.canonical import canonical_json, digest
 
 log = logging.getLogger(__name__)
 STATE_CHARS_PER_TOKEN = 4  # as the miners count it
-FAILED_KEY_RATE, FAILED_KEY_BURST = 2.0, 20  # per client address
+FAILED_KEY_RATE, FAILED_KEY_BURST = 2.0, 20  # invalid keys per client address (IPv6: per /64)
+ANSWER_ENVELOPE_BYTES = 4096  # the receipt, the usage and the response's own fields
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 
@@ -66,16 +69,10 @@ class Gateway:
     router: Router
     upstream: Upstream
     sampler: Sampler
+    served: ServedCounter
     routes_loaded: Callable[[], bool]
     limiter: RateLimiter
     clock: Callable[[], float] = time.monotonic
-
-
-def error(status: int, kind: str, message: str, request_id: str, retry_after: float | None = None) -> JSONResponse:
-    headers = {"X-Request-Id": request_id}
-    if retry_after is not None:
-        headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
-    return JSONResponse({"error": {"type": kind, "message": message}}, status_code=status, headers=headers)
 
 
 def bearer(header: str | None) -> str | None:
@@ -103,10 +100,47 @@ def client_address(request: Request, trusted: list[ipaddress.IPv4Network | ipadd
     return peer
 
 
-def create_app(g: Gateway) -> FastAPI:
-    app = FastAPI(title="Verathos gateway", docs_url=None, redoc_url=None, openapi_url=None)
+def address_group(address: str) -> str:
+    """The unit invalid keys are limited by: an IPv4 address, or an IPv6 /64."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return address
+    return str(ipaddress.ip_network(f"{ip}/64", strict=False)) if ip.version == 6 else address
+
+
+def answer_bytes(request: SystemOneRequest) -> int:
+    """An upper estimate of a response's size for this request: one probability per option of every question."""
+    size = ANSWER_ENVELOPE_BYTES
+    for qid, q in request.questions.items():
+        keys = [json.dumps(k) for k in question_keys(q)]
+        size += len(json.dumps(qid)) + 128 + sum(len(k) + 24 for k in keys)
+        if isinstance(q, Choice):
+            size += max(len(k) for k in keys)  # the chosen option
+    return size
+
+
+def _no_constants(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
+
+
+def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
+    app = FastAPI(title="Verathos gateway", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     trusted = [ipaddress.ip_network(n, strict=False) for n in g.config.trusted_proxies]
     in_flight = 0
+
+    def reject(status: int, kind: str, message: str, request_id: str, retry_after: float | None = None,
+               model: str = "-") -> JSONResponse:
+        metrics.REQUESTS.labels(model, kind).inc()
+        headers = {"X-Request-Id": request_id}
+        if retry_after is not None:
+            headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
+        return JSONResponse({"error": {"type": kind, "message": message}}, status_code=status, headers=headers)
+
+    @app.exception_handler(Exception)
+    async def internal(request: Request, exc: Exception) -> JSONResponse:
+        log.error("request failed", exc_info=exc)
+        return reject(500, "internal", "the gateway failed", getattr(request.state, "request_id", ""))
 
     def ready_reason() -> str | None:
         cat = g.catalog()
@@ -140,74 +174,86 @@ def create_app(g: Gateway) -> FastAPI:
         nonlocal in_flight
         given = request.headers.get("x-request-id", "")
         request_id = given if _REQUEST_ID.fullmatch(given) else secrets.token_hex(12)
-        started = g.clock()
+        request.state.request_id = request_id
         if in_flight >= g.config.max_in_flight:
-            return error(503, "busy", "the gateway is at capacity", request_id, 1)
-        key = bearer(request.headers.get("authorization"))
+            return reject(503, "busy", "the gateway is at capacity", request_id, 1)
+        in_flight += 1
+        metrics.IN_FLIGHT.set(in_flight)
         try:
-            principal = await g.accounts.authenticate(key) if key else None
+            return await serve(request, request_id)
+        finally:
+            in_flight -= 1
+            metrics.IN_FLIGHT.set(in_flight)
+
+    async def serve(request: Request, request_id: str):
+        started = g.clock()
+        key = bearer(request.headers.get("authorization"))
+        address = ("address", address_group(client_address(request, trusted)))
+        if g.limiter.wait(address, FAILED_KEY_RATE, FAILED_KEY_BURST, started):
+            return reject(429, "rate_limited", "too many requests with invalid keys", request_id, 1)
+        try:
+            principal = await g.accounts.authenticate(key) if well_formed_key(key) else None
         except Exception:
             log.exception("key lookup failed")
-            return error(503, "unavailable", "accounts cannot be checked right now", request_id, 5)
+            return reject(503, "unavailable", "accounts cannot be checked right now", request_id, 5)
         if principal is None:
-            wait = g.limiter.check(("address", client_address(request, trusted)), FAILED_KEY_RATE,
-                                   FAILED_KEY_BURST, started)
-            if wait:
-                return error(429, "rate_limited", "too many requests with invalid keys", request_id, wait)
-            return error(401, "unauthorized", "a valid API key is required (Authorization: Bearer ...)",
-                         request_id)
-        wait = g.limiter.check(principal.account_id, principal.rate_rps / g.config.instances, principal.burst,
-                               started)
+            g.limiter.check(address, FAILED_KEY_RATE, FAILED_KEY_BURST, started)
+            return reject(401, "unauthorized", "a valid API key is required (Authorization: Bearer ...)", request_id)
+        wait = g.limiter.check(("key", principal.key_id), principal.rate_rps, principal.burst, started)
         if wait:
-            return error(429, "rate_limited", "over the account's request rate", request_id, wait)
+            return reject(429, "rate_limited", "over the key's request rate", request_id, wait)
         if not g.meter.within_quota(principal):
-            return error(429, "quota_exceeded", "the account's monthly quota is used up", request_id)
+            return reject(429, "quota_exceeded", "the account's monthly quota is used up", request_id)
         body = bytearray()
         async for chunk in request.stream():
             body += chunk
             if len(body) > g.config.max_body_bytes:
-                return error(413, "too_large", f"the body exceeds {g.config.max_body_bytes} bytes", request_id)
+                return reject(413, "too_large", f"the body exceeds {g.config.max_body_bytes} bytes", request_id)
         try:
-            raw = json.loads(body)
+            raw = json.loads(body, parse_constant=_no_constants)
             parsed = SystemOneRequest.model_validate(raw)
-        except (ValueError, ValidationError) as exc:
-            return error(400, "invalid_request", f"not a SystemOne request: {exc}"[:2000], request_id)
+            request_sha256 = digest(raw)
+            state = parsed.state if isinstance(parsed.state, str) else canonical_json(parsed.state).decode()
+        except (ValueError, TypeError, RecursionError, ValidationError) as exc:
+            return reject(400, "invalid_request", f"not a SystemOne request: {exc}"[:2000], request_id)
         cat = g.catalog()
         model = cat.get(parsed.model) if cat is not None else None
         if model is None or model.status != "active" or parsed.model not in g.router.models():
-            return error(404, "model_not_found", f"{parsed.model} is not served", request_id)
-        state = parsed.state if isinstance(parsed.state, str) else canonical_json(parsed.state).decode()
+            return reject(404, "model_not_found", f"{parsed.model} is not served", request_id)
         if len(state) > STATE_CHARS_PER_TOKEN * model.max_state_tokens:
-            return error(413, "too_large", f"the state exceeds what {model.model_id} accepts", request_id)
+            return reject(413, "too_large", f"the state exceeds what {model.model_id} accepts", request_id,
+                          model=parsed.model)
+        if answer_bytes(parsed) > MAX_RESPONSE_BYTES:
+            return reject(413, "too_large", "the answers to these questions would exceed a response's size limit",
+                          request_id, model=parsed.model)
 
-        in_flight += 1
-        metrics.IN_FLIGHT.set(in_flight)
-        try:
-            outcome = await forward(parsed.model, raw, bytes(body), parsed, started)
-        finally:
-            in_flight -= 1
-            metrics.IN_FLIGHT.set(in_flight)
+        outcome = await forward(parsed.model, raw, bytes(body), request_sha256, parsed, started)
         metrics.REQUEST_SECONDS.labels(parsed.model).observe(g.clock() - started)
         if isinstance(outcome, Exchange):
-            usage = outcome.usage or {}
-            g.meter.record(principal, parsed.model, answered=True, input_tokens=int(usage.get("input_tokens") or 0))
+            g.meter.record(principal, parsed.model, answered=True, input_tokens=outcome.input_tokens)
             g.sampler.offer(outcome)
+            g.served.record(outcome.route)
             metrics.REQUESTS.labels(parsed.model, "answered").inc()
             return JSONResponse({"id": request_id, "model": parsed.model, "answers": outcome.answers,
-                                 "usage": outcome.usage, "receipt": outcome.receipt},
+                                 "usage": {"input_tokens": outcome.input_tokens}, "receipt": outcome.receipt},
                                 headers={"X-Request-Id": request_id})
         g.meter.record(principal, parsed.model, answered=False)
-        metrics.REQUESTS.labels(parsed.model, outcome).inc()
+        if outcome == "rejected":
+            return reject(400, "invalid_request", "the miners refused this request", request_id, model=parsed.model)
         if outcome == "busy":
-            return error(503, "busy", f"no capacity free for {parsed.model} right now", request_id, 1)
-        return error(503, "unavailable", f"no miner answered {parsed.model} in time", request_id, 1)
+            return reject(503, "busy", f"no capacity free for {parsed.model} right now", request_id, 1,
+                          model=parsed.model)
+        return reject(503, "unavailable", f"no miner answered {parsed.model} in time", request_id, 1,
+                      model=parsed.model)
 
-    async def forward(model_id: str, raw: dict[str, Any], body: bytes, parsed: SystemOneRequest,
-                      started: float) -> Exchange | str:
+    async def forward(model_id: str, raw: dict[str, Any], body: bytes, request_sha256: str,
+                      parsed: SystemOneRequest, started: float) -> Exchange | str:
         """Up to ``max_attempts`` attempts, each at another miner, within the request's deadline. -> the exchange,
-        or "busy" (no endpoint could take it) or "failed"."""
+        or why there is none: busy (no endpoint could take it), rejected (the miners refused the request itself) or
+        failed. A failure whose cause is unclear counts against a miner only once another miner has answered."""
         deadline = started + g.config.request_timeout_s
         tried: set[str] = set()
+        unclear: list[Endpoint] = []
         result = "busy"
         for attempt in range(g.config.max_attempts):
             remaining = deadline - g.clock()
@@ -218,20 +264,37 @@ def create_app(g: Gateway) -> FastAPI:
                 break
             if attempt:
                 metrics.RETRIES.inc()
+            tried.add(endpoint.route.hotkey)
             g.router.started(endpoint)
+            outcome: Outcome | None = None
             attempt_started = g.clock()
             try:
-                exchange = await g.upstream.call(endpoint.route, raw, body, parsed,
+                exchange = await g.upstream.call(endpoint.route, raw, body, request_sha256, parsed,
                                                  min(g.config.attempt_timeout_s, remaining))
+                outcome = Outcome.ANSWERED
             except UpstreamFailure as failure:
-                g.router.finished(endpoint, Outcome.BUSY if failure.busy else Outcome.FAILED)
                 metrics.UPSTREAM_FAILURES.labels(failure.kind).inc()
                 if failure.exchange is not None:
                     g.sampler.proof(failure.exchange)
-                tried.add(endpoint.route.hotkey)
-                result = "busy" if failure.busy and result == "busy" else "failed"
+                if failure.blame == "miner":
+                    outcome, result = Outcome.FAILED, "failed"
+                elif failure.blame == "busy":
+                    outcome = Outcome.BUSY
+                elif failure.blame == "rejected":
+                    result = "rejected" if result != "failed" else result
+                else:
+                    unclear.append(endpoint)
+                    result = "failed"
                 continue
-            g.router.finished(endpoint, Outcome.ANSWERED)
+            except Exception:
+                log.exception("an attempt at %s failed", endpoint.key)
+                metrics.UPSTREAM_FAILURES.labels("unexpected").inc()
+                outcome, result = Outcome.FAILED, "failed"
+                continue
+            finally:
+                g.router.finished(endpoint, outcome)
+            for other in unclear:
+                g.router.penalize(other)
             metrics.UPSTREAM_SECONDS.labels(model_id).observe(g.clock() - attempt_started)
             return exchange
         return result

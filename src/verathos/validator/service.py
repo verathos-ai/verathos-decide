@@ -10,6 +10,7 @@ validators run no service.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import threading
@@ -23,7 +24,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
 from verathos.catalog import CATALOG_PATH, CatalogStore
-from verathos.protocol.gateway import MAX_SAMPLES_BYTES, ROUTES_PATH, SAMPLES_PATH, GatewaySamples
+from verathos.protocol.gateway import (
+    MAX_SAMPLES_BYTES,
+    MAX_SAMPLES_PER_POST,
+    ROUTES_PATH,
+    SAMPLES_PATH,
+    SERVED_PATH,
+    ServedReport,
+)
 from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, verify_request
 from verathos.protocol.status import STATUS_PATH, HotkeyStatus
 from verathos.subnet.chain import serve_axon
@@ -32,6 +40,8 @@ from verathos.throughput.feed import VERDICTS_PATH
 from verathos.validator.status import StatusBoard
 
 log = logging.getLogger(__name__)
+INTAKE_BODY_S = 10.0
+INTAKE_CONCURRENCY = 4
 
 
 class _DropInvalidRequests(logging.Filter):
@@ -63,9 +73,10 @@ def add_verdicts_route(app: FastAPI, auditor: Auditor) -> None:
 
 def add_gateway_routes(app: FastAPI, auditor: Auditor, *, probation: Callable[[], Collection[str]],
                        gateways: Callable[[], Collection[str]]) -> None:
-    """The routes for the subnet's gateways, and the intake of their sampled exchanges (signed by a catalog
-    gateway)."""
-    nonces = NonceCache()
+    """The routes for the subnet's gateways, and the intake of their sampled exchanges and served counts (signed by
+    a catalog gateway, with a declared length within the limit, read within ``INTAKE_BODY_S``, at most
+    ``INTAKE_CONCURRENCY`` at once)."""
+    nonces, slots = NonceCache(), asyncio.Semaphore(INTAKE_CONCURRENCY)
 
     @app.get(ROUTES_PATH)
     def get_routes():
@@ -74,24 +85,59 @@ def add_gateway_routes(app: FastAPI, auditor: Auditor, *, probation: Callable[[]
             return JSONResponse({"error": "no routes yet: no verdicts"}, status_code=503)
         return signed.model_dump(mode="json")
 
-    @app.post(SAMPLES_PATH)
-    async def post_samples(request: Request):
+    async def intake(request: Request):
+        """-> (caller hotkey, body) or (None, error response)."""
         if request.headers.get(HDR_HOTKEY, "") not in gateways():
-            return JSONResponse({"error": "caller is not a gateway of the catalog"}, status_code=403)
+            return None, JSONResponse({"error": "caller is not a gateway of the catalog"}, status_code=403)
+        declared = request.headers.get("content-length", "")
+        if not declared.isdigit() or int(declared) > MAX_SAMPLES_BYTES:
+            return None, JSONResponse({"error": f"a content-length up to {MAX_SAMPLES_BYTES} is required"},
+                                      status_code=413)
         body = bytearray()
-        async for chunk in request.stream():
-            body += chunk
-            if len(body) > MAX_SAMPLES_BYTES:
-                return JSONResponse({"error": "too large"}, status_code=413)
+        try:
+            async with asyncio.timeout(INTAKE_BODY_S):
+                async for chunk in request.stream():
+                    body += chunk
+                    if len(body) > int(declared):
+                        return None, JSONResponse({"error": "body longer than declared"}, status_code=413)
+        except TimeoutError:
+            return None, JSONResponse({"error": "body too slow"}, status_code=408)
         try:
             caller = verify_request(dict(request.headers), "POST", request.url.path, bytes(body), auditor.hotkey,
                                     nonces)
-            samples = GatewaySamples.model_validate_json(body).samples
         except RequestRejected as e:
-            return JSONResponse({"error": str(e)}, status_code=401)
-        except ValidationError as e:
-            return JSONResponse({"error": f"invalid samples: {e.error_count()} errors"}, status_code=422)
-        return {"kept": await asyncio.to_thread(auditor.accept_samples, caller.hotkey, samples)}
+            return None, JSONResponse({"error": str(e)}, status_code=401)
+        return caller.hotkey, bytes(body)
+
+    @app.post(SAMPLES_PATH)
+    async def post_samples(request: Request):
+        if slots.locked():
+            return JSONResponse({"error": "busy"}, status_code=503)
+        async with slots:
+            gateway, body = await intake(request)
+            if gateway is None:
+                return body
+            try:
+                samples = json.loads(body)["samples"]
+                if not isinstance(samples, list) or len(samples) > MAX_SAMPLES_PER_POST:
+                    raise ValueError(f"samples must be a list of at most {MAX_SAMPLES_PER_POST}")
+            except (ValueError, KeyError, TypeError) as e:
+                return JSONResponse({"error": f"invalid samples: {e}"}, status_code=422)
+            return {"kept": await asyncio.to_thread(auditor.accept_samples, gateway, samples)}
+
+    @app.post(SERVED_PATH)
+    async def post_served(request: Request):
+        if slots.locked():
+            return JSONResponse({"error": "busy"}, status_code=503)
+        async with slots:
+            gateway, body = await intake(request)
+            if gateway is None:
+                return body
+            try:
+                report = ServedReport.model_validate_json(body)
+            except ValidationError as e:
+                return JSONResponse({"error": f"invalid report: {e.error_count()} errors"}, status_code=422)
+            return {"taken": auditor.accept_served(report.counts)}
 
 
 def start_service(*, st: bt.Subtensor, wallet: bt.Wallet, netuid: int, public_host: str, port: int,

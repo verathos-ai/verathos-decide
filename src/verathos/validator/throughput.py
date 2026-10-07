@@ -169,7 +169,7 @@ class Throughput:
             model = cat.get(e.model_id)
             response = parse_response(e.response)
             # A test answer was issued to the auditor, a sampled gateway answer to one of the catalog's gateways.
-            callers = set(cat.gateways) if e.test_id == feed.GATEWAY_EVIDENCE else {self.auditor_hotkey}
+            callers = set(cat.gateways) if e.from_gateway else {self.auditor_hotkey}
             answers = None if response is None else signed_answers(
                 response, e.request, request_id=e.request_id, hotkey=e.hotkey, endpoint_id=e.endpoint_id,
                 model_id=e.model_id, callers=callers, netuid=self.netuid, mechid=self.mechid)

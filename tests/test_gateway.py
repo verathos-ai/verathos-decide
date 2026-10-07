@@ -26,6 +26,7 @@ from verathos.gateway.limits import RateLimiter
 from verathos.gateway.router import BREAKER_FAILURES, OPEN_S, Outcome, Router
 from verathos.gateway.routes import RouteTable
 from verathos.gateway.sampler import Sampler
+from verathos.gateway.served import ServedCounter
 from verathos.gateway.upstream import Upstream
 from verathos.gateway.usage import UsageMeter
 from verathos.miner.app import create_app as miner_app
@@ -97,6 +98,9 @@ class Setup:
                                     max_attempts=max_attempts, attempt_timeout_s=attempt_timeout_s)
         self.auditor = _auditor(tmp_path)
         self.auditor.follower.poll()
+        from verathos.throughput.auditor import Slot
+        self.auditor.update_slots([Slot(keypair.ss58_address, "gpu0", f"http://{host}:8091/e/gpu0", "kev-4b", 40.0)
+                                   for host, (keypair, _) in self.miners.items()])
         auditor_app = FastAPI()
         from verathos.validator.service import add_gateway_routes
         add_gateway_routes(auditor_app, self.auditor, probation=list, gateways=lambda: [self.gateway_kp.ss58_address])
@@ -114,10 +118,12 @@ class Setup:
 
         self.sampler = Sampler(self.gateway_kp, self.client, auditor_url=auditor_url,
                                auditor_hotkey=self.auditor.hotkey, window_s=600, rng=random.Random(2))
+        self.served = ServedCounter(self.gateway_kp, self.client, auditor_url=auditor_url,
+                                    auditor_hotkey=self.auditor.hotkey)
         cat = catalog.Catalog.parse({**catalog.load().document(), "gateways": [self.gateway_kp.ss58_address]})
         self.app = create_app(Gateway(
             config=self.config, hotkey=self.gateway_kp.ss58_address, catalog=lambda: cat, accounts=self.accounts,
-            meter=self.meter, router=self.router, sampler=self.sampler, routes_loaded=lambda: True,
+            meter=self.meter, router=self.router, sampler=self.sampler, served=self.served, routes_loaded=lambda: True,
             upstream=Upstream(self.gateway_kp, self.client, netuid=405, mechid=1), limiter=RateLimiter()))
         self.key = asyncio.run(self._account(rate, burst, monthly_quota))
 
@@ -125,11 +131,13 @@ class Setup:
         await self.accounts.create_account("acme", rate_rps=rate, burst=burst, monthly_quota=quota)
         return await self.accounts.create_key("acme", "prod")
 
-    async def post(self, payload=None, key: str | None = "default", **headers) -> httpx.Response:
+    async def post(self, payload=None, key: str | None = "default", content_override: bytes | None = None,
+                   **headers) -> httpx.Response:
         auth = {"Authorization": f"Bearer {self.key if key == 'default' else key}"} if key else {}
+        body = content_override or json.dumps(REQUEST if payload is None else payload).encode()
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://gw") as c:
-            return await c.post("/v1/systemone", json=REQUEST if payload is None else payload,
-                                headers={**auth, **headers})
+            return await c.post("/v1/systemone", content=body,
+                                headers={"Content-Type": "application/json", **auth, **headers})
 
     def many(self, n: int, payload=None) -> list[httpx.Response]:
         async def run():
@@ -164,7 +172,7 @@ def test_keys_and_rate_limits(tmp_path) -> None:
     assert asyncio.run(s.post()).status_code == 401
     asyncio.run(s.accounts.set_account("acme", status="active", rate_rps=100.0))
     (key,) = asyncio.run(s.accounts.list_keys("acme"))
-    assert asyncio.run(s.accounts.revoke_key(key["prefix"])) == 1
+    assert asyncio.run(s.accounts.revoke_key("acme", key["prefix"])) == 1
     assert asyncio.run(s.post()).status_code == 401
 
 
@@ -350,6 +358,114 @@ def test_the_admin_cli_manages_accounts_and_keys(tmp_path, capsys) -> None:
     assert cli("accounts", "create", "--name", "acme", "--rate", "5", "--burst", "10")["id"] == 1
     key = cli("keys", "create", "--account", "acme", "--name", "prod")["key"]
     (listed,) = cli("keys", "list", "--account", "acme")
-    assert listed["prefix"] == key[:10] and listed["revoked_at"] is None
-    assert cli("keys", "revoke", "--prefix", key[:10]) == {"revoked": 1}
+    assert listed["prefix"] == key[:16] and listed["revoked_at"] is None
+    assert cli("keys", "revoke", "--account", "other", "--prefix", key[:16]) == {"revoked": 0}
+    assert cli("keys", "revoke", "--account", "acme", "--prefix", key[:16]) == {"revoked": 1}
     assert cli("accounts", "set", "--name", "acme", "--status", "suspended") == {"updated": True}
+
+
+# ---- requests and responses that must not hurt anyone ----
+
+class Counting(MockEngine):
+    calls = 0
+
+    async def answer(self, request):
+        Counting.calls += 1
+        if "POISON" in str(request.get("state")):
+            raise EngineError("this request breaks the engine")
+        return await super().answer(request)
+
+
+def test_requests_no_miner_could_answer_are_refused_before_any_miner(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": Counting("kev-4b")})
+    Counting.calls = 0
+    nan = asyncio.run(s.post(content_override=b'{"model": "kev-4b", "state": {"x": NaN}, "questions": '
+                                              b'{"q": {"type": "noul"}}}'))
+    assert nan.status_code == 400 and nan.json()["error"]["type"] == "invalid_request"
+    huge = {"model": "kev-4b", "state": "x", "questions": {
+        f"q{i}": {"type": "choice", "criteria": {f"option {j:03d} with a long name": "" for j in range(255)}}
+        for i in range(20)}}
+    assert asyncio.run(s.post(huge)).json()["error"]["type"] == "too_large"
+    assert Counting.calls == 0
+
+
+def test_a_request_that_breaks_every_miner_opens_no_breaker(tmp_path) -> None:
+    s = Setup(tmp_path, {f"10.0.0.{i}": Counting("kev-4b") for i in (1, 2, 3)})
+    poison = {**REQUEST, "state": "POISON"}
+    for _ in range(4):
+        assert asyncio.run(s.post(poison)).json()["error"]["type"] == "unavailable"
+    assert not any(e.breaker.is_open for e in s.router._pools["kev-4b"].endpoints)
+    assert asyncio.run(s.post()).status_code == 200
+
+
+def test_hostile_responses_are_refused_and_leave_nothing_behind(tmp_path) -> None:
+    import gzip
+
+    from starlette.responses import Response
+
+    s = Setup(tmp_path, {"10.0.0.2": MockEngine("kev-4b")})
+    hostile, deep = FastAPI(), "[" * 5000 + "]" * 5000
+
+    @hostile.post("/e/gpu0/v1/systemone")
+    async def answer():
+        body = gzip.compress(b'{"answers": {}}' + b" " * 1_000_000)
+        return Response(body, headers={"Content-Encoding": "gzip"}, media_type="application/json")
+
+    nested = FastAPI()
+
+    @nested.post("/e/gpu0/v1/systemone")
+    async def nested_answer():
+        return Response('{"answers": ' + deep + ', "receipt": {}}', media_type="application/json")
+
+    for host, app in (("10.0.0.8", hostile), ("10.0.0.9", nested)):
+        s.client._transport._t[host] = httpx.ASGITransport(app=app)
+    s.router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=2, catalog_digest="0" * 64,
+                           routes=[route(kp(), "10.0.0.8", 1000.0), route(kp(), "10.0.0.9", 1000.0)]))
+    responses = s.many(6)
+    assert {r.json()["error"]["type"] for r in responses} <= {"unavailable", "busy"}  # busy once both are shut out
+    assert all(e.in_flight == 0 and e.breaker.is_open for e in s.router._pools["kev-4b"].endpoints)
+
+
+def test_usage_is_what_the_miner_signed_within_bounds(tmp_path) -> None:
+    class Greedy(MockEngine):
+        async def answer(self, request):
+            return {**await super().answer(request), "usage": {"input_tokens": 10 ** 20}}
+
+    s = Setup(tmp_path, {"10.0.0.1": Greedy("kev-4b")})
+    r = asyncio.run(s.post())
+    assert r.status_code == 200 and r.json()["usage"] == {"input_tokens": 10_000_000}
+    asyncio.run(s.meter.flush())  # writes, whatever the miner claimed
+    (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
+    assert usage["input_tokens"] == 10_000_000
+
+
+def test_invalid_keys_are_limited_before_the_database(tmp_path) -> None:
+    import secrets
+
+    from verathos.gateway.app import FAILED_KEY_BURST
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    lookups = []
+    load = s.accounts._load
+
+    async def counted(h):
+        lookups.append(h)
+        return await load(h)
+
+    s.accounts._load = counted
+    codes = [asyncio.run(s.post(key="vd_" + secrets.token_hex(32))).status_code for _ in range(60)]
+    assert codes.count(401) == FAILED_KEY_BURST and codes.count(429) == 60 - FAILED_KEY_BURST
+    assert len(lookups) == FAILED_KEY_BURST
+
+
+def test_what_miners_answer_the_gateway_reaches_the_auditor(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    for _ in range(3):
+        assert asyncio.run(s.post()).status_code == 200
+    s.served.clock = lambda: 4_000_000_000.0  # those seconds are over
+    import time as time_module
+    s.served._counts = {(hk, ep, int(time_module.time())): n for (hk, ep, _), n in s.served._counts.items()}
+    asyncio.run(s.served.report())
+    keypair = s.miners["10.0.0.1"][0]
+    now = time_module.time()
+    assert s.auditor.served_in(keypair.ss58_address, "gpu0", now - 60, now + 1) == pytest.approx(3.0)

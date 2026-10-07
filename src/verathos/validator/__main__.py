@@ -22,7 +22,7 @@ import bittensor as bt
 import httpx
 
 from verathos import catalog
-from verathos.throughput.feed import GATEWAY_EVIDENCE, Verdicts
+from verathos.throughput.feed import Verdicts
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator import chain, status
 from verathos.validator.audit import audit_epoch
@@ -110,7 +110,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     if policy.mode != "observe" and verdicts is None:
         log.warning("  no throughput verdicts: no endpoint has proven capacity this epoch")
     for e in evidence:
-        where = "gateway traffic" if e.test_id == GATEWAY_EVIDENCE else f"throughput test {e.test_id[:12]}"
+        where = "gateway traffic" if e.from_gateway else f"throughput test {e.test_id[:12]}"
         log.info("  %s/%s gave a wrong answer in %s: %s", e.hotkey, e.endpoint_id, where, e.reason)
     invalid_hotkeys = {e.hotkey for e in evidence}
     credited, latency_ms = credited_capacity(endpoints, verdicts, cat, policy.mode)

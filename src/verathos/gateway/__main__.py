@@ -7,7 +7,7 @@
     verathos-gateway accounts list
     verathos-gateway keys create --account acme --name prod [--expires 2027-01-01]
     verathos-gateway keys list --account acme
-    verathos-gateway keys revoke --prefix vd_1a2b3c4
+    verathos-gateway keys revoke --account acme --prefix vd_1a2b3c4d5e6f7
     verathos-gateway usage --account acme [--since 2026-10-01]
 """
 
@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import logging
 import random
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,7 @@ from verathos.gateway.limits import RateLimiter
 from verathos.gateway.router import Router
 from verathos.gateway.routes import RouteTable
 from verathos.gateway.sampler import Sampler
+from verathos.gateway.served import ServedCounter
 from verathos.gateway.upstream import Upstream
 from verathos.gateway.usage import UsageMeter
 from verathos.protocol.gateway import Routes
@@ -85,32 +88,42 @@ async def serve(config: GatewayConfig) -> None:
     accounts = Accounts(engine, meter)
     sampler = Sampler(keypair, client, auditor_url=auditor_url, auditor_hotkey=auditor_hotkey,
                       window_s=config.sample_window_s, rng=random.SystemRandom())
+    served = ServedCounter(keypair, client, auditor_url=auditor_url, auditor_hotkey=auditor_hotkey)
     gateway = Gateway(config=config, hotkey=keypair.ss58_address, catalog=lambda: current[0], accounts=accounts,
-                      meter=meter, router=router, sampler=sampler, routes_loaded=lambda: routes.table is not None,
+                      meter=meter, router=router, sampler=sampler, served=served,
+                      routes_loaded=lambda: routes.table is not None,
                       upstream=Upstream(keypair, client, netuid=config.netuid, mechid=config.mechid),
                       limiter=RateLimiter())
-    await routes.load()
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: Any) -> AsyncIterator[None]:
+        """The background work runs with the server; on shutdown (SIGTERM included) usage, samples and served
+        counts are written before the process ends."""
+        await routes.load()
+        tasks = [asyncio.create_task(t) for t in (routes.run(), meter.run(), sampler.run(), served.run())]
+        log.info("gateway %s on %s:%d (auditor %s, %d instance(s))", keypair.ss58_address, config.listen_host,
+                 config.port, auditor_hotkey, config.instances)
+        try:
+            yield
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for final in (meter.flush(), sampler.flush(), served.report()):
+                try:
+                    await final
+                except Exception:
+                    log.exception("final write failed")
+            await client.aclose()
+            await engine.dispose()
+
     if config.metrics_port:
         from prometheus_client import start_http_server
         start_http_server(config.metrics_port, addr="127.0.0.1")
-    tasks = [asyncio.create_task(t) for t in (routes.run(), meter.run(), sampler.run())]
-    server = uvicorn.Server(uvicorn.Config(create_app(gateway), host=config.listen_host, port=config.port,
-                                           log_level="warning", access_log=False, server_header=False))
-    log.info("gateway %s on %s:%d (auditor %s, %d instance(s))", keypair.ss58_address, config.listen_host,
-             config.port, auditor_hotkey, config.instances)
-    try:
-        await server.serve()
-    finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        for final in (meter.flush(), sampler.flush()):
-            try:
-                await final
-            except Exception:
-                log.exception("final flush failed")
-        await client.aclose()
-        await engine.dispose()
+    server = uvicorn.Server(uvicorn.Config(create_app(gateway, lifespan=lifespan), host=config.listen_host,
+                                           port=config.port, log_level="warning", access_log=False,
+                                           server_header=False))
+    await server.serve()
 
 
 def run(coro: Any) -> Any:
@@ -137,11 +150,14 @@ async def admin(config: GatewayConfig, args: argparse.Namespace) -> Any:
             return await accounts.list_accounts()
         if args.command == "keys":
             if args.action == "create":
-                expires = dt.datetime.fromisoformat(args.expires).replace(tzinfo=dt.UTC) if args.expires else None
+                expires = None
+                if args.expires:
+                    expires = dt.datetime.fromisoformat(args.expires)
+                    expires = expires.replace(tzinfo=dt.UTC) if expires.tzinfo is None else expires.astimezone(dt.UTC)
                 return {"key": await accounts.create_key(args.account, args.name, expires),
                         "note": "shown once; store it now"}
             if args.action == "revoke":
-                return {"revoked": await accounts.revoke_key(args.prefix)}
+                return {"revoked": await accounts.revoke_key(args.account, args.prefix)}
             return await accounts.list_keys(args.account)
         since = dt.date.fromisoformat(args.since) if args.since else dt.datetime.now(dt.UTC).date().replace(day=1)
         return await accounts.usage(args.account, since)
@@ -169,7 +185,7 @@ def main() -> None:
     keys.add_argument("action", choices=["create", "list", "revoke"])
     keys.add_argument("--account")
     keys.add_argument("--name")
-    keys.add_argument("--expires", help="ISO date or datetime, UTC")
+    keys.add_argument("--expires", help="ISO date or datetime (UTC unless an offset is given)")
     keys.add_argument("--prefix")
     usage = commands.add_parser("usage")
     usage.add_argument("--account", required=True)

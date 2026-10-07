@@ -52,7 +52,7 @@ from bittensor_wallet import Keypair
 from verathos import catalog as catalog_module
 from verathos.miner.engine import Engine
 from verathos.protocol.api import MAX_RESPONSE_BYTES
-from verathos.protocol.gateway import GatewaySample, Route, Routes, SignedRoutes
+from verathos.protocol.gateway import GatewaySample, Route, Routes, ServedCount, SignedRoutes
 from verathos.protocol.receipts import parse_response, signed_answers
 from verathos.protocol.status import ThroughputOutcome
 from verathos.throughput import loadgen
@@ -84,10 +84,13 @@ REFERENCE_TIMEOUT_S = 30.0
 RECOMPUTE_BUDGET_S = 900.0  # after this, a test's remaining recomputes are skipped
 BREAKER_FAILURES = 3  # an engine failing this often in a row is not asked again in the test
 ROUTES_TTL_S = 30.0
-SAMPLE_BATCH = 32  # sampled gateway exchanges checked per auditor step
-SAMPLE_BATCH_BUDGET_S = 120.0
+KEPT_PER_ENDPOINT = 8  # gateway samples kept per endpoint and epoch, of which gateway_checks_per_epoch are checked
+MAX_CHECK_ATTEMPTS = 3
+SAMPLE_BUDGET_S = 40.0  # per round of sample checks, under the lead time of a test
+SERVED_WAIT_S = 12.0  # after a test's window, for the gateways' last served counts
+SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
 
 
@@ -121,19 +124,21 @@ class Recomputes:
     def __init__(self, checks: Checks, deadline: float) -> None:
         self.checks, self.deadline = checks, deadline
         self._failures: dict[int, int] = {}
+        self._slots = asyncio.Semaphore(REFERENCE_CONCURRENCY)
 
     async def _compare(self, engine: Engine, model_id: str, request: dict[str, Any], got: dict[str, Any],
                        tolerance: Tolerance) -> RequestComparison | None:
-        if time.monotonic() > self.deadline or self._failures.get(id(engine), 0) >= BREAKER_FAILURES:
-            return None
-        try:
-            comparison = await recompute(request, got, engine, tolerance)
-        except ReferenceUnavailable as exc:
-            self._failures[id(engine)] = self._failures.get(id(engine), 0) + 1
-            log.warning("a %s recompute failed, the answer is unchecked: %s", model_id, exc)
-            return None
-        self._failures[id(engine)] = 0
-        return comparison
+        async with self._slots:  # the deadline and the breaker are judged when the recompute would start
+            if time.monotonic() > self.deadline or self._failures.get(id(engine), 0) >= BREAKER_FAILURES:
+                return None
+            try:
+                comparison = await recompute(request, got, engine, tolerance)
+            except ReferenceUnavailable as exc:
+                self._failures[id(engine)] = self._failures.get(id(engine), 0) + 1
+                log.warning("a %s recompute failed, the answer is unchecked: %s", model_id, exc)
+                return None
+            self._failures[id(engine)] = 0
+            return comparison
 
     async def check(self, model_id: str, request: dict[str, Any], answers: Any, tolerance: Tolerance, *,
                     recompute_answers: bool) -> tuple[str | None, RequestComparison | None]:
@@ -211,13 +216,17 @@ CREATE TABLE results (
 CREATE TABLE samples (
     sample_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL, gateway TEXT NOT NULL, hotkey TEXT NOT NULL,
     endpoint_id TEXT NOT NULL, model_id TEXT NOT NULL, request_id TEXT NOT NULL, request TEXT NOT NULL,
-    response TEXT NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', evidence TEXT,
-    drift_sum REAL NOT NULL DEFAULT 0, drift_count INTEGER NOT NULL DEFAULT 0);
+    response TEXT NOT NULL, proof INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+    evidence TEXT, drift_sum REAL NOT NULL DEFAULT 0, drift_count INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0, checked_epoch INTEGER);
 CREATE INDEX samples_by_state ON samples (state, epoch);
 CREATE INDEX samples_by_endpoint ON samples (hotkey, endpoint_id, epoch);
+CREATE TABLE verdicts (epoch INTEGER PRIMARY KEY, document TEXT NOT NULL);
 """
 # test states: running -> unconfirmed -> confirmed | void
-# sample states: pending -> checked | unchecked (no reference for the model, or not checked within its epoch)
+# sample states: pending -> checked | skipped (its endpoint's checks for the epoch were done) | unchecked (no
+# reference for the model, its recompute kept failing, or it was not checked within the next epoch). A sample counts
+# (evidence, drift) in the epoch its check finished: verdicts for an epoch depend only on checks finished before it.
 
 
 class Store:
@@ -229,7 +238,7 @@ class Store:
         self._lock = threading.Lock()
         if self._db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             self._db.executescript("DROP TABLE IF EXISTS results; DROP TABLE IF EXISTS tests; "
-                                   "DROP TABLE IF EXISTS samples;" + _SCHEMA
+                                   "DROP TABLE IF EXISTS samples; DROP TABLE IF EXISTS verdicts;" + _SCHEMA
                                    + f"PRAGMA user_version = {SCHEMA_VERSION};")
             log.info("auditor database %s started for schema %d", path, SCHEMA_VERSION)
         self._query("UPDATE tests SET state = 'void', reason = 'the auditor restarted during the test' "
@@ -327,7 +336,7 @@ class Store:
             return False
         (total, count), = self._query(
             "SELECT COALESCE(SUM(drift_sum), 0), COALESCE(SUM(drift_count), 0) FROM samples WHERE hotkey = ? "
-            "AND endpoint_id = ? AND model_id = ? AND state = 'checked' AND epoch BETWEEN ? AND ?",
+            "AND endpoint_id = ? AND model_id = ? AND state = 'checked' AND checked_epoch BETWEEN ? AND ?",
             (hotkey, endpoint_id, model_id, last_epoch - epochs + 1, last_epoch))
         return _beyond(total, count, tolerance)
 
@@ -337,8 +346,8 @@ class Store:
         rows = self._query(
             "SELECT t.epoch, r.hotkey, r.evidence FROM results r JOIN tests t USING (test_id) "
             "WHERE t.state = 'confirmed' AND r.evidence IS NOT NULL AND t.epoch BETWEEN ? AND ? "
-            "UNION ALL SELECT epoch, hotkey, evidence FROM samples WHERE evidence IS NOT NULL "
-            "AND epoch BETWEEN ? AND ? ORDER BY 1, 2", (first_epoch, last_epoch, first_epoch, last_epoch))
+            "UNION ALL SELECT checked_epoch, hotkey, evidence FROM samples WHERE evidence IS NOT NULL "
+            "AND checked_epoch BETWEEN ? AND ? ORDER BY 1, 2", (first_epoch, last_epoch, first_epoch, last_epoch))
         first: dict[str, str] = {}
         for _, hotkey, evidence in rows:
             first.setdefault(hotkey, evidence)
@@ -347,32 +356,78 @@ class Store:
     # ---- gateway samples ----
 
     def add_sample(self, *, sample_id: str, epoch: int, gateway: str, hotkey: str, endpoint_id: str, model_id: str,
-                   request_id: str, request: dict[str, Any], response: str, per_endpoint: int) -> bool:
-        """Keep a sample to check, unless its endpoint already has ``per_endpoint`` in the epoch (or it is known)."""
+                   request_id: str, request: dict[str, Any], response: str, proof: bool) -> bool:
+        """Keep a sample, unless its endpoint already has ``KEPT_PER_ENDPOINT`` in the epoch (a proof is always kept)
+        or it is known."""
         with self._lock:
             (count,), = self._db.execute("SELECT COUNT(*) FROM samples WHERE hotkey = ? AND endpoint_id = ? AND "
-                                         "epoch = ?", (hotkey, endpoint_id, epoch)).fetchall()
-            if count >= per_endpoint:
+                                         "epoch = ? AND proof = 0", (hotkey, endpoint_id, epoch)).fetchall()
+            if count >= KEPT_PER_ENDPOINT and not proof:
                 return False
             cursor = self._db.execute(
                 "INSERT OR IGNORE INTO samples (sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, "
-                "request, response, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
-                (sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, json.dumps(request), response))
+                "request, response, proof, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+                (sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, json.dumps(request), response,
+                 int(proof)))
             return cursor.rowcount == 1
 
-    def pending_samples(self, since_epoch: int, limit: int) -> list[tuple]:
-        """Samples to check, oldest first; those of epochs before ``since_epoch`` are given up as unchecked.
-        -> [(sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, request, response)]"""
-        self._query("UPDATE samples SET state = 'unchecked', reason = 'not checked within its epoch' "
-                    "WHERE state = 'pending' AND epoch < ?", (since_epoch,))
-        return self._query("SELECT sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, request, "
-                           "response FROM samples WHERE state = 'pending' ORDER BY epoch, rowid LIMIT ?", (limit,))
+    def samples_to_check(self, epoch: int, per_endpoint: int, rng: random.Random) -> list[tuple]:
+        """The samples to check now: every pending proof, and per endpoint and epoch (this one and the last) random
+        pending samples until ``per_endpoint`` are checked; the rest of a done endpoint's are skipped, and pending
+        ones of older epochs given up. -> [(sample_id, gateway, hotkey, endpoint_id, model_id, request_id, request,
+        response)]"""
+        self._query("UPDATE samples SET state = 'unchecked', reason = 'not checked within the next epoch' "
+                    "WHERE state = 'pending' AND epoch < ?", (epoch - 1,))
+        rows = self._query("SELECT sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, request, "
+                           "response, proof FROM samples WHERE state = 'pending'")
+        checked = {(hk, ep, e): n for hk, ep, e, n in self._query(
+            "SELECT hotkey, endpoint_id, epoch, COUNT(*) FROM samples WHERE state = 'checked' AND proof = 0 "
+            "AND epoch >= ? GROUP BY hotkey, endpoint_id, epoch", (epoch - 1,))}
+        groups: dict[tuple[str, str, int], list[tuple]] = {}
+        chosen = [r for r in rows if r[9]]
+        for r in rows:
+            if not r[9]:
+                groups.setdefault((r[3], r[4], r[1]), []).append(r)
+        for key, pending in groups.items():
+            wanted = max(per_endpoint - checked.get(key, 0), 0)
+            picked = rng.sample(pending, min(wanted, len(pending)))
+            chosen += picked
+            if wanted <= len(picked):  # the endpoint's checks for the epoch are done (once these finish)
+                rest = [r[0] for r in pending if r not in picked]
+                if rest:
+                    marks = ",".join("?" * len(rest))
+                    self._query(f"UPDATE samples SET state = 'skipped' WHERE sample_id IN ({marks})", rest)
+        return [(r[0], r[2], r[3], r[4], r[5], r[6], r[7], r[8]) for r in chosen]
+
+    def failed_check(self, sample_id: str) -> None:
+        """A recompute of the sample could not run; after ``MAX_CHECK_ATTEMPTS`` it is given up."""
+        self._query("UPDATE samples SET attempts = attempts + 1, state = CASE WHEN attempts + 1 >= ? THEN 'unchecked' "
+                    "ELSE state END, reason = CASE WHEN attempts + 1 >= ? THEN 'its recompute kept failing' "
+                    "ELSE reason END WHERE sample_id = ?", (MAX_CHECK_ATTEMPTS, MAX_CHECK_ATTEMPTS, sample_id))
 
     def finish_sample(self, sample_id: str, state: str, reason: str = "", evidence: Evidence | None = None,
-                      drift_sum: float = 0.0, drift_count: int = 0) -> None:
-        self._query("UPDATE samples SET state = ?, reason = ?, evidence = ?, drift_sum = ?, drift_count = ? "
-                    "WHERE sample_id = ?", (state, reason, evidence.model_dump_json() if evidence else None,
-                                           drift_sum, drift_count, sample_id))
+                      drift_sum: float = 0.0, drift_count: int = 0, *, checked_epoch: int | None = None) -> None:
+        self._query("UPDATE samples SET state = ?, reason = ?, evidence = ?, drift_sum = ?, drift_count = ?, "
+                    "checked_epoch = ? WHERE sample_id = ?",
+                    (state, reason, evidence.model_dump_json() if evidence else None, drift_sum, drift_count,
+                     checked_epoch, sample_id))
+
+    def offenders(self, since_epoch: int) -> set[str]:
+        """Hotkeys with a wrong answer proven since ``since_epoch``, confirmed or not yet."""
+        rows = self._query(
+            "SELECT r.hotkey FROM results r JOIN tests t USING (test_id) WHERE r.evidence IS NOT NULL "
+            "AND t.state != 'void' AND t.epoch >= ? UNION SELECT hotkey FROM samples WHERE evidence IS NOT NULL "
+            "AND checked_epoch >= ?", (since_epoch, since_epoch))
+        return {r[0] for r in rows}
+
+    # ---- served verdicts ----
+
+    def served_verdicts(self, epoch: int) -> str | None:
+        rows = self._query("SELECT document FROM verdicts WHERE epoch = ?", (epoch,))
+        return rows[0][0] if rows else None
+
+    def serve_verdicts(self, epoch: int, document: str) -> None:
+        self._query("INSERT OR IGNORE INTO verdicts (epoch, document) VALUES (?, ?)", (epoch, document))
 
     def outcomes(self, hotkey: str, since_epoch: int) -> list[ThroughputOutcome]:
         rows = self._query(
@@ -391,6 +446,7 @@ class Store:
                              (before_epoch,))
             self._db.execute("DELETE FROM tests WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM samples WHERE epoch < ?", (before_epoch,))
+            self._db.execute("DELETE FROM verdicts WHERE epoch < ?", (before_epoch,))
 
 
 def _beyond(total: float, count: int, tolerance: Tolerance) -> bool:
@@ -435,6 +491,9 @@ class Auditor:
         self._pruned_epoch = -1
         self._tests_running = 0
         self._routes: tuple[float, SignedRoutes] | None = None
+        self._verdicts_lock = threading.Lock()
+        self._served: dict[tuple[str, str], dict[int, int]] = {}  # (hotkey, endpoint) -> second -> answered
+        self._rng = random.SystemRandom()
 
     # ---- inputs ----
 
@@ -458,7 +517,7 @@ class Auditor:
         checks = Checks(
             {m: BoundedEngine(r.engine(REFERENCE_TIMEOUT_S)) for m, r in self.reference_specs.items()},
             {m: BoundedEngine(r.engine(REFERENCE_TIMEOUT_S)) for m, r in self.screen_specs.items()})
-        tasks: set[asyncio.Task] = set()
+        tasks: set[asyncio.Task] = {asyncio.create_task(self.check_samples_forever(checks))}
         while True:
             try:
                 for test in await asyncio.to_thread(self.follower.poll):
@@ -466,10 +525,18 @@ class Auditor:
                     tasks.add(task)
                     task.add_done_callback(tasks.discard)
                 await asyncio.to_thread(self.settle)
-                if not self._tests_running:  # a test's own checks come first
-                    await self.check_samples(checks)
             except Exception:
                 log.exception("auditor step failed")
+            await asyncio.sleep(POLL_S)
+
+    async def check_samples_forever(self, checks: Checks) -> None:
+        """Gateway samples are checked between tests, never holding up the schedule."""
+        while True:
+            try:
+                if not self._tests_running:
+                    await self.check_samples(checks)
+            except Exception:
+                log.exception("checking gateway samples failed")
             await asyncio.sleep(POLL_S)
 
     def targets(self, policy: AuditPolicy) -> list[Target]:
@@ -543,8 +610,9 @@ class Auditor:
             self.store.set_state(test.test_id, "void", "the auditor observed the start block too late")
             return
         start_ms = int(time.time() * 1000) + START_DELAY_MS
+        plan = self.plan(test, targets, start_ms, policy)
         try:
-            result = await self.runner(self.plan(test, targets, start_ms, policy), timeout_s=policy.session_s + 30.0)
+            result = await self.runner(plan, timeout_s=policy.session_s + 30.0)
         except loadgen.LoadgenError as exc:
             log.error("throughput test of epoch %d void: load generator failed: %s", test.epoch, exc)
             self.store.set_state(test.test_id, "void", "the auditor's load generator failed")
@@ -552,8 +620,11 @@ class Auditor:
         if result.late_start_ms > MAX_LATE_START_MS:
             self.store.set_state(test.test_id, "void", "the auditor's load generator started late")
             return
+        window_s = (result.started_at_ms / 1000 + plan["warmup_s"], result.started_at_ms / 1000 + plan["warmup_s"]
+                    + policy.test_s)
+        await asyncio.sleep(max(0.0, window_s[1] + SERVED_WAIT_S - time.time()))  # the gateways' last counts
         recomputes = checks.for_test()
-        results = await asyncio.gather(*(self.evaluate(test, t, r, recomputes, policy)
+        results = await asyncio.gather(*(self.evaluate(test, t, r, recomputes, policy, window_s)
                                          for t, r in zip(targets, result.targets)))
         self.store.add_results(test.test_id, results)
         counts = {o: sum(r.outcome == o for r in results) for o in ("passed", "partial", "invalid", "void")}
@@ -562,18 +633,22 @@ class Auditor:
                  sum(t.tested_rps for t in targets))
 
     async def evaluate(self, test: ScheduledTest, target: Target, r: loadgen.TargetResult, recomputes: Recomputes,
-                       policy: AuditPolicy) -> Result:
-        """One endpoint's result; whatever its responses contain, a failure here voids only this endpoint."""
+                       policy: AuditPolicy, window_s: tuple[float, float] = (0.0, 0.0)) -> Result:
+        """One endpoint's result; whatever its responses contain, a failure here voids only this endpoint.
+        ``window_s``: the measured window (unix seconds), in which what the endpoint answered the gateways counts as
+        delivered too."""
         try:
-            return await self._evaluate(test, target, r, recomputes, policy)
+            return await self._evaluate(test, target, r, recomputes, policy, window_s)
         except Exception:
             log.exception("evaluating %s in the test of epoch %d failed", target.slot.key, test.epoch)
             return Result(target, "void", "the auditor could not evaluate this endpoint")
 
     async def _evaluate(self, test: ScheduledTest, target: Target, r: loadgen.TargetResult, recomputes: Recomputes,
-                        policy: AuditPolicy) -> Result:
+                        policy: AuditPolicy, window_s: tuple[float, float]) -> Result:
+        gateway = self.served_in(target.slot.hotkey, target.slot.endpoint_id, *window_s)
         detail = json.dumps({"sent": r.sent, "completed": r.completed, "skipped": r.skipped, "errors": r.errors,
-                             "late_sends": r.late_sends, "samples": len(r.samples)}, sort_keys=True)
+                             "late_sends": r.late_sends, "samples": len(r.samples),
+                             "gateway_answered": round(gateway, 1)}, sort_keys=True)
         latency = {"latency_p50_ms": r.latency_ms.p50 or 0.0, "latency_p95_ms": r.latency_ms.p95 or 0.0,
                    "detail": detail}
         if r.late_sends > LATE_SEND_SHARE * max(r.sent, 1):
@@ -603,53 +678,68 @@ class Auditor:
                                     request=sample.request, response=sample.response)
                 break
         drift = {"drift_sum": drift_sum, "drift_count": drift_count}
-        delivered = round(r.completed / policy.test_s * (valid / len(r.samples) if r.samples else 1.0), 2)
+        delivered = round((r.completed * (valid / len(r.samples) if r.samples else 1.0) + gateway) / policy.test_s, 2)
         if evidence is not None:
             return Result(target, "invalid", evidence.reason, delivered, 0.0, evidence=evidence, **latency, **drift)
         credited = credit(target.tested_rps, delivered, policy)
         if delivered >= policy.pass_fraction * target.tested_rps:
             return Result(target, "passed", "", delivered, credited, **latency, **drift)
         reason = f"delivered {delivered:.1f} of {target.tested_rps:.1f} requests/s"
+        if gateway:
+            reason += f" ({gateway / policy.test_s:.1f} of them to the gateway)"
         if valid < len(r.samples):
             reason += f", {len(r.samples) - valid} of {len(r.samples)} sampled responses without a valid receipt"
         return Result(target, "partial", reason, delivered, credited, **latency, **drift)
 
     # ---- gateway samples ----
 
-    def accept_samples(self, gateway: str, samples: list[GatewaySample]) -> int:
-        """Keep the samples whose receipt binds the request and the answers to the miner and names ``gateway`` as
-        caller, up to ``gateway_checks_per_epoch`` per endpoint and epoch; -> how many were kept."""
-        policy, cat = self.policy, self.catalog()
-        epoch, kept = self.follower.head // policy.epoch_blocks, 0
-        for s in samples:
+    def accept_samples(self, gateway: str, samples: list[Any]) -> int:
+        """Keep the samples of known endpoints whose receipt binds the request and the answers to the miner and names
+        ``gateway`` as caller (each judged on its own; up to ``KEPT_PER_ENDPOINT`` per endpoint and epoch, proofs of
+        malformed answers always); -> how many were kept."""
+        if self.policy.gateway_checks_per_epoch == 0:
+            return 0
+        cat, known = self.catalog(), {(s.hotkey, s.endpoint_id) for s in self._slots}
+        epoch, kept = self.follower.head // self.policy.epoch_blocks, 0
+        for raw in samples:
+            try:
+                s = GatewaySample.model_validate(raw)
+            except ValueError:
+                continue
             response = parse_response(s.response)
             receipt = response.get("receipt") if response is not None else None
             try:
                 nonce, sample_id = receipt["receipt"]["request_nonce"], receipt["signature"]
             except (KeyError, TypeError):
                 continue
-            if cat.get(s.model_id) is None or not isinstance(nonce, str) or not isinstance(sample_id, str):
+            if ((s.hotkey, s.endpoint_id) not in known or cat.get(s.model_id) is None or not isinstance(nonce, str)
+                    or not isinstance(sample_id, str)):
                 continue
-            if signed_answers(response, s.request, request_id=nonce, hotkey=s.hotkey, endpoint_id=s.endpoint_id,
-                              model_id=s.model_id, callers={gateway}, netuid=self.netuid, mechid=self.mechid) is None:
+            answers = signed_answers(response, s.request, request_id=nonce, hotkey=s.hotkey,
+                                     endpoint_id=s.endpoint_id, model_id=s.model_id, callers={gateway},
+                                     netuid=self.netuid, mechid=self.mechid)
+            if answers is None:
                 continue
             kept += self.store.add_sample(sample_id=sample_id, epoch=epoch, gateway=gateway, hotkey=s.hotkey,
                                           endpoint_id=s.endpoint_id, model_id=s.model_id, request_id=nonce,
-                                          request=s.request, response=s.response,
-                                          per_endpoint=policy.gateway_checks_per_epoch)
+                                          request=s.request, response=s.response, proof=readable(answers) is None)
         return kept
 
     async def check_samples(self, checks: Checks) -> None:
-        """Recompute the pending gateway samples of this epoch and the last: a wrong answer becomes evidence, the
-        differences go to the endpoint's gateway drift tally. A sample whose recompute could not run stays pending."""
+        """Check the chosen gateway samples (``Store.samples_to_check``): a wrong answer becomes evidence, the
+        differences go to the endpoint's gateway drift tally. A sample whose recompute could not run is tried again
+        later, up to ``MAX_CHECK_ATTEMPTS``; a test starting stops the round."""
         epoch = self.follower.head // self.policy.epoch_blocks
-        pending = await asyncio.to_thread(self.store.pending_samples, epoch - 1, SAMPLE_BATCH)
-        if not pending:
+        chosen = await asyncio.to_thread(self.store.samples_to_check, epoch, self.policy.gateway_checks_per_epoch,
+                                         self._rng)
+        if not chosen:
             return
-        recomputes, cat = checks.for_test(SAMPLE_BATCH_BUDGET_S), self.catalog()
+        recomputes, cat = checks.for_test(SAMPLE_BUDGET_S), self.catalog()
 
         async def check(row: tuple) -> None:
-            sample_id, _, _, hotkey, endpoint_id, model_id, request_id, request_json, response = row
+            sample_id, _, hotkey, endpoint_id, model_id, request_id, request_json, response = row
+            if self._tests_running:
+                return  # a test's checks come first; still pending
             model, request = cat.get(model_id), json.loads(request_json)
             if model is None or (model_id not in checks.references and model_id not in checks.screens):
                 self.store.finish_sample(sample_id, "unchecked", "no reference for the model")
@@ -657,21 +747,58 @@ class Auditor:
             fault, comparison = await recomputes.check(model_id, request, json.loads(response)["answers"],
                                                        model.tolerance, recompute_answers=True)
             if fault is None and comparison is None:
-                return  # the recompute could not run: try again later
+                if not self._tests_running and time.monotonic() <= recomputes.deadline:
+                    self.store.failed_check(sample_id)
+                return
+            done_epoch = self.follower.head // self.policy.epoch_blocks
             evidence = None if fault is None else Evidence(
-                hotkey=hotkey, endpoint_id=endpoint_id, model_id=model_id, test_id=GATEWAY_EVIDENCE, reason=fault,
-                request_id=request_id, request=request, response=response)
+                hotkey=hotkey, endpoint_id=endpoint_id, model_id=model_id,
+                test_id=f"{GATEWAY_EVIDENCE}-{request_id}", reason=fault, request_id=request_id, request=request,
+                response=response)
             self.store.finish_sample(sample_id, "checked", fault or "", evidence,
-                                     comparison.sum_abs if comparison else 0.0, comparison.count if comparison else 0)
+                                     comparison.sum_abs if comparison else 0.0, comparison.count if comparison else 0,
+                                     checked_epoch=done_epoch)
             if evidence is not None:
                 log.warning("gateway answer of %s/%s is wrong: %s", hotkey, endpoint_id, fault)
 
-        results = await asyncio.gather(*(check(row) for row in pending), return_exceptions=True)
-        for row, outcome in zip(pending, results):
+        results = await asyncio.gather(*(check(row) for row in chosen), return_exceptions=True)
+        for row, outcome in zip(chosen, results):
             if isinstance(outcome, Exception):
-                log.error("checking gateway sample of %s/%s failed: %s", row[3], row[4], outcome)
+                log.error("checking gateway sample of %s/%s failed: %s", row[2], row[3], outcome)
                 self.store.finish_sample(row[0], "unchecked",
                                          f"the auditor could not check it: {type(outcome).__name__}")
+
+    # ---- gateway served counts ----
+
+    def accept_served(self, counts: list[ServedCount]) -> int:
+        """Add what the gateway's endpoints answered per second (known endpoints, recent seconds); -> counts taken."""
+        now, known, taken = time.time(), {(s.hotkey, s.endpoint_id) for s in self._slots}, 0
+        for c in counts:
+            key = (c.hotkey, c.endpoint_id)
+            if key not in known or not now - SERVED_KEEP_S <= c.second <= now + 5:
+                continue
+            per = self._served.setdefault(key, {})
+            per[c.second] = per.get(c.second, 0) + c.answered
+            taken += 1
+        cutoff = int(now) - SERVED_KEEP_S
+        for key in list(self._served):
+            per = self._served[key]
+            for second in [s for s in per if s < cutoff]:
+                del per[second]
+            if not per:
+                del self._served[key]
+        return taken
+
+    def served_in(self, hotkey: str, endpoint_id: str, start_s: float, end_s: float) -> float:
+        """Requests the endpoint answered the gateways in [start_s, end_s), counting partly covered seconds by
+        their covered share."""
+        per = self._served.get((hotkey, endpoint_id), {})
+        total = 0.0
+        for second in range(math.floor(start_s), math.ceil(end_s)):
+            n = per.get(second, 0)
+            if n:
+                total += n * (min(end_s, second + 1) - max(start_s, second))
+        return total
 
     def settle(self) -> None:
         """Confirm tests whose selection block is final with the hash they were selected by; void the others."""
@@ -699,12 +826,23 @@ class Auditor:
     def verdicts(self, epoch: int) -> SignedVerdicts | None:
         """The signed verdicts for scoring epoch ``epoch`` (the current one or the two before); None otherwise, or
         while a test they cover is not settled. Once served, an epoch's verdicts do not change."""
+        with self._verdicts_lock:
+            return self._verdicts_for(epoch)
+
+    def _verdicts_for(self, epoch: int) -> SignedVerdicts | None:
         cached = self._verdicts.get(epoch)
         if cached is not None:
             return cached
         policy, cat = self.policy, self.catalog()
         current, first = self.follower.head // policy.epoch_blocks, epoch - policy.credit_ttl_epochs
-        if not current - 2 <= epoch <= current or self.store.pending(first, epoch - 1):
+        if not current - 2 <= epoch <= current:
+            return None
+        served = self.store.served_verdicts(epoch)
+        if served is not None:  # served before a restart: the same document
+            signed = SignedVerdicts.model_validate_json(served)
+            self._verdicts = {e: v for e, v in self._verdicts.items() if e >= current - 2} | {epoch: signed}
+            return signed
+        if self.store.pending(first, epoch - 1):
             return None
 
         def tolerance_of(model_id: str) -> Tolerance | None:
@@ -715,6 +853,7 @@ class Auditor:
                             credits=self.store.credits(first, epoch - 1, policy, tolerance_of),
                             invalid=self.store.evidence(first, epoch - 1))
         signed = SignedVerdicts.create(verdicts, self.keypair)
+        self.store.serve_verdicts(epoch, signed.model_dump_json())
         self._verdicts = {e: v for e, v in self._verdicts.items() if e >= current - 2} | {epoch: signed}
         return signed
 
@@ -729,8 +868,9 @@ class Auditor:
         signed = self.verdicts(current) or self.verdicts(current - 1)
         if signed is None:
             return None
-        v, excluded = signed.verdicts, set(probation())
-        invalid = {e.hotkey for e in v.invalid}
+        v = signed.verdicts
+        excluded = {key.split("/", 1)[0] for key in probation()}  # probation covers the whole hotkey
+        invalid = {e.hotkey for e in v.invalid} | self.store.offenders(current - 1)
         credits = {(c.hotkey, c.endpoint_id, c.model_id): c for c in v.credits
                    if c.qualified and c.credited_rps > 0 and not c.drift}
         routes = []
@@ -738,7 +878,7 @@ class Auditor:
             credit_ = credits.get((s.hotkey, s.endpoint_id, s.model_id))
             model = cat.get(s.model_id)
             if (credit_ is None or model is None or model.status != "active" or s.hotkey in invalid
-                    or s.key in excluded):
+                    or s.hotkey in excluded):
                 continue
             routes.append(Route(hotkey=s.hotkey, endpoint_id=s.endpoint_id, model_id=s.model_id, url=s.url,
                                 credited_rps=min(credit_.credited_rps, s.declared_rps), latency_ms=credit_.latency_ms))

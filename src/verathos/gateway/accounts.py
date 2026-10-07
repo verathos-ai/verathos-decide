@@ -1,9 +1,10 @@
 """Accounts and their API keys.
 
 A key is ``vd_`` followed by 64 hex characters (32 random bytes). Only its SHA-256 is stored, with its first
-characters as a prefix to recognise it. A lookup is cached per key for ``CACHE_TTL_S`` (a revoked key or a changed
-limit applies within that time), an unknown key for ``NEGATIVE_TTL_S``; concurrent lookups of one key share one
-query. For an account with a monthly quota, a lookup also has the usage meter read the account's month.
+``PREFIX_CHARS`` characters as a unique prefix to recognise it. A lookup is cached per key for ``CACHE_TTL_S`` (a
+revoked key or a changed limit applies within that time), an unknown key for ``NEGATIVE_TTL_S`` in a cache of its
+own, so unknown keys never push valid ones out; concurrent lookups of one key share one query. For an account with
+a monthly quota, a lookup also has the usage meter read the account's month.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from verathos.gateway.db import accounts, api_keys, usage_daily
 from verathos.gateway.usage import UsageMeter
 
 KEY_PREFIX = "vd_"
+PREFIX_CHARS = 16
 _KEY = re.compile(r"vd_[0-9a-f]{64}")
 CACHE_TTL_S = 60.0
 NEGATIVE_TTL_S = 10.0
@@ -49,12 +51,17 @@ def key_hash(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 
+def well_formed_key(key: str | None) -> bool:
+    return key is not None and _KEY.fullmatch(key) is not None
+
+
 class Accounts:
     def __init__(self, engine: AsyncEngine, meter: UsageMeter | None = None, *, ttl_s: float = CACHE_TTL_S,
                  negative_ttl_s: float = NEGATIVE_TTL_S, clock: Callable[[], float] = time.monotonic) -> None:
         self.engine, self.meter, self.ttl_s, self.negative_ttl_s, self.clock = (engine, meter, ttl_s,
                                                                                 negative_ttl_s, clock)
-        self._cache: dict[str, tuple[float, Principal | None]] = {}
+        self._known: dict[str, tuple[float, Principal]] = {}
+        self._unknown: dict[str, float] = {}
         self._loading: dict[str, asyncio.Future[Principal | None]] = {}
 
     # ---- the request path ----
@@ -62,12 +69,14 @@ class Accounts:
     async def authenticate(self, key: str) -> Principal | None:
         """The key's principal, or None if the key is unknown, revoked, expired or its account suspended. Raises on
         database errors."""
-        if not _KEY.fullmatch(key):
+        if not well_formed_key(key):
             return None
         h, now = key_hash(key), self.clock()
-        cached = self._cache.get(h)
-        if cached is not None and cached[0] > now:
-            return cached[1]
+        known = self._known.get(h)
+        if known is not None and known[0] > now:
+            return known[1]
+        if self._unknown.get(h, 0.0) > now:
+            return None
         pending = self._loading.get(h)
         if pending is not None:
             return await asyncio.shield(pending)
@@ -81,11 +90,16 @@ class Accounts:
             raise
         finally:
             del self._loading[h]
-        if len(self._cache) >= MAX_CACHED:
-            self._cache = {k: v for k, v in self._cache.items() if v[0] > now}
-            if len(self._cache) >= MAX_CACHED:
-                self._cache.clear()
-        self._cache[h] = (now + (self.ttl_s if principal else self.negative_ttl_s), principal)
+        if principal is None:
+            if len(self._unknown) >= MAX_CACHED:
+                self._unknown = {k: t for k, t in self._unknown.items() if t > now}
+                if len(self._unknown) >= MAX_CACHED:
+                    self._unknown.clear()
+            self._unknown[h] = now + self.negative_ttl_s
+        else:
+            if len(self._known) >= MAX_CACHED:
+                self._known = {k: v for k, v in self._known.items() if v[0] > now}
+            self._known[h] = (now + self.ttl_s, principal)
         future.set_result(principal)
         return principal
 
@@ -129,14 +143,16 @@ class Accounts:
             if account_id is None:
                 raise LookupError(f"no account {account!r}")
             await conn.execute(insert(api_keys).values(account_id=account_id, key_hash=key_hash(key),
-                                                       prefix=key[:10], name=name, expires_at=expires_at))
+                                                       prefix=key[:PREFIX_CHARS], name=name, expires_at=expires_at))
         return key
 
-    async def revoke_key(self, prefix: str) -> int:
+    async def revoke_key(self, account: str, prefix: str) -> int:
+        """Revoke the account's key with this prefix; -> 1, or 0 if there is none (or it is revoked already)."""
         async with self.engine.begin() as conn:
-            return (await conn.execute(update(api_keys).where(api_keys.c.prefix == prefix,
-                                                              api_keys.c.revoked_at.is_(None))
-                                       .values(revoked_at=dt.datetime.now(dt.UTC)))).rowcount
+            account_id = (await conn.execute(select(accounts.c.id).where(accounts.c.name == account))).scalar()
+            return (await conn.execute(update(api_keys).where(
+                api_keys.c.account_id == account_id, api_keys.c.prefix == prefix, api_keys.c.revoked_at.is_(None))
+                .values(revoked_at=dt.datetime.now(dt.UTC)))).rowcount
 
     async def list_accounts(self) -> list[dict[str, Any]]:
         async with self.engine.connect() as conn:
