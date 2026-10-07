@@ -50,6 +50,7 @@ from verathos.throughput.policy import POLICY_WATCH_S
 
 log = logging.getLogger("verathos.miner")
 LOCAL_HOSTS = {"0.0.0.0": "127.0.0.1", "": "127.0.0.1", "::": "::1"}
+TEST_QUIET_S = 60.0  # a measurement starts only this long after the last test request
 
 
 def servable(config: MinerConfig, cat: catalog.Catalog) -> list[EndpointConfig]:
@@ -111,7 +112,8 @@ class Publisher:
             config, endpoints, dict.fromkeys((e.endpoint_id for e in endpoints), 0.0), wallet.hotkey, cat.digest())
         self.serving = {e.endpoint_id for e in endpoints}
         self.auditor = subtensor.get_subnet_owner_hotkey(config.netuid)  # the subnet owner's validator runs tests
-        self.test_seen = 0.0  # monotonic time the auditor's test traffic last arrived
+        self.test_seen = float("-inf")  # monotonic time the auditor's test traffic last arrived
+        self.interrupted = False  # the last adopt stepped aside for a test
         self._published = False
 
     # ---- the auditor ----
@@ -121,6 +123,10 @@ class Publisher:
 
     def note_test_traffic(self) -> None:
         self.test_seen = time.monotonic()
+
+    def testing(self) -> bool:
+        """Whether the auditor's test traffic arrived within the last ``TEST_QUIET_S``."""
+        return time.monotonic() - self.test_seen < TEST_QUIET_S
 
     # ---- measuring ----
 
@@ -161,14 +167,17 @@ class Publisher:
             reuse = None if remeasure else stored(targets, self.store)
             if reuse is not None:
                 return reuse, failures
+            if self.testing():
+                raise MeasurementInterrupted()  # a test is running: measuring now would distort both
             measured, failed = await measure_and_store(targets, self.store,
                                                        max_latency_s=cat.audit_policy().max_latency_s, stop=stop)
             return measured, failures | failed
 
     def adopt(self, cat: catalog.Catalog, *, remeasure: bool = False) -> bool:
         """Measure the endpoints ``cat`` serves (or reuse their stored measurements) through the running service and
-        sign a manifest of those measured. A measurement steps aside when the auditor's test traffic arrives. False if
-        none could be measured or the measurement stepped aside; the current manifest stays."""
+        sign a manifest of those measured. A measurement neither starts nor continues while the auditor's test traffic
+        arrives. False if none could be measured or the measurement stepped aside (``interrupted``); the current
+        manifest stays."""
         endpoints = servable(self.config, cat)
         if not endpoints:
             log.error("no configured endpoint serves a model of catalog %s", cat.digest()[:12])
@@ -178,13 +187,13 @@ class Publisher:
         self.serving = previous_serving | {e.endpoint_id for e in endpoints}
         for e in endpoints:
             self.admissions[e.endpoint_id].limit = e.max_concurrency
-        started = time.monotonic()
+        started, self.interrupted = time.monotonic(), False
         try:
             measured, failures = asyncio.run(self._measure(endpoints, cat, remeasure,
                                                            stop=lambda: self.test_seen > started))
         except MeasurementInterrupted:
-            log.info("a throughput test reached the miner; measuring again later")
-            measured, failures = {}, {}
+            log.info("a throughput test is running; measuring again after it")
+            measured, failures, self.interrupted = {}, {}, True
         for endpoint_id, reason in sorted(failures.items()):
             log.error("endpoint %s withdrawn: %s", endpoint_id, reason)
         listed = [e for e in endpoints if e.endpoint_id in measured]
@@ -274,6 +283,16 @@ def resolve_catalog(subtensor: bt.Subtensor, config: MinerConfig) -> catalog.Cat
             time.sleep(60)
 
 
+def adopt_first(publisher: Publisher, cat: catalog.Catalog, *, remeasure: bool,
+                sleep: Callable[[float], None] = time.sleep) -> None:
+    """The first manifest: measure (or reuse the stored measurements), after any running test. Exits if no endpoint
+    can be measured."""
+    while not publisher.adopt(cat, remeasure=remeasure):
+        if not publisher.interrupted:
+            raise SystemExit("no endpoint could be measured")
+        sleep(TEST_QUIET_S)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -317,8 +336,7 @@ def main() -> None:
             raise SystemExit(f"the service could not start on port {config.port}")
         time.sleep(0.1)
 
-    if not publisher.adopt(cat, remeasure=args.remeasure):
-        raise SystemExit("no endpoint could be measured")
+    adopt_first(publisher, cat, remeasure=args.remeasure)
     publisher.publish(subtensor)
     if not args.no_publish:
         publisher.watch()

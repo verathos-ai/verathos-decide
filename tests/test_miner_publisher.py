@@ -81,3 +81,31 @@ def test_capacity_is_measured_through_the_service_and_a_dead_engine_is_withdrawn
         assert {e.endpoint_id: e.capacity_rps for e in publisher.signed.manifest.endpoints} == listed
     finally:
         server.should_exit = True
+
+
+def test_a_test_arriving_at_the_start_delays_the_first_manifest_instead_of_stopping_the_miner(tmp_path) -> None:
+    config = MinerConfig.model_validate({
+        "netuid": 405, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5", "port": 8091,
+        "state_dir": str(tmp_path),
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:9"}]})
+    keypair = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
+    publisher = miner_main.Publisher(config, SimpleNamespace(hotkey=keypair), catalog.load(), publish_on_chain=False,
+                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"))
+    outcomes = iter([(False, True), (False, True), (True, False)])  # (adopted, interrupted)
+
+    def adopt(cat, *, remeasure):
+        adopted, publisher.interrupted = next(outcomes)
+        return adopted
+
+    publisher.adopt, waits = adopt, []
+    miner_main.adopt_first(publisher, catalog.load(), remeasure=False, sleep=waits.append)
+    assert waits == [miner_main.TEST_QUIET_S] * 2
+
+    publisher.adopt = lambda cat, *, remeasure: False
+    publisher.interrupted = False
+    with pytest.raises(SystemExit):
+        miner_main.adopt_first(publisher, catalog.load(), remeasure=False, sleep=waits.append)
+
+    assert not publisher.testing()
+    publisher.note_test_traffic()
+    assert publisher.testing()  # no measurement starts now
