@@ -96,13 +96,27 @@ def signed_answers(response: dict[str, Any], request: dict[str, Any], *, request
     issued to one of ``callers`` for the request with nonce ``request_id``; None otherwise. ``request_sha256`` is the
     request's digest if already known."""
     try:
-        receipt = SignedReceipt.model_validate(response["receipt"])
         answers = response["answers"]
-    except (KeyError, TypeError, ValueError):
+        receipt = issued_receipt(response["receipt"], request_id=request_id, hotkey=hotkey, endpoint_id=endpoint_id,
+                                 model_id=model_id, callers=callers, netuid=netuid, mechid=mechid)
+    except (KeyError, TypeError):
+        return None
+    if receipt is None or not receipt.binds(request, answers, request_sha256=request_sha256):
+        return None
+    return answers
+
+
+def issued_receipt(document: Any, *, request_id: str, hotkey: str, endpoint_id: str, model_id: str,
+                   callers: Collection[str], netuid: int, mechid: int) -> SignedReceipt | None:
+    """The receipt if it is the miner's valid signature for this endpoint and model, issued to one of ``callers`` for
+    the request with nonce ``request_id`` on this subnet; None otherwise. It says nothing about which request and
+    answers it binds (see ``SignedReceipt.binds``)."""
+    try:
+        receipt = SignedReceipt.model_validate(document)
+    except (TypeError, ValueError):
         return None
     r = receipt.receipt
-    bound = (receipt.signature_valid() and receipt.binds(request, answers, request_sha256=request_sha256)
-             and r.miner_hotkey == hotkey
-             and r.endpoint_id == endpoint_id and r.model_id == model_id and r.caller_hotkey in callers
-             and r.request_nonce == request_id and r.netuid == netuid and r.mechid == mechid)
-    return answers if bound else None
+    issued = (receipt.signature_valid() and r.miner_hotkey == hotkey and r.endpoint_id == endpoint_id
+              and r.model_id == model_id and r.caller_hotkey in callers and r.request_nonce == request_id
+              and r.netuid == netuid and r.mechid == mechid)
+    return receipt if issued else None

@@ -2,9 +2,11 @@
 
 For scoring epoch ``E`` the verdicts list the credited capacity of every endpoint in the latest confirmed test of
 epochs ``E - credit_ttl_epochs .. E - 1``, its median latency there, whether it has qualified, and the evidence of a
-wrong answer for every hotkey the auditor proved one against in those tests. Each piece of evidence is the request
-and the miner's response as received (answers and signed receipt), so any validator can check it against its own
-reference.
+wrong answer for every hotkey the auditor proved one against in those epochs. Evidence from a test is the request and
+the miner's response as received (answers and signed receipt), so any validator can check it against its own
+reference. Evidence from a sampled user request carries only the miner's signed receipt: user requests are not
+published, so validators check that the miner answered the gateway and take the auditor's word for the wrongness,
+as they take it for capacity.
 """
 
 from __future__ import annotations
@@ -48,8 +50,8 @@ class Evidence(BaseModel):
     test_id: str  # the test, or "gateway-<request nonce>" for an answer the gateway sampled
     reason: str
     request_id: str  # the receipt's nonce: the test request id, or the gateway's request nonce
-    request: dict[str, Any]
-    response: str  # the response body as received: the answers and the signed receipt
+    request: dict[str, Any]  # the test request; empty for a user request
+    response: str  # the response as received (answers and signed receipt); for a user request, {"receipt": ...}
 
     @property
     def from_gateway(self) -> bool:

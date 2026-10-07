@@ -153,15 +153,17 @@ For scoring epoch `E` the auditor publishes, signed by its hotkey, at `GET /v1/t
   `qualification_tests` confirmed tests with a credit). An endpoint the latest test did not target has no credit,
   so leaving a test out does not keep an older credit;
 - for every hotkey with a wrong answer in those tests or in the gateway answers it checked in those epochs, the
-  evidence of one.
+  evidence of one: from a test, the request and the response as received; from a user request, only the miner's
+  signed receipt (user requests are not published).
 
 The verdicts for the current epoch and the two before are served once their tests are settled (404 otherwise);
 once served, an epoch's verdicts do not change.
 Validators wait up to 5 minutes for them, then use the last verdicts they hold while those still cover a test in
 the window. A validator counts a credit only for the model the endpoint serves now, and at most the capacity it
-declares now. It applies a piece of evidence only if the receipt in it binds the request and the answers to the
-miner's hotkey and, when it runs a reference engine for the model and that engine answers, its own reference also
-proves the answers wrong. Each piece applies once.
+declares now. It applies test evidence only if the receipt in it binds the request and the answers to the miner's
+hotkey and, when it runs a reference engine for the model and that engine answers, its own reference also proves the
+answers wrong; evidence from a user request only if the receipt in it was issued to one of the catalog's gateways,
+taking the auditor's word for the wrongness, as for capacity. Each piece applies once.
 
 How credits and wrong answers enter the score is in `SCORING.md`.
 

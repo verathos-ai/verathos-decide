@@ -21,7 +21,7 @@ import httpx
 
 from verathos import catalog
 from verathos.miner.engine import Engine
-from verathos.protocol.receipts import parse_response, signed_answers
+from verathos.protocol.receipts import issued_receipt, parse_response, signed_answers
 from verathos.throughput import feed
 from verathos.throughput.auditor import Auditor, Slot
 from verathos.throughput.chain import SubtensorChainView
@@ -162,17 +162,27 @@ class Throughput:
 
     async def proven_invalid(self, evidence: list[feed.Evidence], references: dict[str, Engine],
                              cat: catalog.Catalog) -> list[feed.Evidence]:
-        """The evidence this validator accepts: the miner's receipt binds the request and the answers, and the
-        validator's own reference (if it has one for the model and it answers) also proves the answers wrong."""
+        """The evidence this validator accepts. From a test: the miner's receipt binds the request and the answers,
+        and the validator's own reference (if it has one for the model and it answers) also proves the answers wrong.
+        From a sampled user request (not published): the miner's receipt shows it answered one of the catalog's
+        gateways, and the auditor's word stands for the wrongness, as it does for capacity."""
         accepted = []
         for e in evidence:
             model = cat.get(e.model_id)
             response = parse_response(e.response)
-            # A test answer was issued to the auditor, a sampled gateway answer to one of the catalog's gateways.
-            callers = set(cat.gateways) if e.from_gateway else {self.auditor_hotkey}
+            if e.from_gateway:
+                receipt = None if response is None or model is None else issued_receipt(
+                    response.get("receipt"), request_id=e.request_id, hotkey=e.hotkey, endpoint_id=e.endpoint_id,
+                    model_id=e.model_id, callers=set(cat.gateways), netuid=self.netuid, mechid=self.mechid)
+                if receipt is None:
+                    log.warning("evidence against %s/%s rejected: no receipt issued to a gateway", e.hotkey,
+                                e.endpoint_id)
+                else:
+                    accepted.append(e)
+                continue
             answers = None if response is None else signed_answers(
                 response, e.request, request_id=e.request_id, hotkey=e.hotkey, endpoint_id=e.endpoint_id,
-                model_id=e.model_id, callers=callers, netuid=self.netuid, mechid=self.mechid)
+                model_id=e.model_id, callers={self.auditor_hotkey}, netuid=self.netuid, mechid=self.mechid)
             if answers is None or model is None:
                 log.warning("evidence against %s/%s rejected: %s", e.hotkey, e.endpoint_id,
                             "unknown model" if model is None else "the receipt does not bind it")

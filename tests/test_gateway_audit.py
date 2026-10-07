@@ -99,8 +99,13 @@ def test_sampled_gateway_answers_prove_wrong_answers(tmp_path) -> None:
 
     auditor.chain.head_block = 4 * 180 + 1
     auditor.follower.poll()
-    (evidence,) = auditor.verdicts(4).verdicts.invalid
+    published = auditor.verdicts(4)
+    (evidence,) = published.verdicts.invalid
     assert evidence.hotkey == wrong_kp.ss58_address and evidence.from_gateway
+    # user requests are not published, nor kept once checked: the miner's receipt is all that remains
+    assert "billed twice" not in published.model_dump_json() and evidence.request == {}
+    assert set(json.loads(evidence.response)) == {"receipt"}
+    assert all(r == ("{}", "") for r in auditor.store._query("SELECT request, response FROM samples"))
 
     validator = Throughput(netuid=405, mechid=1, policy=AuditPolicy(), auditor_hotkey=auditor.hotkey,
                            chain=auditor.chain)

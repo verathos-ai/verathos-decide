@@ -224,6 +224,7 @@ CREATE INDEX samples_by_endpoint ON samples (hotkey, endpoint_id, epoch);
 CREATE TABLE verdicts (epoch INTEGER PRIMARY KEY, document TEXT NOT NULL);
 """
 # test states: running -> unconfirmed -> confirmed | void
+_SCRUB = "request = '{}', response = ''"  # a user's request and answers are kept only until their check
 # sample states: pending -> checked | skipped (its endpoint's checks for the epoch were done) | unchecked (no
 # reference for the model, its recompute kept failing, or it was not checked within the next epoch). A sample counts
 # (evidence, drift) in the epoch its check finished: verdicts for an epoch depend only on checks finished before it.
@@ -376,8 +377,8 @@ class Store:
         pending samples until ``per_endpoint`` are checked; the rest of a done endpoint's are skipped, and pending
         ones of older epochs given up. -> [(sample_id, gateway, hotkey, endpoint_id, model_id, request_id, request,
         response)]"""
-        self._query("UPDATE samples SET state = 'unchecked', reason = 'not checked within the next epoch' "
-                    "WHERE state = 'pending' AND epoch < ?", (epoch - 1,))
+        self._query(f"UPDATE samples SET state = 'unchecked', reason = 'not checked within the next epoch', "
+                    f"{_SCRUB} WHERE state = 'pending' AND epoch < ?", (epoch - 1,))
         rows = self._query("SELECT sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, request, "
                            "response, proof FROM samples WHERE state = 'pending'")
         checked = {(hk, ep, e): n for hk, ep, e, n in self._query(
@@ -396,7 +397,8 @@ class Store:
                 rest = [r[0] for r in pending if r not in picked]
                 if rest:
                     marks = ",".join("?" * len(rest))
-                    self._query(f"UPDATE samples SET state = 'skipped' WHERE sample_id IN ({marks})", rest)
+                    self._query(f"UPDATE samples SET state = 'skipped', {_SCRUB} WHERE sample_id IN ({marks})",
+                                rest)
         return [(r[0], r[2], r[3], r[4], r[5], r[6], r[7], r[8]) for r in chosen]
 
     def failed_check(self, sample_id: str) -> None:
@@ -404,11 +406,12 @@ class Store:
         self._query("UPDATE samples SET attempts = attempts + 1, state = CASE WHEN attempts + 1 >= ? THEN 'unchecked' "
                     "ELSE state END, reason = CASE WHEN attempts + 1 >= ? THEN 'its recompute kept failing' "
                     "ELSE reason END WHERE sample_id = ?", (MAX_CHECK_ATTEMPTS, MAX_CHECK_ATTEMPTS, sample_id))
+        self._query(f"UPDATE samples SET {_SCRUB} WHERE sample_id = ? AND state = 'unchecked'", (sample_id,))
 
     def finish_sample(self, sample_id: str, state: str, reason: str = "", evidence: Evidence | None = None,
                       drift_sum: float = 0.0, drift_count: int = 0, *, checked_epoch: int | None = None) -> None:
-        self._query("UPDATE samples SET state = ?, reason = ?, evidence = ?, drift_sum = ?, drift_count = ?, "
-                    "checked_epoch = ? WHERE sample_id = ?",
+        self._query(f"UPDATE samples SET state = ?, reason = ?, evidence = ?, drift_sum = ?, drift_count = ?, "
+                    f"checked_epoch = ?, {_SCRUB} WHERE sample_id = ?",
                     (state, reason, evidence.model_dump_json() if evidence else None, drift_sum, drift_count,
                      checked_epoch, sample_id))
 
@@ -751,10 +754,10 @@ class Auditor:
                     self.store.failed_check(sample_id)
                 return
             done_epoch = self.follower.head // self.policy.epoch_blocks
-            evidence = None if fault is None else Evidence(
+            evidence = None if fault is None else Evidence(  # user requests are not published: the receipt only
                 hotkey=hotkey, endpoint_id=endpoint_id, model_id=model_id,
-                test_id=f"{GATEWAY_EVIDENCE}-{request_id}", reason=fault, request_id=request_id, request=request,
-                response=response)
+                test_id=f"{GATEWAY_EVIDENCE}-{request_id}", reason=fault, request_id=request_id, request={},
+                response=json.dumps({"receipt": json.loads(response)["receipt"]}))
             self.store.finish_sample(sample_id, "checked", fault or "", evidence,
                                      comparison.sum_abs if comparison else 0.0, comparison.count if comparison else 0,
                                      checked_epoch=done_epoch)

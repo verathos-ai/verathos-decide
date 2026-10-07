@@ -53,8 +53,9 @@ traffic. To keep it from answering users with a cheaper model, the gateway keeps
 sampling window (`sample_window_s`, 10 minutes), drawn uniformly from the window's answers after they are in, and
 sends the window's picks to the auditor. The auditor keeps up to 8 per endpoint and epoch and recomputes a random
 `gateway_checks_per_epoch` (2) of them, between tests:
-- a wrong answer is evidence, like one in a throughput test: every validator checks the receipt (issued to a catalog
-  gateway) and its own reference, and the hotkey is reset and put on probation (`SCORING.md`);
+- a wrong answer is evidence: the auditor publishes the miner's signed receipt (not the request), every validator
+  checks that the receipt was issued to a catalog gateway, and the hotkey is reset and put on probation
+  (`SCORING.md`);
 - the differences are tallied per endpoint over the last `drift_window_tests` epochs, apart from the test answers'
   tally, so correct test answers do not hide drifted answers to users; beyond the model's `mean_abs`, the endpoint's
   credit is removed (and with it its routes).
@@ -65,6 +66,15 @@ a post fails.
 The gateway also reports, every 5 s, how many requests each endpoint answered it per second. Miners serve the gateway
 before the auditor's test traffic; what an endpoint answers the gateway inside a test's measured window counts as
 delivered, so serving users never costs a miner credit (`THROUGHPUT_AUDIT.md`).
+
+## Privacy of user requests
+
+A user's request is seen by the gateway, by the miner that answers it, and, for the few sampled ones, by the auditor
+until their check: the auditor then deletes the request and the answers and keeps only the miner's receipt (hashes of
+the request and the answers) and the differences it measured. Nothing a user sent is published: evidence of a wrong
+answer to a user carries only the receipt. Validators check that the miner answered the gateway and take the
+auditor's word for the wrongness, as they take it for capacity; test evidence, whose requests are synthetic, stays
+fully checkable by every validator.
 
 ## Routes
 
