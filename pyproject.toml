@@ -17,7 +17,10 @@ dependencies = [
 [project.optional-dependencies]
 server = ["fastapi>=0.115", "uvicorn>=0.30", "httpx>=0.27"]
 chain = ["bittensor==10.3.2"]
-test = ["pytest>=8", "fastapi>=0.115", "httpx>=0.27"]
+gateway = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "httpx>=0.27", "sqlalchemy[asyncio]>=2.0", "asyncpg>=0.29",
+           "aiosqlite>=0.20", "alembic>=1.13", "prometheus-client>=0.20"]
+test = ["pytest>=8", "fastapi>=0.115", "httpx>=0.27", "sqlalchemy[asyncio]>=2.0", "aiosqlite>=0.20", "alembic>=1.13",
+        "prometheus-client>=0.20"]
 ops = ["keyring>=25", "secretstorage>=3.3"]
 clef = ["torch>=2.10,<2.11", "torchvision", "transformers>=5.10,<6", "huggingface_hub", "accelerate", "safetensors",
         "pillow", "fastapi>=0.115", "uvicorn>=0.30"]
@@ -28,6 +31,7 @@ verathos-validator = "verathos.validator.__main__:main"
 verathos-build-loadgen = "verathos.throughput.loadgen:build"
 verathos-subnet = "verathos.subnet.admin:main"
 verathos-engine = "verathos.engine.__main__:main"
+verathos-gateway = "verathos.gateway.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -35,6 +39,7 @@ include = ["verathos*"]
 
 [tool.setuptools.package-data]
 "verathos.catalog" = ["catalog.json"]
+"verathos.gateway.migrations" = ["script.py.mako"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

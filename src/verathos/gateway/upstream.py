@@ -1,0 +1,85 @@
+"""Signed requests to miners, and the checks on their responses.
+
+The request is signed with the gateway's hotkey for the endpoint's miner (``protocol.requests``). A response counts
+only as a JSON object within ``MAX_RESPONSE_BYTES`` whose receipt is the miner's signature over this request and
+these answers, issued to this gateway for this request's nonce, with well-formed answers. Well-formed answers the
+miner signed are what the auditor can recompute; signed malformed answers are proof on their own.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlsplit
+
+import httpx
+from bittensor_wallet import Keypair
+
+from verathos.protocol.api import MAX_RESPONSE_BYTES, SystemOneRequest, well_formed
+from verathos.protocol.gateway import Route
+from verathos.protocol.receipts import parse_response, signed_answers
+from verathos.protocol.requests import HDR_NONCE, sign_request
+
+
+@dataclass(frozen=True)
+class Exchange:
+    route: Route
+    request: dict[str, Any]
+    response: str  # the response body as received
+    answers: dict[str, Any]
+    usage: dict[str, Any] | None
+    receipt: dict[str, Any]
+
+
+class UpstreamFailure(Exception):
+    """An attempt at a miner that produced no usable answer. ``busy``: the miner refused for capacity (not its
+    fault); ``exchange``: signed malformed answers, proof against the miner."""
+
+    def __init__(self, kind: str, detail: str = "", *, exchange: Exchange | None = None) -> None:
+        super().__init__(f"{kind}: {detail}" if detail else kind)
+        self.kind, self.exchange = kind, exchange
+
+    @property
+    def busy(self) -> bool:
+        return self.kind == "busy"
+
+
+class Upstream:
+    def __init__(self, keypair: Keypair, client: httpx.AsyncClient, *, netuid: int, mechid: int) -> None:
+        self.keypair, self.client, self.netuid, self.mechid = keypair, client, netuid, mechid
+        self.hotkey = keypair.ss58_address
+
+    async def call(self, route: Route, request: dict[str, Any], body: bytes, parsed: SystemOneRequest,
+                   timeout_s: float) -> Exchange:
+        """One attempt at ``route``. Raises UpstreamFailure."""
+        url = route.url + "/v1/systemone"
+        headers = {"Content-Type": "application/json",
+                   **sign_request(self.keypair, "POST", urlsplit(url).path, body, route.hotkey)}
+        try:
+            async with asyncio.timeout(timeout_s):
+                async with self.client.stream("POST", url, content=body, headers=headers) as r:
+                    if r.status_code in (429, 503):
+                        raise UpstreamFailure("busy", str(r.status_code))
+                    if r.status_code != 200:
+                        raise UpstreamFailure("status", str(r.status_code))
+                    raw = bytearray()
+                    async for chunk in r.aiter_bytes():
+                        raw += chunk
+                        if len(raw) > MAX_RESPONSE_BYTES:
+                            raise UpstreamFailure("too_large")
+        except TimeoutError:
+            raise UpstreamFailure("timeout") from None
+        except httpx.HTTPError as exc:
+            raise UpstreamFailure("connect", type(exc).__name__) from None
+        text = raw.decode("utf-8", errors="replace")
+        response = parse_response(text)
+        answers = None if response is None else signed_answers(
+            response, request, request_id=headers[HDR_NONCE], hotkey=route.hotkey, endpoint_id=route.endpoint_id,
+            model_id=route.model_id, callers={self.hotkey}, netuid=self.netuid, mechid=self.mechid)
+        if answers is None:
+            raise UpstreamFailure("receipt", "no receipt binding this request and these answers")
+        exchange = Exchange(route, request, text, answers, response.get("usage"), response["receipt"])
+        if not well_formed(parsed, answers):
+            raise UpstreamFailure("malformed", "signed malformed answers", exchange=exchange)
+        return exchange

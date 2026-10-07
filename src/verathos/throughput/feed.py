@@ -9,8 +9,6 @@ reference.
 
 from __future__ import annotations
 
-import json
-from collections.abc import Collection
 from typing import Any
 
 import httpx
@@ -19,14 +17,12 @@ from pydantic import BaseModel, Field
 
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
-from verathos.protocol.api import MAX_RESPONSE_BYTES, Distribution, distributions
+from verathos.protocol.api import Distribution, distributions
 from verathos.protocol.http import request_json
-from verathos.protocol.receipts import SignedReceipt
 from verathos.validator.compare import RequestComparison, Tolerance, compare_request
 
 VERDICTS_PATH = "/v1/throughput/{epoch}"
 VERDICTS_DOMAIN = "verathos/throughput-verdicts/v1"
-MAX_JSON_DEPTH = 32  # nor one nested deeper
 MAX_VERDICTS_BYTES = 32 << 20  # at most one piece of evidence per hotkey
 MALFORMED = "malformed answers"
 
@@ -100,42 +96,6 @@ async def fetch(client: httpx.AsyncClient, auditor_url: str | None, *, auditor_h
     if (v.auditor, v.netuid, v.epoch) != (auditor_hotkey, netuid, epoch):
         raise VerdictsUnavailable("verdicts are for another auditor, netuid or epoch")
     return v
-
-
-def parse_response(text: str) -> dict[str, Any] | None:
-    """A response body as a JSON object, or None if it is not one, or too large or too deeply nested to be an
-    answer."""
-    if len(text) > MAX_RESPONSE_BYTES:
-        return None
-    try:
-        value = json.loads(text)
-    except (ValueError, RecursionError):
-        return None
-    return value if isinstance(value, dict) and _depth(value) <= MAX_JSON_DEPTH else None
-
-
-def _depth(value: Any) -> int:
-    if isinstance(value, dict):
-        return 1 + max(map(_depth, value.values()), default=0)
-    if isinstance(value, list):
-        return 1 + max(map(_depth, value), default=0)
-    return 0
-
-
-def signed_answers(response: dict[str, Any], request: dict[str, Any], *, request_id: str, hotkey: str,
-                   endpoint_id: str, model_id: str, callers: Collection[str], netuid: int, mechid: int) -> Any:
-    """The answers of a response if its receipt is the miner's signature over exactly this request and these answers,
-    issued to one of ``callers`` for the request with nonce ``request_id``; None otherwise."""
-    try:
-        receipt = SignedReceipt.model_validate(response["receipt"])
-        answers = response["answers"]
-    except (KeyError, TypeError, ValueError):
-        return None
-    r = receipt.receipt
-    bound = (receipt.signature_valid() and receipt.binds(request, answers) and r.miner_hotkey == hotkey
-             and r.endpoint_id == endpoint_id and r.model_id == model_id and r.caller_hotkey in callers
-             and r.request_nonce == request_id and r.netuid == netuid and r.mechid == mechid)
-    return answers if bound else None
 
 
 def readable(answers: Any) -> dict[str, Distribution] | None:

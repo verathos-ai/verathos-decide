@@ -115,3 +115,14 @@ def distributions(answers: Any) -> dict[str, Distribution]:
     if not isinstance(answers, dict):
         raise ValueError("answers must be an object")
     return {qid: answer_distribution(a) for qid, a in answers.items()}
+
+
+def well_formed(request: SystemOneRequest, answers: Any) -> bool:
+    """Whether the answers give one valid distribution per question, over the question's own options. A miner signs
+    nothing else: a signed malformed answer counts as a wrong answer."""
+    try:
+        got = distributions(answers)
+    except Exception:
+        return False
+    return set(got) == set(request.questions) and all(set(got[qid]) == set(question_keys(q))
+                                                       for qid, q in request.questions.items())

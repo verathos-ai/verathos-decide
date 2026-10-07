@@ -53,6 +53,7 @@ from verathos import catalog as catalog_module
 from verathos.miner.engine import Engine
 from verathos.protocol.api import MAX_RESPONSE_BYTES
 from verathos.protocol.gateway import GatewaySample, Route, Routes, SignedRoutes
+from verathos.protocol.receipts import parse_response, signed_answers
 from verathos.protocol.status import ThroughputOutcome
 from verathos.throughput import loadgen
 from verathos.throughput.chain import SubtensorChainView
@@ -65,10 +66,8 @@ from verathos.throughput.feed import (
     SignedVerdicts,
     Verdicts,
     fault_of,
-    parse_response,
     readable,
     recompute,
-    signed_answers,
 )
 from verathos.throughput.follow import POLL_S, ScheduleFollower
 from verathos.throughput.policy import AuditPolicy, ScheduledTest, Session, session_headers

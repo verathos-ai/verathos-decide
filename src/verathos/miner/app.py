@@ -28,7 +28,7 @@ from verathos.miner.admission import Admission
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
-from verathos.protocol.api import SystemOneRequest, distributions, question_keys
+from verathos.protocol.api import SystemOneRequest, well_formed
 from verathos.protocol.canonical import canonical_json, digest
 from verathos.protocol.manifest import SignedManifest
 from verathos.protocol.receipts import Receipt, SignedReceipt
@@ -229,13 +229,3 @@ def create_app(
 
     return app
 
-
-def well_formed(request: SystemOneRequest, answers: Any) -> bool:
-    """Whether the answers give one valid distribution per question, over the question's own options. The miner signs
-    nothing else: a signed malformed answer counts as a wrong answer."""
-    try:
-        got = distributions(answers)
-    except Exception:
-        return False
-    return set(got) == set(request.questions) and all(set(got[qid]) == set(question_keys(q))
-                                                       for qid, q in request.questions.items())

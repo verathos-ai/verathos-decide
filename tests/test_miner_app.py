@@ -165,8 +165,7 @@ def test_states_longer_than_the_model_accepts_are_refused(setup) -> None:
 
 
 def test_the_miner_signs_only_well_formed_answers() -> None:
-    from verathos.miner.app import well_formed
-    from verathos.protocol.api import SystemOneRequest
+    from verathos.protocol.api import SystemOneRequest, well_formed
 
     request = SystemOneRequest.model_validate(REQUEST)
     good = asyncio.run(MockEngine("kev-4b").answer(REQUEST))["answers"]
