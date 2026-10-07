@@ -2,8 +2,8 @@
 
 Validators that run a service (the subnet owner and the throughput auditor) serve it read-only at
 ``GET /v1/status/{hotkey}``, together with the hotkey's recent throughput-test results when the validator is the
-auditor. Miners poll it and log it. It is that validator's own view; every validator scores the same way from the
-same rules.
+auditor, and every hotkey's at ``GET /v1/network`` (for network dashboards). Miners poll it and log it. It is that
+validator's own view; every validator scores the same way from the same rules.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Collection
 
-from verathos.protocol.status import EndpointStatus, HotkeyStatus
+from verathos.protocol.status import EndpointStatus, HotkeyStatus, NetworkStatus
 from verathos.validator.audit import EndpointResult
 from verathos.validator.discovery import DiscoveredEndpoint
 from verathos.validator.scoring import ScoreState, windowed_verdict
@@ -20,8 +20,9 @@ from verathos.validator.scoring import ScoreState, windowed_verdict
 def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint], results: dict[str, EndpointResult],
           scores: dict[str, float], failed: Collection[str], invalid_hotkeys: Collection[str],
           credited: dict[str, float], scored_models: Collection[str], state: ScoreState,
-          model_shares: dict[str, float] | None = None) -> dict[str, HotkeyStatus]:
-    """Status per hotkey after ``update`` has folded the epoch into ``state``."""
+          model_shares: dict[str, float] | None = None,
+          weights: dict[int, float] | None = None) -> dict[str, HotkeyStatus]:
+    """Status per hotkey after ``update`` has folded the epoch into ``state``; ``weights``: per UID, as set."""
     out: dict[str, HotkeyStatus] = {}
     for ep in endpoints:
         key, r = ep.key, results.get(ep.key)
@@ -46,8 +47,9 @@ def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint],
             status.state = "candidate"
         elif not r.identity_ok or not r.answered:
             status.state = "unanswered"
-        out.setdefault(ep.hotkey, HotkeyStatus(hotkey=ep.hotkey, epoch=epoch, epoch_blocks=epoch_blocks,
-                                               endpoints=[], model_shares=model_shares or {})).endpoints.append(status)
+        out.setdefault(ep.hotkey, HotkeyStatus(
+            hotkey=ep.hotkey, uid=ep.uid, weight=round((weights or {}).get(ep.uid, 0.0), 6), epoch=epoch,
+            epoch_blocks=epoch_blocks, endpoints=[], model_shares=model_shares or {})).endpoints.append(status)
     return out
 
 
@@ -65,3 +67,10 @@ class StatusBoard:
     def get(self, hotkey: str) -> HotkeyStatus | None:
         with self._lock:
             return self._by_hotkey.get(hotkey)
+
+    def network(self) -> NetworkStatus:
+        with self._lock:
+            hotkeys = sorted(self._by_hotkey.values(), key=lambda h: (h.uid is None, h.uid, h.hotkey))
+        first = hotkeys[0] if hotkeys else None
+        return NetworkStatus(epoch=first.epoch if first else None, epoch_blocks=first.epoch_blocks if first else None,
+                             model_shares=first.model_shares if first else {}, hotkeys=hotkeys)

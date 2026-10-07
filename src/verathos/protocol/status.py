@@ -1,4 +1,5 @@
-"""Endpoint status as validators serve it (``GET /v1/status/{hotkey}``) and miners read it."""
+"""Endpoint status as validators serve it (``GET /v1/status/{hotkey}``, ``GET /v1/network`` for every hotkey)
+and miners read it."""
 
 from __future__ import annotations
 
@@ -7,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 STATUS_PATH = "/v1/status/{hotkey}"
+NETWORK_PATH = "/v1/network"
 
 State = Literal["scored", "qualifying", "candidate", "failed", "invalid", "probation", "unanswered", "not_audited"]
 
@@ -46,8 +48,19 @@ class ThroughputOutcome(BaseModel):
 
 class HotkeyStatus(BaseModel):
     hotkey: str
+    uid: int | None = None
+    weight: float = 0.0  # the UID's share of the weights the validator set after the epoch
     epoch: int | None = None  # None: the validator has not scored the hotkey yet (test outcomes only)
     epoch_blocks: int | None = None
     endpoints: list[EndpointStatus] = []
     tests: list[ThroughputOutcome] = []
     model_shares: dict[str, float] = {}  # each active model's share of the epoch's emission
+
+
+class NetworkStatus(BaseModel):
+    """Every hotkey's status in the validator's last scored epoch."""
+
+    epoch: int | None = None
+    epoch_blocks: int | None = None
+    model_shares: dict[str, float] = {}
+    hotkeys: list[HotkeyStatus] = []

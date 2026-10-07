@@ -3,8 +3,8 @@
 The subnet owner's validator serves catalogs by digest (``GET /v1/catalog/{digest}``) so miners and validators can
 fetch a newly committed catalog; as the throughput auditor it serves its signed verdicts
 (``GET /v1/throughput/{epoch}``), and to the subnet's gateways the routes and the intake for sampled exchanges
-(``protocol.gateway``). It serves each hotkey's status (``GET /v1/status/{hotkey}``, see ``validator.status``). Other
-validators run no service.
+(``protocol.gateway``). It serves each hotkey's status (``GET /v1/status/{hotkey}``, see ``validator.status``) and all
+of them at once (``GET /v1/network``). Other validators run no service.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from verathos.protocol.gateway import (
     ServedReport,
 )
 from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, verify_request
-from verathos.protocol.status import STATUS_PATH, HotkeyStatus
+from verathos.protocol.status import NETWORK_PATH, STATUS_PATH, HotkeyStatus
 from verathos.subnet.chain import serve_axon
 from verathos.throughput.auditor import Auditor
 from verathos.throughput.feed import VERDICTS_PATH
@@ -59,6 +59,12 @@ def add_status_route(app: FastAPI, board: StatusBoard, auditor: Auditor | None) 
             epoch = auditor.follower.head // auditor.policy.epoch_blocks
             status = status.model_copy(update={"tests": auditor.outcomes(hotkey, epoch)})
         return status.model_dump()
+
+
+def add_network_route(app: FastAPI, board: StatusBoard) -> None:
+    @app.get(NETWORK_PATH)
+    def get_network():
+        return JSONResponse(board.network().model_dump(), headers={"Cache-Control": "public, max-age=30"})
 
 
 def add_verdicts_route(app: FastAPI, auditor: Auditor) -> None:
@@ -146,6 +152,7 @@ def start_service(*, st: bt.Subtensor, wallet: bt.Wallet, netuid: int, public_ho
                   gateways: Callable[[], Collection[str]] = frozenset) -> None:
     app = FastAPI(title="verathos validator", docs_url=None, redoc_url=None, openapi_url=None)
     add_status_route(app, board, auditor)
+    add_network_route(app, board)
 
     if store is not None:
         @app.get(CATALOG_PATH)

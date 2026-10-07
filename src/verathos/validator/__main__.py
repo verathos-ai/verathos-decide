@@ -167,13 +167,15 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                  key, r.tally.verdict().value, r.answered, r.sent, r.identity_ok, r.tally.mean_abs,
                  credited.get(key, 0.0), proven.user_availability.get(key, 1.0), scores.get(key, 0.0),
                  f" errors={sorted(set(r.errors))}" if r.errors else "")
+    uid_weights = weights(state, hotkey_of_uid)
     board.publish(status.build(
         epoch=epoch, epoch_blocks=cat.epoch_blocks, endpoints=endpoints, results=results, scores=scores, failed=failed,
         invalid_hotkeys=invalid_hotkeys, credited=credited,
-        scored_models={m.model_id for m in cat.models if m.status == "active"}, state=state, model_shares=shares))
+        scored_models={m.model_id for m in cat.models if m.status == "active"}, state=state, model_shares=shares,
+        weights=uid_weights))
     # The epoch is scored; a failure from here on must not run it again.
     try:
-        set_weights(cfg, st, wallet, weights(state, hotkey_of_uid), hotkey_of_uid)
+        set_weights(cfg, st, wallet, uid_weights, hotkey_of_uid)
     except Exception:
         log.exception("setting weights failed this epoch")
 

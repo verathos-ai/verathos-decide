@@ -141,9 +141,10 @@ recent test; without any, no endpoint has proven capacity that epoch. In `observ
 capacities, up to the model's `first_test_rps`, and fetches nothing.
 
 Validators that run a service (the subnet owner's and the auditor's) also serve each hotkey's status for its miners
-at `GET /v1/status/<hotkey>`: per endpoint the state in the last epoch (scored, qualifying, candidate, failed,
-invalid, probation), its checks, declared and proven capacity and scores, and the auditor's recent test results for
-the hotkey.
+at `GET /v1/status/<hotkey>`: the UID and its share of the weights set, per endpoint the state in the last epoch
+(scored, qualifying, candidate, failed, invalid, probation), its checks, declared and proven capacity and scores, and
+the auditor's recent test results for the hotkey. `GET /v1/network` serves every hotkey's status of the last epoch at
+once (without the test results), for network dashboards.
 
 If the validator's hotkey is the auditor, it also:
 - serves the verdicts on `port` and points its axon at `public_host:port`, where miners and validators find it;

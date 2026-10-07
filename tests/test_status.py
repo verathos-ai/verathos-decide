@@ -33,7 +33,8 @@ def test_each_endpoint_gets_one_state() -> None:
     credited = {k: 45.0 for k in results if k != "hkA/new"}
     board = status.build(epoch=13, epoch_blocks=180, endpoints=list(eps.values()), results=results,
                          scores={"hkA/ok": 45.0}, failed={"hkA/failed", "hkB/gpu0"}, invalid_hotkeys={"hkB"},
-                         credited=credited, scored_models={"kev-4b"}, state=state)
+                         credited=credited, scored_models={"kev-4b"}, state=state, weights={1: 0.75})
+    assert (board["hkA"].uid, board["hkA"].weight) == (1, 0.75)
     states = {e.endpoint_id: e.state for e in board["hkA"].endpoints}
     assert states == {"ok": "scored", "new": "qualifying", "cand": "candidate", "failed": "failed",
                       "probe": "probation", "noref": "not_audited"}
@@ -105,3 +106,26 @@ def test_status_route_serves_the_board_and_tests() -> None:
     got = HotkeyStatus.model_validate(client.get(STATUS_PATH.format(hotkey="hkA")).json())
     assert got.epoch == 5 and got.tests[0].epoch == 4
     assert HotkeyStatus.model_validate(client.get(STATUS_PATH.format(hotkey="hkB")).json()).epoch is None
+
+
+def test_network_route_serves_every_hotkey_of_the_last_epoch() -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from verathos.protocol.status import NETWORK_PATH, NetworkStatus
+    from verathos.validator.service import add_network_route
+    from verathos.validator.status import StatusBoard
+
+    board = StatusBoard()
+    app = FastAPI()
+    add_network_route(app, board)
+    client = TestClient(app)
+    assert NetworkStatus.model_validate(client.get(NETWORK_PATH).json()).hotkeys == []  # nothing scored yet
+    board.publish({"hkB": HotkeyStatus(hotkey="hkB", uid=7, weight=0.4, epoch=5, epoch_blocks=180,
+                                       model_shares={"kev-4b": 1.0}),
+                   "hkA": HotkeyStatus(hotkey="hkA", uid=2, weight=0.6, epoch=5, epoch_blocks=180,
+                                       model_shares={"kev-4b": 1.0})})
+    response = client.get(NETWORK_PATH)
+    got = NetworkStatus.model_validate(response.json())
+    assert (got.epoch, got.model_shares, [h.uid for h in got.hotkeys]) == (5, {"kev-4b": 1.0}, [2, 7])
+    assert response.headers["cache-control"] == "public, max-age=30"
