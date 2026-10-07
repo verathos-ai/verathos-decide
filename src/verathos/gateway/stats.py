@@ -47,12 +47,17 @@ class ModelStats:
         counts = self._minute(model)
         counts[2] = counts[2] or unavailable
 
-    def success_rate(self, model: str, minutes: int) -> float | None:
+    def requests(self, model: str, minutes: int) -> tuple[int, int]:
+        """(answered, failed) user requests in the last ``minutes``."""
         now = int(self.clock() // 60)
         answered = failed = 0
         for minute, counts in self._minutes.get(model, {}).items():
             if minute > now - minutes:
                 answered, failed = answered + counts[0], failed + counts[1]
+        return answered, failed
+
+    def success_rate(self, model: str, minutes: int) -> float | None:
+        answered, failed = self.requests(model, minutes)
         return None if answered + failed < MIN_REQUESTS else round(answered / (answered + failed), 4)
 
     def summary(self, model: str) -> dict[str, Any]:
@@ -67,6 +72,7 @@ class ModelStats:
                 "p50": round(1000 * recent[len(recent) // 2]), "p95": round(1000 * recent[int(len(recent) * 0.95)]),
                 "window_s": LATENCY_WINDOW_S},
             "success_rate_1h": self.success_rate(model, 60),
+            "requests_1h": sum(self.requests(model, 60)),
             "availability_24h": None if not minutes else round(
                 sum(1 for counts in minutes.values() if not counts[2]) / len(minutes), 4),
         }

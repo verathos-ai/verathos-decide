@@ -186,7 +186,10 @@ def test_monthly_quota_and_bad_requests(tmp_path) -> None:
     assert asyncio.run(s.post()).json()["error"]["type"] == "quota_exceeded"
 
     t = Setup(tmp_path / "other", {"10.0.0.1": MockEngine("kev-4b")})
-    assert asyncio.run(t.post({"model": "kev-4b"})).json()["error"]["type"] == "invalid_request"
+    invalid = asyncio.run(t.post({"model": "kev-4b"})).json()["error"]
+    assert (invalid["type"], invalid["message"]) == ("invalid_request",
+                                                     "not a SystemOne request: state: Field required (and 1 more)")
+    assert "pydantic" not in asyncio.run(t.post({"model": "kev-4b", "questions": {"q": {"type": "nope"}}})).text
     assert asyncio.run(t.post({**REQUEST, "model": "clef-flash"})).json()["error"]["type"] == "model_not_found"
     gone = asyncio.run(t.post({**REQUEST, "model": "kev-9b"}))  # active, but nobody serves it now: try again later
     assert gone.status_code == 503 and gone.json()["error"]["type"] == "unavailable" and "Retry-After" in gone.headers
@@ -233,7 +236,7 @@ def test_the_status_says_per_model_what_users_get(tmp_path) -> None:
     assert response.headers["cache-control"] == "public, max-age=15"
     assert (kev4["state"], kev4["endpoints"], kev4["capacity_rps"]) == ("operational", 2, 40.0)
     assert kev4["latency_ms"]["p50"] >= 0 and kev4["latency_ms"]["window_s"] == 900
-    assert kev4["success_rate_1h"] is None  # under 20 requests: no rate yet
+    assert kev4["success_rate_1h"] is None and kev4["requests_1h"] == 5  # under 20 requests: no rate yet
     assert models["kev-9b"]["state"] == "unavailable" and models["kev-9b"]["latency_ms"] is None
     for host in ("10.0.0.1", "10.0.0.2"):  # the miners' host dies
         s.client._transport._t[host] = Unreachable()

@@ -169,6 +169,14 @@ NO_ANSWER = {  # why a forwarded request got no answer -> the API error
 }
 
 
+def validation_message(exc: ValidationError) -> str:
+    """The first problem of a validation error, short: where and what (no input echo, no documentation link)."""
+    first = exc.errors(include_url=False, include_input=False)[0]
+    where = ".".join(str(part) for part in first["loc"])
+    more = f" (and {exc.error_count() - 1} more)" if exc.error_count() > 1 else ""
+    return f"{where + ': ' if where else ''}{first['msg']}{more}"[:300]
+
+
 def check_request(g: Gateway, body: bytes) -> Checked:
     """A body the gateway can forward: strict JSON, a SystemOne request for an active model miners serve now, within
     the model's state limit and with answers that fit a response. Raises Rejected."""
@@ -177,8 +185,10 @@ def check_request(g: Gateway, body: bytes) -> Checked:
         parsed = SystemOneRequest.model_validate(raw)
         request_sha256 = digest(raw)
         state = parsed.state if isinstance(parsed.state, str) else canonical_json(parsed.state).decode()
-    except (ValueError, TypeError, RecursionError, ValidationError) as exc:
-        raise Rejected(400, "invalid_request", f"not a SystemOne request: {exc}"[:2000]) from None
+    except ValidationError as exc:
+        raise Rejected(400, "invalid_request", f"not a SystemOne request: {validation_message(exc)}") from None
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise Rejected(400, "invalid_request", f"not a SystemOne request: {exc}"[:500]) from None
     cat = g.catalog()
     model = cat.get(parsed.model) if cat is not None else None
     if model is None or model.status != "active":
