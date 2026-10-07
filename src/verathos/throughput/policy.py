@@ -49,7 +49,6 @@ class AuditPolicy:
     """The ``throughput_audit`` settings of the catalog."""
 
     mode: str = "enforce"  # enforce | observe (emergency switch: declared capacities count, nothing is gated)
-    auditor_hotkey: str = ""  # empty: the subnet owner
     epoch_blocks: int = 180  # the catalog's epoch length
     lead_blocks: int = 5
     max_latency_s: float = 2.0  # the miner declares capacity only at concurrencies answering within this

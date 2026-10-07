@@ -4,9 +4,9 @@ A validator discovers miners from chain state, sends every endpoint a few canary
 answers with its own reference computation, and sets weights on mechanism 1. How answers are compared and scored
 is in `SCORING.md`.
 
-Every validator takes part in the throughput audit (`THROUGHPUT_AUDIT.md`). The validator whose hotkey is the
-auditor (the subnet owner unless the catalog names another hotkey) runs the tests; every other validator applies
-the auditor's signed verdicts. Each validator finds its role at startup from the catalog and the chain.
+Every validator takes part in the throughput audit (`THROUGHPUT_AUDIT.md`). The subnet owner's validator is the
+auditor and runs the tests; every other validator applies the auditor's signed verdicts. Each validator finds its
+role at startup from the chain.
 
 ## Requirements
 
@@ -94,8 +94,7 @@ the same ones.
 .venv/bin/verathos-validator --config validator.json
 ```
 
-Run it under a supervisor (systemd, pm2) that restarts it: when a new catalog names another auditor, the validator
-exits (code 3) to take its new role on restart.
+Run it under a supervisor (systemd, pm2) that restarts it.
 
 Per epoch (`epoch_blocks` from the catalog, default 180 blocks) the validator:
 1. uses the catalog the subnet owner commits (shipped copy, local store, owner's axon, mirrors; any copy is

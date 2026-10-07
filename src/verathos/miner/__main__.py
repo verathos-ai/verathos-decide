@@ -46,7 +46,7 @@ from verathos.throughput.measure import (
     stored,
     wait_ready,
 )
-from verathos.throughput.policy import BLOCK_TIME_S, POLICY_WATCH_S
+from verathos.throughput.policy import POLICY_WATCH_S
 
 log = logging.getLogger("verathos.miner")
 LOCAL_HOSTS = {"0.0.0.0": "127.0.0.1", "": "127.0.0.1", "::": "::1"}
@@ -110,26 +110,14 @@ class Publisher:
         self.signed = self._last_published() or build_manifest(
             config, endpoints, dict.fromkeys((e.endpoint_id for e in endpoints), 0.0), wallet.hotkey, cat.digest())
         self.serving = {e.endpoint_id for e in endpoints}
-        self._auditors: dict[str, float] = {}  # hotkey -> accepted until (monotonic); the current one: forever
-        self._set_auditor(self._auditor(subtensor))
+        self.auditor = subtensor.get_subnet_owner_hotkey(config.netuid)  # the subnet owner's validator runs tests
         self.test_seen = 0.0  # monotonic time the auditor's test traffic last arrived
         self._published = False
-        self.on_catalog: list[Callable[[catalog.Catalog], None]] = []
 
     # ---- the auditor ----
 
-    def _auditor(self, st: bt.Subtensor) -> str:
-        return self.catalog.audit_policy().auditor_hotkey or st.get_subnet_owner_hotkey(self.config.netuid)
-
-    def _set_auditor(self, hotkey: str) -> None:
-        """A new auditor is accepted at once; the previous one for one more epoch, while validators switch."""
-        grace = time.monotonic() + self.catalog.epoch_blocks * BLOCK_TIME_S
-        self._auditors = {h: grace if until == float("inf") else until for h, until in self._auditors.items()
-                          if until > time.monotonic()} | {hotkey: float("inf")}
-
     def auditors(self) -> set[str]:
-        now = time.monotonic()
-        return {h for h, until in self._auditors.items() if until > now}
+        return {self.auditor}
 
     def note_test_traffic(self) -> None:
         self.test_seen = time.monotonic()
@@ -257,19 +245,15 @@ class Publisher:
                     st = st or bt.Subtensor(network=self.config.network)
                     if committed_catalog(st, self.config.netuid) != self.catalog.digest():
                         cat = current_catalog(st, self.config.netuid, store, self.config.catalog_mirrors)
-                        self._set_auditor(cat.audit_policy().auditor_hotkey
-                                          or st.get_subnet_owner_hotkey(self.config.netuid))
                         if self.adopt(cat):
                             log.info("catalog %s committed; manifest rebuilt", cat.digest()[:12])
-                            for callback in self.on_catalog:
-                                callback(cat)
                         else:
                             log.error("catalog %s committed but not adopted yet; keeping the current manifest",
                                       cat.digest()[:12])
                     elif self.engines_changed():
                         log.info("an engine changed; measuring again")
                         self.adopt(self.catalog)
-                    self._set_auditor(self._auditor(st))
+                    self.auditor = st.get_subnet_owner_hotkey(self.config.netuid)
                     if not self._published:
                         self.publish(st)
                         log.info("manifest published")
@@ -335,8 +319,7 @@ def main() -> None:
     publisher.publish(subtensor)
     if not args.no_publish:
         publisher.watch()
-        chain = SubtensorChainView(config.network, config.netuid, cat.audit_policy().auditor_hotkey)
-        publisher.on_catalog.append(lambda c: chain.set_auditor_hotkey(c.audit_policy().auditor_hotkey))
+        chain = SubtensorChainView(config.network, config.netuid)
         StatusWatcher(hotkey=wallet.hotkey.ss58_address, auditor_url=chain.auditor_url,
                       listed=lambda: [e.endpoint_id for e in publisher.signed.manifest.endpoints]).start()
     log.info("serving %d endpoints on port %d; throughput tests are accepted from %s; status is logged once per "

@@ -9,8 +9,8 @@ rates at the same time. A GPU behind two endpoints delivers its capacity once, s
 machines behind many hotkeys delivers its capacity once, however it is spread. There are no GPU classes: what counts
 is proven throughput, so miners choose hardware by throughput per cost.
 
-One validator runs the tests: the auditor, by default the subnet owner's validator (the catalog can name another
-hotkey). It publishes signed verdicts every validator applies. Every setting lives in the catalog the subnet owner
+One validator runs the tests: the auditor, which is the subnet owner's validator. It publishes signed verdicts
+every validator applies. Every setting lives in the catalog the subnet owner
 commits on chain.
 
 | | Code |
@@ -173,7 +173,6 @@ recognisable by its session, so hardware used for other work between tests could
 | Setting | Default | Meaning |
 |---|---|---|
 | `mode` | `enforce` | `observe`: validators count declared capacities and apply no evidence; tests still run |
-| `auditor_hotkey` | subnet owner | hotkey that runs the tests and signs the verdicts |
 | `lead_blocks` | 5 | blocks from the selection block to the start of the traffic |
 | `max_latency_s` | 2 | highest latency at which a miner's measurement counts throughput |
 | `warmup_s`, `test_s` | 3, 16 | shortest unmeasured traffic (each test draws it from [`warmup_s`, 2 x `warmup_s`]) and the measured window, seconds; `warmup_s` is at least `max_latency_s` |

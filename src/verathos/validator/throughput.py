@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable, Collection
@@ -32,7 +31,6 @@ from verathos.validator.config import ReferenceEngine
 from verathos.validator.discovery import DiscoveredMiner, Neuron, discover
 
 log = logging.getLogger(__name__)
-RESTART_EXIT_CODE = 3
 SLOT_REFRESH_S = 120.0
 VERDICTS_RETRY_S = 30.0
 VERDICTS_WAIT_S = 300.0
@@ -46,11 +44,10 @@ def slots(miners: list[DiscoveredMiner]) -> list[Slot]:
 
 class Throughput:
     def __init__(self, *, netuid: int, mechid: int, policy: AuditPolicy, auditor_hotkey: str,
-                 chain: SubtensorChainView, owner_hotkey: str = "", auditor: Auditor | None = None,
+                 chain: SubtensorChainView, auditor: Auditor | None = None,
                  follower: ScheduleFollower | None = None) -> None:
         self.netuid, self.mechid, self.policy, self.auditor_hotkey, self.chain = (netuid, mechid, policy,
                                                                                   auditor_hotkey, chain)
-        self.owner_hotkey = owner_hotkey or auditor_hotkey
         self.auditor, self.follower = auditor, follower
         self._known: dict[str, tuple[str | None, list[Slot]]] = {}
         self._last: feed.Verdicts | None = None
@@ -59,32 +56,26 @@ class Throughput:
     def start(cls, *, network: str, netuid: int, mechid: int, current: Callable[[], catalog.Catalog],
               st: bt.Subtensor, wallet: bt.Wallet, references: dict[str, ReferenceEngine],
               screens: dict[str, ReferenceEngine], state_dir: Path) -> Throughput:
-        """The auditor role if this validator's hotkey is the auditor, else a schedule follower."""
+        """The auditor role if this validator's hotkey is the subnet owner's, else a schedule follower."""
         policy = current().audit_policy()
-        owner_hotkey = st.get_subnet_owner_hotkey(netuid)
-        auditor_hotkey = policy.auditor_hotkey or owner_hotkey
-        chain = SubtensorChainView(network, netuid, auditor_hotkey)
+        auditor_hotkey = st.get_subnet_owner_hotkey(netuid)
+        chain = SubtensorChainView(network, netuid)
         if wallet.hotkey.ss58_address != auditor_hotkey:
             follower = ScheduleFollower(chain, policy)
             follower.start()
             log.info("throughput tests are run by %s; applying its verdicts", auditor_hotkey)
             return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
-                       owner_hotkey=owner_hotkey, follower=follower)
+                       follower=follower)
         auditor = Auditor(netuid=netuid, mechid=mechid, keypair=wallet.hotkey, chain=chain, policy=policy,
                           catalog=current, references=references, screens=screens,
                           db_path=state_dir / "throughput.sqlite")
         auditor.start()
         log.info("throughput auditor running (%s mode)", policy.mode)
         return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
-                   owner_hotkey=owner_hotkey, auditor=auditor)
+                   auditor=auditor)
 
     def set_policy(self, policy: AuditPolicy) -> None:
-        """Adopt the policy of a newly committed catalog. A new auditor changes this validator's role, which a
-        restart sets up: the process exits for its supervisor to start it again."""
-        if (policy.auditor_hotkey or self.owner_hotkey) != self.auditor_hotkey:
-            log.critical("the catalog names %s as the throughput auditor; restarting to take the new role",
-                         policy.auditor_hotkey or self.owner_hotkey)
-            os._exit(RESTART_EXIT_CODE)
+        """Adopt the policy of a newly committed catalog."""
         self.policy = policy
         (self.auditor or self.follower).set_policy(policy)
 

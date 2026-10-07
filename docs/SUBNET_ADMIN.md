@@ -60,8 +60,7 @@ model's request mix changed), the auditor applies a new audit policy at once, an
 under the catalog committed at its first block, accepting manifests built for the previous catalog for one more
 epoch. A changed request mix lowers declared capacities while miners measure again, so change it rarely and
 announce it. Announce model changes before committing so validators can start a reference engine for a new model
-and miners can deploy it: a validator without a reference engine for an `active` model stops. Naming another
-`auditor_hotkey` restarts every validator (exit code 3, for its supervisor) to take its new role. A model family
+and miners can deploy it: a validator without a reference engine for an `active` model stops. A model family
 whose engine needs new code, or a protocol change, still goes out as a code release.
 
 ## Throughput audit

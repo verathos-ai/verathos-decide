@@ -561,21 +561,3 @@ def test_the_ladder_reaches_max_concurrency_and_a_measurement_steps_aside() -> N
     assert measure._ladder(target) == [1, 2, 4, 8, 16, 32, 48]
     with pytest.raises(measure.MeasurementInterrupted):
         asyncio.run(measure.measure_all([target], 1.0, run_s=0.1, stop=lambda: True))
-
-
-def test_the_previous_auditor_is_accepted_for_one_epoch(tmp_path) -> None:
-    from types import SimpleNamespace
-
-    from verathos.miner import __main__ as miner_main
-    from verathos.miner.config import MinerConfig
-
-    config = MinerConfig.model_validate({
-        "netuid": 405, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5", "port": 8091,
-        "state_dir": str(tmp_path),
-        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:9"}]})
-    publisher = miner_main.Publisher(config, SimpleNamespace(hotkey=kp()), catalog.load(), publish_on_chain=False,
-                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "old"))
-    publisher._set_auditor("new")
-    assert publisher.auditors() == {"old", "new"}
-    publisher._auditors["old"] = 0.0  # its grace has passed
-    assert publisher.auditors() == {"new"}

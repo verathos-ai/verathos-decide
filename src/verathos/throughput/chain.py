@@ -25,19 +25,15 @@ def _hash_bytes(raw: object) -> bytes | None:
 
 
 class SubtensorChainView:
-    """Head blocks, block hashes and the auditor's axon, read through one dedicated connection."""
+    """Head blocks, block hashes and the auditor's axon (the subnet owner's validator), read through one dedicated
+    connection."""
 
-    def __init__(self, network: str, netuid: int, auditor_hotkey: str = "", *, cache_s: float = 600.0) -> None:
-        self._network, self._netuid, self._auditor_override = network, netuid, auditor_hotkey
+    def __init__(self, network: str, netuid: int, *, cache_s: float = 600.0) -> None:
+        self._network, self._netuid = network, netuid
         self._cache_s = cache_s
         self._lock = threading.Lock()
         self._subtensor: bt.Subtensor | None = None
         self._auditor: tuple[float, str] | None = None
-
-    def set_auditor_hotkey(self, auditor_hotkey: str) -> None:
-        """Follow a newly committed auditor (empty: the subnet owner)."""
-        if auditor_hotkey != self._auditor_override:
-            self._auditor_override, self._auditor = auditor_hotkey, None
 
     def _st(self) -> bt.Subtensor:
         if self._subtensor is None:
@@ -94,7 +90,7 @@ class SubtensorChainView:
     def _resolve_auditor_url(self) -> str | None:
         with self._lock:
             st = self._st()
-            hotkey = self._auditor_override or st.get_subnet_owner_hotkey(self._netuid)
+            hotkey = st.get_subnet_owner_hotkey(self._netuid)
             if not hotkey:
                 return None
             neuron = st.get_neuron_for_pubkey_and_subnet(hotkey, self._netuid)
