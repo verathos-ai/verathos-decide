@@ -52,6 +52,10 @@ class UsageMeter:
         if answered:
             self._unwritten[principal.account_id] = self._unwritten.get(principal.account_id, 0) + 1
 
+    def pending(self) -> int:
+        """Usage rows not written yet."""
+        return len(self._counts)
+
     def within_quota(self, principal: Principal) -> bool:
         if principal.monthly_quota is None:
             return True

@@ -58,6 +58,9 @@ class Sampler:
         if self.rng.random() * seen < 1:
             self._picked[key] = exchange
 
+    def pending(self) -> dict[str, int]:
+        return {"picked": len(self._picked), "proofs": len(self._proofs)}
+
     def proof(self, exchange: Exchange) -> None:
         if len(self._proofs) < MAX_PROOFS:
             self._proofs.append(exchange)

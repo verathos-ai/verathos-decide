@@ -110,8 +110,9 @@ class Setup:
         self.accounts = Accounts(self.engine, self.meter, ttl_s=0.0, negative_ttl_s=0.0)
         self.router = Router(share=1.0, max_latency_s=2.0, rng=random.Random(1))
         routes = [route(keypair, host, credited) for host, (keypair, _) in self.miners.items()]
-        self.router.update(Routes(netuid=405, auditor=self.auditor.hotkey, epoch=3, issued_ms=1,
-                                  catalog_digest=catalog.load().digest(), routes=routes))
+        self.router_table = Routes(netuid=405, auditor=self.auditor.hotkey, epoch=3, issued_ms=1,
+                                   catalog_digest=catalog.load().digest(), routes=routes)
+        self.router.update(self.router_table)
 
         async def auditor_url():
             return "http://auditor"
@@ -121,10 +122,12 @@ class Setup:
         self.served = ServedCounter(self.gateway_kp, self.client, auditor_url=auditor_url,
                                     auditor_hotkey=self.auditor.hotkey)
         cat = catalog.Catalog.parse({**catalog.load().document(), "gateways": [self.gateway_kp.ss58_address]})
-        self.app = create_app(Gateway(
+        self.gateway = Gateway(
             config=self.config, hotkey=self.gateway_kp.ss58_address, catalog=lambda: cat, accounts=self.accounts,
-            meter=self.meter, router=self.router, sampler=self.sampler, served=self.served, routes_loaded=lambda: True,
-            upstream=Upstream(self.gateway_kp, self.client, netuid=405, mechid=1), limiter=RateLimiter()))
+            meter=self.meter, router=self.router, sampler=self.sampler, served=self.served,
+            routes=lambda: self.router_table,
+            upstream=Upstream(self.gateway_kp, self.client, netuid=405, mechid=1), limiter=RateLimiter())
+        self.app = create_app(self.gateway)
         self.key = asyncio.run(self._account(rate, burst, monthly_quota))
 
     async def _account(self, rate, burst, quota) -> str:
@@ -471,3 +474,79 @@ def test_what_miners_answer_the_gateway_reaches_the_auditor(tmp_path) -> None:
     keypair = s.miners["10.0.0.1"][0]
     now = time_module.time()
     assert s.auditor.served_in(keypair.ss58_address, "gpu0", now - 60, now + 1) == pytest.approx(3.0)
+
+
+# ---- the admin API ----
+
+ADMIN_TOKEN = "a" * 40
+
+
+def admin_setup(tmp_path):
+    from verathos.gateway.admin import add_admin_routes
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": MockEngine("kev-4b")})
+    add_admin_routes(s.app, s.gateway, port=9999, token=ADMIN_TOKEN)
+    return s
+
+
+async def admin_call(s, method: str, path: str, *, port: int = 9999, token: str | None = ADMIN_TOKEN, json_=None):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=s.app), base_url=f"http://admin:{port}") as c:
+        return await c.request(method, path, headers=headers, json=json_)
+
+
+def test_the_admin_api_exists_only_on_its_port_and_only_with_the_token(tmp_path) -> None:
+    s = admin_setup(tmp_path)
+    assert asyncio.run(admin_call(s, "GET", "/admin/v1/state", port=80)).status_code == 404  # the public port
+    assert asyncio.run(admin_call(s, "GET", "/admin/v1/state", token=None)).status_code == 401
+    assert asyncio.run(admin_call(s, "GET", "/admin/v1/state", token="b" * 40)).status_code == 401
+    state = asyncio.run(admin_call(s, "GET", "/admin/v1/state")).json()
+    assert state["models"] == ["kev-4b"] and state["routes"]["endpoints"] == 2 and "usage_rows" in state["pending"]
+    routes = asyncio.run(admin_call(s, "GET", "/admin/v1/routes")).json()["routes"]
+    assert {r["url"] for r in routes} == {"http://10.0.0.1:8091/e/gpu0", "http://10.0.0.2:8091/e/gpu0"}
+    assert all(r["in_flight"] == 0 and not r["breaker"]["open"] for r in routes)
+
+
+def test_an_admin_request_goes_where_it_is_sent_and_is_never_billed(tmp_path) -> None:
+    s = admin_setup(tmp_path)
+    target_kp = s.miners["10.0.0.2"][0]
+    target = {"hotkey": target_kp.ss58_address, "endpoint_id": "gpu0"}
+    r = asyncio.run(admin_call(s, "POST", "/admin/v1/systemone", json_={"request": REQUEST, "target": target}))
+    body = r.json()
+    assert r.status_code == 200 and body["endpoint"] == f"{target_kp.ss58_address}/gpu0" and not body["counted"]
+    assert body["attempts"][0]["outcome"] == "answered" and json.loads(body["response"])["receipt"]
+    assert s.served.pending() == 0 and s.sampler.pending() == {"picked": 0, "proofs": 0} and s.meter.pending() == 0
+    counted = asyncio.run(admin_call(s, "POST", "/admin/v1/systemone",
+                                     json_={"request": REQUEST, "target": target, "count": True})).json()
+    assert counted["counted"] and s.served.pending() == 1 and s.sampler.pending()["picked"] == 1
+    assert s.meter.pending() == 0  # never billed
+    routed = asyncio.run(admin_call(s, "POST", "/admin/v1/systemone", json_={"request": REQUEST})).json()
+    assert routed["attempts"] and routed["answers"] and s.served.pending() == 1 and s.meter.pending() == 0
+    unknown = asyncio.run(admin_call(s, "POST", "/admin/v1/systemone",
+                                     json_={"request": REQUEST, "target": {"hotkey": "x", "endpoint_id": "gpu0"}}))
+    assert unknown.status_code == 502 and unknown.json()["attempts"][0]["detail"].startswith("not a routable")
+    assert all(e.in_flight == 0 for e in s.router._pools["kev-4b"].endpoints)
+
+
+def test_the_admin_api_is_never_public_and_needs_a_private_token(tmp_path) -> None:
+    import os
+
+    from verathos.gateway.admin import read_token
+
+    base = {"netuid": 405, "wallet_name": "w", "hotkey_name": "h", "database_url": "sqlite+aiosqlite:///x.db"}
+    for public in ("8.8.8.8", "0.0.0.0", "::"):
+        with pytest.raises(ValueError):
+            GatewayConfig(**base, admin_host=public, admin_port=9100, admin_token_file="t")
+    with pytest.raises(ValueError):
+        GatewayConfig(**base, admin_port=9100)
+    GatewayConfig(**base, admin_host="10.1.2.3", admin_port=9100, admin_token_file="t")
+    token = tmp_path / "admin.token"
+    token.write_text(ADMIN_TOKEN)
+    os.chmod(token, 0o644)
+    with pytest.raises(SystemExit):
+        read_token(token)
+    os.chmod(token, 0o600)
+    assert read_token(token) == ADMIN_TOKEN
+    token.write_text("short")
+    with pytest.raises(SystemExit):
+        read_token(token)

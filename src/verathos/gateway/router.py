@@ -122,6 +122,22 @@ class Router:
     def models(self) -> set[str]:
         return set(self._pools)
 
+    def find(self, model_id: str, hotkey: str, endpoint_id: str) -> Endpoint | None:
+        pool = self._pools.get(model_id)
+        return next((e for e in pool.endpoints if (e.route.hotkey, e.route.endpoint_id) == (hotkey, endpoint_id)),
+                    None) if pool else None
+
+    def describe(self) -> list[dict[str, object]]:
+        """Every endpoint with the router's state of it."""
+        now = self.clock()
+        return [{"model": model, "endpoint": e.key, "url": e.route.url, "credited_rps": e.route.credited_rps,
+                 "latency_ms": e.route.latency_ms, "cap": e.cap, "in_flight": e.in_flight,
+                 "busy_for_s": round(max(e.busy_until - now, 0.0), 1),
+                 "breaker": {"open": e.breaker.is_open, "failures": e.breaker.failures, "probing": e.breaker.probing,
+                             "open_for_s": round(max(e.breaker.open_until - now, 0.0), 1) if e.breaker.is_open
+                             else 0.0}}
+                for model, pool in sorted(self._pools.items()) for e in pool.endpoints]
+
     def capacity(self, model_id: str) -> float:
         pool = self._pools.get(model_id)
         return sum(e.route.credited_rps for e in pool.endpoints) * self.share if pool else 0.0

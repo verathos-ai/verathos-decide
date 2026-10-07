@@ -20,6 +20,7 @@ import datetime as dt
 import json
 import logging
 import random
+import socket
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ import uvicorn
 from verathos import catalog as catalog_module
 from verathos.gateway import db
 from verathos.gateway.accounts import Accounts
+from verathos.gateway.admin import add_admin_routes, read_token
 from verathos.gateway.app import Gateway, create_app
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
@@ -94,8 +96,7 @@ async def serve(config: GatewayConfig) -> None:
                       window_s=config.sample_window_s, rng=random.SystemRandom())
     served = ServedCounter(keypair, client, auditor_url=auditor_url, auditor_hotkey=auditor_hotkey)
     gateway = Gateway(config=config, hotkey=keypair.ss58_address, catalog=lambda: current[0], accounts=accounts,
-                      meter=meter, router=router, sampler=sampler, served=served,
-                      routes_loaded=lambda: routes.table is not None,
+                      meter=meter, router=router, sampler=sampler, served=served, routes=lambda: routes.table,
                       upstream=Upstream(keypair, client, netuid=config.netuid, mechid=config.mechid),
                       limiter=RateLimiter())
 
@@ -124,10 +125,18 @@ async def serve(config: GatewayConfig) -> None:
     if config.metrics_port:
         from prometheus_client import start_http_server
         start_http_server(config.metrics_port, addr="127.0.0.1")
-    server = uvicorn.Server(uvicorn.Config(create_app(gateway, lifespan=lifespan), host=config.listen_host,
-                                           port=config.port, log_level="warning", access_log=False,
-                                           server_header=False))
-    await server.serve()
+    app = create_app(gateway, lifespan=lifespan)
+    sockets = [listen(config.listen_host, config.port)]
+    if config.admin_port is not None:
+        add_admin_routes(app, gateway, port=config.admin_port, token=read_token(config.admin_token_file))
+        sockets.append(listen(config.admin_host, config.admin_port))
+        log.info("admin API on %s:%d", config.admin_host, config.admin_port)
+    server = uvicorn.Server(uvicorn.Config(app, log_level="warning", access_log=False, server_header=False))
+    await server.serve(sockets=sockets)
+
+
+def listen(host: str, port: int) -> socket.socket:
+    return socket.create_server((host, port), family=socket.AF_INET6 if ":" in host else socket.AF_INET)
 
 
 def run(coro: Any) -> Any:

@@ -6,7 +6,7 @@ import ipaddress
 import json
 from pathlib import Path
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class GatewayConfig(BaseModel):
@@ -20,6 +20,10 @@ class GatewayConfig(BaseModel):
     listen_host: str = "127.0.0.1"
     port: int = Field(8080, ge=1, le=65535)
     metrics_port: int | None = Field(None, ge=1, le=65535, description="Prometheus metrics on 127.0.0.1")
+    admin_host: str = Field("127.0.0.1", description="Address of the admin API: loopback or a private network")
+    admin_port: int | None = Field(None, ge=1, le=65535, description="The admin API's port; none: no admin API")
+    admin_token_file: Path | None = Field(None, description="File holding the admin token (at least 32 characters, "
+                                          "readable by the gateway's user only)")
     auditor_url: str | None = Field(None, description="The auditor's service; default: the subnet owner's axon")
     instances: int = Field(1, ge=1, description="Gateway processes sharing the miners' capacity (each uses 1 / "
                            "instances of it); route each API key to one process, so its limits hold exactly")
@@ -41,6 +45,22 @@ class GatewayConfig(BaseModel):
         for network in value:
             ipaddress.ip_network(network, strict=False)
         return value
+
+    @field_validator("admin_host")
+    @classmethod
+    def _not_public(cls, value: str) -> str:
+        address = ipaddress.ip_address(value)
+        if address.is_unspecified or not (address.is_loopback or address.is_private):
+            raise ValueError("the admin API listens on loopback or one private address only")
+        return value
+
+    @model_validator(mode="after")
+    def _admin_needs_token(self) -> GatewayConfig:
+        if self.admin_port is not None and self.admin_token_file is None:
+            raise ValueError("admin_port needs admin_token_file")
+        if self.admin_port is not None and self.admin_port == self.port:
+            raise ValueError("admin_port must differ from port")
+        return self
 
     @classmethod
     def load(cls, path: Path) -> GatewayConfig:

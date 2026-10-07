@@ -126,6 +126,7 @@ credited.
    | `max_in_flight` | 4096 | requests in flight per process; more get 503 |
    | `max_body_bytes` | 1 MiB | |
    | `sample_window_s` | 600 | one exchange per endpoint and window goes to the auditor |
+   | `admin_host`, `admin_port`, `admin_token_file` | 127.0.0.1, -, - | the admin API (see below); off without a port |
    | `state_dir`, `catalog_dir` | `~/.verathos/gateway`, `~/.verathos/catalog` | last routes, catalogs |
 
 6. Schema: `verathos-gateway --config gateway.json db upgrade` (after every update; the gateway does not start on
@@ -195,6 +196,41 @@ verathos-gateway keys list --account acme
 verathos-gateway keys revoke --account acme --prefix vd_1a2b3c4d5e6f7
 verathos-gateway usage --account acme --since 2026-10-01
 ```
+
+## Admin API
+
+For the operators only: inspection, and requests sent past the router or to one chosen endpoint. Off unless
+`admin_port` is set. It listens on a socket of its own, `admin_host:admin_port` (loopback by default; a private
+address at most, never `0.0.0.0`), so the reverse proxy never reaches it, and on the public port its routes answer
+404. Every call needs `Authorization: Bearer <token>`, the token read from `admin_token_file` at start:
+
+```bash
+umask 077; openssl rand -hex 32 > ~/.verathos/gateway/admin.token   # at least 32 characters, mode 600
+```
+
+The gateway refuses to start with a shorter token or a file others can read. Every call is logged, wrong tokens
+with the caller's address.
+
+| Call | Returns |
+|---|---|
+| `GET /admin/v1/state` | the routes in use (epoch, age, endpoints, catalog), active models, limits, and what waits to be written or sent (usage rows, samples, served counts) |
+| `GET /admin/v1/routes` | every routable endpoint as the router sees it: credited rate, latency, cap, in flight, busy time, breaker |
+| `POST /admin/v1/systemone` | a SystemOne request, served as described below |
+
+```bash
+curl -s http://127.0.0.1:8090/admin/v1/systemone -H "Authorization: Bearer $(cat ~/.verathos/gateway/admin.token)" \
+  -d '{"request": {"model": "kev-4b", "state": "...", "questions": {...}},
+       "target": {"hotkey": "5F...", "endpoint_id": "gpu0"},
+       "count": false}'
+```
+
+- `target`: the one endpoint to send it to, one attempt, outside the router's accounting (its load and breaker are
+  untouched); it must be a routable endpoint of the model. Without it, the request is routed as users' requests are.
+- `count`: whether the exchange counts as user traffic: served counts (test windows, demand) and the sampler. Off by
+  default. Admin requests are never billed to an account.
+- The reply holds the endpoint, its URL, the answers, input tokens, the receipt, the miner's response as received,
+  every attempt (endpoint, outcome, failure kind and blame, milliseconds) and the total time; 502 with the attempts
+  if no endpoint answered.
 
 ## Metrics
 

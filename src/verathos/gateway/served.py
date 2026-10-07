@@ -39,6 +39,10 @@ class ServedCounter:
         counts[0] += 1
         counts[1] += input_tokens
 
+    def pending(self) -> int:
+        """Per-endpoint seconds not reported yet."""
+        return len(self._counts)
+
     async def report(self) -> None:
         now = int(self.clock())
         done = {k: n for k, n in self._counts.items() if k[2] < now}
