@@ -121,19 +121,27 @@ Outcomes per endpoint: `passed` (delivered at least `pass_fraction` of the teste
 The miner admits requests from validators and gateways ahead of test requests: a test request waits while any
 other request waits, and a request that finds the queue full takes the place of the newest waiting test request. A
 test request is dropped once its session expires, or when the load generator has given up on it. A test never
-delays other traffic; test requests beyond the endpoint's spare capacity are not delivered, and the credit shows
-it. A caller other than a gateway (the catalog's `gateways`, or one in the miner's own `gateway_hotkeys`) gets at
-most 4 requests at once per endpoint, so a validator cannot crowd a competitor's test out with priority traffic. The miner signs only well-formed answers: an engine fault
-returns an error, never a signed wrong answer.
+delays other traffic. What an endpoint answers the subnet's gateway during the test's window counts as delivered
+(see Gateway answers); test requests beyond its spare capacity otherwise go undelivered, and the credit shows it. A
+caller other than a gateway (the catalog's `gateways`, or one in the miner's own `gateway_hotkeys`) gets at most 4
+requests at once per endpoint, so a validator cannot crowd a competitor's test out with priority traffic. The miner
+signs only well-formed answers: an engine fault returns an error, never a signed wrong answer.
 
 ## Gateway answers
 
 The subnet's gateway (`GATEWAY.md`) sends the auditor sampled exchanges of its user traffic: one per endpoint and
-sampling window, drawn after the answers are in, signed by a gateway the catalog lists. The auditor keeps those whose
-receipt binds the request and the answers and names that gateway, up to `gateway_checks_per_epoch` per endpoint and
-epoch, and recomputes them between tests (screen and fp32 reference as above). A wrong answer is evidence like one in
-a test. The differences form a drift tally of their own over the last `drift_window_tests` epochs: an endpoint whose
-answers to users drift beyond the model's `mean_abs` loses its credit, however correct its test answers are.
+sampling window, drawn after the answers are in, signed by a gateway the catalog lists. The auditor keeps, for
+endpoints it tests, those whose receipt binds the request and the answers and names that gateway (up to 8 per
+endpoint and epoch; signed malformed answers always), and recomputes a random `gateway_checks_per_epoch` of them per
+endpoint and epoch, between tests (screen and fp32 reference as above). A wrong answer is evidence like one in a
+test. The differences form a drift tally of their own over the last `drift_window_tests` epochs: an endpoint whose
+answers to users drift beyond the model's `mean_abs` loses its credit, however correct its test answers are. A
+gateway answer counts in the epoch its check finished, so an epoch's verdicts depend only on checks finished before
+it began.
+
+The gateway also reports, per second, how many requests each endpoint answered it. Miners serve the gateway before
+test traffic, so what an endpoint answered the gateway inside a test's measured window counts as delivered, next to
+the test's own replies: serving users never costs credit, and refusing them during a test gains nothing.
 
 ## Verdicts
 
@@ -170,7 +178,8 @@ How credits and wrong answers enter the score is in `SCORING.md`.
 | Renaming or adding endpoints to make the auditor send more | a hotkey's test rate grows only from what its endpoints delivered |
 | Fast junk responses | receipts that do not bind scale delivered down; a signed wrong answer invalidates the hotkey |
 | Responses built to break the auditor | size and nesting limits; each endpoint is evaluated on its own |
-| Flooding a competitor's endpoint with validator traffic during its test | at most 4 requests at once per caller and endpoint |
+| Flooding a competitor's endpoint with validator traffic during its test | at most 4 requests at once per validator and endpoint |
+| Flooding it with gateway traffic during its test, or a miner refusing users then | what an endpoint answers the gateway inside the test's window counts as delivered |
 | Caching or sharing answers | every request is unique |
 
 What a test proves is that an endpoint delivers its declared rate on about 60 s notice: test traffic is
@@ -195,7 +204,7 @@ recognisable by its session, so hardware used for other work between tests could
 | `credit_ttl_epochs` | 2 | how many closed epochs back a test still counts |
 | `rate_growth` | 2.0 | tested rate at most this times the last delivered rate |
 | `min_test_share` | 0.125 | ... but at least this share of the model's `first_test_rps` |
-| `drift_window_tests` | 8 | tests over which an endpoint's recomputed answers must stay within the model's `mean_abs` |
+| `drift_window_tests` | 8 | tests (and, for gateway answers, epochs) over which an endpoint's recomputed answers must stay within the model's `mean_abs` |
 | `gateway_checks_per_epoch` | 2 | sampled gateway answers the auditor recomputes per endpoint and epoch (0: none) |
 
 Per model: `workload` (the request mix), `score_per_rps` and `first_test_rps`.
@@ -212,4 +221,5 @@ The auditor needs:
 - a public IP and port for its service, and an uplink for the whole network's test traffic in one burst: about
   6 KB per request, so 1,000 endpoints at 20,000 requests/s take about 1 Gbit/s, and 2-3 CPU cores.
 
-Its database is `state_dir/throughput.sqlite` (tables `tests` and `results`, the last 30 epochs).
+Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers) and
+`verdicts` (as served), the last 30 epochs).

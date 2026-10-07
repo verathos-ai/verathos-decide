@@ -38,6 +38,9 @@ endpoints together; later tests grow from what was delivered.
 the per-caller limit, and the auditor checks a sample of their answers. Rotating a gateway hotkey is a catalog
 commit.
 
+The auditor is the validator of the subnet owner hotkey. After changing the subnet owner hotkey on chain, restart
+every validator so it applies the new auditor's verdicts (miners follow within a minute).
+
 Model status: `active` models are scored; `candidate` models can be served and are checked but weighted zero, which
 lets a new model run on the network before it is scored; `retired` models are skipped, and miners withdraw endpoints
 serving them from their manifests (a miner with no other endpoint stops).
@@ -70,7 +73,8 @@ whose engine needs new code, or a protocol change, still goes out as a code rele
 ## Throughput audit
 
 The shipped catalog runs the audit in `enforce` mode. Check results in the auditor's database
-(`state_dir/throughput.sqlite`, tables `tests` and `results`): honest endpoints should be `passed`, and `partial`
+(`state_dir/throughput.sqlite`, tables `tests`, `results`, `samples` and `verdicts`): honest endpoints should be
+`passed`, and `partial`
 or `void` results should have identifiable causes. If the audit misbehaves (for example the auditor's connection
 cannot carry the network's test traffic), publish a catalog with `"mode": "observe"`: tests still run and are
 recorded, validators count declared capacities (up to each model's `first_test_rps`) and apply no evidence. `docs/THROUGHPUT_AUDIT.md` describes every

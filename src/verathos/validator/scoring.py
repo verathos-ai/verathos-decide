@@ -4,10 +4,10 @@ Per endpoint and epoch:
 - zero if the identity challenge failed or verification failed. A hard failure counts in the epoch it happens; the
   statistical bound is evaluated over the endpoint's last ``statistical_window_epochs`` audited epochs, because one
   epoch of canaries is too few probabilities to separate a lower-precision substitute from honest drift;
-- a verification failure, or a wrong answer the throughput auditor proved (an answer the miner signed in a test),
-  fails every endpoint of the hotkey: their averages reset to zero and they score zero for ``probation_epochs``
-  epochs, the failing one included, regardless of later results. An endpoint the hotkey adds while on probation
-  inherits the remaining probation, so moving hardware to another endpoint does not escape it;
+- a verification failure, or a wrong answer the throughput auditor proved (an answer the miner signed in a test or
+  to the subnet's gateway), fails every endpoint of the hotkey: their averages reset to zero and they score zero for
+  ``probation_epochs`` epochs, the failing one included, regardless of later results. An endpoint the hotkey adds
+  while on probation inherits the remaining probation, so moving hardware to another endpoint does not escape it;
 - zero until the endpoint has proven capacity in a throughput test;
 - otherwise score per request/s of the model x proven capacity (requests/s) x availability (answered / sent) x latency
   factor. The latency factor compares the endpoint's median latency in its throughput test with the median over the

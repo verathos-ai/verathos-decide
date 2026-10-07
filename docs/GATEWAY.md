@@ -23,43 +23,55 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
 ## How a request is served
 
 1. **Key.** `Authorization: Bearer vd_...`. Keys are looked up by their SHA-256 and cached for 60 s, so a revoked
-   key or a changed limit applies within a minute. Repeated unknown keys from one address are rate limited.
-2. **Limits.** The account's rate (requests/s and burst, GCRA) and its monthly quota (UTC calendar month).
-3. **Request.** A SystemOne request (`protocol/api.py`) for a model the catalog lists as `active` and the routes
-   serve, with a state within the model's `max_state_tokens` (4 characters per token, as miners count).
+   key or a changed limit applies within a minute. An address (IPv6: a /64) sending invalid keys is limited to 2 per
+   second (bursts of 20) before any lookup.
+2. **Limits.** The account's rate (requests/s and burst, GCRA), applied to each of its keys, and its monthly quota
+   (UTC calendar month) for the account.
+3. **Request.** Strict JSON (no NaN or infinities): a SystemOne request (`protocol/api.py`) for a model the catalog
+   lists as `active` and the routes serve, with a state within the model's `max_state_tokens` (4 characters per
+   token, as miners count), and questions whose answers fit a response (64 KiB). Requests no miner could answer are
+   refused here, so they cannot count against miners.
 4. **Endpoint.** Two endpoints of the model are drawn in proportion to their proven capacity; the one with fewer
    requests in flight per unit of capacity takes the request. In this process an endpoint takes at most
    `credited rps x max_latency_s / instances` requests at once, what it serves within the latency bound.
 5. **Miner.** The request is signed with the gateway's hotkey for that miner. The answer counts only if the miner's
    receipt binds this request and these answers and names the gateway as caller, and the answers are well formed.
-6. **Retries.** A failed attempt (connection, timeout, error status, no valid receipt) is retried on another miner,
-   up to `max_attempts` within `request_timeout_s`; decision requests have no side effects. A miner that answers
-   busy (429, 503) is skipped for that request without counting as a failure. After 3 failures in a row an
-   endpoint's circuit breaker opens for 5 s; one probe request then decides, and each failed probe doubles the time
-   (up to 120 s).
-7. **Response.** The answers, the usage, the miner's signed receipt and the request id. Usage is counted per
-   account, key, model and day, and written every 5 s.
+6. **Retries.** A failed attempt is retried on another miner, up to `max_attempts` within `request_timeout_s`;
+   decision requests have no side effects. A failure that is the miner's (no connection, a response without a valid
+   receipt, a compressed or oversized response, a refusal of the gateway) counts against it at once; one that the
+   request itself may cause (a timeout, an error status) counts only if another miner then answers the same request.
+   A miner that answers busy (429, 503) is skipped for one second, and a refusal of the request (another 4xx) counts
+   against nobody. After 3 failures in a row an endpoint's circuit breaker opens for 5 s; one probe request then
+   decides, and each failed probe doubles the time (up to 120 s).
+7. **Response.** The answers, the input tokens the miner signed in its receipt, the receipt itself and the request
+   id. Usage is counted per account, key, model and day, and written every 5 s.
 
 ## Answer checks
 
 The gateway's hotkey is listed in the catalog (`gateways`), so a miner can tell user traffic from validator
 traffic. To keep it from answering users with a cheaper model, the gateway keeps one exchange per endpoint and
 sampling window (`sample_window_s`, 10 minutes), drawn uniformly from the window's answers after they are in, and
-sends the window's picks to the auditor. The auditor recomputes up to `gateway_checks_per_epoch` (2) per endpoint and
-epoch, between tests:
+sends the window's picks to the auditor. The auditor keeps up to 8 per endpoint and epoch and recomputes a random
+`gateway_checks_per_epoch` (2) of them, between tests:
 - a wrong answer is evidence, like one in a throughput test: every validator checks the receipt (issued to a catalog
   gateway) and its own reference, and the hotkey is reset and put on probation (`SCORING.md`);
 - the differences are tallied per endpoint over the last `drift_window_tests` epochs, apart from the test answers'
   tally, so correct test answers do not hide drifted answers to users; beyond the model's `mean_abs`, the endpoint's
   credit is removed (and with it its routes).
 
-Signed malformed answers are proof on their own and always go to the auditor.
+Signed malformed answers are proof on their own: they always go to the auditor, and are kept for the next window if
+a post fails.
+
+The gateway also reports, every 5 s, how many requests each endpoint answered it per second. Miners serve the gateway
+before the auditor's test traffic; what an endpoint answers the gateway inside a test's measured window counts as
+delivered, so serving users never costs a miner credit (`THROUGHPUT_AUDIT.md`).
 
 ## Routes
 
 `GET /v1/routes` on the owner's validator: the endpoints listed in an accepted manifest now, credited in the current
-verdicts (qualified, not drifted), of `active` models, whose hotkey has no proven wrong answer there and that are
-not on probation at the owner's validator; with their credited capacity and test latency. The table is signed by
+verdicts (the previous epoch's while the current ones wait for a test to settle; qualified, not drifted), of `active`
+models, whose hotkey has no wrong answer proven there or since, and is not on probation at the owner's validator;
+with their credited capacity and test latency. The table is signed by
 the auditor hotkey. The gateway polls it every 30 s, uses only tables signed by the subnet owner's hotkey and newer
 than its own, and keeps the last good one on disk. A new endpoint is routable once its first throughput test is
 credited.
@@ -119,9 +131,9 @@ with nginx:
 upstream gateway { hash $http_authorization consistent; server 127.0.0.1:8080; server 127.0.0.1:8081; }
 ```
 
-Each process then uses `1 / instances` of every endpoint's capacity, and per-key limits hold exactly. A monthly quota
-is enforced from the database's usage plus each process's own counts, so it can be exceeded by what other processes
-served in the last few seconds.
+Each process then uses `1 / instances` of every endpoint's capacity, and each key's rate holds exactly (an account's
+keys may land on different processes). A monthly quota is enforced from the database's usage plus each process's own
+counts, so it can be exceeded by what other processes served in the last few seconds.
 
 ## API
 
@@ -151,12 +163,13 @@ Every response carries `X-Request-Id` (the client's, if it sent a valid one). Er
 
 | Status | Type | When |
 |---|---|---|
-| 400 | `invalid_request` | not JSON, or not a SystemOne request |
+| 400 | `invalid_request` | not JSON (NaN and infinities included), not a SystemOne request, or refused by the miners |
 | 401 | `unauthorized` | missing, unknown, revoked or expired key, or a suspended account |
 | 404 | `model_not_found` | a model the gateway does not serve |
-| 413 | `too_large` | body or state over the limits |
-| 429 | `rate_limited` | over the account's rate; `Retry-After` |
+| 413 | `too_large` | body, state, or the answers the questions would need, over the limits |
+| 429 | `rate_limited` | over the key's rate, or too many invalid keys from the address; `Retry-After` |
 | 429 | `quota_exceeded` | the month's quota is used up |
+| 500 | `internal` | a fault of the gateway |
 | 503 | `busy` | no capacity free for the model now; `Retry-After` |
 | 503 | `unavailable` | no miner answered in time, or accounts cannot be checked; `Retry-After` |
 
@@ -167,7 +180,7 @@ verathos-gateway accounts create --name acme --rate 50 --burst 100 [--monthly-qu
 verathos-gateway accounts set --name acme --rate 100        # also --burst, --monthly-quota, --status suspended
 verathos-gateway keys create --account acme --name prod     # prints the key once
 verathos-gateway keys list --account acme
-verathos-gateway keys revoke --prefix vd_1a2b3c4
+verathos-gateway keys revoke --account acme --prefix vd_1a2b3c4d5e6f7
 verathos-gateway usage --account acme --since 2026-10-01
 ```
 

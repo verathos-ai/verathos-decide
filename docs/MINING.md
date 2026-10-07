@@ -155,7 +155,7 @@ validator's epoch 45352:
 | `qualifying` | checked, but not scored until it passes a throughput test |
 | `candidate model` | the catalog lists the model as a candidate: checked, not scored |
 | `answers FAILED` | an answer failed verification; zero score for the probation epochs shown |
-| `WRONG ANSWER in a throughput test` | the auditor proved a wrong answer the hotkey signed; every endpoint of the hotkey restarts from zero after probation |
+| `WRONG ANSWER (in a throughput test or to the gateway)` | the auditor proved a wrong answer the hotkey signed; every endpoint of the hotkey restarts from zero after probation |
 | `on probation` | still serving out an earlier failure |
 | `not in that epoch` | the validator did not accept the manifest in that epoch (published after it started, or rejected: check the validator's reason with `scripts/probe_miner.py`) |
 

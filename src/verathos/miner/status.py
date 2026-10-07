@@ -36,7 +36,8 @@ def describe_endpoint(e: EndpointStatus) -> str:
     if e.state == "candidate":
         return f"{name}: candidate model, checked but not scored; {capacity}; {_answers(e)}"
     if e.state == "invalid":
-        return f"{name}: a WRONG ANSWER in a throughput test was proven against this hotkey; average reset, {probation}"
+        return (f"{name}: a WRONG ANSWER (in a throughput test or to the gateway) was proven against this hotkey; "
+                f"average reset, {probation}")
     if e.state == "failed":
         return f"{name}: answers FAILED verification this epoch; {probation}; {_answers(e)}"
     if e.state == "probation":

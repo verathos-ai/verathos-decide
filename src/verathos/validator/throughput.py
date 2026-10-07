@@ -1,8 +1,8 @@
 """The validator's side of the throughput audit.
 
-Every validator follows the public test schedule and holds its canaries while a test runs. The validator whose
-hotkey is the policy's auditor (by default the subnet owner) runs the tests and serves signed verdicts
-(``validator.service``); every other validator fetches them. A validator applies a piece of evidence only after
+Every validator follows the public test schedule and holds its canaries while a test runs. The subnet owner's
+validator is the auditor: it runs the tests and serves signed verdicts (``validator.service``); every other validator
+fetches them. A validator applies a piece of evidence only after
 checking the miner's receipt in it, and, when it runs a reference engine for the model, only if its own reference also
 proves the answer wrong.
 """
