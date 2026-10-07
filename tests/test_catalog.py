@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from verathos import catalog
+from verathos.protocol.canonical import digest
 
 
 def test_shipped_catalog_loads_and_digest_is_stable() -> None:
@@ -77,3 +78,19 @@ def test_a_fetched_catalog_is_checked_against_the_commitment_before_parsing(tmp_
     got = catalog_module.resolve(wanted, store=catalog_module.CatalogStore(tmp_path),
                                  sources=["https://a/{digest}", "https://b/{digest}"])
     assert got.digest() == wanted
+
+
+def test_a_stored_catalog_of_an_older_format_does_not_stop_a_node(tmp_path) -> None:
+    """A node upgraded before the owner commits the catalog for its release finds the old one unreadable: it is
+    not available here, and the node keeps looking (and waiting) instead of failing."""
+    import pytest
+
+    old = {**catalog.load().document()}
+    old["models"] = [{k: v for k, v in m.items() if k != "price"} for m in old["models"]]
+    old_digest = digest(old)
+    store = catalog.CatalogStore(tmp_path)
+    store.path(old_digest).parent.mkdir(parents=True, exist_ok=True)
+    store.path(old_digest).write_text(json.dumps(old))
+    assert store.get(old_digest) is None
+    with pytest.raises(catalog.CatalogUnavailable):
+        catalog.resolve(old_digest, store=store, sources=[])

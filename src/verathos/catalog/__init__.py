@@ -177,10 +177,17 @@ class CatalogStore:
         return self.directory / f"{catalog_digest}.json"
 
     def get(self, catalog_digest: str) -> Catalog | None:
+        """The stored catalog, or None if there is none, or none this code can read (a catalog of an older format
+        stays on disk while a newer release runs)."""
         path = self.path(catalog_digest)
         if not path.exists():
             return None
-        catalog = load(path)
+        try:
+            catalog = load(path)
+        except Exception as exc:
+            log.warning("stored catalog %s not readable by this release: %s", catalog_digest[:12],
+                        str(exc).splitlines()[0])
+            return None
         return catalog if catalog.digest() == catalog_digest else None
 
     def put(self, catalog: Catalog) -> Path:
