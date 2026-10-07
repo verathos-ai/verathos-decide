@@ -67,6 +67,7 @@ async def serve(config: GatewayConfig) -> None:
                         path=state_dir / "routes.json")
     store = catalog_module.CatalogStore(config.catalog_dir)
     current: list[catalog_module.Catalog | None] = [None]
+    known: list[set[tuple[str, str, str]] | None] = [None]
 
     async def adopt(table: Routes) -> None:
         cat = current[0]
@@ -79,9 +80,12 @@ async def serve(config: GatewayConfig) -> None:
                 log.error("this gateway's hotkey %s is not among catalog %s's gateways: miners will refuse it",
                           keypair.ss58_address, cat.digest()[:12])
         router.max_latency_s = cat.audit_policy().max_latency_s
+        endpoints = {(r.hotkey, r.endpoint_id, r.model_id) for r in table.routes}
         router.update(table)
-        log.info("routes of epoch %d: %d endpoints for %s", table.epoch, len(table.routes),
-                 ", ".join(sorted(router.models())) or "no model")
+        if endpoints != known[0]:
+            known[0] = endpoints
+            log.info("routes of epoch %d: %d endpoints for %s", table.epoch, len(table.routes),
+                     ", ".join(sorted(router.models())) or "no model")
 
     routes.on_change.append(adopt)
     meter = UsageMeter(engine)

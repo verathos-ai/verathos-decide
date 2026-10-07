@@ -833,6 +833,8 @@ class Auditor:
         cached = self._verdicts.get(epoch)
         if cached is not None:
             return cached
+        if self.follower.head <= 0:
+            return None  # the chain head is not known yet
         policy, cat = self.policy, self.catalog()
         current, first = self.follower.head // policy.epoch_blocks, epoch - policy.credit_ttl_epochs
         if not current - 2 <= epoch <= current:

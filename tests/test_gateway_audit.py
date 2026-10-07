@@ -275,3 +275,10 @@ def test_sample_checks_wait_while_a_test_runs(tmp_path) -> None:
     auditor._tests_running = 0
     asyncio.run(auditor.check_samples(Checks({"kev-4b": MockEngine("kev-4b")}, {})))
     assert auditor.store._query("SELECT state FROM samples")[0][0] == "checked"
+
+
+def test_nothing_is_served_before_the_chain_head_is_known(tmp_path) -> None:
+    auditor = _auditor(tmp_path)  # its follower has not polled yet
+    assert auditor.routes(list) is None and auditor.verdicts(0) is None
+    auditor.follower.poll()
+    assert auditor.routes(list) is not None
