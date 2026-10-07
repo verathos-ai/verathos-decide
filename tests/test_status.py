@@ -60,8 +60,9 @@ def test_miner_logs_each_epoch_once_and_each_final_test_once() -> None:
     assert ("scored 44.10% of the epoch's emission, average 30.20%; proven 45.0 of 50.0 requests/s declared"
             in lines[2])
     assert "gpu2: not in that epoch" in lines[3]
-    shared = doc.model_copy(update={"epoch": 14, "model_shares": {"kev-4b": 0.6, "kev-9b": 0.4}})
-    assert watcher.lines(shared)[1] == "  emission shares: kev-4b 60.0%, kev-9b 40.0%"
+    shared = doc.model_copy(update={"model_shares": {"kev-4b": 0.6, "kev-9b": 0.4}})
+    fresh = StatusWatcher(hotkey="hkA", auditor_url=lambda: None, listed=lambda: [])
+    assert fresh.lines(shared)[1] == "  emission shares: kev-4b 60.0%, kev-9b 40.0%"
     assert lines[4] == ("throughput test of epoch 12 (block 2200), gpu1: passed, delivered 46.2 of 45.0 requests/s, "
                         "p95 latency 830 ms; credited 45.0")
     assert watcher.lines(doc) == []  # nothing new; the unconfirmed test is not final yet
