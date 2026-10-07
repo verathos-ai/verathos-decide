@@ -3,11 +3,13 @@
 The validator checks the owner's commitment every ``POLICY_WATCH_S``, like the miners, so a new throughput-audit
 policy reaches the audit within a minute of the miners. Each epoch is scored under the catalog committed at its first
 block (``for_epoch``), the same for every validator. Manifests built for the previous catalog stay acceptable for
-one epoch after a change, while miners re-publish.
+one epoch after a change, while miners re-publish; the change is kept on disk, so this holds across a restart, also
+for a change made while the validator was down.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -30,6 +32,35 @@ class CatalogFollower:
         self.on_change: list[Callable[[catalog.Catalog], None]] = []
         self._previous: tuple[str, float] | None = None
         self._lock = threading.Lock()
+        self._state_path = store.directory / "followed.json"
+        self._resume()
+
+    def _grace_s(self) -> float:
+        return self.catalog.epoch_blocks * BLOCK_TIME_S
+
+    def _resume(self) -> None:
+        """Take up the grace of the catalog followed before the restart: still running, or starting now if the
+        committed catalog changed meanwhile."""
+        try:
+            saved = json.loads(self._state_path.read_text())
+            followed, previous, until = saved["catalog"], saved.get("previous"), float(saved.get("until", 0))
+        except FileNotFoundError:
+            followed = None
+        except (ValueError, KeyError, TypeError) as exc:
+            log.warning("%s unreadable, starting without a previous catalog: %s", self._state_path, exc)
+            followed = None
+        if followed is not None and followed != self.catalog.digest():
+            self._previous = (followed, time.time() + self._grace_s())
+        elif followed is not None and previous and until > time.time():
+            self._previous = (previous, until)
+        self._save()
+
+    def _save(self) -> None:
+        previous, until = self._previous or (None, 0.0)
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"catalog": self.catalog.digest(), "previous": previous, "until": until}))
+        tmp.replace(self._state_path)
 
     def _wait(self, st: bt.Subtensor) -> catalog.Catalog:
         while True:
@@ -68,9 +99,9 @@ class CatalogFollower:
         if new.digest() == self.catalog.digest():
             return False
         with self._lock:
-            grace_s = self.catalog.epoch_blocks * BLOCK_TIME_S
-            self._previous = (self.catalog.digest(), time.time() + grace_s)
+            self._previous = (self.catalog.digest(), time.time() + self._grace_s())
             self.catalog = new
+            self._save()
         log.info("catalog %s committed", new.digest()[:12])
         for callback in self.on_change:
             callback(new)

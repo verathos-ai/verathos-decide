@@ -94,3 +94,29 @@ def test_a_stored_catalog_of_an_older_format_does_not_stop_a_node(tmp_path) -> N
     assert store.get(old_digest) is None
     with pytest.raises(catalog.CatalogUnavailable):
         catalog.resolve(old_digest, store=store, sources=[])
+
+
+def test_manifests_of_the_previous_catalog_stay_accepted_across_a_validator_restart(tmp_path, monkeypatch) -> None:
+    from bittensor_wallet import Keypair
+
+    from verathos.validator import follow
+
+    first = catalog.load()
+    second = catalog.Catalog.parse({**first.document(), "gateways": [Keypair.create_from_uri("//gw").ss58_address]})
+    committed = {"catalog": first}
+    monkeypatch.setattr(follow, "current_catalog", lambda *args, **kwargs: committed["catalog"])
+    store = catalog.CatalogStore(tmp_path)
+
+    def start() -> follow.CatalogFollower:
+        return follow.CatalogFollower(None, "test", 405, store, [])
+
+    running = start()
+    assert running.accepted() == {first.digest()}
+    committed["catalog"] = second
+    assert running.refresh(None) and running.accepted() == {first.digest(), second.digest()}
+    assert start().accepted() == {first.digest(), second.digest()}  # restarted inside the grace
+    committed["catalog"] = first  # changed back while the validator was down: miners still announce the second
+    assert start().accepted() == {first.digest(), second.digest()}
+    state = json.loads((tmp_path / "followed.json").read_text())
+    (tmp_path / "followed.json").write_text(json.dumps({**state, "until": 0}))
+    assert start().accepted() == {first.digest()}  # the grace is over

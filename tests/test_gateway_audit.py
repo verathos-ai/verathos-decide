@@ -151,9 +151,11 @@ def test_routes_list_the_credited_endpoints_a_gateway_may_use(tmp_path) -> None:
     auditor.store.finish_sample("s", "checked", "wrong", Evidence(
         hotkey="hk-wrong", endpoint_id="gpu0", model_id="kev-4b", test_id=f"{GATEWAY_EVIDENCE}-n", reason="wrong",
         request_id="n", request={}, response="{}"), checked_epoch=3)
-    auditor.update_slots(list(slots.values()))
     auditor.chain.head_block = 4 * 180 + 1
     auditor.follower.poll()
+    assert auditor.verdicts(4) is not None
+    assert auditor.routes(lambda: []) is None  # no miners discovered since the start: no table to replace a good one
+    auditor.update_slots(list(slots.values()))
 
     signed = auditor.routes(lambda: ["hk-probation/other-endpoint"])  # probation covers the whole hotkey
     assert signed.verify(auditor.hotkey, 405) and not signed.verify(kp().ss58_address, 405)
@@ -305,10 +307,12 @@ def test_sample_checks_wait_while_a_test_runs(tmp_path) -> None:
     assert auditor.store._query("SELECT state FROM samples")[0][0] == "checked"
 
 
-def test_nothing_is_served_before_the_chain_head_is_known(tmp_path) -> None:
+def test_nothing_is_served_before_the_chain_head_is_known_and_miners_are_discovered(tmp_path) -> None:
     auditor = _auditor(tmp_path)  # its follower has not polled yet
     assert auditor.routes(list) is None and auditor.verdicts(0) is None
     auditor.follower.poll()
+    assert auditor.routes(list) is None
+    auditor.update_slots([])
     assert auditor.routes(list) is not None
 
 

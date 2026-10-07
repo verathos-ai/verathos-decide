@@ -524,6 +524,7 @@ class Auditor:
         self.store = Store(db_path)
         self.follower = ScheduleFollower(chain, policy)
         self._slots: list[Slot] = []
+        self._discovered = False  # whether _slots holds a discovery yet
         self._verdicts: dict[int, SignedVerdicts] = {}
         self._pruned_epoch = -1
         self._tests_running = 0
@@ -542,7 +543,7 @@ class Auditor:
         self.follower.set_policy(policy)
 
     def update_slots(self, slots: list[Slot]) -> None:
-        self._slots = slots
+        self._slots, self._discovered = slots, True
 
     def holding(self) -> bool:
         return self.follower.holding()
@@ -936,9 +937,11 @@ class Auditor:
         return signed
 
     def routes(self, probation: Callable[[], Collection[str]]) -> SignedRoutes | None:
-        """The endpoints the gateways may route to (``protocol.gateway``), signed; None until there are verdicts.
-        ``probation`` gives the endpoint keys on probation at the owner's validator. Rebuilt at most every
-        ``ROUTES_TTL_S``."""
+        """The endpoints the gateways may route to (``protocol.gateway``), signed; None until there are verdicts and
+        the miners have been discovered once (a gateway keeps its last table meanwhile). ``probation`` gives the
+        endpoint keys on probation at the owner's validator. Rebuilt at most every ``ROUTES_TTL_S``."""
+        if not self._discovered:
+            return None
         now = time.monotonic()
         if self._routes is not None and now - self._routes[0] < ROUTES_TTL_S:
             return self._routes[1]
