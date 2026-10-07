@@ -313,6 +313,70 @@ def test_what_users_got_from_an_endpoint_is_published_with_its_credit(tmp_path) 
             ServedCount(hotkey="hk", endpoint_id="gpu0", second=now, **bad)
 
 
+def test_a_test_is_judged_against_what_the_endpoint_was_asked(tmp_path) -> None:
+    """Users sending less than the test left room for cost the endpoint nothing; users it refused count as asked. A
+    report posted again is taken once."""
+    import time as time_module
+
+    from tests.test_throughput import _result
+    from verathos.protocol.gateway import ServedCount
+
+    auditor = _auditor(tmp_path)
+    dip, refuser = (Slot("hk", e, f"http://x/e/{e}", "kev-4b", 20.0) for e in ("dip", "refuser"))
+    auditor.update_slots([dip, refuser])
+    start = int(time_module.time()) - 30
+    window = (start + 0.5, start + 16.5)  # test_s 16; the test left 10/s for users and sent 10/s itself
+    assert auditor.accept_served([ServedCount(hotkey="hk", endpoint_id="dip", second=start + i, attempts=6,
+                                              answered=6) for i in range(17)], report_id="r1") == 17
+    assert auditor.accept_served([ServedCount(hotkey="hk", endpoint_id="dip", second=start, attempts=6,
+                                              answered=6)], report_id="r1") == 0  # the same report again
+    auditor.accept_served([ServedCount(hotkey="hk", endpoint_id="refuser", second=start + i, attempts=10,
+                                       answered=5) for i in range(17)], report_id="r2")
+    test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+
+    def evaluate(slot: Slot):
+        return asyncio.run(auditor.evaluate(test, Target(slot, 20.0), _result(slot.key, completed=160),
+                                            Checks({}, {}).for_test(), auditor.policy, window))
+
+    users_dipped = evaluate(dip)
+    assert users_dipped.outcome == "passed" and users_dipped.credited_rps == pytest.approx(20.0)
+    refused = evaluate(refuser)  # delivered 15 of the 20 requests/s it was asked
+    assert refused.outcome == "partial" and refused.credited_rps == pytest.approx(20 * 0.75 * 0.75)
+
+
+def test_a_discovery_that_finds_no_miner_keeps_the_endpoints_known(tmp_path) -> None:
+    from verathos.validator.discovery import Neuron
+    from verathos.validator.throughput import Throughput
+
+    auditor = _auditor(tmp_path)
+    slot = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 20.0)
+    auditor.update_slots([slot])
+    throughput = Throughput(netuid=405, mechid=1, policy=auditor.policy, auditor_hotkey=auditor.hotkey,
+                            chain=auditor.chain, auditor=auditor)
+    throughput.update_slots([], [Neuron(1, "hk", "1.2.3.4", 8091, "commitment")])  # every fetch failed
+    assert auditor._slots == [slot]
+
+
+def test_signed_documents_of_a_newer_auditor_still_verify() -> None:
+    from verathos.protocol import signing
+    from verathos.protocol.gateway import ROUTES_DOMAIN, Routes, SignedRoutes
+    from verathos.throughput.feed import VERDICTS_DOMAIN, SignedVerdicts, Verdicts
+
+    keypair = kp()
+    verdicts = Verdicts.model_validate({"netuid": 405, "auditor": keypair.ss58_address, "epoch": 4, "credits": [
+        {"hotkey": "hk", "endpoint_id": "gpu0", "model_id": "kev-4b", "credited_rps": 1.0, "latency_ms": 1.0,
+         "test_epoch": 3, "qualified": True, "a_later_field": 7}], "invalid": [], "another": {"x": 1}})
+    received = SignedVerdicts.model_validate_json(SignedVerdicts.create(verdicts, keypair).model_dump_json())
+    assert signing.verify(keypair.ss58_address, VERDICTS_DOMAIN, received.verdicts.model_dump(mode="json"),
+                          received.signature)
+    routes = Routes.model_validate({"netuid": 405, "auditor": keypair.ss58_address, "epoch": 4, "issued_ms": 1,
+                                    "catalog_digest": "0" * 64, "routes": [], "later": True})
+    received_routes = SignedRoutes.model_validate_json(SignedRoutes.create(routes, keypair).model_dump_json())
+    assert received_routes.verify(keypair.ss58_address, 405)
+    assert signing.verify(keypair.ss58_address, ROUTES_DOMAIN, received_routes.routes.model_dump(mode="json"),
+                          received_routes.signature)
+
+
 def test_served_verdicts_are_the_same_after_a_restart(tmp_path) -> None:
     from verathos.throughput.auditor import Auditor
 

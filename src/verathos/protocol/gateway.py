@@ -22,7 +22,7 @@ import math
 from typing import Any
 
 from bittensor_wallet import Keypair
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from verathos.protocol import signing
 from verathos.protocol.api import MAX_RESPONSE_BYTES
@@ -39,6 +39,7 @@ MAX_REQUEST_BYTES = 1 << 20  # a gateway request's body, at most
 
 
 class Route(BaseModel):
+    model_config = ConfigDict(extra="allow")  # a newer auditor's fields stay signed
     hotkey: str
     endpoint_id: str
     model_id: str
@@ -48,6 +49,7 @@ class Route(BaseModel):
 
 
 class Routes(BaseModel):
+    model_config = ConfigDict(extra="allow")  # a newer auditor's fields stay signed
     netuid: int
     auditor: str
     epoch: int
@@ -111,7 +113,8 @@ class ServedCount(BaseModel):
     hotkey: str
     endpoint_id: str
     second: int  # unix time, whole seconds
-    answered: int = Field(0, ge=0, le=1_000_000)  # user requests sent in [second, second + 1) that it answered
+    attempts: int = Field(0, ge=0, le=1_000_000)  # user requests sent to it in [second, second + 1)
+    answered: int = Field(0, ge=0, le=1_000_000)  # of those, the ones it answered
     input_tokens: int = Field(0, ge=0)  # of those requests, as the miner signed them (at most one per request byte)
     offered: int = Field(0, ge=0, le=10_000_000)  # times the router considered it for a user request (drew it)
     refused: int = Field(0, ge=0, le=10_000_000)  # of those, it was not ready (busy, open breaker, slow), plus
@@ -120,7 +123,7 @@ class ServedCount(BaseModel):
 
     @model_validator(mode="after")
     def _consistent(self) -> ServedCount:
-        if not (self.answered or self.offered or self.refused):
+        if not (self.attempts or self.answered or self.offered or self.refused):
             raise ValueError("an empty count")
         if any(not 0 <= b < LATENCY_BUCKETS or n < 1 for b, n in self.latency.items()):
             raise ValueError("latency buckets out of range")

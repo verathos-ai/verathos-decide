@@ -206,7 +206,7 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
         if attempt:
             metrics.RETRIES.inc()
         tried.add(endpoint.route.hotkey)
-        g.router.started(endpoint)
+        g.router.started(endpoint, observe=counted)
         outcome: Outcome | None = None
         attempt_started = g.clock()
         note = {"endpoint": endpoint.key}

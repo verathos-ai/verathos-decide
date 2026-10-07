@@ -137,7 +137,7 @@ def add_gateway_routes(app: FastAPI, auditor: Auditor, *, probation: Callable[[]
                 report = ServedReport.model_validate_json(body)
             except ValidationError as e:
                 return JSONResponse({"error": f"invalid report: {e.error_count()} errors"}, status_code=422)
-            return {"taken": auditor.accept_served(report.counts)}
+            return {"taken": await asyncio.to_thread(auditor.accept_served, report.counts, report.report_id)}
 
 
 def start_service(*, st: bt.Subtensor, wallet: bt.Wallet, netuid: int, public_host: str, port: int,

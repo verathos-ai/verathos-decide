@@ -298,6 +298,9 @@ class Observer:
         self.offers[route.hotkey] = self.offers.get(route.hotkey, 0) + 1
         self.refusals[route.hotkey] = self.refusals.get(route.hotkey, 0) + refused
 
+    def attempted(self, route: Route) -> None:
+        pass
+
     def refused(self, route: Route) -> None:
         self.refusals[route.hotkey] = self.refusals.get(route.hotkey, 0) + 1
 

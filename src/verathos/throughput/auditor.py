@@ -16,11 +16,12 @@ Per test:
 3. Per endpoint: delivered = replies inside the window to requests sent no earlier than ``max_latency_s`` before it,
    per second, scaled by the share of sampled responses whose receipt is valid. Every signed sample must be well
    formed; ``answer_checks_per_test`` of them are recomputed (on the bf16 screen if there is one, whose flags the
-   fp32 reference must confirm). Credit = delivered (up to the tested rate); below ``pass_fraction`` of the tested
-   rate it is scaled by delivered / tested once more. A sampled answer the miner signed and the reference proves
-   wrong makes the result invalid; the evidence is kept for the verdicts. The recomputed answers' differences are
-   tallied per endpoint; one whose mean over its last ``drift_window_tests`` tests exceeds the model's ``mean_abs``
-   gets no credit.
+   fp32 reference must confirm). Credit = the tested rate x the share of what was asked in the window (the test's
+   own requests and the user requests the gateways sent it) that was delivered (the test's replies and the users'
+   answers), at most 1; below ``pass_fraction`` scaled by that share once more. A sampled answer the miner signed
+   and the reference proves wrong makes the result invalid; the evidence is kept for the verdicts. The recomputed
+   answers' differences are tallied per endpoint; one whose mean over its last ``drift_window_tests`` tests exceeds
+   the model's ``mean_abs`` gets no credit.
 4. Once the selection block is final with the hash it was selected by, the test is confirmed; otherwise void. A test
    is also void when the load generator fails or starts late; one endpoint's result is void when the generator fell
    behind its schedule or ran out of local resources for it, or when the auditor could not evaluate it.
@@ -279,12 +280,13 @@ class Store:
         self._lock = threading.Lock()
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         while version in _MIGRATIONS:
-            self._db.executescript(_MIGRATIONS[version] + f"PRAGMA user_version = {version + 1};")
+            self._db.executescript(f"BEGIN; {_MIGRATIONS[version]} PRAGMA user_version = {version + 1}; COMMIT;")
             version += 1
         if version != SCHEMA_VERSION:
-            self._db.executescript("DROP TABLE IF EXISTS results; DROP TABLE IF EXISTS tests; "
-                                   "DROP TABLE IF EXISTS samples; DROP TABLE IF EXISTS verdicts;" + _SCHEMA
-                                   + f"PRAGMA user_version = {SCHEMA_VERSION};")
+            self._db.executescript("BEGIN; DROP TABLE IF EXISTS results; DROP TABLE IF EXISTS tests; "
+                                   "DROP TABLE IF EXISTS samples; DROP TABLE IF EXISTS verdicts; "
+                                   "DROP TABLE IF EXISTS demand; DROP TABLE IF EXISTS users;" + _SCHEMA
+                                   + f"PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;")
             log.info("auditor database %s started for schema %d", path, SCHEMA_VERSION)
         self._query("UPDATE tests SET state = 'void', reason = 'the auditor restarted during the test' "
                     "WHERE state = 'running'")
@@ -326,7 +328,7 @@ class Store:
         rows = self._query(
             "SELECT r.hotkey, r.endpoint_id, r.model_id, r.delivered_rps, r.outcome FROM results r "
             "JOIN tests t USING (test_id) WHERE t.state != 'void' AND r.outcome != 'void' "
-            "ORDER BY t.epoch, t.start_block")
+            "ORDER BY t.start_block")
         outcomes: dict[str, list[str]] = {}
         last: dict[str, tuple[str, float]] = {}
         for hk, ep, model, rps, outcome in rows:
@@ -487,7 +489,9 @@ class Store:
                for m in set(before) | set(tokens)}
         rows = [(epoch, m, tokens.get(m, 0), round(v, 6)) for m, v in ema.items() if v > 1e-6 or m in tokens]
         with self._lock:
+            self._db.execute("BEGIN")
             self._db.executemany("INSERT OR REPLACE INTO demand VALUES (?, ?, ?, ?)", rows)
+            self._db.execute("COMMIT")
         return {m: v for _, m, _, v in rows}
 
     def demand_ema(self, epoch: int) -> dict[str, float]:
@@ -502,7 +506,9 @@ class Store:
         rows = [(epoch, hk, ep, t.offered, t.refused, t.answers, json.dumps(t.latency, sort_keys=True))
                 for (hk, ep), t in tallies.items()]
         with self._lock:
+            self._db.execute("BEGIN")
             self._db.executemany("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+            self._db.execute("COMMIT")
 
     def users_closed(self, epoch: int) -> bool:
         return bool(self._query("SELECT 1 FROM users WHERE epoch = ? LIMIT 1", (epoch,)))
@@ -534,7 +540,11 @@ class Store:
                 "delivered_rps", "credited_rps", "latency_p50_ms", "latency_p95_ms")
         return [ThroughputOutcome(**dict(zip(keys, row))) for row in rows]
 
-    def prune(self, before_epoch: int) -> None:
+    def prune(self, before_epoch: int, after_epoch: int | None = None) -> None:
+        """Forget epochs before ``before_epoch``, and after ``after_epoch`` (numbered under a shorter epoch
+        length)."""
+        if after_epoch is not None:
+            self._prune_after(after_epoch)
         with self._lock:
             self._db.execute("DELETE FROM results WHERE test_id IN (SELECT test_id FROM tests WHERE epoch < ?)",
                              (before_epoch,))
@@ -543,6 +553,15 @@ class Store:
             self._db.execute("DELETE FROM verdicts WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM demand WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM users WHERE epoch < ?", (before_epoch,))
+
+    def _prune_after(self, after_epoch: int) -> None:
+        with self._lock:
+            self._db.execute("BEGIN")
+            self._db.execute("DELETE FROM results WHERE test_id IN (SELECT test_id FROM tests WHERE epoch > ?)",
+                             (after_epoch,))
+            for table in ("tests", "samples", "verdicts", "demand", "users"):
+                self._db.execute(f"DELETE FROM {table} WHERE epoch > ?", (after_epoch,))
+            self._db.execute("COMMIT")
 
 
 def _beyond(total: float, count: int, tolerance: Tolerance) -> bool:
@@ -563,13 +582,16 @@ def planned_rate(slot: Slot, first_test_rps: float, last_delivered: float | None
     return round(min(slot.declared_rps, ceiling), 2)
 
 
-def credit(tested_rps: float, delivered_rps: float, policy: AuditPolicy) -> float:
-    """What was delivered, up to the tested rate; below ``pass_fraction`` of the tested rate, scaled by delivered /
-    tested once more."""
-    delivered = min(delivered_rps, tested_rps)
-    if delivered >= policy.pass_fraction * tested_rps:
-        return round(delivered, 2)
-    return round(delivered * delivered / tested_rps, 2)
+def credit(tested_rps: float, delivered_rps: float, policy: AuditPolicy, asked_rps: float | None = None) -> float:
+    """The tested rate times the share of what was asked that was delivered (at most 1); below ``pass_fraction``
+    scaled by that share once more. ``asked_rps``: what the endpoint was asked in the window, the test's own
+    requests and the users' (default: the tested rate), so users sending less than the test left room for cost
+    nothing, and users refused count as asked."""
+    asked = tested_rps if asked_rps is None else asked_rps
+    share = min(delivered_rps / asked, 1.0) if asked > 0 else 0.0
+    if share >= policy.pass_fraction:
+        return round(tested_rps * share, 2)
+    return round(tested_rps * share * share, 2)
 
 
 class Auditor:
@@ -592,9 +614,11 @@ class Auditor:
         self._tests_running = 0
         self._routes: tuple[float, SignedRoutes] | None = None
         self._verdicts_lock = threading.Lock()
-        self._served: dict[tuple[str, str], dict[int, int]] = {}  # (hotkey, endpoint) -> second -> answered
+        # (hotkey, endpoint) -> second -> [user requests answered, user requests sent]
+        self._served: dict[tuple[str, str], dict[int, list[int]]] = {}
         self._demand: dict[int, dict[str, int]] = {}  # epoch -> model -> users' input tokens (not closed yet)
         self._users: dict[int, dict[tuple[str, str], UserTally]] = {}  # epoch -> endpoint -> tally (not closed yet)
+        self._reports: dict[str, float] = {}  # served reports taken lately -> when
         self._demand_lock = threading.Lock()
         self._rng = random.SystemRandom()
 
@@ -670,7 +694,8 @@ class Auditor:
         serves first and which count as delivered; at least ``MIN_TEST_SHARE`` of the tested rate, and enough for
         the test's samples."""
         end = now_s - USER_RATE_LAG_S
-        users = self.served_in(target.slot.hotkey, target.slot.endpoint_id, end - USER_RATE_S, end) / USER_RATE_S
+        key = (target.slot.hotkey, target.slot.endpoint_id, end - USER_RATE_S, end)
+        users = max(self.served_in(*key, attempts=True), self.served_in(*key)) / USER_RATE_S
         floor = max(MIN_TEST_SHARE * target.tested_rps, policy.samples_per_test / policy.test_s)
         return round(min(target.tested_rps, max(floor, target.tested_rps - users)), 3)
 
@@ -763,8 +788,9 @@ class Auditor:
     async def _evaluate(self, test: ScheduledTest, target: Target, r: loadgen.TargetResult, recomputes: Recomputes,
                         policy: AuditPolicy, window_s: tuple[float, float]) -> Result:
         gateway = self.served_in(target.slot.hotkey, target.slot.endpoint_id, *window_s)
+        users = self.served_in(target.slot.hotkey, target.slot.endpoint_id, *window_s, attempts=True)
         detail = json.dumps({"sent": r.sent, "completed": r.completed, "skipped": r.skipped, "errors": r.errors,
-                             "late_sends": r.late_sends, "samples": len(r.samples),
+                             "late_sends": r.late_sends, "samples": len(r.samples), "gateway_sent": round(users, 1),
                              "gateway_answered": round(gateway, 1)}, sort_keys=True)
         latency = {"latency_p50_ms": r.latency_ms.p50 or 0.0, "latency_p95_ms": r.latency_ms.p95 or 0.0,
                    "detail": detail}
@@ -797,12 +823,13 @@ class Auditor:
                 break
         drift = {"drift_sum": drift_sum, "drift_count": drift_count}
         delivered = round((r.completed * (valid / len(r.samples) if r.samples else 1.0) + gateway) / policy.test_s, 2)
+        asked = (r.sent + max(users, gateway)) / policy.test_s
         if evidence is not None:
             return Result(target, "invalid", evidence.reason, delivered, 0.0, evidence=evidence, **latency, **drift)
-        credited = credit(target.tested_rps, delivered, policy)
-        if delivered >= policy.pass_fraction * target.tested_rps:
+        credited = credit(target.tested_rps, delivered, policy, asked)
+        if delivered >= policy.pass_fraction * asked:
             return Result(target, "passed", "", delivered, credited, **latency, **drift)
-        reason = f"delivered {delivered:.1f} of {target.tested_rps:.1f} requests/s"
+        reason = f"delivered {delivered:.1f} of {asked:.1f} requests/s asked"
         if gateway:
             reason += f" ({gateway / policy.test_s:.1f} of them to the gateway)"
         if valid < len(r.samples):
@@ -869,14 +896,15 @@ class Auditor:
                 if not self._tests_running and time.monotonic() <= recomputes.deadline:
                     self.store.failed_check(sample_id)
                 return
-            done_epoch = self.follower.head // self.policy.epoch_blocks
             evidence = None if fault is None else Evidence(  # user requests are not published: the receipt only
                 hotkey=hotkey, endpoint_id=endpoint_id, model_id=model_id,
                 test_id=f"{GATEWAY_EVIDENCE}-{request_id}", reason=fault, request_id=request_id, request={},
-                response=json.dumps({"receipt": json.loads(response)["receipt"]}))
-            self.store.finish_sample(sample_id, "checked", fault or "", evidence,
-                                     comparison.sum_abs if comparison else 0.0, comparison.count if comparison else 0,
-                                     checked_epoch=done_epoch)
+                response=json.dumps({"receipt": parsed["receipt"]}))
+            with self._verdicts_lock:  # labelled with an epoch whose verdicts are not served yet
+                self.store.finish_sample(sample_id, "checked", fault or "", evidence,
+                                         comparison.sum_abs if comparison else 0.0,
+                                         comparison.count if comparison else 0,
+                                         checked_epoch=self.follower.head // self.policy.epoch_blocks)
             if evidence is not None:
                 log.warning("gateway answer of %s/%s is wrong: %s", hotkey, endpoint_id, fault)
 
@@ -889,11 +917,18 @@ class Auditor:
 
     # ---- gateway served counts ----
 
-    def accept_served(self, counts: list[ServedCount]) -> int:
+    def accept_served(self, counts: list[ServedCount], report_id: str = "") -> int:
         """Add what the gateway's endpoints answered per second (known endpoints, recent seconds), their input tokens
         to the epoch's demand per model, and their offers, refusals and durations to the epoch's user tallies;
-        -> counts taken."""
+        -> counts taken. A report is taken once: a gateway posting it again (its answer was lost) adds nothing."""
         now, taken = time.time(), 0
+        if report_id:
+            with self._demand_lock:
+                if report_id in self._reports:
+                    return 0
+                self._reports[report_id] = now
+                for seen in [r for r, t in self._reports.items() if t < now - SERVED_KEEP_S]:
+                    del self._reports[seen]
         model_of = {(s.hotkey, s.endpoint_id): s.model_id for s in self._slots}
         with self._demand_lock:
             epoch = self.follower.head // self.policy.epoch_blocks
@@ -902,9 +937,10 @@ class Auditor:
                 key = (c.hotkey, c.endpoint_id)
                 if key not in model_of or not now - SERVED_KEEP_S <= c.second <= now + 5:
                     continue
-                if c.answered:
-                    per = self._served.setdefault(key, {})
-                    per[c.second] = per.get(c.second, 0) + c.answered
+                if c.answered or c.attempts:
+                    second = self._served.setdefault(key, {}).setdefault(c.second, [0, 0])
+                    second[0] += c.answered
+                    second[1] += c.attempts
                 demand[model_of[key]] = demand.get(model_of[key], 0) + c.input_tokens
                 tally = users.setdefault(key, UserTally())
                 tally.offered += c.offered
@@ -922,15 +958,16 @@ class Auditor:
                     del self._served[key]
         return taken
 
-    def served_in(self, hotkey: str, endpoint_id: str, start_s: float, end_s: float) -> float:
-        """Requests the endpoint answered the gateways in [start_s, end_s), counting partly covered seconds by
-        their covered share."""
+    def served_in(self, hotkey: str, endpoint_id: str, start_s: float, end_s: float, *,
+                  attempts: bool = False) -> float:
+        """User requests the gateways sent the endpoint in [start_s, end_s) that it answered (``attempts``: all of
+        them), counting partly covered seconds by their covered share."""
         per = self._served.get((hotkey, endpoint_id), {})
         total = 0.0
         for second in range(math.floor(start_s), math.ceil(end_s)):
-            n = per.get(second, 0)
+            n = per.get(second)
             if n:
-                total += n * (min(end_s, second + 1) - max(start_s, second))
+                total += n[1 if attempts else 0] * (min(end_s, second + 1) - max(start_s, second))
         return total
 
     def close_demand(self, current: int) -> None:
@@ -970,7 +1007,7 @@ class Auditor:
         the users' demand of finished epochs."""
         epoch = self.follower.head // self.policy.epoch_blocks
         if epoch != self._pruned_epoch:
-            self.store.prune(epoch - KEEP_EPOCHS)
+            self.store.prune(epoch - KEEP_EPOCHS, epoch + 2)
             self._pruned_epoch = epoch
         if self.follower.head > 0:
             self.close_epoch(epoch)

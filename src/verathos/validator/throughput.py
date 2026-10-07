@@ -95,13 +95,13 @@ class Throughput:
 
         def run() -> None:
             st = bt.Subtensor(network=network)
-            while True:
-                time.sleep(interval_s)
+            while True:  # at once, then every interval: a restarted auditor tests and routes from the start
                 try:
                     neurons, _ = validator_chain.snapshot(st, self.netuid)
                     self.update_slots(asyncio.run(self._discover(neurons, catalog_digests())), neurons)
                 except Exception:
                     log.exception("throughput slot refresh failed")
+                time.sleep(interval_s)
 
         threading.Thread(target=run, name="throughput-slots", daemon=True).start()
 
@@ -115,6 +115,9 @@ class Throughput:
         test."""
         if self.auditor is None:
             return
+        if not miners and any(n.commitment for n in neurons):
+            log.warning("no miner could be discovered; keeping the endpoints known before")
+            return  # a failed discovery must not empty the tests and the gateways' routes
         commitments = {n.hotkey: n.commitment for n in neurons}
         known = {m.hotkey: (commitments.get(m.hotkey), slots([m])) for m in miners}
         for hotkey, (commitment, kept) in self._known.items():

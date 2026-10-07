@@ -16,7 +16,7 @@ from typing import Any
 
 import httpx
 from bittensor_wallet import Keypair
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
@@ -31,6 +31,7 @@ MALFORMED = "malformed answers"
 
 
 class Credit(BaseModel):
+    model_config = ConfigDict(extra="allow")  # a newer auditor's fields stay signed
     hotkey: str
     endpoint_id: str
     model_id: str
@@ -50,6 +51,7 @@ GATEWAY_EVIDENCE = "gateway"  # evidence from a sampled gateway answer: test_id 
 
 
 class Evidence(BaseModel):
+    model_config = ConfigDict(extra="allow")  # a newer auditor's fields stay signed
     hotkey: str
     endpoint_id: str
     model_id: str
@@ -65,6 +67,7 @@ class Evidence(BaseModel):
 
 
 class Verdicts(BaseModel):
+    model_config = ConfigDict(extra="allow")  # a newer auditor's fields stay signed
     netuid: int
     auditor: str
     epoch: int

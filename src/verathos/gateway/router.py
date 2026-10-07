@@ -48,6 +48,8 @@ class Outcome(Enum):
 class Observer(Protocol):
     def offered(self, route: Route, refused: bool) -> None: ...
 
+    def attempted(self, route: Route) -> None: ...
+
     def refused(self, route: Route) -> None: ...
 
 
@@ -192,9 +194,12 @@ class Router:
             self.observer.offered(chosen.route, refused=chosen.slow)
         return chosen
 
-    def started(self, endpoint: Endpoint) -> None:
+    def started(self, endpoint: Endpoint, *, observe: bool = True) -> None:
+        """An attempt is sent; ``observe``: it is user traffic (the auditor judges a test against what was sent)."""
         endpoint.in_flight += 1
         endpoint.breaker.started()
+        if observe and self.observer is not None:
+            self.observer.attempted(endpoint.route)
 
     def finished(self, endpoint: Endpoint, outcome: Outcome | None, seconds: float | None = None, *,
                  observe: bool = True) -> None:

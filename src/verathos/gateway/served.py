@@ -1,6 +1,6 @@
 """What the miners did for this gateway process's users, per endpoint and second, reported to the auditor: the
-requests they answered with their input tokens and durations, how often the router considered them for a request, and
-how often they were not ready then or refused it (see ``router``).
+user requests sent to them and those they answered (with input tokens and durations), how often the router
+considered them for a request, and how often they were not ready then or refused it (see ``router``).
 
 Miners serve the gateway before the auditor's test traffic; the auditor counts what an endpoint answered the gateway
 inside a test's measured window as delivered too, so serving users never costs a miner credit, and refusing users
@@ -38,6 +38,7 @@ KEEP_S = 120
 
 @dataclass
 class _Second:
+    attempts: int = 0
     answered: int = 0
     input_tokens: int = 0
     offered: int = 0
@@ -45,6 +46,7 @@ class _Second:
     latency: dict[int, int] = field(default_factory=dict)
 
     def add(self, other: _Second) -> None:
+        self.attempts += other.attempts
         self.answered += other.answered
         self.input_tokens += other.input_tokens
         self.offered += other.offered
@@ -74,6 +76,9 @@ class ServedCounter:
         counts.input_tokens += input_tokens
         bucket = latency_bucket(seconds)
         counts.latency[bucket] = counts.latency.get(bucket, 0) + 1
+
+    def attempted(self, route: Route) -> None:
+        self._second(route).attempts += 1
 
     def offered(self, route: Route, refused: bool) -> None:
         counts = self._second(route)
@@ -133,7 +138,7 @@ def _parts(counts: dict[tuple[str, str, int], _Second]):
     part: list[tuple[tuple[str, str, int], _Second, str]] = []
     size = 0
     for (hk, ep, second), n in counts.items():
-        entry = ServedCount(hotkey=hk, endpoint_id=ep, second=second, answered=n.answered,
+        entry = ServedCount(hotkey=hk, endpoint_id=ep, second=second, attempts=n.attempts, answered=n.answered,
                             input_tokens=n.input_tokens, offered=n.offered, refused=n.refused,
                             latency=n.latency).model_dump_json()
         if part and (len(part) >= MAX_SERVED_COUNTS or size + len(entry) + 1 > MAX_SERVED_BYTES - 1024):

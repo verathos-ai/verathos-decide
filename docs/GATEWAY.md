@@ -46,8 +46,8 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    the time (up to 120 s).
 7. **Response.** The answers, the input tokens the miner signed in its receipt (at most one per byte of the
    request; the auditor checks sampled counts against its reference), the receipt itself and the request id. Usage is counted per account, key, model and day, and written every 5 s.
-8. **Report.** Every 5 s the gateway tells the auditor, per endpoint and second, what it answered (with input tokens
-   and durations), how often it considered it for a request (drew it), and how often it was not ready then (busy,
+8. **Report.** Every 5 s the gateway tells the auditor, per endpoint and second, the user requests it sent it and
+   those it answered (with input tokens and durations), how often it considered it for a request (drew it), and how often it was not ready then (busy,
    behind an open breaker, or its latest answer or timed-out attempt took at least twice the latency bound it
    declared its capacity at, `max_latency_s`, 2 s) or refused the request (answered busy or failed, or refused a
    request another miner answered). An answer counts in the second its request was sent. Drawn while full at speed counts neither

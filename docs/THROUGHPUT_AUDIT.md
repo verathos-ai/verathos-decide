@@ -104,9 +104,12 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
    only once the fp32 reference confirms it. The recomputed answers' differences are also tallied per endpoint: over
    its last `drift_window_tests` tests, their mean must stay within the model's `mean_abs` (the bound the
    validators' canaries apply), so a lower-precision engine serving test traffic does not pass.
-5. **Credit.** What was delivered, up to the tested rate. If delivered falls short of `pass_fraction` (0.95) of the
-   tested rate, the credit is scaled by delivered / tested once more: an endpoint that declares twice what it serves
-   is credited a quarter of its declaration, so declaring more than an endpoint serves never pays. A result with a
+5. **Credit.** The tested rate times the share of what the endpoint was asked in the window that it delivered (at
+   most 1). Asked: the test's own requests sent in the window and the user requests the gateway sent it then
+   (answered or not, see below); delivered: the test's counted replies and the users' answers. If it delivered less
+   than `pass_fraction` (0.95) of what it was asked, the credit is scaled by that share once more: an endpoint that
+   declares twice what it serves, tested at its declaration, is credited a quarter of it, so declaring more than an
+   endpoint serves never pays. A result with a
    wrong answer is `invalid` and credits nothing; an endpoint whose answers drift credits nothing.
 6. **Confirmation.** Once the selection block is final with the hash it was selected by, the test is confirmed;
    otherwise it is void. A test is also void if the load generator fails, starts more than 1 s late, or the
@@ -116,7 +119,7 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
    the traffic, and an engine that fails three times in a row is not asked again in that test, so an unreachable
    screen or reference skips recomputes instead of holding the test open.
 
-Outcomes per endpoint: `passed` (delivered at least `pass_fraction` of the tested rate), `partial`, `invalid`,
+Outcomes per endpoint: `passed` (delivered at least `pass_fraction` of what it was asked), `partial`, `invalid`,
 `void`.
 
 ## Other traffic goes first
@@ -130,11 +133,11 @@ caller other than a gateway (the catalog's `gateways`, or one in the miner's own
 requests at once per endpoint, so a validator cannot crowd a competitor's test out with priority traffic. The miner
 signs only well-formed answers: an engine fault returns an error, never a signed wrong answer.
 
-A test also leaves room for users: it sends each endpoint its tested rate less what the endpoint answered the
-subnet's gateway over the last minute (ending 10 s before the test, as the gateway's counts arrive), at least 10% of
-the tested rate and enough for the test's samples. What the endpoint answers users inside the window counts as
-delivered (see Gateway answers), so in all it is asked for its tested rate, not more: a test runs every endpoint at
-its tested rate at once, but never beyond it, whatever the user traffic.
+A test also leaves room for users: it sends each endpoint its tested rate less the rate of user requests the
+subnet's gateway sent it over the last minute (ending 10 s before the test, as the gateway's counts arrive), at
+least 10% of the tested rate and enough for the test's samples. With users at their usual rate, an endpoint is asked
+for its tested rate in all, not more; it is judged against what it was asked (Credit above), so users sending less
+in the window cost it nothing, and users it refused count against it.
 
 ## Gateway answers
 
@@ -144,15 +147,17 @@ endpoints it tests, those whose receipt binds the request and the answers and na
 endpoint and epoch; signed malformed answers always), and recomputes a random `gateway_checks_per_epoch` of them per
 endpoint and epoch, between tests (screen and fp32 reference as above). A wrong answer is evidence like one in a
 test; so is a receipt signing more input tokens than the reference counts (beyond 2% and 2 tokens), here and in
-tests, since users' input tokens set the models' emission shares. The differences form a drift tally of their own over the last `drift_window_tests` epochs: an endpoint whose
-answers to users drift beyond the model's `mean_abs` loses its credit, however correct its test answers are. A
+tests, since users' input tokens set the models' emission shares. The differences form a drift tally of their own
+over the last `drift_window_tests` epochs: an endpoint whose answers to users drift beyond the model's `mean_abs`
+loses its credit, however correct its test answers are. A
 gateway answer counts in the epoch its check finished, so an epoch's verdicts depend only on checks finished before
 it began.
 
-The gateway also reports, per second, how many requests each endpoint answered it. Miners serve the gateway before
-test traffic, so what an endpoint answered the gateway inside a test's measured window counts as delivered, next to
-the test's own replies: serving users never costs credit, and refusing them during a test costs what the test left
-room for.
+The gateway also reports, per endpoint and by the second each request was sent, how many user requests it sent the
+endpoint and how many of them it answered (a report is taken once, even if the gateway posts it again). Miners
+serve the gateway before test traffic, so what an endpoint answered the gateway for requests sent inside a test's
+measured window counts as delivered, next to the test's own replies: serving users never costs credit, and an
+answer held back cannot be moved into a window.
 
 Tests alone cannot show what users get between them: a test is known shortly before it starts (its selection block
 is public) and its requests carry the auditor's session. So the gateway also reports, per endpoint and second, how
@@ -245,5 +250,6 @@ The auditor needs:
 - a public IP and port for its service, and an uplink for the whole network's test traffic in one burst: about
   6 KB per request, so 1,000 endpoints at 20,000 requests/s take about 1 Gbit/s, and 2-3 CPU cores.
 
-Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers) and
-`verdicts` (as served), the last 30 epochs).
+Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers), `verdicts`
+(as served), `demand` (users' input tokens per model) and `users` (what users got from each endpoint), the last 30
+epochs).
