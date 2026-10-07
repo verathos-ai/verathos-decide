@@ -80,8 +80,8 @@ class Scoring(BaseModel):
                                         "the anchor shares")
     min_model_share: float = Field(0.1, ge=0, le=1, description="Emission share every active model keeps, whatever "
                                    "its demand")
-    user_refusals_min_offers: int = Field(20, ge=1, description="Times an endpoint must have been offered user "
-                                          "requests in an epoch for its refusals of them to count")
+    user_refusals_min_offers: int = Field(20, ge=1, description="Times an endpoint must have been considered for "
+                                          "user requests in an epoch for its readiness to count")
     user_latency_min_answers: int = Field(50, ge=1, description="Answers to users an endpoint needs in an epoch for "
                                           "its latency factor to come from them; with fewer, from its test")
 

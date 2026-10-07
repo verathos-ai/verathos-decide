@@ -60,9 +60,11 @@ Per endpoint and epoch:
   endpoints in proportion to `proven capacity x answered / sent x availability to users x latency factor`. The
   proven capacity is the auditor's credit in requests/s of the model's standard mix, at most what the endpoint
   declares now (in `observe` mode the declaration itself, up to the model's `first_test_rps`). Availability to users
-  is `1 - refused / offered` over the user requests the gateway offered the endpoint in the epoch before (busy,
-  slower than the latency bound, failing; see `GATEWAY.md`), once it was offered `user_refusals_min_offers` (20) of
-  them, else 1: capacity shown in tests but kept from users does not count. The latency factor is `sqrt(median /
+  is `1 - refused / offered` over the times the gateways considered the endpoint for a user request in the epoch
+  before (refused: not ready then, being busy, failing, or with its latest answer slower than twice the latency
+  bound, plus requests it answered busy or failed; see `GATEWAY.md`), once it was considered
+  `user_refusals_min_offers` (20) times, else 1: capacity shown in tests but kept from users does not count, and
+  neither does keeping users waiting. The latency factor is `sqrt(median /
   own latency)`, capped to [0.7, 1.3]. An endpoint's latency is the median latency of its answers to users once it
   gave `user_latency_min_answers` (50) of them in the epoch before, compared with the median over the model's scored
   endpoints measured the same way; else its median latency in its throughput test, compared with those measured so.

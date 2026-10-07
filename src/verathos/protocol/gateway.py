@@ -3,8 +3,8 @@
     GET  /v1/routes            the endpoints the gateway may send user traffic to, signed by the auditor
     POST /v1/gateway/samples   sampled gateway exchanges for the auditor to check, signed by a catalog gateway
     POST /v1/gateway/served    what each endpoint answered the gateway, per second, signed by a catalog gateway: its
-                               answers, input tokens, how often it was offered users and refused them, and how long
-                               its answers took
+                               answers, input tokens, how often it was considered for a user request and how often
+                               it was not ready or refused, and how long its answers took
 
 A route is an endpoint listed in an accepted manifest that has qualified and is credited in the auditor's current
 verdicts, whose hotkey has no proven wrong answer there and is not on probation at the owner's validator. A sample is
@@ -111,9 +111,9 @@ class ServedCount(BaseModel):
     second: int  # unix time, whole seconds
     answered: int = Field(0, ge=0)  # user requests it answered in [second, second + 1)
     input_tokens: int = Field(0, ge=0)  # of those requests, as the miner signed them
-    offered: int = Field(0, ge=0)  # times the router drew it as a candidate for a user request
-    refused: int = Field(0, ge=0)  # of those, it was skipped for its own fault (busy, too slow, failing), plus
-    # attempts it answered busy or failed
+    offered: int = Field(0, ge=0)  # times the router considered it for a user request (drew it)
+    refused: int = Field(0, ge=0)  # of those, it was not ready (busy, open breaker, slow), plus requests it answered
+    # busy or failed
     latency: dict[int, int] = Field(default_factory=dict)  # its answers' durations: bucket -> answers
 
     @model_validator(mode="after")

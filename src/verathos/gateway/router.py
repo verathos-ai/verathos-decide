@@ -7,13 +7,13 @@ what it serves within the latency bound (Little's law), for this process's share
 
 A circuit breaker per endpoint stops traffic after ``BREAKER_FAILURES`` failures in a row, for ``OPEN_S``; then one
 probe request decides, and each failed probe doubles the time, up to ``MAX_OPEN_S``. A miner refusing work because it
-is busy gets no requests for ``BUSY_S``. One answering slower than the latency bound it declared its capacity at
-gets none for ``SLOW_S`` while another endpoint can take them: users do not wait on an endpoint that cannot keep up,
-and get a slow answer rather than none.
+is busy gets no requests for ``BUSY_S``. A slow endpoint gets fewer: its requests stay in flight longer.
 
-The router tells an observer (the served counter) how often each endpoint was drawn as a candidate and how often it
-refused: drawn while skipped or behind an open breaker, or answering busy or failing. What users get from an endpoint
-between tests is scored from that.
+The router tells an observer (the served counter) each time it considers an endpoint for a user request (draws it)
+and whether it was ready then: not busy, not behind an open breaker, and not slow (its latest answer within
+``SLOW_FACTOR`` times the latency bound it declared its capacity at); and each request the endpoint answered busy or
+failed. Being drawn while full at speed is neither. What users get from an endpoint between tests is scored from that:
+the share of the times it was considered that it was ready.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ BREAKER_FAILURES = 3
 OPEN_S = 5.0
 MAX_OPEN_S = 120.0
 BUSY_S = 1.0
-SLOW_S = 1.0
+SLOW_FACTOR = 2.0  # an endpoint whose latest answer took longer than this times max_latency_s is not ready
 DRAWS = 8  # weighted draws before every endpoint is scanned
 
 
@@ -85,7 +85,7 @@ class Endpoint:
     breaker: Breaker = field(default_factory=Breaker)
     in_flight: int = 0
     busy_until: float = 0.0  # it refused work: no requests until then
-    slow_until: float = 0.0  # it answered too slowly: none until then while others can take them
+    slow: bool = False  # its latest answer took more than SLOW_FACTOR x max_latency_s
 
     @property
     def key(self) -> str:
@@ -148,7 +148,6 @@ class Router:
         return [{"model": model, "endpoint": e.key, "url": e.route.url, "credited_rps": e.route.credited_rps,
                  "latency_ms": e.route.latency_ms, "cap": e.cap, "in_flight": e.in_flight,
                  "busy_for_s": round(max(e.busy_until - now, 0.0), 1),
-                 "slow_for_s": round(max(e.slow_until - now, 0.0), 1),
                  "breaker": {"open": e.breaker.is_open, "failures": e.breaker.failures, "probing": e.breaker.probing,
                              "open_for_s": round(max(e.breaker.open_until - now, 0.0), 1) if e.breaker.is_open
                              else 0.0}}
@@ -159,33 +158,32 @@ class Router:
         return sum(e.route.credited_rps for e in pool.endpoints) * self.share if pool else 0.0
 
     def pick(self, model_id: str, exclude: Collection[str] = (), *, observe: bool = True) -> Endpoint | None:
-        """An endpoint for one attempt, not of a hotkey in ``exclude``; None if none can take it now. ``observe``:
-        the request is user traffic, so who was offered it and who was not available for it is told."""
+        """An endpoint for one attempt, not of a hotkey in ``exclude``; None if none can take it now. ``observe``: the
+        request is user traffic, so each endpoint drawn is reported with whether it was ready."""
         pool = self._pools.get(model_id)
         if pool is None:
             return None
         now = self.clock()
 
-        def usable(e: Endpoint, slow_ok: bool = False) -> bool:
-            return (e.in_flight < e.cap and e.busy_until <= now and (slow_ok or e.slow_until <= now)
-                    and e.route.hotkey not in exclude and e.breaker.allows(now))
+        def usable(e: Endpoint) -> bool:
+            return (e.in_flight < e.cap and e.busy_until <= now and e.route.hotkey not in exclude
+                    and e.breaker.allows(now))
 
         picks: list[Endpoint] = []
         drawn: set[int] = set()
         for _ in range(DRAWS):
             e = pool.draw(self.rng)
-            if id(e) not in drawn:
+            if observe and self.observer is not None and id(e) not in drawn and e.route.hotkey not in exclude and (
+                    e.in_flight < e.cap or e.slow):
                 drawn.add(id(e))
-                if observe and self.observer is not None and e.route.hotkey not in exclude and e.in_flight < e.cap:
-                    # busy, slow or behind an open breaker: its own doing; full or tried: not
-                    self.observer.offered(e.route, refused=not usable(e))
+                ready = e.busy_until <= now and e.breaker.allows(now) and not e.slow
+                self.observer.offered(e.route, refused=not ready)
             if usable(e) and e not in picks:
                 picks.append(e)
                 if len(picks) == 2:
                     break
         if not picks:
-            usable_ = ([e for e in pool.endpoints if usable(e)]
-                       or [e for e in pool.endpoints if usable(e, slow_ok=True)])  # a slow answer beats none
+            usable_ = [e for e in pool.endpoints if usable(e)]
             if not usable_:
                 return None
             picks = self.rng.choices(usable_, weights=[e.route.credited_rps for e in usable_], k=2)
@@ -197,13 +195,11 @@ class Router:
 
     def finished(self, endpoint: Endpoint, outcome: Outcome | None, seconds: float | None = None, *,
                  observe: bool = True) -> None:
-        """One attempt is over after ``seconds``; ``outcome`` None: it counts neither way (yet, see ``penalize``). An
-        answer slower than ``max_latency_s`` skips the endpoint like a busy one."""
+        """One attempt is over after ``seconds``; ``outcome`` None: it counts neither way (yet, see ``penalize``)."""
         endpoint.in_flight -= 1
         if outcome is Outcome.ANSWERED:
             self._breaker(endpoint, endpoint.breaker.succeeded)
-            if seconds is not None and seconds > self.max_latency_s:
-                endpoint.slow_until = self.clock() + SLOW_S
+            endpoint.slow = seconds is not None and seconds > SLOW_FACTOR * self.max_latency_s
         elif outcome is Outcome.FAILED:
             self._breaker(endpoint, lambda: endpoint.breaker.failed(self.clock()))
         else:

@@ -69,7 +69,7 @@ class Proven(NamedTuple):
     credited: dict[str, float]  # proven capacity, requests/s
     latency_ms: dict[str, float]  # median latency in its throughput test
     user_latency_ms: dict[str, float]  # median latency of its answers to users, where there were enough of them
-    user_availability: dict[str, float]  # share of the user requests offered to it it did not refuse, where enough
+    user_availability: dict[str, float]  # share of the times it was considered for users that it was ready
 
 
 def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | None, cat: catalog.Catalog,
@@ -89,8 +89,8 @@ def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | 
         proven.credited[e.key], proven.latency_ms[e.key] = min(c.credited_rps, e.endpoint.capacity_rps), c.latency_ms
         if c.user_answers >= sc.user_latency_min_answers and c.user_latency_ms > 0:
             proven.user_latency_ms[e.key] = c.user_latency_ms
-        if c.users_offered >= sc.user_refusals_min_offers:
-            proven.user_availability[e.key] = max(0.0, 1.0 - c.users_refused / c.users_offered)
+        if c.user_offers >= sc.user_refusals_min_offers:
+            proven.user_availability[e.key] = max(0.0, 1.0 - c.user_refusals / c.user_offers)
     return proven
 
 

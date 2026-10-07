@@ -272,7 +272,7 @@ def test_what_users_got_from_an_endpoint_is_published_with_its_credit(tmp_path) 
     auditor.chain.head_block = 4 * 180 + 1
     auditor.follower.poll()
     (credit,) = auditor.verdicts(4).verdicts.credits
-    assert (credit.users_offered, credit.users_refused, credit.user_answers) == (10, 3, 3)
+    assert (credit.user_offers, credit.user_refusals, credit.user_answers) == (10, 3, 3)
     assert credit.user_latency_ms == pytest.approx(200, rel=0.06)
     assert auditor.store.users(3)[("hk", "gpu0")].offered == 10  # kept across a restart
     for bad in ({}, {"answered": 1, "latency": {latency_bucket(0.2): 2}}, {"answered": 1, "latency": {500: 1}}):

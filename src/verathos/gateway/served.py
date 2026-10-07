@@ -1,6 +1,6 @@
 """What the miners did for this gateway process's users, per endpoint and second, reported to the auditor: the
-requests they answered with their input tokens and durations, how often the router offered them a request, and how
-often they refused (see ``router``).
+requests they answered with their input tokens and durations, how often the router considered them for a request, and
+how often they were not ready then or refused it (see ``router``).
 
 Miners serve the gateway before the auditor's test traffic; the auditor counts what an endpoint answered the gateway
 inside a test's measured window as delivered too, so serving users never costs a miner credit, and refusing users

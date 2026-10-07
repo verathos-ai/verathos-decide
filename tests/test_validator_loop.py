@@ -189,9 +189,9 @@ def test_credited_capacity() -> None:
                                                                    "hkA/d": 25.0}, {}, {}, {})
     # what users got counts once there is enough of it
     users = Verdicts(netuid=405, auditor="aud", epoch=9, invalid=[], credits=[
-        credit("hkA", "a").model_copy(update={"users_offered": 100, "users_refused": 40, "user_answers": 60,
+        credit("hkA", "a").model_copy(update={"user_offers": 100, "user_refusals": 40, "user_answers": 60,
                                               "user_latency_ms": 300.0}),
-        credit("hkA", "c").model_copy(update={"users_offered": 5, "users_refused": 5, "user_answers": 10,
+        credit("hkA", "c").model_copy(update={"user_offers": 5, "user_refusals": 5, "user_answers": 10,
                                               "user_latency_ms": 900.0})])
     proven = credited_capacity(endpoints, users, cat, "enforce")
     assert proven.user_availability == {"hkA/a": pytest.approx(0.6)} and proven.user_latency_ms == {"hkA/a": 300.0}

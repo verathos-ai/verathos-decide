@@ -11,11 +11,13 @@ Per endpoint and epoch:
 - zero until the endpoint has proven capacity in a throughput test;
 - otherwise its model's share of the epoch's emission (``model_shares``), split among the model's scored endpoints in
   proportion to proven capacity (requests/s) x availability (answered / sent) x availability to users x latency
-  factor. Availability to users is the share of the gateways' user requests the endpoint was offered that it did not
-  refuse (busy, slower than the latency bound, failing), once it was offered ``user_refusals_min_offers`` of them:
-  capacity shown in tests but kept from users does not count. The latency factor compares the endpoint's median
-  latency with the median over the scored endpoints serving the same model, each weighted by its proven capacity (so
-  splitting capacity over more endpoints does not move it), capped to [0.7, 1.3]: the latency of its answers to
+  factor. Availability to users is the share of the times the gateways considered the endpoint for a user request
+  that it was ready (not busy, failing, or answering slower than twice the latency bound), less the requests it
+  refused, once it was considered ``user_refusals_min_offers`` times: capacity shown in tests but kept from users
+  does not count, and neither does keeping users waiting. The latency
+  factor compares the endpoint's median latency with the median over the scored endpoints serving the same model,
+  each weighted by its proven capacity (so splitting capacity over more endpoints does not move it), capped to
+  [0.7, 1.3]: the latency of its answers to
   users once it gave ``user_latency_min_answers`` of them, compared among endpoints measured the same way, else its
   latency in its throughput test, compared among those. Every validator reads the same figures from the auditor's
   verdicts. Candidate models score zero.
@@ -148,8 +150,8 @@ def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, flo
     endpoint's proven capacity in requests/s (missing: none proven yet), ``latency_ms`` its median latency in that
     test (missing: no latency factor); ``failed_hotkeys`` the hotkeys with a wrong answer proven by the throughput
     auditor; ``user_latency_ms`` the median latency of its answers to users, where there were enough (it takes the
-    place of the test's); ``user_availability`` the share of user requests offered to it it did not refuse (missing:
-    1).
+    place of the test's); ``user_availability`` the share of the times it was considered for users that it was
+    ready (missing: 1).
     """
     user_latency_ms, user_availability = user_latency_ms or {}, user_availability or {}
     scores: dict[str, float] = {}

@@ -118,8 +118,8 @@ Runner = Callable[..., Awaitable[loadgen.LoadResult]]
 
 @dataclass
 class UserTally:
-    """What one endpoint did for the gateways' users in one epoch: times it was offered a request, refusals (see
-    ``gateway.router``), answers with a known duration, and those durations (``protocol.gateway`` buckets)."""
+    """What one endpoint did for the gateways' users in one epoch: times it was considered for a request, refusals
+    (see ``gateway.router``), answers with a known duration, and those durations (``protocol.gateway`` buckets)."""
 
     offered: int = 0
     refused: int = 0
@@ -502,8 +502,8 @@ class Store:
 
     def users(self, epoch: int) -> dict[tuple[str, str], UserTally]:
         """What each endpoint did for the gateways' users in ``epoch``."""
-        rows = self._query("SELECT hotkey, endpoint_id, offered, refused, answers, latency FROM users WHERE epoch = ?",
-                           (epoch,))
+        rows = self._query("SELECT hotkey, endpoint_id, offered, refused, answers, latency FROM users "
+                           "WHERE epoch = ?", (epoch,))
         return {(hk, ep): UserTally(offered, refused, answers, {int(b): n for b, n in json.loads(latency).items()})
                 for hk, ep, offered, refused, answers, latency in rows}
 
@@ -1017,7 +1017,7 @@ class Auditor:
             t = users.get((c.hotkey, c.endpoint_id))
             if t is None:
                 return c
-            return c.model_copy(update={"users_offered": t.offered, "users_refused": t.refused,
+            return c.model_copy(update={"user_offers": t.offered, "user_refusals": t.refused,
                                         "user_answers": t.answers,
                                         "user_latency_ms": round(latency_median_ms(t.latency) or 0.0, 1)})
 
