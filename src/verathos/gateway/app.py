@@ -2,7 +2,7 @@
 
     POST /v1/systemone   a SystemOne request with ``Authorization: Bearer <key>`` -> the answers, the usage, the
                          miner's signed receipt and the request id
-    GET  /v1/models      the models served now
+    GET  /v1/models      the models served now, with their state limit and price
     GET  /health         the process is up
     GET  /ready          routes are loaded and the gateway is in the catalog (503 otherwise)
 
@@ -293,7 +293,8 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
     async def models() -> dict[str, Any]:
         cat = g.catalog()
         served = g.router.models()
-        data = [] if cat is None else [{"id": m.model_id, "object": "model", "max_state_tokens": m.max_state_tokens}
+        data = [] if cat is None else [{"id": m.model_id, "object": "model", "max_state_tokens": m.max_state_tokens,
+                                        "price": {"usd_per_million_input_tokens": m.price}}
                                        for m in cat.models if m.status == "active" and m.model_id in served]
         return {"object": "list", "data": data}
 

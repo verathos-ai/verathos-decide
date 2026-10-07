@@ -710,6 +710,12 @@ def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
     (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
     assert cost > 0 and usage["cost"] == cost and balance() == -cost
 
+    async def models():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=s.app), base_url="http://gw") as c:
+            return (await c.get("/v1/models")).json()["data"]
+    (listed,) = asyncio.run(models())
+    assert listed["id"] == "kev-4b" and listed["price"] == {"usd_per_million_input_tokens": price}
+
     asyncio.run(s.accounts.set_account("acme", prepaid=True))
     refused = asyncio.run(s.post(long))
     assert refused.status_code == 402 and refused.json()["error"]["type"] == "insufficient_credit"

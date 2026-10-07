@@ -216,7 +216,8 @@ curl -s https://<gateway>/v1/systemone -H "Authorization: Bearer $KEY" -H "Conte
              "signature": "..."}}
 ```
 
-`GET /v1/models` lists the models served now; `GET /health` answers while the process runs.
+`GET /v1/models` lists the models served now, each with its state limit (`max_state_tokens`) and price
+(`price.usd_per_million_input_tokens`); `GET /health` answers while the process runs.
 
 Every response carries `X-Request-Id` (the client's, if it sent a valid one). Errors are
 `{"error": {"type": ..., "message": ...}}`:
