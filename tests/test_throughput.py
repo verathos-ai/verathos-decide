@@ -109,7 +109,8 @@ def test_a_policy_change_never_selects_a_second_test_in_an_epoch() -> None:
 
 def test_policy_comes_from_the_catalog_and_is_checked() -> None:
     assert policy_from({"pass_fraction": 0.9, "samples_per_test": 20}, 360).samples_per_test == 20
-    for bad in ({"pass_fraction": 1.5}, {"rate_growth": 0.5}, {"test_s": 400.0}, {"answer_checks_per_test": 11}):
+    for bad in ({"pass_fraction": 1.5}, {"rate_growth": 0.5}, {"test_s": 400.0}, {"answer_checks_per_test": 11},
+                {"retest_growth": 3.0}, {"regrow_after": 0}):
         with pytest.raises(ValueError):
             policy_from(bad, 180)
     # settings this code does not know: an error when publishing, ignored when following
@@ -140,6 +141,7 @@ def test_tested_rate_grows_from_what_was_delivered() -> None:
     assert planned_rate(slot, 50.0, 5.0, policy) == 10.0
     assert planned_rate(slot, 50.0, 0.0, policy) == 6.25  # an endpoint that delivered nothing is probed
     assert planned_rate(dataclasses.replace(slot, declared_rps=30.0), 50.0, 90.0, policy) == 30.0
+    assert planned_rate(slot, 50.0, 90.0, policy, fell_short=True) == 99.0  # probes only 10% beyond after a shortfall
 
 
 def test_credit_is_what_was_delivered_and_over_declaring_costs() -> None:
@@ -358,6 +360,12 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
     outcomes = {o.outcome for o in auditor.outcomes(keys["over"].ss58_address, 4)}
     assert outcomes == {"partial"}
     assert auditor.store.last_delivered()[f"{keys['honest'].ss58_address}/gpu0"][1] == pytest.approx(40, rel=0.2)
+    # the over-declarer is probed next only 10% beyond what it delivered, the honest endpoint up to twice
+    last = auditor.store.last_delivered(auditor.policy.regrow_after)
+    over, honest = f"{keys['over'].ss58_address}/gpu0", f"{keys['honest'].ss58_address}/gpu0"
+    assert last[over][2] and not last[honest][2]
+    rates = {t.slot.key: t.tested_rps for t in auditor.targets(auditor.policy)}
+    assert rates[over] == pytest.approx(min(1.1 * last[over][1], 80.0), rel=0.02)
 
 
 def test_a_test_whose_selection_block_is_not_final_is_void(tmp_path) -> None:

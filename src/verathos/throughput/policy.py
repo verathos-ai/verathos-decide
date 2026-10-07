@@ -61,7 +61,9 @@ class AuditPolicy:
     capacity_margin: float = 0.95
     qualification_tests: int = 1
     credit_ttl_epochs: int = 2
-    rate_growth: float = 2.0  # an endpoint is tested at no more than this times what it last delivered
+    rate_growth: float = 2.0  # an endpoint is tested at no more than this times what it last delivered ...
+    retest_growth: float = 1.1  # ... or this times, while one of its last regrow_after counted tests fell short
+    regrow_after: int = 3
     min_test_share: float = 0.125  # ... but at least this share of the model's first_test_rps
     drift_window_tests: int = 8  # tests over which an endpoint's recomputed answers are held to mean_abs
     gateway_checks_per_epoch: int = 2  # sampled gateway answers the auditor recomputes per endpoint and epoch
@@ -85,8 +87,10 @@ class AuditPolicy:
             raise ValueError("gateway_checks_per_epoch cannot be negative")
         if self.answer_checks_per_test > self.samples_per_test:
             raise ValueError("answer_checks_per_test cannot exceed samples_per_test")
-        if self.rate_growth < 1:
-            raise ValueError("rate_growth must be at least 1")
+        if not 1 <= self.retest_growth <= self.rate_growth:
+            raise ValueError("retest_growth must be at least 1 and at most rate_growth")
+        if self.regrow_after < 1:
+            raise ValueError("regrow_after must be at least 1")
         if not 0 < self.min_test_share <= 1:
             raise ValueError("min_test_share must be in (0, 1]")
         if eligible_range(0, self)[1] < eligible_range(0, self)[0]:

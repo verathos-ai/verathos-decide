@@ -73,8 +73,11 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
 
 1. **Targets.** At the selection block the auditor takes every open endpoint listed in an accepted manifest with a
    declared capacity and a model that is not retired. Each is tested at its declared rate, but at most
-   `rate_growth` (2) times what it delivered in its last counted test (at least `min_test_share` (1/8) of the
-   model's `first_test_rps`), and at most `first_test_rps` before its first. Counted in first tests' worth (rate /
+   `rate_growth` (2) times what it delivered in its last counted test, or `retest_growth` (1.1) times while one of
+   its last `regrow_after` (3) counted tests fell short (at least `min_test_share` (1/8) of the model's
+   `first_test_rps`), and at most `first_test_rps` before its first. A test probes far beyond what an endpoint has
+   shown it serves only while it keeps up: one that declares more than it serves is tested at about what it
+   serves, so the users it also serves during the test are not held up, and its credit stays below that. Counted in first tests' worth (rate /
    the model's `first_test_rps`), a hotkey's endpoints together get at most `rate_growth` times what all its
    endpoints delivered last, renamed ones included, and at least one first test's worth; beyond that their rates are
    scaled down together. Neither an endpoint nor a hotkey can make the auditor send much more than it has shown it
@@ -215,6 +218,8 @@ recognisable by its session, so hardware used for other work between tests could
 | `qualification_tests` | 1 | confirmed tests with a credit before an endpoint is scored |
 | `credit_ttl_epochs` | 2 | how many closed epochs back a test still counts |
 | `rate_growth` | 2.0 | tested rate at most this times the last delivered rate |
+| `retest_growth` | 1.1 | ... at most this times it while one of the last `regrow_after` counted tests fell short |
+| `regrow_after` | 3 | passed tests in a row after which the tested rate may grow by `rate_growth` again |
 | `min_test_share` | 0.125 | ... but at least this share of the model's `first_test_rps` |
 | `drift_window_tests` | 8 | tests (and, for gateway answers, epochs) over which an endpoint's recomputed answers must stay within the model's `mean_abs` |
 | `gateway_checks_per_epoch` | 2 | sampled gateway answers the auditor recomputes per endpoint and epoch (0: none) |

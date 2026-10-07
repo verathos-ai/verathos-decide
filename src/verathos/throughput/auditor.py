@@ -3,8 +3,10 @@
 Per test:
 
 1. At the selection block the auditor fixes the targets: every listed open endpoint with a declared capacity, each at
-   its declared rate, but at most ``rate_growth`` times what it delivered in its last test (at most the model's
-   ``first_test_rps`` before its first, and never less than ``min_test_share`` of that). A hotkey's endpoints
+   its declared rate, but at most ``rate_growth`` times what it delivered in its last test, or ``retest_growth``
+   times while one of its last ``regrow_after`` tests fell short (at most the model's ``first_test_rps`` before its
+   first, and never less than ``min_test_share`` of that): a test probes beyond what an endpoint has shown it
+   serves only while it keeps up, so users of an endpoint that cannot are not held up. A hotkey's endpoints
    together get at most ``rate_growth`` times what the hotkey delivered last, measured in first tests' worth, and at
    least one first test's worth. Neither an endpoint nor a hotkey can make the auditor send much more than it has
    shown it serves.
@@ -288,12 +290,20 @@ class Store:
         """-> [(test_id, selection_block, selection_hash)]"""
         return self._query("SELECT test_id, selection_block, selection_hash FROM tests WHERE state = 'unconfirmed'")
 
-    def last_delivered(self) -> dict[str, tuple[str, float]]:
-        """Endpoint key -> (model, delivered rate) in its latest counted result."""
+    def last_delivered(self, recent: int = 1) -> dict[str, tuple[str, float, bool]]:
+        """Endpoint key -> (model, delivered rate in its latest counted result, whether one of its latest ``recent``
+        counted results fell short of passing)."""
         rows = self._query(
-            "SELECT r.hotkey, r.endpoint_id, r.model_id, r.delivered_rps FROM results r JOIN tests t USING (test_id) "
-            "WHERE t.state != 'void' AND r.outcome != 'void' ORDER BY t.epoch, t.start_block")
-        return {f"{hk}/{ep}": (model, rps) for hk, ep, model, rps in rows}
+            "SELECT r.hotkey, r.endpoint_id, r.model_id, r.delivered_rps, r.outcome FROM results r "
+            "JOIN tests t USING (test_id) WHERE t.state != 'void' AND r.outcome != 'void' "
+            "ORDER BY t.epoch, t.start_block")
+        outcomes: dict[str, list[str]] = {}
+        last: dict[str, tuple[str, float]] = {}
+        for hk, ep, model, rps, outcome in rows:
+            outcomes.setdefault(f"{hk}/{ep}", []).append(outcome)
+            last[f"{hk}/{ep}"] = (model, rps)
+        return {key: (model, rps, any(o != "passed" for o in outcomes[key][-recent:]))
+                for key, (model, rps) in last.items()}
 
     def pending(self, first_epoch: int, last_epoch: int) -> bool:
         return bool(self._query("SELECT 1 FROM tests WHERE epoch BETWEEN ? AND ? AND state IN "
@@ -492,12 +502,15 @@ def _beyond(total: float, count: int, tolerance: Tolerance) -> bool:
     return count >= tolerance.min_probabilities and total / count > tolerance.mean_abs
 
 
-def planned_rate(slot: Slot, first_test_rps: float, last_delivered: float | None, policy: AuditPolicy) -> float:
-    """The rate an endpoint is tested at, before its hotkey's budget."""
+def planned_rate(slot: Slot, first_test_rps: float, last_delivered: float | None, policy: AuditPolicy,
+                 fell_short: bool = False) -> float:
+    """The rate an endpoint is tested at, before its hotkey's budget; ``fell_short``: one of its last
+    ``regrow_after`` counted tests did."""
     if last_delivered is None:
         ceiling = first_test_rps
     else:
-        ceiling = max(policy.min_test_share * first_test_rps, policy.rate_growth * last_delivered)
+        growth = policy.retest_growth if fell_short else policy.rate_growth
+        ceiling = max(policy.min_test_share * first_test_rps, growth * last_delivered)
     return round(min(slot.declared_rps, ceiling), 2)
 
 
@@ -580,7 +593,7 @@ class Auditor:
             await asyncio.sleep(POLL_S)
 
     def targets(self, policy: AuditPolicy) -> list[Target]:
-        cat, last = self.catalog(), self.store.last_delivered()
+        cat, last = self.catalog(), self.store.last_delivered(policy.regrow_after)
         by_hotkey: dict[str, list[tuple[Slot, catalog_module.CatalogModel]]] = {}
         for slot in self._slots:
             model = cat.get(slot.model_id)
@@ -588,10 +601,12 @@ class Auditor:
                 by_hotkey.setdefault(slot.hotkey, []).append((slot, model))
         out = []
         for hotkey, slots in by_hotkey.items():
-            rates = [planned_rate(slot, model.first_test_rps, last.get(slot.key, (None, None))[1], policy)
-                     for slot, model in slots]
+            rates = []
+            for slot, model in slots:
+                _, delivered_last, fell_short = last.get(slot.key, (None, None, False))
+                rates.append(planned_rate(slot, model.first_test_rps, delivered_last, policy, fell_short))
             # The hotkey's budget in first tests' worth, from what all its endpoints (renamed ones too) delivered.
-            delivered = sum(rps / cat.get(m).first_test_rps for key, (m, rps) in last.items()
+            delivered = sum(rps / cat.get(m).first_test_rps for key, (m, rps, _) in last.items()
                             if key.startswith(hotkey + "/") and cat.get(m) is not None)
             budget = max(1.0, policy.rate_growth * delivered)
             units = sum(rate / model.first_test_rps for rate, (_, model) in zip(rates, slots))

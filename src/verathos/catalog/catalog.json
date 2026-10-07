@@ -208,6 +208,8 @@
     "qualification_tests": 1,
     "credit_ttl_epochs": 2,
     "rate_growth": 2.0,
+    "retest_growth": 1.1,
+    "regrow_after": 3,
     "min_test_share": 0.125,
     "drift_window_tests": 8
   },
