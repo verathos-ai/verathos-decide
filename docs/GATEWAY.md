@@ -40,16 +40,17 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    decision requests have no side effects. A failure that is the miner's (no connection, a response without a valid
    receipt, a compressed or oversized response, a refusal of the gateway) counts against it at once; one that the
    request itself may cause (a timeout, an error status) counts only if another miner then answers the same request.
-   A miner that answers busy (429, 503) is skipped for one second, and a refusal of the request (another 4xx) counts
-   against nobody. A slow endpoint gets fewer requests on its own: they stay in flight longer. After 3 failures in a
+   A miner that answers busy (429, 503) is skipped for one second; a refusal of the request (another 4xx) counts
+   against it only if another miner then answers the same request. A slow endpoint gets fewer requests on its own: they stay in flight longer. After 3 failures in a
    row an endpoint's circuit breaker opens for 5 s; one probe request then decides, and each failed probe doubles
    the time (up to 120 s).
 7. **Response.** The answers, the input tokens the miner signed in its receipt, the receipt itself and the request
    id. Usage is counted per account, key, model and day, and written every 5 s.
 8. **Report.** Every 5 s the gateway tells the auditor, per endpoint and second, what it answered (with input tokens
    and durations), how often it considered it for a request (drew it), and how often it was not ready then (busy,
-   behind an open breaker, or its latest answer slower than twice the latency bound it declared its capacity at,
-   `max_latency_s`, 2 s) or refused the request (answered busy or failed). Drawn while full at speed counts neither
+   behind an open breaker, or its latest answer or timed-out attempt took at least twice the latency bound it
+   declared its capacity at, `max_latency_s`, 2 s) or refused the request (answered busy or failed, or refused a
+   request another miner answered). An answer counts in the second its request was sent. Drawn while full at speed counts neither
    way. Requests that are not user traffic (admin requests not counted) are left out. The auditor publishes each endpoint's tally with its credit, and validators score it
    (`SCORING.md`).
 

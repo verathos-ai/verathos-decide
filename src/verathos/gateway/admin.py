@@ -1,7 +1,8 @@
 """The gateway's admin API: inspection and debugging, for the operators only.
 
-Served on a socket of its own (``admin_host:admin_port``: loopback or a private network) and only with the admin
-token (``admin_token_file``); on the public port these routes do not exist. Every call is logged.
+An app of its own (``admin_app``), served on a socket of its own (``admin_host:admin_port``: loopback or a private
+network; ``ByPort`` hands it the requests that arrive there) and only with the admin token (``admin_token_file``). On
+the public port none of its routes exist. Every call is logged.
 
     GET  /admin/v1/state       routes, catalog, and what is waiting to be written (usage) or sent (samples, counts)
     GET  /admin/v1/routes      every routable endpoint as the router sees it: capacity, cap, in flight, breaker
@@ -15,6 +16,7 @@ token (``admin_token_file``); on the public port these routes do not exist. Ever
 
 from __future__ import annotations
 
+import dataclasses
 import hmac
 import json
 import logging
@@ -24,6 +26,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError
 
 from verathos.gateway.app import Checked, Gateway, Rejected, check_request, forward
 from verathos.gateway.upstream import Exchange, UpstreamFailure
@@ -43,25 +46,51 @@ def read_token(path: Path) -> str:
     return token
 
 
-def add_admin_routes(app: FastAPI, g: Gateway, *, port: int, token: str) -> None:
+class Target(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    hotkey: str
+    endpoint_id: str
+
+
+class Command(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request: dict[str, Any]
+    target: Target | None = None
+    count: StrictBool = False
+
+
+class ByPort:
+    """One server, two sockets: requests that arrive on ``port`` go to ``app``, all others (and the lifespan) to
+    ``default``."""
+
+    def __init__(self, default: Any, port: int, app: Any) -> None:
+        self.default, self.port, self.app = default, port, app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        server = scope.get("server") or (None, None)
+        if scope["type"] != "lifespan" and server[1] == self.port:
+            await self.app(scope, receive, send)
+        else:
+            await self.default(scope, receive, send)
+
+
+def admin_app(g: Gateway, *, token: str) -> FastAPI:
+    app = FastAPI(title="Verathos gateway admin", docs_url=None, redoc_url=None, openapi_url=None)
     expected = f"Bearer {token}".encode()
 
-    def denied(request: Request) -> JSONResponse | None:
-        server = request.scope.get("server")
-        if not server or server[1] != port:
-            return JSONResponse({"error": {"type": "not_found", "message": "not found"}}, status_code=404)
-        given = request.headers.get("authorization", "").encode()
-        if not hmac.compare_digest(given, expected):
-            log.warning("admin call to %s with a wrong token from %s", request.url.path,
-                        request.client.host if request.client else "?")
+    @app.middleware("http")
+    async def authorized(request: Request, call_next):
+        client = request.client.host if request.client else "?"
+        if not hmac.compare_digest(request.headers.get("authorization", "").encode(), expected):
+            log.warning("admin call %s %s with a wrong token from %s", request.method, request.url.path, client)
             return JSONResponse({"error": {"type": "unauthorized", "message": "admin token required"}},
                                 status_code=401)
-        return None
+        response = await call_next(request)
+        log.info("admin call %s %s from %s -> %d", request.method, request.url.path, client, response.status_code)
+        return response
 
     @app.get("/admin/v1/state")
-    async def state(request: Request):
-        if (refused := denied(request)) is not None:
-            return refused
+    async def state():
         cat = g.catalog()
         return {"hotkey": g.hotkey, "catalog": cat.digest() if cat else None, "routes": g.routes_state(),
                 "models": sorted(g.router.models()), "pending": g.pending_state(),
@@ -70,39 +99,33 @@ def add_admin_routes(app: FastAPI, g: Gateway, *, port: int, token: str) -> None
                            "attempt_timeout_s": g.config.attempt_timeout_s, "max_attempts": g.config.max_attempts}}
 
     @app.get("/admin/v1/routes")
-    async def routes(request: Request):
-        if (refused := denied(request)) is not None:
-            return refused
+    async def routes():
         return {"routes": g.router.describe()}
 
     @app.post("/admin/v1/systemone")
     async def debug_request(request: Request):
-        if (refused := denied(request)) is not None:
-            return refused
         try:
-            command = json.loads(await request.body())
-            body = json.dumps(command["request"]).encode()
-            target, count = command.get("target"), bool(command.get("count", False))
-        except (ValueError, KeyError, TypeError) as exc:
-            return JSONResponse({"error": {"type": "invalid_request", "message": f"{type(exc).__name__}: {exc}"}},
+            command = Command.model_validate_json(await request.body())
+        except ValidationError as exc:
+            return JSONResponse({"error": {"type": "invalid_request", "message": str(exc).splitlines()[0]}},
                                 status_code=400)
         try:
-            checked = check_request(g, body)
+            checked = check_request(g, json.dumps(command.request).encode())
         except Rejected as r:
             return JSONResponse({"error": {"type": r.kind, "message": r.message}}, status_code=r.status)
-        started, attempts = g.clock(), []
-        if target:
+        started, attempts, target = g.clock(), [], command.target
+        if target is not None:
             outcome = await _to_target(g, checked, target, attempts)
         else:
-            outcome = await forward(g, checked, started, attempts, counted=count)
+            outcome = await forward(g, checked, started, attempts, counted=command.count)
         log.info("admin request %s target=%s count=%s -> %s", checked.parsed.model,
-                 f"{target.get('hotkey')}/{target.get('endpoint_id')}" if target else "router", count,
+                 f"{target.hotkey}/{target.endpoint_id}" if target else "router", command.count,
                  "answered" if isinstance(outcome, Exchange) else outcome)
         reply: dict[str, Any] = {"model": checked.parsed.model, "attempts": attempts, "counted": False,
                                  "ms": round(1000 * (g.clock() - started), 1)}
         if not isinstance(outcome, Exchange):
             return JSONResponse({**reply, "error": outcome}, status_code=502)
-        if count:
+        if command.count:
             g.sampler.offer(outcome)
             g.served.record(outcome.route, outcome.input_tokens, outcome.seconds)
             reply["counted"] = True
@@ -110,12 +133,14 @@ def add_admin_routes(app: FastAPI, g: Gateway, *, port: int, token: str) -> None
                 "answers": outcome.answers, "input_tokens": outcome.input_tokens, "receipt": outcome.receipt,
                 "response": outcome.response}
 
+    return app
 
-async def _to_target(g: Gateway, checked: Checked, target: dict[str, Any], attempts: list[dict[str, Any]]):
+
+async def _to_target(g: Gateway, checked: Checked, target: Target, attempts: list[dict[str, Any]]):
     """One attempt at the named endpoint, outside the router's accounting (its breaker and load are untouched)."""
-    endpoint = g.router.find(checked.parsed.model, str(target.get("hotkey")), str(target.get("endpoint_id")))
+    endpoint = g.router.find(checked.parsed.model, target.hotkey, target.endpoint_id)
     if endpoint is None:
-        attempts.append({"endpoint": f"{target.get('hotkey')}/{target.get('endpoint_id')}", "outcome": "failed",
+        attempts.append({"endpoint": f"{target.hotkey}/{target.endpoint_id}", "outcome": "failed",
                          "detail": "not a routable endpoint of this model"})
         return "failed"
     started = time.monotonic()
@@ -124,7 +149,7 @@ async def _to_target(g: Gateway, checked: Checked, target: dict[str, Any], attem
         exchange = await g.upstream.call(endpoint.route, checked.raw, checked.body, checked.request_sha256,
                                          checked.parsed, g.config.request_timeout_s)
         note["outcome"] = "answered"
-        return exchange
+        return dataclasses.replace(exchange, seconds=time.monotonic() - started)
     except UpstreamFailure as failure:
         note.update(outcome="failed", kind=failure.kind, blame=failure.blame, detail=str(failure))
         return "failed"

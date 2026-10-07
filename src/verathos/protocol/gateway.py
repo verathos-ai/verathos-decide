@@ -33,7 +33,9 @@ SAMPLES_PATH = "/v1/gateway/samples"
 SERVED_PATH = "/v1/gateway/served"
 MAX_SAMPLES_PER_POST = 64
 MAX_SAMPLES_BYTES = 8 << 20
-MAX_SERVED_COUNTS = 20_000  # entries per post, within MAX_SAMPLES_BYTES with their latencies
+MAX_SERVED_COUNTS = 20_000  # entries per post ...
+MAX_SERVED_BYTES = 8 << 20  # ... and bytes
+MAX_REQUEST_BYTES = 1 << 20  # a gateway request's body, at most
 
 
 class Route(BaseModel):
@@ -109,11 +111,11 @@ class ServedCount(BaseModel):
     hotkey: str
     endpoint_id: str
     second: int  # unix time, whole seconds
-    answered: int = Field(0, ge=0)  # user requests it answered in [second, second + 1)
-    input_tokens: int = Field(0, ge=0)  # of those requests, as the miner signed them
-    offered: int = Field(0, ge=0)  # times the router considered it for a user request (drew it)
-    refused: int = Field(0, ge=0)  # of those, it was not ready (busy, open breaker, slow), plus requests it answered
-    # busy or failed
+    answered: int = Field(0, ge=0, le=1_000_000)  # user requests sent in [second, second + 1) that it answered
+    input_tokens: int = Field(0, ge=0)  # of those requests, as the miner signed them (at most one per request byte)
+    offered: int = Field(0, ge=0, le=10_000_000)  # times the router considered it for a user request (drew it)
+    refused: int = Field(0, ge=0, le=10_000_000)  # of those, it was not ready (busy, open breaker, slow), plus
+    # requests it answered busy, refused or failed
     latency: dict[int, int] = Field(default_factory=dict)  # its answers' durations: bucket -> answers
 
     @model_validator(mode="after")
@@ -124,8 +126,11 @@ class ServedCount(BaseModel):
             raise ValueError("latency buckets out of range")
         if sum(self.latency.values()) > self.answered:
             raise ValueError("more latencies than answers")
+        if self.input_tokens > self.answered * MAX_REQUEST_BYTES:
+            raise ValueError("more input tokens than the requests' bytes")
         return self
 
 
 class ServedReport(BaseModel):
+    report_id: str = Field("", max_length=64)  # the auditor takes a report once, even when it is posted again
     counts: list[ServedCount] = Field(min_length=1, max_length=MAX_SERVED_COUNTS)

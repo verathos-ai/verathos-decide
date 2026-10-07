@@ -147,7 +147,7 @@ class Router:
         now = self.clock()
         return [{"model": model, "endpoint": e.key, "url": e.route.url, "credited_rps": e.route.credited_rps,
                  "latency_ms": e.route.latency_ms, "cap": e.cap, "in_flight": e.in_flight,
-                 "busy_for_s": round(max(e.busy_until - now, 0.0), 1),
+                 "busy_for_s": round(max(e.busy_until - now, 0.0), 1), "slow": e.slow,
                  "breaker": {"open": e.breaker.is_open, "failures": e.breaker.failures, "probing": e.breaker.probing,
                              "open_for_s": round(max(e.breaker.open_until - now, 0.0), 1) if e.breaker.is_open
                              else 0.0}}
@@ -187,7 +187,10 @@ class Router:
             if not usable_:
                 return None
             picks = self.rng.choices(usable_, weights=[e.route.credited_rps for e in usable_], k=2)
-        return min(picks, key=lambda e: e.load)
+        chosen = min(picks, key=lambda e: e.load)
+        if observe and self.observer is not None and id(chosen) not in drawn:  # found by the scan, not drawn
+            self.observer.offered(chosen.route, refused=chosen.slow)
+        return chosen
 
     def started(self, endpoint: Endpoint) -> None:
         endpoint.in_flight += 1
@@ -197,9 +200,11 @@ class Router:
                  observe: bool = True) -> None:
         """One attempt is over after ``seconds``; ``outcome`` None: it counts neither way (yet, see ``penalize``)."""
         endpoint.in_flight -= 1
+        slow = seconds is not None and seconds >= SLOW_FACTOR * self.max_latency_s
+        if outcome is Outcome.ANSWERED or slow:  # a timeout at the attempt's limit is slow too
+            endpoint.slow = slow
         if outcome is Outcome.ANSWERED:
             self._breaker(endpoint, endpoint.breaker.succeeded)
-            endpoint.slow = seconds is not None and seconds > SLOW_FACTOR * self.max_latency_s
         elif outcome is Outcome.FAILED:
             self._breaker(endpoint, lambda: endpoint.breaker.failed(self.clock()))
         else:

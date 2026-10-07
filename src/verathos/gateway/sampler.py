@@ -68,19 +68,30 @@ class Sampler:
     async def flush(self) -> None:
         proofs, picked = self._proofs, list(self._picked.values())
         self._seen, self._picked, self._proofs = {}, {}, []
-        url = await self.auditor_url() if proofs or picked else None
-        for exchanges, is_proof in ((proofs, True), (picked, False)):
-            if not exchanges:
-                continue
-            serialized = [GatewaySample(hotkey=e.route.hotkey, endpoint_id=e.route.endpoint_id,
-                                        model_id=e.route.model_id, request=e.request,
-                                        response=e.response).model_dump_json() for e in exchanges]
-            failed = 0
-            for batch in batches(serialized):
-                if not await self._post(url, batch):
-                    failed += len(batch)
-            if failed and is_proof:  # proofs are kept for the next window
-                self._proofs = (exchanges + self._proofs)[:MAX_PROOFS]
+        if not (proofs or picked):
+            return
+        sent_proofs = False
+        try:
+            try:
+                url = await self.auditor_url()
+            except Exception as exc:
+                log.warning("the auditor's address is unknown: %s", exc)
+                url = None
+            for exchanges, is_proof in ((proofs, True), (picked, False)):
+                if not exchanges:
+                    continue
+                serialized = [GatewaySample(hotkey=e.route.hotkey, endpoint_id=e.route.endpoint_id,
+                                            model_id=e.route.model_id, request=e.request,
+                                            response=e.response).model_dump_json() for e in exchanges]
+                failed = 0
+                for batch in batches(serialized):
+                    if not await self._post(url, batch):
+                        failed += len(batch)
+                if is_proof:
+                    sent_proofs = not failed
+        finally:
+            if proofs and not sent_proofs:  # proofs are kept for the next window, whatever stopped this one
+                self._proofs = (proofs + self._proofs)[:MAX_PROOFS]
 
     async def _post(self, url: str | None, batch: list[str]) -> bool:
         if not url:

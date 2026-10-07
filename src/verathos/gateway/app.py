@@ -224,7 +224,8 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
                 outcome, result = Outcome.FAILED, "failed"
             elif failure.blame == "busy":
                 outcome = Outcome.BUSY
-            elif failure.blame == "rejected":
+            elif failure.blame == "rejected":  # the request's fault, unless another miner answers it
+                unclear.append(endpoint)
                 result = "rejected" if result != "failed" else result
             else:
                 unclear.append(endpoint)

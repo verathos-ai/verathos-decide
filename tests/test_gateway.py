@@ -337,11 +337,16 @@ def test_an_endpoint_that_refuses_users_or_keeps_them_waiting_is_reported() -> N
     assert offers == refusals > 50 and all(router.pick("kev-4b") is f for _ in range(50))
     clock.now += BUSY_S
     router.started(s)
-    router.finished(s, None, 4.5)  # a timeout counts only once another miner answers (penalize)
+    router.finished(s, None, 1.0)  # a quick unclear failure counts only once another miner answers (penalize)
     assert considered(slow)[1] == 0
     before = observer.refusals[slow]
     router.penalize(s)
     assert observer.refusals[slow] == before + 1
+    router.started(s)
+    router.finished(s, None, 4.0)  # an attempt that timed out at twice the bound: slow, so not ready
+    assert s.slow and considered(slow)[1] > 0
+    router.started(s)
+    router.finished(s, Outcome.ANSWERED, 0.2)
     for _ in range(f.cap):
         router.started(f)
     assert considered(fast) == (0, 0)  # full at speed: neither way
@@ -546,6 +551,34 @@ def test_what_miners_answer_the_gateway_reaches_the_auditor(tmp_path) -> None:
     assert s.auditor.served_in(keypair.ss58_address, "gpu0", now - 60, now + 1) == pytest.approx(3.0)
 
 
+def test_a_miner_refusing_requests_another_miner_answers_is_counted(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.2": MockEngine("kev-4b")})
+    refuser, bad = FastAPI(), kp()
+
+    @refuser.post("/e/gpu0/v1/systemone")
+    async def refuse():
+        return JSONResponse({"error": "not today"}, status_code=400)
+
+    s.client._transport._t["10.0.0.7"] = httpx.ASGITransport(app=refuser)
+    s.router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=2, catalog_digest="0" * 64, routes=[
+        route(bad, "10.0.0.7", 1000.0), route(s.miners["10.0.0.2"][0], "10.0.0.2", 20.0)]))
+    assert all(r.status_code == 200 for r in s.many(5))
+    assert sum(n.refused for (hk, _, _), n in s.served._counts.items() if hk == bad.ss58_address) >= 1
+
+
+def test_served_counts_are_kept_while_the_auditor_cannot_be_found() -> None:
+    async def unknown():
+        raise RuntimeError("chain unreachable")
+
+    counter = ServedCounter(kp(), httpx.AsyncClient(), auditor_url=unknown, auditor_hotkey="a", clock=lambda: 1000.0)
+    r = Route(hotkey="hk", endpoint_id="gpu0", model_id="kev-4b", url="http://x/e/gpu0", credited_rps=10.0,
+              latency_ms=300.0)
+    counter.record(r, 10, 3.0)
+    assert ("hk", "gpu0", 997) in counter._counts  # in the second its request was sent
+    asyncio.run(counter.report(final=True))
+    assert counter.pending() == 1
+
+
 def test_what_users_get_from_each_endpoint_reaches_the_auditor(tmp_path) -> None:
     s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": MockEngine("kev-4b")})
     s.router.max_latency_s = 1e-9  # every answer is slower than twice this bound
@@ -569,10 +602,10 @@ ADMIN_TOKEN = "a" * 40
 
 
 def admin_setup(tmp_path):
-    from verathos.gateway.admin import add_admin_routes
+    from verathos.gateway.admin import ByPort, admin_app
 
-    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": MockEngine("kev-4b")})
-    add_admin_routes(s.app, s.gateway, port=9999, token=ADMIN_TOKEN)
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": Slow("kev-4b", 0.05)})
+    s.app = ByPort(s.app, 9999, admin_app(s.gateway, token=ADMIN_TOKEN))
     return s
 
 
@@ -584,7 +617,9 @@ async def admin_call(s, method: str, path: str, *, port: int = 9999, token: str 
 
 def test_the_admin_api_exists_only_on_its_port_and_only_with_the_token(tmp_path) -> None:
     s = admin_setup(tmp_path)
-    assert asyncio.run(admin_call(s, "GET", "/admin/v1/state", port=80)).status_code == 404  # the public port
+    for method, path in (("GET", "/admin/v1/state"), ("GET", "/admin/v1/systemone"), ("POST", "/admin/v1/systemone")):
+        assert asyncio.run(admin_call(s, method, path, port=80)).status_code == 404  # nothing on the public port
+    assert asyncio.run(admin_call(s, "POST", "/v1/systemone")).status_code == 404  # nor public routes here
     assert asyncio.run(admin_call(s, "GET", "/admin/v1/state", token=None)).status_code == 401
     assert asyncio.run(admin_call(s, "GET", "/admin/v1/state", token="b" * 40)).status_code == 401
     state = asyncio.run(admin_call(s, "GET", "/admin/v1/state")).json()
@@ -612,6 +647,11 @@ def test_an_admin_request_goes_where_it_is_sent_and_is_never_billed(tmp_path) ->
     unknown = asyncio.run(admin_call(s, "POST", "/admin/v1/systemone",
                                      json_={"request": REQUEST, "target": {"hotkey": "x", "endpoint_id": "gpu0"}}))
     assert unknown.status_code == 502 and unknown.json()["attempts"][0]["detail"].startswith("not a routable")
+    for bad in ({"request": REQUEST, "target": "x"}, {"request": REQUEST, "count": "false"}, {"request": []}):
+        assert asyncio.run(admin_call(s, "POST", "/admin/v1/systemone", json_=bad)).status_code == 400
+    from verathos.protocol.gateway import latency_bucket
+    latencies = {b for (hk, _, _), n in s.served._counts.items() for b in n.latency if hk == target["hotkey"]}
+    assert latencies == {latency_bucket(counted["attempts"][0]["ms"] / 1000)}  # the targeted answer's own duration
     assert all(e.in_flight == 0 for e in s.router._pools["kev-4b"].endpoints)
 
 

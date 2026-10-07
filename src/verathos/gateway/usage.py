@@ -97,8 +97,8 @@ class UsageMeter:
                 state = self._month.get(account)
                 if state is not None and month_start(day) == state[0]:
                     state[1] += c[0]
-        except Exception:
-            for key, c in counts.items():  # keep them for the next write
+        except BaseException:  # kept for the next write, also when the write is cancelled at shutdown
+            for key, c in counts.items():
                 if len(self._counts) >= MAX_PENDING:
                     break
                 mine = self._counts.setdefault(key, [0, 0, 0])

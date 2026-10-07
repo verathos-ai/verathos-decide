@@ -32,7 +32,7 @@ import uvicorn
 from verathos import catalog as catalog_module
 from verathos.gateway import db
 from verathos.gateway.accounts import Accounts
-from verathos.gateway.admin import add_admin_routes, read_token
+from verathos.gateway.admin import ByPort, admin_app, read_token
 from verathos.gateway.app import Gateway, create_app
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
@@ -115,7 +115,7 @@ async def serve(config: GatewayConfig) -> None:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            for final in (meter.flush(), sampler.flush(), served.report()):
+            for final in (meter.flush(), sampler.flush(), served.report(final=True)):
                 try:
                     await final
                 except Exception:
@@ -126,10 +126,10 @@ async def serve(config: GatewayConfig) -> None:
     if config.metrics_port:
         from prometheus_client import start_http_server
         start_http_server(config.metrics_port, addr="127.0.0.1")
-    app = create_app(gateway, lifespan=lifespan)
+    app: Any = create_app(gateway, lifespan=lifespan)
     sockets = [listen(config.listen_host, config.port)]
     if config.admin_port is not None:
-        add_admin_routes(app, gateway, port=config.admin_port, token=read_token(config.admin_token_file))
+        app = ByPort(app, config.admin_port, admin_app(gateway, token=read_token(config.admin_token_file)))
         sockets.append(listen(config.admin_host, config.admin_port))
         log.info("admin API on %s:%d", config.admin_host, config.admin_port)
     # On SIGTERM: stop accepting (the reverse proxy turns to the standby), finish what is in flight, write usage.

@@ -33,7 +33,7 @@ class GatewayConfig(BaseModel):
     attempt_timeout_s: float = Field(4.0, gt=0, description="Per attempt at one miner")
     max_attempts: int = Field(3, ge=1, le=5)
     max_in_flight: int = Field(4096, ge=1, description="User requests in flight in this process; more get 503")
-    max_body_bytes: int = Field(1 << 20, ge=1024)
+    max_body_bytes: int = Field(1 << 20, ge=1024, le=1 << 20)
     sample_window_s: float = Field(600.0, ge=10, description="One exchange per endpoint and window goes to the "
                                    "auditor")
     catalog_dir: Path = Path("~/.verathos/catalog")
