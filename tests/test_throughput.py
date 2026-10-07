@@ -569,3 +569,42 @@ def test_the_ladder_reaches_max_concurrency_and_a_measurement_steps_aside() -> N
     assert measure._ladder(target) == [1, 2, 4, 8, 16, 32, 48]
     with pytest.raises(measure.MeasurementInterrupted):
         asyncio.run(measure.measure_all([target], 1.0, run_s=0.1, stop=lambda: True))
+
+
+def test_under_pressure_recomputes_reach_as_many_endpoints_as_they_can_in_an_unpredictable_order() -> None:
+    """When the reference cannot recompute every endpoint's answers before the deadline, every endpoint's first check
+    runs before any second one, and which endpoints miss out differs from test to test."""
+    import secrets as secrets_module
+    import time as time_module
+
+    from verathos.throughput.auditor import Checks
+    from verathos.validator.compare import Tolerance
+
+    class Reference(MockEngine):
+        async def answer(self, request):
+            await asyncio.sleep(0.01)
+            return await super().answer(request)
+
+    request = {"model": "kev-4b", "state": "hello", "questions": {"q": {"type": "noul", "instructions": "x"}}}
+
+    async def one_test() -> dict[int, int]:
+        answers = (await MockEngine("kev-4b").answer(request))["answers"]
+        recomputes = Checks({"kev-4b": Reference("kev-4b")}, {}).for_test(budget_s=0.15)
+        endpoints, checked = 200, {}
+        order = list(range(endpoints))
+        secrets_module.SystemRandom().shuffle(order)
+
+        async def endpoint(e: int, place: int) -> None:
+            for round_ in range(2):
+                _, comparison = await recomputes.check("kev-4b", request, answers, Tolerance(),
+                                                       recompute_answers=True, rank=round_ * endpoints + place)
+                checked[e] = checked.get(e, 0) + (comparison is not None)
+
+        started = time_module.monotonic()
+        await asyncio.gather(*(endpoint(e, place) for e, place in zip(range(endpoints), order)))
+        assert time_module.monotonic() - started < 1.0  # what does not fit is skipped, nothing waits it out
+        return {e: n for e, n in checked.items() if n}
+
+    first, second = asyncio.run(one_test()), asyncio.run(one_test())
+    assert 20 < len(first) < 200 and all(n == 1 for n in first.values())  # coverage first: no second checks
+    assert set(first) != set(second)  # and not the same endpoints every time

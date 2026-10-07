@@ -1,9 +1,12 @@
 """One epoch of canary audits.
 
-For every model with a reference engine, the validator computes reference answers for the epoch's canary pool once,
-then sends each endpoint its assigned subset as signed requests, checks every receipt, and compares the answers with
-the reference. Nothing a miner returns can abort the epoch: every reply is size- and time-bounded and every parse
-failure is recorded against that endpoint.
+For every model with a reference engine, the validator computes reference answers for the epoch's canary pool once
+(the models side by side, each within ``REFERENCE_SHARE`` of the epoch's audit time: what is not done by then is left
+out of the pool), then sends each endpoint its assigned subset of the canaries computed, spread over the time left,
+as signed requests, checks every receipt, and compares the answers with the reference. The reference work does not
+grow with the number of endpoints, and a slow reference shrinks the pool instead of delaying the epoch. Nothing a
+miner returns can abort the epoch: every reply is size- and time-bounded and every parse failure is recorded against
+that endpoint.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ MAX_HOLD_WAIT_S = 120.0
 REQUEST_TIMEOUT_S = 60.0
 IDENTITY_CONCURRENCY = 256
 MAX_REPLY_BYTES = 1 << 20
+REFERENCE_SHARE = 0.3  # of an epoch's audit time, the most the canaries' reference answers may take
 
 
 @dataclass
@@ -53,15 +57,27 @@ class EndpointResult:
             self.tally = EndpointTally(self.tolerance)
 
 
-async def reference_answers(pool: list[dict[str, Any]], engine: Engine) -> list[dict[str, dict[str, float]] | None]:
-    """Reference distributions for each canary; None where the reference engine failed."""
+async def reference_answers(pool: list[dict[str, Any]], engine: Engine,
+                            deadline: float | None = None) -> list[dict[str, dict[str, float]] | None]:
+    """Reference distributions for each canary, in order until ``deadline`` (``time.monotonic``); None where the
+    reference engine failed or the time was up."""
     out: list[dict[str, dict[str, float]] | None] = []
     for request in pool:
+        left = None if deadline is None else deadline - time.monotonic()
+        if left is not None and left <= 0:
+            out.append(None)
+            continue
         try:
-            out.append(distributions((await engine.answer(request))["answers"]))
+            out.append(distributions((await asyncio.wait_for(engine.answer(request), left))["answers"]))
+        except TimeoutError:
+            out.append(None)
         except (EngineError, KeyError, ValueError) as e:
             log.warning("reference failed for a %s canary: %s", request["model"], e)
             out.append(None)
+    missing = sum(r is None for r in out)
+    if missing:
+        log.warning("%s: %d of %d canaries without a reference answer this epoch", pool[0]["model"] if pool else "?",
+                    missing, len(pool))
     return out
 
 
@@ -138,18 +154,21 @@ async def audit_epoch(
     mechid: int,
     pool_size: int = 16,
     per_endpoint: int = 10,
-    spread_s: float = 0.0,
+    budget_s: float | None = None,
     holding: Callable[[], bool] = lambda: False,
 ) -> dict[str, EndpointResult]:
-    """Audit every endpoint whose model has a reference engine. Returns results keyed by endpoint key; endpoints
-    without a usable canary this epoch (no reference engine, or every reference failed) have no result."""
-    pools: dict[str, list[tuple[dict[str, Any], dict[str, dict[str, float]] | None]]] = {}
-    for model_id in sorted({e.endpoint.model_id for e in endpoints}):
-        if model_id not in references:
-            log.info("no reference engine for %s; its endpoints are not audited this epoch", model_id)
-            continue
-        pool = canary_pool(secret, epoch, model_id, pool_size)
-        pools[model_id] = list(zip(pool, await reference_answers(pool, references[model_id])))
+    """Audit every endpoint whose model has a reference engine, within ``budget_s`` (None: references unbounded,
+    canaries at once). Returns results keyed by endpoint key; endpoints without a usable canary this epoch (no
+    reference engine, or no reference answer) have no result."""
+    start = time.monotonic()
+    deadline = None if budget_s is None else start + REFERENCE_SHARE * budget_s
+    models = [m for m in sorted({e.endpoint.model_id for e in endpoints}) if m in references]
+    for model_id in sorted({e.endpoint.model_id for e in endpoints} - set(models)):
+        log.info("no reference engine for %s; its endpoints are not audited this epoch", model_id)
+    canaries = {m: canary_pool(secret, epoch, m, pool_size) for m in models}
+    answers = await asyncio.gather(*(reference_answers(canaries[m], references[m], deadline) for m in models))
+    pools = {m: [(c, a) for c, a in zip(canaries[m], got) if a is not None] for m, got in zip(models, answers)}
+    spread_s = 0.0 if budget_s is None else max(start + budget_s - time.monotonic(), 0.0) / max(per_endpoint, 1)
 
     results: dict[str, EndpointResult] = {}
     tasks = []
@@ -159,7 +178,7 @@ async def audit_epoch(
         pool = pools.get(ep.endpoint.model_id)
         if pool is None:
             continue
-        picked = [pool[i] for i in assignment(secret, epoch, ep.key, len(pool), per_endpoint) if pool[i][1] is not None]
+        picked = [pool[i] for i in assignment(secret, epoch, ep.key, len(pool), per_endpoint)]
         if not picked:
             continue
         res = EndpointResult(ep, tolerances[ep.endpoint.model_id])

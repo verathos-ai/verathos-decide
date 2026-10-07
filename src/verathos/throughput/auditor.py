@@ -37,6 +37,8 @@ drifted answers to users.
 from __future__ import annotations
 
 import asyncio
+import heapq
+import itertools
 import json
 import logging
 import math
@@ -154,18 +156,49 @@ class Checks:
         return Recomputes(self, time.monotonic() + budget_s)
 
 
+class RankedSlots:
+    """At most ``n`` holders at once; waiters are let in lowest rank first (ties: first come)."""
+
+    def __init__(self, n: int) -> None:
+        self._free, self._waiting, self._order = n, [], itertools.count()
+
+    async def acquire(self, rank: float) -> None:
+        if self._free > 0 and not self._waiting:
+            self._free -= 1
+            return
+        waiter = asyncio.get_running_loop().create_future()
+        heapq.heappush(self._waiting, (rank, next(self._order), waiter))
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            if waiter.done() and not waiter.cancelled():
+                self.release()
+            raise
+
+    def release(self) -> None:
+        while self._waiting:
+            _, _, waiter = heapq.heappop(self._waiting)
+            if not waiter.done():
+                waiter.set_result(None)
+                return
+        self._free += 1
+
+
 class Recomputes:
     """The answer checks of one test: recomputes stop at the test's deadline, and an engine that fails
-    ``BREAKER_FAILURES`` times in a row is not asked again in it."""
+    ``BREAKER_FAILURES`` times in a row is not asked again in it. Under pressure the order decides which run: a
+    recompute's rank (lower first) is its round times the number of endpoints plus the endpoint's place in a random
+    order, so every endpoint's first check runs before any second, and which endpoints miss out is not predictable."""
 
     def __init__(self, checks: Checks, deadline: float) -> None:
         self.checks, self.deadline = checks, deadline
         self._failures: dict[int, int] = {}
-        self._slots = asyncio.Semaphore(REFERENCE_CONCURRENCY)
+        self._slots = RankedSlots(REFERENCE_CONCURRENCY)
 
     async def _compare(self, engine: Engine, model_id: str, request: dict[str, Any], got: dict[str, Any],
-                       tolerance: Tolerance) -> RequestComparison | None:
-        async with self._slots:  # the deadline and the breaker are judged when the recompute would start
+                       tolerance: Tolerance, rank: float = 0.0) -> RequestComparison | None:
+        await self._slots.acquire(rank)
+        try:  # the deadline and the breaker are judged when the recompute would start
             if time.monotonic() > self.deadline or self._failures.get(id(engine), 0) >= BREAKER_FAILURES:
                 return None
             try:
@@ -176,16 +209,20 @@ class Recomputes:
                 return None
             self._failures[id(engine)] = 0
             return comparison
+        finally:
+            self._slots.release()
 
     async def check(self, model_id: str, request: dict[str, Any], answers: Any, tolerance: Tolerance, *,
-                    recompute_answers: bool, claimed: int | None = None) -> tuple[str | None, RequestComparison | None]:
+                    recompute_answers: bool, claimed: int | None = None,
+                    rank: float = 0.0) -> tuple[str | None, RequestComparison | None]:
         """-> (why the answers are wrong or None, the comparison made or None). Without ``recompute_answers`` only
-        their form is checked; with it, also the input tokens the receipt signs (``claimed``)."""
-        fault, comparison = await self._check(model_id, request, answers, tolerance, recompute_answers)
+        their form is checked; with it, also the input tokens the receipt signs (``claimed``). ``rank``: see the
+        class."""
+        fault, comparison = await self._check(model_id, request, answers, tolerance, recompute_answers, rank)
         return fault or tokens_fault(claimed, comparison), comparison
 
     async def _check(self, model_id: str, request: dict[str, Any], answers: Any, tolerance: Tolerance,
-                     recompute_answers: bool) -> tuple[str | None, RequestComparison | None]:
+                     recompute_answers: bool, rank: float) -> tuple[str | None, RequestComparison | None]:
         got = readable(answers)
         if got is None:
             return MALFORMED, None
@@ -194,7 +231,7 @@ class Recomputes:
         first = screen or reference
         if not recompute_answers or first is None:
             return None, None
-        comparison = await self._compare(first, model_id, request, got, tolerance)
+        comparison = await self._compare(first, model_id, request, got, tolerance, rank)
         if comparison is None:
             return None, None
         fault = fault_of(comparison, tolerance)
@@ -203,7 +240,7 @@ class Recomputes:
         if reference is None:
             log.warning("the %s screen flagged an answer but there is no fp32 reference to confirm it", model_id)
             return None, comparison
-        confirmed = await self._compare(reference, model_id, request, got, tolerance)
+        confirmed = await self._compare(reference, model_id, request, got, tolerance, -1.0)  # a flag is confirmed first
         if confirmed is None:
             return None, comparison
         return fault_of(confirmed, tolerance), confirmed
@@ -430,8 +467,9 @@ class Store:
     def samples_to_check(self, epoch: int, per_endpoint: int, rng: random.Random) -> list[tuple]:
         """The samples to check now: every pending proof, and per endpoint and epoch (this one and the last) random
         pending samples until ``per_endpoint`` are checked; the rest of a done endpoint's are skipped, and pending
-        ones of older epochs given up. -> [(sample_id, gateway, hotkey, endpoint_id, model_id, request_id, request,
-        response)]"""
+        ones of older epochs given up. In the order to check them: proofs, then every endpoint's first sample (the
+        endpoints in random order), then every second one, so a round cut short checks as many endpoints as it can.
+        -> [(sample_id, gateway, hotkey, endpoint_id, model_id, request_id, request, response)]"""
         self._query(f"UPDATE samples SET state = 'unchecked', reason = 'not checked within the next epoch', "
                     f"{_SCRUB} WHERE state = 'pending' AND epoch < ?", (epoch - 1,))
         rows = self._query("SELECT sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, request, "
@@ -444,16 +482,20 @@ class Store:
         for r in rows:
             if not r[9]:
                 groups.setdefault((r[3], r[4], r[1]), []).append(r)
+        picks: dict[tuple[str, str, int], list[tuple]] = {}
         for key, pending in groups.items():
             wanted = max(per_endpoint - checked.get(key, 0), 0)
-            picked = rng.sample(pending, min(wanted, len(pending)))
-            chosen += picked
+            picked = picks[key] = rng.sample(pending, min(wanted, len(pending)))
             if wanted <= len(picked):  # the endpoint's checks for the epoch are done (once these finish)
                 rest = [r[0] for r in pending if r not in picked]
                 if rest:
                     marks = ",".join("?" * len(rest))
                     self._query(f"UPDATE samples SET state = 'skipped', {_SCRUB} WHERE sample_id IN ({marks})",
                                 rest)
+        keys = list(picks)
+        rng.shuffle(keys)
+        for k in range(max((len(p) for p in picks.values()), default=0)):
+            chosen += [picks[key][k] for key in keys if k < len(picks[key])]
         return [(r[0], r[2], r[3], r[4], r[5], r[6], r[7], r[8]) for r in chosen]
 
     def failed_check(self, sample_id: str) -> None:
@@ -769,9 +811,11 @@ class Auditor:
                     + policy.test_s)
         await asyncio.sleep(max(0.0, window_s[1] + SERVED_WAIT_S - time.time()))  # the gateways' last counts
         recomputes, scales = checks.for_test(), self.user_scales(window_s)
+        order = list(range(len(targets)))
+        secrets.SystemRandom().shuffle(order)  # which endpoints' checks wait longest under pressure: unpredictable
         results = await asyncio.gather(*(self.evaluate(test, t, r, recomputes, policy, window_s,
-                                                       scales.get(t.slot.model_id, 1.0))
-                                         for t, r in zip(targets, result.targets)))
+                                                       scales.get(t.slot.model_id, 1.0), (place, len(targets)))
+                                         for t, r, place in zip(targets, result.targets, order)))
         self.store.add_results(test.test_id, results)
         counts = {o: sum(r.outcome == o for r in results) for o in ("passed", "partial", "invalid", "void")}
         log.info("throughput test of epoch %d done: %s; %.0f of %.0f requests/s credited", test.epoch,
@@ -791,18 +835,19 @@ class Auditor:
 
     async def evaluate(self, test: ScheduledTest, target: Target, r: loadgen.TargetResult, recomputes: Recomputes,
                        policy: AuditPolicy, window_s: tuple[float, float] = (0.0, 0.0),
-                       user_scale: float = 1.0) -> Result:
+                       user_scale: float = 1.0, place: tuple[int, int] = (0, 1)) -> Result:
         """One endpoint's result; whatever its responses contain, a failure here voids only this endpoint.
         ``window_s``: the measured window (unix seconds), in which what the endpoint answered the gateways counts as
         delivered too."""
         try:
-            return await self._evaluate(test, target, r, recomputes, policy, window_s, user_scale)
+            return await self._evaluate(test, target, r, recomputes, policy, window_s, user_scale, place)
         except Exception:
             log.exception("evaluating %s in the test of epoch %d failed", target.slot.key, test.epoch)
             return Result(target, "void", "the auditor could not evaluate this endpoint")
 
     async def _evaluate(self, test: ScheduledTest, target: Target, r: loadgen.TargetResult, recomputes: Recomputes,
-                        policy: AuditPolicy, window_s: tuple[float, float], user_scale: float = 1.0) -> Result:
+                        policy: AuditPolicy, window_s: tuple[float, float], user_scale: float = 1.0,
+                        place: tuple[int, int] = (0, 1)) -> Result:
         endpoint = (target.slot.hotkey, target.slot.endpoint_id)
         gateway = self.served_in(*endpoint, *window_s)
         users = self.served_in(*endpoint, *window_s, attempts=True)
@@ -832,11 +877,13 @@ class Auditor:
             if answers is not None:
                 signed.append((sample, answers))
         valid, evidence, drift_sum, drift_count = len(signed), None, 0.0, 0
-        recomputed = {id(s) for s, _ in random.sample(signed, min(policy.answer_checks_per_test, len(signed)))}
+        recomputed = {id(s): k for k, (s, _) in enumerate(
+            random.sample(signed, min(policy.answer_checks_per_test, len(signed))))}  # -> its round
         for sample, answers in signed if model is not None else []:
             fault, comparison = await recomputes.check(slot.model_id, sample.request, answers, model.tolerance,
                                                        recompute_answers=id(sample) in recomputed,
-                                                       claimed=claimed_tokens(parse_response(sample.response)))
+                                                       claimed=claimed_tokens(parse_response(sample.response)),
+                                                       rank=recomputed.get(id(sample), 0) * place[1] + place[0])
             if comparison is not None:
                 drift_sum, drift_count = drift_sum + comparison.sum_abs, drift_count + comparison.count
             if fault:
@@ -904,7 +951,7 @@ class Auditor:
             return
         recomputes, cat = checks.for_test(SAMPLE_BUDGET_S), self.catalog()
 
-        async def check(row: tuple) -> None:
+        async def check(rank: int, row: tuple) -> None:
             sample_id, _, hotkey, endpoint_id, model_id, request_id, request_json, response = row
             if self._tests_running:
                 return  # a test's checks come first; still pending
@@ -914,7 +961,8 @@ class Auditor:
                 return
             parsed = json.loads(response)
             fault, comparison = await recomputes.check(model_id, request, parsed["answers"], model.tolerance,
-                                                       recompute_answers=True, claimed=claimed_tokens(parsed))
+                                                       recompute_answers=True, claimed=claimed_tokens(parsed),
+                                                       rank=rank)
             if fault is None and comparison is None:
                 if not self._tests_running and time.monotonic() <= recomputes.deadline:
                     self.store.failed_check(sample_id)
@@ -931,7 +979,7 @@ class Auditor:
             if evidence is not None:
                 log.warning("gateway answer of %s/%s is wrong: %s", hotkey, endpoint_id, fault)
 
-        results = await asyncio.gather(*(check(row) for row in chosen), return_exceptions=True)
+        results = await asyncio.gather(*(check(i, row) for i, row in enumerate(chosen)), return_exceptions=True)
         for row, outcome in zip(chosen, results):
             if isinstance(outcome, Exception):
                 log.error("checking gateway sample of %s/%s failed: %s", row[2], row[3], outcome)

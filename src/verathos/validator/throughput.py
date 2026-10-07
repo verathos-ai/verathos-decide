@@ -164,12 +164,14 @@ class Throughput:
             raise feed.VerdictsUnavailable(f"{type(exc).__name__}: {exc}") from None
 
     async def proven_invalid(self, evidence: list[feed.Evidence], references: dict[str, Engine],
-                             cat: catalog.Catalog) -> list[feed.Evidence]:
+                             cat: catalog.Catalog, budget_s: float | None = None) -> list[feed.Evidence]:
         """The evidence this validator accepts. From a test: the miner's receipt binds the request and the answers,
         and the validator's own reference (if it has one for the model and it answers) also proves the answers wrong.
         From a sampled user request (not published): the miner's receipt shows it answered one of the catalog's
-        gateways, and the auditor's word stands for the wrongness, as it does for capacity."""
+        gateways, and the auditor's word stands for the wrongness, as it does for capacity. Rechecks run within
+        ``budget_s``; past it, as when the reference is unavailable, the auditor's verdict applies."""
         accepted = []
+        deadline = None if budget_s is None else time.monotonic() + budget_s
         for e in evidence:
             model = cat.get(e.model_id)
             response = parse_response(e.response)
@@ -191,10 +193,14 @@ class Throughput:
                             "unknown model" if model is None else "the receipt does not bind it")
                 continue
             if self.auditor is None and e.model_id in references:
+                left = None if deadline is None else deadline - time.monotonic()
                 try:
-                    fault = await feed.answer_fault(e.request, answers, references[e.model_id], model.tolerance,
-                                                    feed.claimed_tokens(response))
-                except feed.ReferenceUnavailable as exc:
+                    if left is not None and left <= 0:
+                        raise feed.ReferenceUnavailable("no time left this epoch")
+                    recheck = feed.answer_fault(e.request, answers, references[e.model_id], model.tolerance,
+                                                feed.claimed_tokens(response))
+                    fault = await asyncio.wait_for(recheck, left)
+                except (feed.ReferenceUnavailable, TimeoutError) as exc:
                     log.warning("evidence against %s/%s not rechecked, reference unavailable (%s); applying the "
                                 "auditor's verdict", e.hotkey, e.endpoint_id, exc)
                     fault = e.reason

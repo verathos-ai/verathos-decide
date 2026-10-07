@@ -13,13 +13,21 @@ role at startup from the chain.
 - Linux, Python 3.12, `git`.
 - A hotkey registered on the subnet with a validator permit.
 - One reference engine per catalog model. The reference is the model run in fp32; CPU is enough because each
-  canary is computed once per epoch and reused for every endpoint. Measured on a rented server CPU: Kev-4B 3.4 s and
-  Kev-9B 6.6 s per request; the fp32 weights alone take about 16 GB and 36 GB of RAM. A GPU in fp32 is faster.
+  canary is computed once per epoch and reused for every endpoint, so the reference work does not grow with the
+  number of miners: 16 canaries per model and epoch (`canary_pool_size`). They are computed within 30% of the
+  canaries' time, about 6.5 minutes per epoch, the models side by side; a slower reference computes fewer of them
+  (each endpoint then gets fewer canaries) and never delays the epoch. Measured on a rented server CPU: Kev-4B 3.4 s
+  and Kev-9B 6.6 s per request; on 12 cores shared with other work Kev-9B took 16-29 s, which still computes 16
+  canaries alone and 8 next to Kev-4B. The fp32 weights alone take about 16 GB and 36 GB of RAM. A GPU in fp32 is
+  faster. Rechecking the auditor's evidence on the references takes at most a tenth of the epoch; what is not
+  rechecked by then is taken on the auditor's word, as when a reference is down.
 - The auditor additionally needs Rust (rustup) and `build-essential` for the load generator, a public IP and one
   open TCP port with an uplink for the network's test traffic, and fast recomputes: 2 answers per endpoint and
   test, within 15 minutes. A bf16 screen per model on a GPU does that (on an A100, Kev-4B recomputes about 6
-  answers per second in bf16 and 2 in fp32; the bf16 weights of Kev-4B, Kev-9B and Clef-flash take about 45 GB), with the
-  fp32 references confirming what it flags.
+  answers per second in bf16 and 2 in fp32; the bf16 weights of Kev-4B, Kev-9B and Clef-flash take about 45 GB),
+  with the fp32 references confirming what it flags: at 6 per second every endpoint is checked at least once per
+  test up to about 5,000 endpoints of the model. Beyond what fits, the checks run every endpoint's first before any
+  second, in a random order (`THROUGHPUT_AUDIT.md`).
 - A public IP of its own: behind most NATs a machine cannot reach other machines that share its public IP through
   that IP, so a validator next to miners on one NAT cannot send them canaries.
 
@@ -105,9 +113,9 @@ Per epoch (`epoch_blocks` from the catalog, default 180 blocks) the validator:
    committed digest, lists its endpoints on the hotkey's axon and was built for the current catalog (or, for one
    epoch after a change, the previous one);
 3. challenges each endpoint to sign a nonce with the listing hotkey;
-4. derives the epoch's canaries from its secret, computes the references, sends each endpoint its subset spread over
-   the first `canary_spread_fraction` of the epoch (holding them while a throughput test runs), and checks every
-   signed receipt;
+4. derives the epoch's canaries from its secret, computes the references (within 30% of the canaries' time), sends
+   each endpoint its subset of the canaries computed, spread over the rest of the first `canary_spread_fraction` of
+   the epoch (holding them while a throughput test runs), and checks every signed receipt;
 5. reads the auditor's verdicts for the epoch: each endpoint's proven capacity, what users got from it (readiness
    and latency), each model's user demand, and any proven wrong answers;
 6. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and

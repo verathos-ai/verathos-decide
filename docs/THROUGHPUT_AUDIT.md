@@ -117,7 +117,10 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
    sends left the generator late, if the generator's own host ran out of sockets or ports for it, or if the auditor
    could not evaluate it; what one endpoint returns affects only its own result. Recomputes stop 15 minutes after
    the traffic, and an engine that fails three times in a row is not asked again in that test, so an unreachable
-   screen or reference skips recomputes instead of holding the test open.
+   screen or reference skips recomputes instead of holding the test open. When not all fit, every endpoint's first
+   recompute runs before any second one, the endpoints in a random order drawn for each test: as many endpoints as
+   possible are checked, and which ones miss out cannot be known in advance. Sampled user answers are checked in
+   the same order (every endpoint's first, then second).
 
 Outcomes per endpoint: `passed` (delivered at least `pass_fraction` of what it was asked), `partial`, `invalid`,
 `void`.

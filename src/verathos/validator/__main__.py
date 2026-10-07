@@ -47,6 +47,7 @@ from verathos.validator.throughput import Throughput
 
 log = logging.getLogger("verathos.validator")
 WEIGHT_ATTEMPTS = 10
+EVIDENCE_SHARE = 0.1  # of the epoch, the most rechecking the auditor's evidence may take
 
 
 def load_secret(state_dir: Path) -> bytes:
@@ -125,11 +126,11 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         endpoints = [e for m in miners for e in m.endpoints() if e.endpoint.tier == "open"
                      and cat.get(e.endpoint.model_id) is not None and cat.get(e.endpoint.model_id).status != "retired"]
         log.info("epoch %d: %d miners, %d open endpoints", epoch, len(miners), len(endpoints))
-        spread_s = blocks_left * BLOCK_TIME_S * sc.canary_spread_fraction / sc.canaries_per_endpoint
         results = await audit_epoch(endpoints, epoch=epoch, secret=secret, keypair=wallet.hotkey,
                                     references=references, tolerances=tolerances, client=client, netuid=cfg.netuid,
                                     mechid=cfg.mechid, pool_size=sc.canary_pool_size,
-                                    per_endpoint=sc.canaries_per_endpoint, spread_s=spread_s,
+                                    per_endpoint=sc.canaries_per_endpoint,
+                                    budget_s=blocks_left * BLOCK_TIME_S * sc.canary_spread_fraction,
                                     holding=throughput.holding)
         verdicts = None if policy.mode == "observe" else await throughput.verdicts(client, epoch)
         evidence = []
@@ -137,7 +138,8 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
             fresh = new_evidence(state, [f"{e.test_id}/{e.hotkey}/{e.endpoint_id}" for e in verdicts.invalid],
                                  epoch, policy.credit_ttl_epochs + 1)
             evidence = await throughput.proven_invalid(
-                [e for e in verdicts.invalid if f"{e.test_id}/{e.hotkey}/{e.endpoint_id}" in fresh], references, cat)
+                [e for e in verdicts.invalid if f"{e.test_id}/{e.hotkey}/{e.endpoint_id}" in fresh], references, cat,
+                budget_s=EVIDENCE_SHARE * blocks_left * BLOCK_TIME_S)
     for e in references.values():
         await e.close()
     if policy.mode != "observe" and verdicts is None:

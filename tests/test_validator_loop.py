@@ -63,6 +63,41 @@ def test_canary_pool_is_deterministic_and_assignment_rotates() -> None:
     assert len(a) == 6 and a != assignment(secret, 8, "hk/gpu0", 20, 6)
 
 
+def test_a_slow_reference_shrinks_the_canary_pool_instead_of_delaying_the_epoch() -> None:
+    """Reference work per epoch is the canary pool per model, whatever the number of endpoints, and it runs within a
+    share of the epoch's audit time: what a slow reference cannot compute by then is left out of the pool, and every
+    endpoint still gets canaries from what was computed."""
+    import time as time_module
+
+    class SlowReference(MockEngine):
+        async def answer(self, request):
+            await asyncio.sleep(0.15)
+            return await super().answer(request)
+
+    validator = kp()
+    miners_ = {f"10.0.1.{i}": (kp(), MockEngine("kev-4b")) for i in range(30)}
+    apps, neurons = {}, []
+    for uid, (host, (keypair, engine)) in enumerate(miners_.items()):
+        apps[host], commit = miner(host, keypair, validator, engine)
+        neurons.append(Neuron(uid, keypair.ss58_address, host, 80, commit))
+
+    async def run():
+        async with httpx.AsyncClient(transport=HostRouter(apps)) as client:
+            endpoints = [e for m in await discover(neurons, 405, 1, client, {catalog.load().digest()})
+                         for e in m.endpoints()]
+            started = time_module.monotonic()
+            results = await audit_epoch(endpoints, epoch=1, secret=b"k" * 32, keypair=validator,
+                                        references={"kev-4b": SlowReference("kev-4b")},
+                                        tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client,
+                                        netuid=405, mechid=1, pool_size=16, per_endpoint=6, budget_s=2.0)
+            return results, time_module.monotonic() - started
+
+    results, took = asyncio.run(run())
+    assert took < 2.0 + 1.0  # the budget, not 16 x 0.15 s of references plus the canaries' spread
+    assert len(results) == 30 and all(0 < r.sent <= 4 and r.answered == r.sent for r in results.values())
+    assert all(r.tally.verdict() is not Verdict.FAIL_HARD for r in results.values())
+
+
 def test_epoch_scores_honest_and_zeroes_cheater() -> None:
     validator, honest_kp, cheat_kp, ghost_kp = kp(), kp(), kp(), kp()
     honest, cheat, ghost = "10.0.0.1", "10.0.0.2", "10.0.0.3"
