@@ -44,8 +44,8 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    against it only if another miner then answers the same request. A slow endpoint gets fewer requests on its own: they stay in flight longer. After 3 failures in a
    row an endpoint's circuit breaker opens for 5 s; one probe request then decides, and each failed probe doubles
    the time (up to 120 s).
-7. **Response.** The answers, the input tokens the miner signed in its receipt, the receipt itself and the request
-   id. Usage is counted per account, key, model and day, and written every 5 s.
+7. **Response.** The answers, the input tokens the miner signed in its receipt (at most one per byte of the
+   request; the auditor checks sampled counts against its reference), the receipt itself and the request id. Usage is counted per account, key, model and day, and written every 5 s.
 8. **Report.** Every 5 s the gateway tells the auditor, per endpoint and second, what it answered (with input tokens
    and durations), how often it considered it for a request (drew it), and how often it was not ready then (busy,
    behind an open breaker, or its latest answer or timed-out attempt took at least twice the latency bound it

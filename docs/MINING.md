@@ -136,6 +136,8 @@ characters per token of the model's `max_state_tokens`. A validator gets at most
 (HTTP 429 beyond that); gateways are not limited. The miner signs only well-formed answers: an engine that returns
 anything else gets an error back to the caller, never a signed receipt. The auditor recomputes a sample of the
 answers given to the subnet's gateway, as it does test answers: serve users the same model, at the same precision.
+The input tokens a receipt signs are checked against the reference's count too: they set each model's share of the
+emission, and signing more than the reference counts is a wrong answer.
 
 ## Reading the log
 

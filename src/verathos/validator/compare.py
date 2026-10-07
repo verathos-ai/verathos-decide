@@ -41,6 +41,7 @@ class RequestComparison:
     count: int
     confident_flips: int
     structural_error: str | None = None
+    reference_input_tokens: int | None = None  # the input tokens the reference counted, if it said
 
     def hard_fail(self, tolerance: Tolerance) -> bool:
         return self.structural_error is not None or self.max_abs > tolerance.hard_abs or self.confident_flips > 0

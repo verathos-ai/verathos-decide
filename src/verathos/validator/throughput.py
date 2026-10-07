@@ -189,7 +189,8 @@ class Throughput:
                 continue
             if self.auditor is None and e.model_id in references:
                 try:
-                    fault = await feed.answer_fault(e.request, answers, references[e.model_id], model.tolerance)
+                    fault = await feed.answer_fault(e.request, answers, references[e.model_id], model.tolerance,
+                                                    feed.claimed_tokens(response))
                 except feed.ReferenceUnavailable as exc:
                     log.warning("evidence against %s/%s not rechecked, reference unavailable (%s); applying the "
                                 "auditor's verdict", e.hotkey, e.endpoint_id, exc)

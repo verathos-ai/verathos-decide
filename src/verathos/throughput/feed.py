@@ -11,6 +11,7 @@ as they take it for capacity.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import httpx
@@ -118,14 +119,39 @@ def readable(answers: Any) -> dict[str, Distribution] | None:
         return None
 
 
+TOKENS_SLACK = 0.02  # input tokens a miner may sign beyond the reference's count: this share of it ...
+TOKENS_SLACK_ABS = 2  # ... plus this many
+
+
 async def recompute(request: dict[str, Any], got: dict[str, Distribution], reference: Engine,
                     tolerance: Tolerance) -> RequestComparison:
     """Compare readable answers with the reference's own answers to the request. Raises ReferenceUnavailable."""
     try:
-        expected = distributions((await reference.answer(request))["answers"])
-    except (EngineError, KeyError, ValueError) as exc:
+        response = await reference.answer(request)
+        expected = distributions(response["answers"])
+        tokens = (response.get("usage") or {}).get("input_tokens")
+        tokens = int(tokens) if tokens is not None else None
+    except (EngineError, KeyError, ValueError, TypeError) as exc:
         raise ReferenceUnavailable(str(exc)) from None
-    return compare_request(expected, got, tolerance)
+    return dataclasses.replace(compare_request(expected, got, tolerance), reference_input_tokens=tokens)
+
+
+def claimed_tokens(response: dict[str, Any] | None) -> int | None:
+    """The input tokens a parsed response's receipt signs, if any."""
+    try:
+        return int(response["receipt"]["receipt"]["input_tokens"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def tokens_fault(claimed: int | None, comparison: RequestComparison | None) -> str | None:
+    """Why the signed input tokens are wrong: more than the reference counts (they set the users' demand per
+    model, and with it the models' emission shares). None if they are not, or cannot be told."""
+    if claimed is None or comparison is None or comparison.reference_input_tokens is None:
+        return None
+    if claimed > comparison.reference_input_tokens * (1 + TOKENS_SLACK) + TOKENS_SLACK_ABS:
+        return f"input tokens misreported: signed {claimed}, the reference counts {comparison.reference_input_tokens}"
+    return None
 
 
 def fault_of(comparison: RequestComparison, tolerance: Tolerance) -> str | None:
@@ -138,12 +164,14 @@ def fault_of(comparison: RequestComparison, tolerance: Tolerance) -> str | None:
 
 
 async def answer_fault(request: dict[str, Any], answers: Any, reference: Engine | None,
-                       tolerance: Tolerance) -> str | None:
+                       tolerance: Tolerance, claimed: int | None = None) -> str | None:
     """Why ``answers`` are wrong for ``request``: unreadable, or (with a reference engine) outside the model's hard
-    tolerance. None if they pass, or if there is no reference engine. Raises ReferenceUnavailable."""
+    tolerance, or signed with more input tokens (``claimed``) than the reference counts. None if they pass, or if
+    there is no reference engine. Raises ReferenceUnavailable."""
     got = readable(answers)
     if got is None:
         return MALFORMED
     if reference is None:
         return None
-    return fault_of(await recompute(request, got, reference, tolerance), tolerance)
+    comparison = await recompute(request, got, reference, tolerance)
+    return fault_of(comparison, tolerance) or tokens_fault(claimed, comparison)

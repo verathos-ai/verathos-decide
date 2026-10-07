@@ -26,8 +26,6 @@ from verathos.protocol.gateway import Route
 from verathos.protocol.receipts import parse_response, signed_answers
 from verathos.protocol.requests import HDR_NONCE, sign_request
 
-MAX_INPUT_TOKENS = 10_000_000  # a receipt claiming more is clamped
-
 
 @dataclass(frozen=True)
 class Exchange:
@@ -91,7 +89,8 @@ class Upstream:
         if answers is None:
             raise UpstreamFailure("receipt", "miner", "no receipt binding this request and these answers")
         receipt = response["receipt"]
-        tokens = min(max(int(receipt["receipt"].get("input_tokens", 0)), 0), MAX_INPUT_TOKENS)
+        # at most one token per byte of the request; the auditor checks sampled counts against its reference
+        tokens = min(max(int(receipt["receipt"].get("input_tokens", 0)), 0), len(body))
         exchange = Exchange(route, request, text, answers, receipt, tokens)
         if not well_formed(parsed, answers):
             raise UpstreamFailure("malformed", "miner", "signed malformed answers", exchange=exchange)

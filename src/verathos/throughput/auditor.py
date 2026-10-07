@@ -74,9 +74,11 @@ from verathos.throughput.feed import (
     ReferenceUnavailable,
     SignedVerdicts,
     Verdicts,
+    claimed_tokens,
     fault_of,
     readable,
     recompute,
+    tokens_fault,
 )
 from verathos.throughput.follow import POLL_S, ScheduleFollower
 from verathos.throughput.policy import BLOCK_TIME_S, AuditPolicy, ScheduledTest, Session, session_headers
@@ -174,9 +176,14 @@ class Recomputes:
             return comparison
 
     async def check(self, model_id: str, request: dict[str, Any], answers: Any, tolerance: Tolerance, *,
-                    recompute_answers: bool) -> tuple[str | None, RequestComparison | None]:
+                    recompute_answers: bool, claimed: int | None = None) -> tuple[str | None, RequestComparison | None]:
         """-> (why the answers are wrong or None, the comparison made or None). Without ``recompute_answers`` only
-        their form is checked."""
+        their form is checked; with it, also the input tokens the receipt signs (``claimed``)."""
+        fault, comparison = await self._check(model_id, request, answers, tolerance, recompute_answers)
+        return fault or tokens_fault(claimed, comparison), comparison
+
+    async def _check(self, model_id: str, request: dict[str, Any], answers: Any, tolerance: Tolerance,
+                     recompute_answers: bool) -> tuple[str | None, RequestComparison | None]:
         got = readable(answers)
         if got is None:
             return MALFORMED, None
@@ -779,7 +786,8 @@ class Auditor:
         recomputed = {id(s) for s, _ in random.sample(signed, min(policy.answer_checks_per_test, len(signed)))}
         for sample, answers in signed if model is not None else []:
             fault, comparison = await recomputes.check(slot.model_id, sample.request, answers, model.tolerance,
-                                                       recompute_answers=id(sample) in recomputed)
+                                                       recompute_answers=id(sample) in recomputed,
+                                                       claimed=claimed_tokens(parse_response(sample.response)))
             if comparison is not None:
                 drift_sum, drift_count = drift_sum + comparison.sum_abs, drift_count + comparison.count
             if fault:
@@ -854,8 +862,9 @@ class Auditor:
             if model is None or (model_id not in checks.references and model_id not in checks.screens):
                 self.store.finish_sample(sample_id, "unchecked", "no reference for the model")
                 return
-            fault, comparison = await recomputes.check(model_id, request, json.loads(response)["answers"],
-                                                       model.tolerance, recompute_answers=True)
+            parsed = json.loads(response)
+            fault, comparison = await recomputes.check(model_id, request, parsed["answers"], model.tolerance,
+                                                       recompute_answers=True, claimed=claimed_tokens(parsed))
             if fault is None and comparison is None:
                 if not self._tests_running and time.monotonic() <= recomputes.deadline:
                     self.store.failed_check(sample_id)

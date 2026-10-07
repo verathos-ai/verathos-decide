@@ -513,10 +513,11 @@ def test_usage_is_what_the_miner_signed_within_bounds(tmp_path) -> None:
 
     s = Setup(tmp_path, {"10.0.0.1": Greedy("kev-4b")})
     r = asyncio.run(s.post())
-    assert r.status_code == 200 and r.json()["usage"] == {"input_tokens": 10_000_000}
+    tokens = r.json()["usage"]["input_tokens"]
+    assert r.status_code == 200 and 0 < tokens <= len(json.dumps(REQUEST))  # at most one per byte of the request
     asyncio.run(s.meter.flush())  # writes, whatever the miner claimed
     (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
-    assert usage["input_tokens"] == 10_000_000
+    assert usage["input_tokens"] == tokens
 
 
 def test_invalid_keys_are_limited_before_the_database(tmp_path) -> None:

@@ -116,6 +116,39 @@ def test_sampled_gateway_answers_prove_wrong_answers(tmp_path) -> None:
     assert asyncio.run(validator.proven_invalid([evidence], reference, catalog.load())) == []
 
 
+def test_input_tokens_signed_beyond_the_references_count_are_evidence(tmp_path) -> None:
+    """The users' input tokens set the models' emission shares; a miner signing more than the reference counts is
+    caught on its sampled answers, as a wrong answer would be."""
+    class Inflating(MockEngine):
+        async def answer(self, request):
+            response = await super().answer(request)
+            return {**response, "usage": {"input_tokens": 3 * response["usage"]["input_tokens"] + 10}}
+
+    gateway, honest_kp, greedy_kp = kp(), kp(), kp()
+    honest = miner(honest_kp, MockEngine("kev-4b"), gateway)
+    greedy = miner(greedy_kp, Inflating("kev-4b"), gateway)
+
+    async def collect():
+        out = []
+        for app, keypair in ((honest, honest_kp), (greedy, greedy_kp)):
+            r = await exchange(app, gateway, keypair, request(0))
+            assert r.status_code == 200
+            out.append(GatewaySample(hotkey=keypair.ss58_address, endpoint_id="gpu0", model_id="kev-4b",
+                                     request=request(0), response=r.text))
+        return out
+
+    auditor = _auditor(tmp_path, gateway_checks_per_epoch=2)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(k.ss58_address, "gpu0", "http://x/e/gpu0", "kev-4b", 40.0)
+                          for k in (honest_kp, greedy_kp)])
+    assert auditor.accept_samples(gateway.ss58_address, asyncio.run(collect())) == 2
+    asyncio.run(auditor.check_samples(Checks({"kev-4b": MockEngine("kev-4b")}, {})))
+    auditor.chain.head_block = 4 * 180 + 1
+    auditor.follower.poll()
+    (evidence,) = auditor.verdicts(4).verdicts.invalid
+    assert evidence.hotkey == greedy_kp.ss58_address and evidence.reason.startswith("input tokens misreported")
+
+
 def test_drifted_gateway_answers_lose_the_credit_whatever_the_tests_show(tmp_path) -> None:
     """Correct test answers do not dilute drifted answers to users: the two are tallied apart."""
     auditor = _auditor(tmp_path)
