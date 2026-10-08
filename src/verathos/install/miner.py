@@ -423,7 +423,7 @@ def init(argv: list[str]) -> None:
     if role == "worker":
         info(f"check from another machine: curl http://{address}{ENDPOINTS_PATH}")
         info("list this machine on the primary, with every other worker (comma-separated):")
-        print(f"      bash ~/verathos/scripts/install.sh miner --yes --peers {address}", flush=True)
+        print(f"      bash {common.INSTALLER} miner --yes --peers {address}", flush=True)
         info(f'or add "{address}" to "peers" in the primary\'s miner.json and restart its miner')
     else:
         info(f"check from another machine: curl http://{address}/v1/manifest")

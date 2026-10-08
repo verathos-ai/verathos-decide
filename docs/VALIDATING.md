@@ -171,7 +171,8 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 
 What it does (a full validator; light, see below):
 1. installs `git`, `curl` and, in a container without systemd, `supervisor`; then uv and Python 3.12;
-2. puts the code in `~/verathos` with its Python environment, and `verathos-validator` on the `PATH`;
+2. puts the code in `~/verathos-decide` (an install from before in `~/verathos` stays there) with its Python
+   environment, and `verathos-validator` on the `PATH`;
 3. checks the hotkey, its registration and validator permit, and reads the catalog the subnet owner commits;
 4. places a float32 reference engine for every `active` model in the free memory, smallest first: on the GPU with
    the most free memory while one has room, otherwise in RAM. With `--candidates` it then places the `candidate`
@@ -242,7 +243,7 @@ A validator restarted in an epoch it already scored (or, light, whose weights it
 ### Update
 
 ```bash
-bash ~/verathos/scripts/install.sh validator --yes
+bash ~/verathos-decide/scripts/install.sh validator --yes
 ```
 
 updates the code, and the engines and weights when the catalog pins new revisions; it adds a reference when the
@@ -256,11 +257,12 @@ on. A light validator has only its code to update.
 ### Uninstall
 
 ```bash
-bash ~/verathos/scripts/install.sh uninstall
+bash ~/verathos-decide/scripts/install.sh uninstall
 ```
 
 stops and removes the services, the code, the engines and the weights. The configuration and state in `~/.verathos`
-(with the canary secret and the score history) stay; `--purge` deletes them too. Wallets are never touched.
+(with the canary secret and the score history) stay; `--purge` deletes them too (other files in `~/.verathos`
+stay). Wallets are never touched.
 
 ### Troubleshooting
 
@@ -287,7 +289,7 @@ stops and removes the services, the code, the engines and the weights. The confi
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone https://github.com/<org>/verathos && cd verathos
+git clone https://github.com/<org>/verathos verathos-decide && cd verathos-decide
 uv venv -p 3.12 .venv
 VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"
 ```

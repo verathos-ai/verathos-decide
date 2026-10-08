@@ -61,12 +61,13 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--worker`, `--name` | this machine serves its GPUs for the hotkey's primary machine; its endpoint ids start with `--name` (default: its IP address) ([One hotkey, several GPUs and machines](#one-hotkey-several-gpus-and-machines)) |
 | `--peers` | on the primary: every worker's public `ip:port`, comma-separated; replaces the list (`''` for none) |
 | `--no-service` | set everything up, and print the commands to run instead of installing services |
-| `--source`, `--ref`, `--dir` | the code from another git URL, git bundle or tarball; a branch, tag or commit; another directory than `~/verathos` |
+| `--source`, `--ref`, `--dir` | the code from another git URL, git bundle or tarball; a branch, tag or commit; another directory than `~/verathos-decide`, which must be missing, empty or a checkout of this code (another checkout is never changed) |
 
 What it does:
 1. installs `git`, `curl`, `build-essential` (the engine compiles its GPU kernels on first use) and, in a container
    without systemd, `supervisor`; then uv and Python 3.12;
-2. puts the code in `~/verathos` with its Python environment, and `verathos-miner` and `verathos-validator` on the
+2. puts the code in `~/verathos-decide` (an install from before in `~/verathos` stays there) with its Python
+   environment, and `verathos-miner` and `verathos-validator` on the
    `PATH`;
 3. checks the hotkey, its registration, the subnet's catalog and the GPUs;
 4. installs each chosen model's engine with `flash-linear-attention` at the version the engine pins (the Kev engine
@@ -80,7 +81,7 @@ What it does:
 
 | Path | |
 |---|---|
-| `~/verathos` | code and its Python environment |
+| `~/verathos-decide` | code and its Python environment |
 | `~/.verathos/miner.json` | configuration |
 | `~/.verathos/miner/` | capacity measurements and the caps tests set on them, the last published manifest and the endpoints this machine serves |
 | `~/.verathos/engines/`, `~/.verathos/hf/` | engines (one per pinned Kev revision, one for Clef) and model weights |
@@ -173,7 +174,7 @@ validators saw ([Reading the log](#reading-the-log)).
 Run the command again; `--yes` keeps every earlier answer:
 
 ```bash
-bash ~/verathos/scripts/install.sh miner --yes
+bash ~/verathos-decide/scripts/install.sh miner --yes
 ```
 
 It updates the code from where it was installed, and the engines and weights when the catalog pins new revisions.
@@ -185,11 +186,11 @@ the miner then measures again.
 ### Uninstall
 
 ```bash
-bash ~/verathos/scripts/install.sh uninstall
+bash ~/verathos-decide/scripts/install.sh uninstall
 ```
 
 stops and removes the services, the code, the engines and the weights. The configuration and state in `~/.verathos`
-stay for a later install; `--purge` deletes them too. Wallets are never touched.
+stay for a later install; `--purge` deletes them too (other files in `~/.verathos` stay). Wallets are never touched.
 
 ### Troubleshooting
 
@@ -206,7 +207,8 @@ stay for a later install; `--purge` deletes them too. Wallets are never touched.
 | an engine keeps stopping | its log says why; out of GPU memory: another model, or a GPU free of other work |
 | `no endpoint could be measured` | the engine logs: the measurement needs the engines answering |
 | no services after a container restart | containers start no services by themselves: run the command again, or `supervisord -c /etc/supervisor/supervisord.conf` |
-| `local changes in ... stop the update` | the installer manages `~/verathos`: see `git -C ~/verathos status` and discard the changes |
+| `local changes in ... stop the update` | the installer manages `~/verathos-decide`: see `git -C ~/verathos-decide status` and discard the changes |
+| `... is a checkout of other code` | the directory holds another repository, such as an earlier Verathos release: the installer leaves it as it is; keep the default `~/verathos-decide` or choose another `--dir` |
 | downloads slow or rate limited | use a Hugging Face token: `export HF_TOKEN=<token>` before the command |
 
 ## One hotkey, several GPUs and machines
@@ -265,7 +267,7 @@ same paths on the miner machine.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone https://github.com/<org>/verathos && cd verathos
+git clone https://github.com/<org>/verathos verathos-decide && cd verathos-decide
 uv venv -p 3.12 .venv
 VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"
 ```

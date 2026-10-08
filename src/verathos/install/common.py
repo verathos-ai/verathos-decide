@@ -225,9 +225,12 @@ def manager_for(args: argparse.Namespace, record: Record) -> services.Manager | 
     return manager
 
 
+INSTALLER = Path(__file__).resolve().parents[3] / "scripts" / "install.sh"  # the installer of this checkout
+
+
 def script_commands(role: str, home: Path, options: str = "") -> list[str]:
     """How to update and uninstall this setup with the installer of this checkout."""
-    script = Path(__file__).resolve().parents[3] / "scripts" / "install.sh"
+    script = INSTALLER
     if not script.exists():
         return []
     extra = "" if home == DEFAULT_HOME.expanduser() else f" --home {shlex.quote(str(home))}"

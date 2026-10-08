@@ -3,9 +3,9 @@
 #
 #   curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
 #   curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator [--full]
-#   bash ~/verathos/scripts/install.sh uninstall [--purge]
+#   bash ~/verathos-decide/scripts/install.sh uninstall [--purge]
 #
-# Installs the system packages it needs, uv, the code (in ~/verathos) and its Python environment, then runs
+# Installs the system packages it needs, uv, the code (in ~/verathos-decide) and its Python environment, then runs
 # `verathos-miner init` or `verathos-validator init`, which asks a few questions (or takes --yes and options) and
 # starts everything as system services. Run it again to update. It only uses a wallet's hotkey and coldkeypub.txt.
 #
@@ -13,8 +13,10 @@
 #   --source <src>  git URL, path to a git bundle, or path to a source tarball (default: the public repository;
 #                   when updating, where the installed code came from)
 #   --ref <ref>     branch, tag or commit to install (default: the source's default branch)
-#   --dir <dir>     where the code goes (default ~/verathos, or the checkout this script is in)
-#   --purge         with uninstall: also delete ~/.verathos (configuration, state, measurements)
+#   --dir <dir>     where the code goes (default: the checkout this script is in, else ~/verathos if an earlier
+#                   install put this code there, else ~/verathos-decide); another checkout there is never touched
+#   --purge         with uninstall: also delete what the setups keep in ~/.verathos (configuration, state,
+#                   measurements); other files there stay
 # Every other option goes to `verathos-<role> init`, for example:
 #   --yes --wallet <name> --hotkey <name> --network finney|test|<ws url> --netuid <n>
 #   validator mode: --light (the default, except for the subnet owner's hotkey: sets the auditor's published weights;
@@ -30,6 +32,7 @@
 set -euo pipefail
 
 PUBLIC_REPOSITORY="https://github.com/<org>/verathos.git"
+DEFAULT_DIR="$HOME/verathos-decide"
 PYTHON_VERSION="3.12"
 SOURCE_FILE=".install-source"  # where a checkout installed from a tarball came from
 
@@ -67,14 +70,15 @@ main() {
     esac
     shift
   done
-  dir="$(realpath -m -- "${dir:-$(script_checkout || echo "$HOME/verathos")}")"
+  dir="$(realpath -m -- "${dir:-$(default_dir)}")"
   home="$(realpath -m -- "$home")"
   [ "$home" = "$HOME/.verathos" ] || init_args+=(--home "$home")
-  sudo_setup
   if [ "$role" = uninstall ]; then
     uninstall "$dir" "$home" "$purge"
     return
   fi
+  check_dir "$dir"
+  sudo_setup
   check_os
   system_packages "$role"
   install_uv
@@ -91,7 +95,19 @@ main() {
 }
 
 is_checkout() {
-  [ -f "$1/pyproject.toml" ] && grep -q '^name = "verathos"' "$1/pyproject.toml"
+  # This code: its package name and the setup package, which other repositories of that name do not have.
+  [ -f "$1/pyproject.toml" ] && grep -q '^name = "verathos"' "$1/pyproject.toml" \
+    && [ -f "$1/src/verathos/install/__init__.py" ]
+}
+
+default_dir() {
+  # The checkout this script is in (as when updating), else an earlier install in ~/verathos, else ~/verathos-decide.
+  script_checkout && return
+  if is_checkout "$HOME/verathos"; then
+    printf '%s' "$HOME/verathos"
+  else
+    printf '%s' "$DEFAULT_DIR"
+  fi
 }
 
 script_checkout() {
@@ -100,6 +116,14 @@ script_checkout() {
   [ -f "${BASH_SOURCE[0]:-}" ] || return 1
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
   is_checkout "$here" && printf '%s' "$here"
+}
+
+check_dir() {
+  # The code goes into a missing or empty directory, or a checkout of this code; never into another one.
+  [ -e "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ] || return 0
+  is_checkout "$1" && return
+  [ -e "$1/.git" ] && die "$1 is a checkout of other code; it is left as it is: choose another --dir"
+  die "$1 exists and holds other files; choose another --dir"
 }
 
 sudo_setup() {
@@ -176,9 +200,6 @@ fetch_code() {
   if [ -e "$source" ]; then
     source="$(realpath -- "$source")"
   fi
-  if [ -e "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ] && ! is_checkout "$dir" && [ ! -d "$dir/.git" ]; then
-    die "$dir exists and is not a Verathos checkout; choose another --dir"
-  fi
   if is_tarball "$source"; then
     install_tarball "$dir" "$source"
     return
@@ -211,7 +232,7 @@ install_tarball() {
   trap "rm -rf '$tmp'" EXIT
   tar -xf "$source" -C "$tmp"
   found="$(find "$tmp" -maxdepth 2 -name pyproject.toml | head -n 1)"
-  [ -n "$found" ] && is_checkout "$(dirname "$found")" || die "$source holds no Verathos source tree"
+  [ -n "$found" ] && is_checkout "$(dirname "$found")" || die "$source holds no source tree of this code"
   mkdir -p "$dir"
   find "$dir" -mindepth 1 -maxdepth 1 ! -name .venv -exec rm -rf {} +
   cp -a "$(dirname "$found")"/. "$dir"/
@@ -260,11 +281,18 @@ uninstall() {
     say "Removing the code in $dir"
     rm -rf "$dir"
   elif [ -e "$dir" ]; then
-    echo "    $dir is not a Verathos checkout; left as it is"
+    echo "    $dir is not a checkout of this code; left as it is"
   fi
   if [ -n "$purge" ]; then
-    rm -rf "$home"
-    echo "    removed $home"
+    # What the setups keep there; other programs may keep files in the same directory.
+    for c in install catalog engines hf miner validator miner.json validator.json; do
+      rm -rf "${home:?}/$c"
+    done
+    if rmdir "$home" 2>/dev/null; then
+      echo "    removed $home"
+    elif [ -e "$home" ]; then
+      echo "    removed the configuration and state in $home; other files there stay"
+    fi
   fi
   echo "    wallets in ~/.bittensor were not touched"
 }

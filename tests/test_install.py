@@ -4,6 +4,7 @@ and the service definitions."""
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -416,6 +417,69 @@ def test_install_script_parses_and_documents_its_options() -> None:
     assert usage.returncode == 0 and "--source" in usage.stdout and "uninstall" in usage.stdout
     assert "--worker" in usage.stdout and "--peers" in usage.stdout
     assert "--light" in usage.stdout and "--full" in usage.stdout and "--references" in usage.stdout
+
+
+def installer(home: Path, *args: str) -> subprocess.CompletedProcess:
+    """install.sh as ``curl ... | bash -s -- <args>`` runs it: from standard input, not from a checkout."""
+    return subprocess.run(["bash", "-s", "--", *args], input=(ROOT / "scripts" / "install.sh").read_text(),
+                          capture_output=True, text=True, env={**os.environ, "HOME": str(home)}, timeout=60)
+
+
+def this_code(path: Path) -> Path:
+    (path / "src" / "verathos" / "install").mkdir(parents=True)
+    (path / "src" / "verathos" / "install" / "__init__.py").touch()
+    (path / "pyproject.toml").write_text('[project]\nname = "verathos"\n')
+    return path
+
+
+def other_code(path: Path) -> Path:
+    """A checkout of another repository of the same package name, as the earlier Verathos release."""
+    (path / ".git").mkdir(parents=True)
+    (path / "neurons").mkdir()
+    (path / "pyproject.toml").write_text('[project]\nname = "verathos"\n')
+    return path
+
+
+def test_the_installer_never_takes_over_another_checkout(tmp_path) -> None:
+    other = other_code(tmp_path / "verathos")
+    before = sorted(p.name for p in other.iterdir())
+    refused = installer(tmp_path, "validator", "--yes", "--dir", str(other))
+    assert refused.returncode != 0 and "is a checkout of other code; it is left as it is" in refused.stderr
+    (tmp_path / "files").mkdir()
+    (tmp_path / "files" / "notes.txt").touch()
+    refused = installer(tmp_path, "miner", "--dir", str(tmp_path / "files"))
+    assert refused.returncode != 0 and "holds other files" in refused.stderr
+    left = installer(tmp_path, "uninstall", "--dir", str(other))
+    assert left.returncode == 0 and "not a checkout of this code; left as it is" in left.stdout
+    assert installer(tmp_path, "uninstall").returncode == 0  # the default is not the other checkout
+    assert sorted(p.name for p in other.iterdir()) == before and (tmp_path / "files" / "notes.txt").exists()
+
+
+def test_new_installs_go_to_verathos_decide_and_one_from_before_in_verathos_stays_there(tmp_path) -> None:
+    other = other_code(tmp_path / "verathos")
+    ours = this_code(tmp_path / "verathos-decide")
+    removed = installer(tmp_path, "uninstall")
+    assert removed.returncode == 0 and f"Removing the code in {ours}" in removed.stdout
+    assert not ours.exists() and other.exists()
+    other_dir = tmp_path / "other"
+    other.rename(other_dir)
+    before = this_code(tmp_path / "verathos")  # set up by an earlier installer
+    removed = installer(tmp_path, "uninstall")
+    assert f"Removing the code in {before}" in removed.stdout and not before.exists() and other_dir.exists()
+
+
+def test_purge_deletes_only_what_the_setups_keep(tmp_path) -> None:
+    home = tmp_path / ".verathos"
+    for d in ("validator", "catalog", "engines", "hf", "install"):
+        (home / d).mkdir(parents=True)
+    (home / "validator.json").write_text("{}")
+    (home / "verathos_validator.db").write_text("another program's")
+    purged = installer(tmp_path, "uninstall", "--purge")
+    assert purged.returncode == 0 and "other files there stay" in purged.stdout
+    assert sorted(p.name for p in home.iterdir()) == ["verathos_validator.db"]
+    (home / "verathos_validator.db").unlink()
+    (home / "miner").mkdir()
+    assert "removed " + str(home) in installer(tmp_path, "uninstall", "--purge").stdout and not home.exists()
 
 
 def test_a_validator_is_light_unless_full_is_asked_for_or_set_up_before_and_the_owners_is_full(tmp_path) -> None:
