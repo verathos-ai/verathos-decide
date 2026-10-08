@@ -19,8 +19,9 @@ Per test:
    fp32 reference must confirm). Credit = the tested rate x the share of what was asked in the window (the user
    requests the gateways sent it, and the test's own requests up to what the users' answers leave of the tested
    rate) that was delivered (the test's replies and the users' answers), at most 1; below ``pass_fraction`` scaled by
-   that share once more. A sampled answer the miner signed
-   and the reference proves wrong makes the result invalid; the evidence is kept for the verdicts. The recomputed
+   that share once more. The users' answers count only once the gateways' sample of them from the test is checked;
+   without one the credit is at most what the test's own replies prove. A sampled answer the miner signed and the
+   reference proves wrong makes the result invalid; the evidence is kept for the verdicts. The recomputed
    answers' differences are tallied per endpoint; one whose mean over its last ``drift_window_tests`` tests exceeds
    the model's ``mean_abs`` gets no credit.
 4. Once the selection block is final with the hash it was selected by, the test is confirmed; otherwise void. A test
