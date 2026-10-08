@@ -7,6 +7,10 @@
 
 Test traffic carries the auditor's session for this endpoint and test instead of a per-request signature (see
 ``throughput.policy``); its receipts name the auditor as caller and the request id as nonce.
+
+Callers other than gateways (validators) need only their canaries: one request at once per endpoint, at most the size
+of the model's largest standard request (``caller_request_bytes``), and while test traffic arrives their requests wait
+behind it (``admission``). More would crowd out a test.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from verathos.miner.admission import Admission
+from verathos.miner.admission import BEHIND_TESTS, REGULAR, TEST, Admission
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
@@ -34,12 +38,14 @@ from verathos.protocol.manifest import SignedManifest
 from verathos.protocol.receipts import Receipt, SignedReceipt
 from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, verify_request
 from verathos.throughput.policy import HDR_SESSION, SessionGate
+from verathos.throughput.workload import Workload
+from verathos.validator import canaries
 
 log = logging.getLogger(__name__)
 IDENTITY_DOMAIN = "verathos/identity/v1"
 MAX_REQUEST_BYTES = 1 << 20
 BODY_TIMEOUT_S = 10.0
-CALLER_CONCURRENCY = 4
+CALLER_CONCURRENCY = 1
 STATE_CHARS_PER_TOKEN = 4  # a generous bound: tokens of these models average fewer characters
 
 
@@ -58,6 +64,12 @@ def identity_payload(endpoint_id: str, challenge: str, caller: str) -> dict[str,
     return {"endpoint_id": endpoint_id, "challenge": challenge, "caller": caller}
 
 
+def caller_request_bytes(model_id: str, workload: Workload) -> int:
+    """The largest request (canonical JSON) a caller other than a gateway may send an endpoint of the model: the
+    largest of the model's request mix, or of the validators' canaries if that is larger."""
+    return max(workload.max_request_bytes(model_id), canaries.max_request_bytes(model_id))
+
+
 def create_app(
     *,
     config: MinerConfig,
@@ -69,14 +81,18 @@ def create_app(
     admissions: dict[str, Admission] | None = None,
     serving: Callable[[], Collection[str]] | None = None,
     max_state_tokens: Callable[[str], int | None] = lambda model_id: None,
+    max_caller_request: Callable[[str], int | None] = lambda model_id: None,
     on_test_traffic: Callable[[], None] = lambda: None,
+    testing: Callable[[], bool] = lambda: False,
     gateways: Callable[[], Collection[str]] | None = None,
 ) -> FastAPI:
     """``auditors`` gives the hotkeys whose test sessions are accepted (besides the miner's own, for its
-    measurement), and ``on_test_traffic`` is called for each of their requests; ``admissions`` the engine admission per
-    endpoint (default: ``max_concurrency`` slots); ``serving`` the endpoints answered (default: those the manifest
-    lists); ``max_state_tokens`` a model's state limit; ``gateways`` the callers exempt from the per-caller limit
-    (default: the configured ``gateway_hotkeys``)."""
+    measurement), and ``on_test_traffic`` is called for each of their requests; ``testing`` whether their traffic
+    arrives now; ``admissions`` the engine admission per endpoint (default: ``max_concurrency`` slots); ``serving``
+    the endpoints answered (default: those the manifest lists); ``max_state_tokens`` a model's state limit;
+    ``max_caller_request`` the largest request of a model callers other than gateways may send
+    (``caller_request_bytes``); ``gateways`` the callers exempt from the per-caller limits (default: the configured
+    ``gateway_hotkeys``)."""
     app = FastAPI(title="Verathos miner")
     nonces = NonceCache()
     endpoints = {e.endpoint_id: e for e in config.endpoints}
@@ -183,14 +199,17 @@ def create_app(
         state = parsed.state if isinstance(parsed.state, str) else canonical_json(parsed.state).decode()
         if limit is not None and len(state) > STATE_CHARS_PER_TOKEN * limit:
             return error(413, "state longer than the model accepts")
-        # Callers other than gateways (validators) send a few requests at a time; more would crowd out tests.
         capped = (caller.hotkey, endpoint_id) if not test and caller.hotkey not in gateways() else None
-        if capped is not None and in_flight.get(capped, 0) >= CALLER_CONCURRENCY:
-            return error(429, "too many concurrent requests from this caller")
         if capped is not None:
+            largest = max_caller_request(endpoint.model_id)
+            if largest is not None and len(canonical_json(raw)) > largest:
+                return error(413, "request larger than the model's standard requests")
+            if in_flight.get(capped, 0) >= CALLER_CONCURRENCY:
+                return error(429, "too many concurrent requests from this caller")
             in_flight[capped] = in_flight.get(capped, 0) + 1
+        cls = TEST if test else BEHIND_TESTS if capped is not None and testing() else REGULAR
         try:
-            return await answer(endpoint, endpoint_id, request, raw, parsed, caller, test, received_ms)
+            return await answer(endpoint, endpoint_id, request, raw, parsed, caller, cls, received_ms)
         finally:
             if capped is not None:
                 in_flight[capped] -= 1
@@ -198,11 +217,11 @@ def create_app(
                     del in_flight[capped]
 
     async def answer(endpoint, endpoint_id: str, request: Request, raw: dict[str, Any], parsed: SystemOneRequest,
-                     caller, test: bool, received_ms: int):
+                     caller, cls: int, received_ms: int):
         admission = admissions[endpoint_id]
         # A test request is useful only until its session ends.
-        wait_s = (caller.not_after_ms - time.time() * 1000) / 1000 if test else None
-        if not await admission.acquire(test=test, wait_s=wait_s):
+        wait_s = (caller.not_after_ms - time.time() * 1000) / 1000 if cls == TEST else None
+        if not await admission.acquire(cls, wait_s=wait_s):
             return error(503, "endpoint at capacity")
         try:
             if await request.is_disconnected():

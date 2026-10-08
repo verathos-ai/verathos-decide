@@ -130,11 +130,15 @@ Outcomes per endpoint: `passed` (delivered at least `pass_fraction` of what it w
 The miner admits requests from validators and gateways ahead of test requests: a test request waits while any
 other request waits, and a request that finds the queue full takes the place of the newest waiting test request. A
 test request is dropped once its session expires, or when the load generator has given up on it. A test never
-delays other traffic. What an endpoint answers the subnet's gateway during the test's window counts as delivered
-(see Gateway answers); test requests beyond its spare capacity otherwise go undelivered, and the credit shows it. A
-caller other than a gateway (the catalog's `gateways`, or one in the miner's own `gateway_hotkeys`) gets at most 4
-requests at once per endpoint, so a validator cannot crowd a competitor's test out with priority traffic. The miner
-signs only well-formed answers: an engine fault returns an error, never a signed wrong answer.
+delays users. What an endpoint answers the subnet's gateway during the test's window counts as delivered (see
+Gateway answers); test requests beyond its spare capacity otherwise go undelivered, and the credit shows it.
+
+A caller other than a gateway (the catalog's `gateways`, or one in the miner's own `gateway_hotkeys`) needs only its
+canaries, so it gets one request at once per endpoint, each no larger (as canonical JSON) than the largest request
+of the model's request mix (HTTP 413 beyond), and while the auditor's test traffic arrives at the miner (and for a
+minute after) its requests wait behind the test's. Validators hold their canaries during a test, so honest ones never
+wait; a validator cannot crowd a competitor's test out with priority traffic. The miner signs only well-formed
+answers: an engine fault returns an error, never a signed wrong answer.
 
 A test also leaves room for users: it sends each endpoint its tested rate less the rate of user requests the
 subnet's gateway sent it over the last minute (ending 10 s before the test, as the gateway's counts arrive), at
@@ -210,7 +214,7 @@ How credits and wrong answers enter the score is in `SCORING.md`.
 | Renaming or adding endpoints to make the auditor send more | a hotkey's test rate grows only from what its endpoints delivered |
 | Fast junk responses | receipts that do not bind scale delivered down; a signed wrong answer invalidates the hotkey |
 | Responses built to break the auditor | size and nesting limits; each endpoint is evaluated on its own |
-| Flooding a competitor's endpoint with validator traffic during its test | at most 4 requests at once per validator and endpoint |
+| Flooding a competitor's endpoint with validator traffic during its test | one request at once per validator and endpoint, no larger than the model's standard requests, and behind the test's requests while they arrive |
 | Flooding it with gateway traffic during its test, or a miner refusing users then | what an endpoint answers the gateway inside the test's window counts as delivered; the test sends only the rest of the tested rate |
 | Caching or sharing answers | every request is unique |
 

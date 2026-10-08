@@ -15,7 +15,7 @@ from bittensor_wallet import Keypair
 
 from tests.mock_engine import MockEngine
 from verathos import catalog
-from verathos.miner.app import create_app
+from verathos.miner.app import caller_request_bytes, create_app
 from verathos.miner.config import MinerConfig
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
 from verathos.validator.audit import audit_epoch
@@ -49,8 +49,10 @@ def miner(host: str, keypair: Keypair, validator: Keypair, engine: MockEngine):
         netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest=digest,
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
                             capacity_rps=40.0)]), keypair)
+    kev = catalog.load().get("kev-4b")
     app = create_app(config=config, keypair=keypair, manifest=lambda: signed, engines={"gpu0": engine},
-                     authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set())
+                     authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set(),
+                     max_caller_request=lambda m: caller_request_bytes(m, kev.workload))
     return app, commitment_value(signed.manifest.digest())
 
 

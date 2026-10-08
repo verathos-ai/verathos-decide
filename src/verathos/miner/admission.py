@@ -1,9 +1,10 @@
 """Admission to an endpoint's engine.
 
 At most ``limit`` requests reach the engine at once (the concurrency at which it measured its best throughput; more
-only slows it down); the others wait in order. Regular requests from validators and gateways go ahead of the
-auditor's test traffic: a test request is admitted only while no regular request waits, and a regular request that
-finds the queue full takes the place of the newest waiting test request.
+only slows it down); the others wait by class, then in order. Regular requests from validators and gateways go first,
+then the auditor's test traffic, then validators' requests while test traffic arrives (``BEHIND_TESTS``). A request is
+admitted only while no request of its class or a higher one waits, and a request that finds the queue full takes the
+place of the newest waiting request of the lowest class below its own.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from collections import deque
 
 QUEUE_FACTOR = 4  # requests that may wait, per engine slot
 WAIT_S = 30.0
+REGULAR, TEST, BEHIND_TESTS = 0, 1, 2  # classes, first served first
 
 
 class Admission:
@@ -20,23 +22,20 @@ class Admission:
         self.limit = limit  # may be replaced at any time (a new measurement)
         self.wait_s = wait_s
         self.inflight = 0
-        self._regular: deque[asyncio.Future[bool]] = deque()
-        self._test: deque[asyncio.Future[bool]] = deque()
+        self._queues: tuple[deque[asyncio.Future[bool]], ...] = (deque(), deque(), deque())
 
-    def _waiting(self) -> int:
-        return len(self._regular) + len(self._test)
-
-    async def acquire(self, *, test: bool, wait_s: float | None = None) -> bool:
+    async def acquire(self, cls: int = REGULAR, *, wait_s: float | None = None) -> bool:
         """Wait for an engine slot, at most ``wait_s`` (default ``self.wait_s``); False if the queue is full or the
         wait times out. Call ``release`` after a True."""
-        if self.inflight < self.limit and not self._regular and not (test and self._test):
+        if self.inflight < self.limit and not any(self._queues[:cls + 1]):
             self.inflight += 1
             return True
-        if self._waiting() >= QUEUE_FACTOR * self.limit:
-            if test or not self._test:
+        if sum(map(len, self._queues)) >= QUEUE_FACTOR * self.limit:
+            lower = next((q for q in reversed(self._queues[cls + 1:]) if q), None)
+            if lower is None:
                 return False
-            self._test.pop().set_result(False)
-        queue = self._test if test else self._regular
+            lower.pop().set_result(False)
+        queue = self._queues[cls]
         waiter = asyncio.get_running_loop().create_future()
         queue.append(waiter)
         try:
@@ -58,6 +57,6 @@ class Admission:
 
     def release(self) -> None:
         self.inflight -= 1
-        while self.inflight < self.limit and (self._regular or self._test):
+        while self.inflight < self.limit and any(self._queues):
             self.inflight += 1
-            (self._regular or self._test).popleft().set_result(True)
+            next(q for q in self._queues if q).popleft().set_result(True)

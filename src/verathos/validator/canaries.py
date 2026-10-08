@@ -10,7 +10,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import random
+from collections.abc import Callable
 from typing import Any
+
+from verathos.protocol.canonical import canonical_json
 
 DOMAINS: dict[str, dict[str, Any]] = {
     "support": {
@@ -72,10 +75,10 @@ def _rng(secret: bytes, *parts: object) -> random.Random:
     return random.Random(int.from_bytes(seed, "big"))
 
 
-def _fill(template: str, rng: random.Random) -> str:
+def _fill(template: str, choose: Callable[[list[str]], str]) -> str:
     for key, values in FILL.items():
         while "{" + key + "}" in template:
-            template = template.replace("{" + key + "}", rng.choice(values), 1)
+            template = template.replace("{" + key + "}", choose(values), 1)
     return template
 
 
@@ -86,12 +89,27 @@ def canary_pool(secret: bytes, epoch: int, model_id: str, size: int) -> list[dic
         rng = _rng(secret, "canary", epoch, model_id, i)
         domain = DOMAINS[rng.choice(sorted(DOMAINS))]
         issues = rng.sample(domain["issues"], 2)
-        state = " ".join(x for x in [rng.choice(domain["openers"]), _fill(issues[0], rng) + ".",
-                                     "Also, " + _fill(issues[1], rng) + ".", rng.choice(domain["tones"]),
+        state = " ".join(x for x in [rng.choice(domain["openers"]), _fill(issues[0], rng.choice) + ".",
+                                     "Also, " + _fill(issues[1], rng.choice) + ".", rng.choice(domain["tones"]),
                                      f"Ref {rng.randrange(10**5, 10**6)}."] if x)
         qids = rng.sample(sorted(domain["questions"]), k=rng.randint(2, len(domain["questions"])))
         pool.append({"model": model_id, "state": state, "questions": {q: domain["questions"][q] for q in qids}})
     return pool
+
+
+def max_request_bytes(model_id: str) -> int:
+    """An upper bound of a canary's size (canonical JSON): every part at its longest, with every question."""
+
+    def longest(values: list[str]) -> str:
+        return max(values, key=len)
+
+    sizes = []
+    for domain in DOMAINS.values():
+        issues = sorted((_fill(t, longest) for t in domain["issues"]), key=len)[-2:]
+        state = " ".join([longest(domain["openers"]), issues[1] + ".", "Also, " + issues[0] + ".",
+                          longest(domain["tones"]), f"Ref {10**6 - 1}."])
+        sizes.append(len(canonical_json({"model": model_id, "state": state, "questions": domain["questions"]})))
+    return max(sizes)
 
 
 def assignment(secret: bytes, epoch: int, endpoint_key: str, pool_size: int, per_endpoint: int) -> list[int]:

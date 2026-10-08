@@ -17,7 +17,7 @@ from tests.fake_loadgen import make_runner
 from tests.mock_engine import MockEngine
 from verathos import catalog
 from verathos.miner.admission import Admission
-from verathos.miner.app import create_app
+from verathos.miner.app import caller_request_bytes, create_app
 from verathos.miner.config import MinerConfig
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest
 from verathos.throughput import loadgen
@@ -160,37 +160,79 @@ def test_credit_is_what_was_delivered_and_over_declaring_costs() -> None:
 # ---- the miner ----
 
 def test_admission_serves_regular_requests_before_test_traffic() -> None:
+    from verathos.miner.admission import REGULAR, TEST
+
     async def run():
         admission = Admission(1, wait_s=0.5)
-        assert await admission.acquire(test=False)
+        assert await admission.acquire(REGULAR)
         order = []
 
-        async def wait(name: str, test: bool) -> None:
-            if await admission.acquire(test=test):
+        async def wait(name: str, cls: int) -> None:
+            if await admission.acquire(cls):
                 order.append(name)
                 await asyncio.sleep(0.01)
                 admission.release()
 
-        waiters = [asyncio.create_task(wait("test", True))]
+        waiters = [asyncio.create_task(wait("test", TEST))]
         await asyncio.sleep(0.01)
-        waiters.append(asyncio.create_task(wait("regular", False)))
+        waiters.append(asyncio.create_task(wait("regular", REGULAR)))
         await asyncio.sleep(0.01)
         admission.release()
         await asyncio.gather(*waiters)
         assert order == ["regular", "test"] and admission.inflight == 0
 
         # a full queue: a regular request takes the newest test request's place; a test request is refused
-        assert await admission.acquire(test=False)
-        tests = [asyncio.create_task(admission.acquire(test=True)) for _ in range(4)]
+        assert await admission.acquire(REGULAR)
+        tests = [asyncio.create_task(admission.acquire(TEST)) for _ in range(4)]
         await asyncio.sleep(0.01)
-        assert not await admission.acquire(test=True)
-        regular = asyncio.create_task(admission.acquire(test=False))
+        assert not await admission.acquire(TEST)
+        regular = asyncio.create_task(admission.acquire(REGULAR))
         await asyncio.sleep(0.01)
         assert tests[-1].done() and not tests[-1].result()
         admission.release()
         assert await regular
         admission.release()
         assert [await t for t in tests[:3]] == [True, False, False]  # one slot, then the 0.5 s wait ends
+        admission.release()
+        assert admission.inflight == 0
+
+    asyncio.run(run())
+
+
+def test_while_test_traffic_arrives_validators_wait_behind_it() -> None:
+    from verathos.miner.admission import BEHIND_TESTS, REGULAR, TEST
+
+    async def run():
+        admission = Admission(1, wait_s=0.5)
+        assert await admission.acquire(REGULAR)
+        order = []
+
+        async def wait(name: str, cls: int) -> None:
+            if await admission.acquire(cls):
+                order.append(name)
+                await asyncio.sleep(0.01)
+                admission.release()
+
+        waiters = []
+        for name, cls in (("validator", BEHIND_TESTS), ("test", TEST), ("gateway", REGULAR)):
+            waiters.append(asyncio.create_task(wait(name, cls)))
+            await asyncio.sleep(0.01)
+        admission.release()
+        await asyncio.gather(*waiters)
+        assert order == ["gateway", "test", "validator"]
+
+        # a full queue: a test request takes the place of a waiting validator request, never the other way round
+        assert await admission.acquire(REGULAR)
+        held = [asyncio.create_task(admission.acquire(BEHIND_TESTS)) for _ in range(4)]
+        await asyncio.sleep(0.01)
+        assert not await admission.acquire(BEHIND_TESTS)
+        test = asyncio.create_task(admission.acquire(TEST))
+        await asyncio.sleep(0.01)
+        assert held[-1].done() and not held[-1].result()
+        admission.release()
+        assert await test
+        admission.release()
+        assert [await t for t in held[:3]] == [True, False, False]
         admission.release()
         assert admission.inflight == 0
 
@@ -283,7 +325,8 @@ def miner_app(host: str, keypair: Keypair, auditor: Keypair, engines: dict[str, 
         endpoints=[Endpoint(endpoint_id=e, url=config.endpoint_url(e), model_id="kev-4b", capacity_rps=declared)
                    for e in engines]), keypair)
     app = create_app(config=config, keypair=keypair, manifest=lambda: signed, engines=engines,
-                     authorized=lambda hk: False, auditors=lambda: {auditor.ss58_address})
+                     authorized=lambda hk: False, auditors=lambda: {auditor.ss58_address}, testing=lambda: True,
+                     max_caller_request=lambda m: caller_request_bytes(m, KEV.workload))
     return app, signed.manifest
 
 

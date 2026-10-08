@@ -175,11 +175,25 @@ def test_the_miner_signs_only_well_formed_answers() -> None:
     assert not well_formed(request, {**good, "team": {"type": "choice", "probabilities": {"billing": 1.0}}})
 
 
-def test_a_validator_cannot_crowd_out_a_test_with_many_requests() -> None:
-    """Callers other than gateways get at most CALLER_CONCURRENCY requests at once per endpoint."""
-    from verathos.miner.app import CALLER_CONCURRENCY
+class Slow(MockEngine):
+    """Answers after ``delay_s``, recording the order of the states it answered."""
 
-    miner, validator = (Keypair.create_from_mnemonic(Keypair.generate_mnemonic()) for _ in range(2))
+    def __init__(self, model_id: str, delay_s: float = 0.3) -> None:
+        super().__init__(model_id)
+        self.delay_s, self.answered = delay_s, []
+
+    async def answer(self, request):
+        await asyncio.sleep(self.delay_s)
+        self.answered.append(request["state"])
+        return await super().answer(request)
+
+
+def capped_miner(engine: MockEngine, *, testing=lambda: False, admission_limit: int | None = None):
+    """A miner whose validator and gateway are known, with the per-caller limits of a real miner."""
+    from verathos.miner.admission import Admission
+    from verathos.miner.app import caller_request_bytes
+
+    miner, validator, gateway = (Keypair.create_from_mnemonic(Keypair.generate_mnemonic()) for _ in range(3))
     config = MinerConfig.model_validate({
         "netuid": 405, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5", "port": 8091,
         "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1"}]})
@@ -187,23 +201,99 @@ def test_a_validator_cannot_crowd_out_a_test_with_many_requests() -> None:
         netuid=405, mechid=1, hotkey=miner.ss58_address, catalog_digest=catalog.load().digest(),
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
                             capacity_rps=40.0)]), miner)
+    cat = catalog.load()
+    app = create_app(config=config, keypair=miner, manifest=lambda: manifest, engines={"gpu0": engine},
+                     authorized=lambda hk: hk in (validator.ss58_address, gateway.ss58_address),
+                     auditors=lambda: {AUDITOR.ss58_address}, gateways=lambda: {gateway.ss58_address},
+                     admissions={"gpu0": Admission(admission_limit)} if admission_limit else None,
+                     max_state_tokens=lambda m: cat.get(m).max_state_tokens,
+                     max_caller_request=lambda m: caller_request_bytes(m, cat.get(m).workload), testing=testing)
+    return app, miner, validator, gateway
 
-    class Slow(MockEngine):
-        async def answer(self, request):
-            await asyncio.sleep(0.3)
-            return await super().answer(request)
 
-    app = create_app(config=config, keypair=miner, manifest=lambda: manifest, engines={"gpu0": Slow("kev-4b")},
-                     authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set())
+async def signed_post(client: httpx.AsyncClient, caller: Keypair, miner: Keypair, payload: dict) -> httpx.Response:
+    body = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json",
+               **sign_request(caller, "POST", "/e/gpu0/v1/systemone", body, miner.ss58_address)}
+    return await client.post("/e/gpu0/v1/systemone", content=body, headers=headers)
+
+
+def test_a_validator_cannot_crowd_out_a_test_with_many_requests() -> None:
+    """Callers other than gateways get one request at once per endpoint."""
+    app, miner, validator, gateway = capped_miner(Slow("kev-4b"))
 
     async def run():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://m") as client:
-            async def one():
-                body = json.dumps(REQUEST).encode()
-                headers = {"Content-Type": "application/json",
-                           **sign_request(validator, "POST", "/e/gpu0/v1/systemone", body, miner.ss58_address)}
-                return (await client.post("/e/gpu0/v1/systemone", content=body, headers=headers)).status_code
-            return await asyncio.gather(*(one() for _ in range(CALLER_CONCURRENCY + 3)))
+            validators = await asyncio.gather(*(signed_post(client, validator, miner, REQUEST) for _ in range(5)))
+            gateways = await asyncio.gather(*(signed_post(client, gateway, miner, REQUEST) for _ in range(5)))
+            return [r.status_code for r in validators], [r.status_code for r in gateways]
 
-    codes = asyncio.run(run())
-    assert sorted(codes) == [200] * CALLER_CONCURRENCY + [429] * 3
+    validators, gateways = asyncio.run(run())
+    assert sorted(validators) == [200] + [429] * 4 and gateways == [200] * 5
+
+
+def test_a_validators_requests_are_no_larger_than_the_models_standard_ones() -> None:
+    """A validator cannot make each of its requests cost many test requests: its canaries pass, a request beyond the
+    largest of the model's request mix does not, while a gateway's users may send states up to the model's limit."""
+    from verathos.validator.canaries import canary_pool
+
+    app, miner, validator, gateway = capped_miner(MockEngine("kev-4b"))
+    long_state = {**REQUEST, "state": "word " * 13_000}
+    padded = {**REQUEST, "questions": {**REQUEST["questions"], "pad": {"type": "noul", "instructions": "x" * 20_000}}}
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://m") as client:
+            canaries = [(await signed_post(client, validator, miner, c)).status_code
+                        for c in canary_pool(b"k" * 32, 7, "kev-4b", 16)]
+            refused = [await signed_post(client, validator, miner, p) for p in (long_state, padded)]
+            served = await signed_post(client, gateway, miner, long_state)
+            return canaries, refused, served.status_code
+
+    canaries, refused, served = asyncio.run(run())
+    assert canaries == [200] * 16 and served == 200
+    assert [(r.status_code, r.json()["error"]) for r in refused] == [
+        (413, "request larger than the model's standard requests")] * 2
+
+
+def test_canaries_and_test_requests_fit_the_bound_for_validators() -> None:
+    import random
+
+    from verathos.miner.app import caller_request_bytes
+    from verathos.protocol.canonical import canonical_json
+    from verathos.throughput.workload import Workload, make_request
+    from verathos.validator.canaries import canary_pool
+
+    kev = catalog.load().get("kev-4b")
+    bound = caller_request_bytes("kev-4b", kev.workload)
+    largest = max(len(canonical_json(c)) for e in range(200) for c in canary_pool(b"s" * 32, e, "kev-4b", 16))
+    assert largest <= bound and largest < 1_000 < 16_000 < bound  # canaries are a few hundred characters
+    rng = random.Random(1)
+    assert all(len(canonical_json(make_request("kev-4b", kev.workload, rng))) <= bound for _ in range(200))
+    tiny = Workload(state_words=(2, 3), questions={"q": {"type": "noul"}})
+    assert caller_request_bytes("kev-4b", tiny) >= largest  # a small mix never shuts out canaries
+
+
+def test_while_test_traffic_arrives_a_validators_request_waits_behind_it() -> None:
+    engine = Slow("kev-4b", delay_s=0.1)
+    app, miner, validator, gateway = capped_miner(engine, testing=lambda: True, admission_limit=1)
+    session = Session(netuid=405, auditor=AUDITOR.ss58_address, miner_hotkey=miner.ss58_address, endpoint_id="gpu0",
+                      test_id="t" * 64, not_after_ms=int(time.time() * 1000) + 30_000)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://m") as client:
+            def tagged(tag: str) -> dict:
+                return {**REQUEST, "state": tag}
+
+            async def test_request():
+                headers = {**session_headers(session, AUDITOR), HDR_REQUEST_ID: secrets.token_hex(16)}
+                return await client.post("/e/gpu0/v1/systemone", json=tagged("test"), headers=headers)
+
+            first = asyncio.create_task(signed_post(client, gateway, miner, tagged("user")))
+            await asyncio.sleep(0.02)
+            held = asyncio.create_task(signed_post(client, validator, miner, tagged("canary")))
+            await asyncio.sleep(0.02)
+            test = asyncio.create_task(test_request())
+            return [r.status_code for r in await asyncio.gather(first, held, test)]
+
+    assert asyncio.run(run()) == [200, 200, 200]
+    assert engine.answered == ["user", "test", "canary"]

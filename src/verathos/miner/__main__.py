@@ -27,7 +27,7 @@ import uvicorn
 
 from verathos import catalog
 from verathos.miner.admission import Admission
-from verathos.miner.app import create_app
+from verathos.miner.app import caller_request_bytes, create_app
 from verathos.miner.chain import PermitAuthorizer, build_manifest, publish
 from verathos.miner.config import EndpointConfig, MinerConfig
 from verathos.miner.engine import HttpEngine
@@ -327,10 +327,15 @@ def main() -> None:
         model = publisher.catalog.get(model_id)
         return model.max_state_tokens if model is not None else None
 
+    def max_caller_request(model_id: str) -> int | None:
+        model = publisher.catalog.get(model_id)
+        return caller_request_bytes(model_id, model.workload) if model is not None else None
+
     app = create_app(config=config, keypair=wallet.hotkey, manifest=lambda: publisher.signed, engines=engines,
                      authorized=authorizer, auditors=publisher.auditors, admissions=publisher.admissions,
                      serving=lambda: publisher.serving, max_state_tokens=max_state_tokens,
-                     on_test_traffic=publisher.note_test_traffic, gateways=gateways)
+                     max_caller_request=max_caller_request, on_test_traffic=publisher.note_test_traffic,
+                     testing=publisher.testing, gateways=gateways)
     # Connections beyond the descriptors left are refused, so a flood of idle connections cannot starve the rest.
     limit = max(256, raise_open_file_limit() - 256)
     server = uvicorn.Server(uvicorn.Config(app, host=config.listen_host, port=config.port, log_level="warning",

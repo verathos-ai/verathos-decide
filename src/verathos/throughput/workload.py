@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import BaseModel, Field, model_validator
 
 from verathos.protocol.api import SystemOneRequest
+from verathos.protocol.canonical import canonical_json
 
 WORDS = tuple("""
 account access address advice agent alert amount answer api app approve archive arrive attach audit backup balance
@@ -45,6 +46,12 @@ class Workload(BaseModel):
             raise ValueError(f"state_words must be a range [low, high] with 1 <= low <= high <= {MAX_STATE_WORDS}")
         SystemOneRequest.model_validate({"model": "m", "state": "s", "questions": self.questions})
         return self
+
+    def max_request_bytes(self, model_id: str) -> int:
+        """The size (canonical JSON) of the mix's largest request: the most words, each as long as the longest."""
+        words = " ".join([max(WORDS, key=len)] * self.state_words[1])
+        return len(canonical_json({"model": model_id, "state": f"Ticket {'0' * 16}. {words}.",
+                                   "questions": self.questions}))
 
 
 def make_request(model_id: str, workload: Workload, rng: random.Random) -> dict[str, Any]:

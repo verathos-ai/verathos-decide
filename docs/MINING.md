@@ -255,8 +255,9 @@ Run it under a supervisor (systemd, pm2) so it restarts after updates and crashe
 hotkeys holding a validator permit, from the subnet's gateways (the catalog's `gateways`) and the miner's own
 `gateway_hotkeys`, and as test traffic under a session the auditor signed. Other callers are refused before their
 request body is read; bodies are capped at 1 MiB and must arrive within 10 s, and a state may hold at most 4
-characters per token of the model's `max_state_tokens`. A validator gets at most 4 requests at once per endpoint
-(HTTP 429 beyond that); gateways are not limited. The miner signs only well-formed answers: an engine that returns
+characters per token of the model's `max_state_tokens`. A validator gets one request at once per endpoint (HTTP
+429 beyond that), each no larger than the largest request of the model's request mix (HTTP 413), and while the
+auditor's test traffic arrives its requests wait behind the test's; gateways are not limited. The miner signs only well-formed answers: an engine that returns
 anything else gets an error back to the caller, never a signed receipt. The auditor recomputes a sample of the
 answers given to the subnet's gateway, as it does test answers: serve users the same model, at the same precision.
 The input tokens a receipt signs are checked against the reference's count too: they set each model's share of the
@@ -310,8 +311,8 @@ needs to be done by hand, but:
 - serve the catalog's precision: the auditor recomputes test answers, and an endpoint whose answers drift from the
   reference over several tests loses its credit;
 - an engine that just restarted runs slow for its first minutes, and a test then credits less;
-- requests from validators and gateways are always served before test requests, so a busy endpoint delivers less
-  of the test rate;
+- requests from gateways are always served before test requests, and what an endpoint answers them during a test
+  counts as delivered; validators' requests wait behind test requests while the test's traffic arrives;
 - users count between tests too: the share of the times the gateway considers an endpoint while it is not ready
   (busy, failing, or answering slower than twice `max_latency_s`) comes off its score, and its latency factor comes
   from the latency its users see. An endpoint that declares more than it serves is tested at about what it serves,
