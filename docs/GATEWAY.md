@@ -43,19 +43,22 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    decision requests have no side effects. A failure that is the miner's (no connection, a response without a valid
    receipt, a compressed or oversized response, a refusal of the gateway) counts against it at once; one that the
    request itself may cause (a timeout, an error status) counts only if another miner then answers the same request.
-   A miner that answers busy (429, 503) is skipped for one second; a refusal of the request (another 4xx) counts
-   against it only if another miner then answers the same request. A slow endpoint gets fewer requests on its own: they stay in flight longer. After 3 failures in a
-   row an endpoint's circuit breaker opens for 5 s; one probe request then decides, and each failed probe doubles
-   the time (up to 120 s).
+   A miner that answers busy (429, 503) is skipped for one second. A refusal of the request (another 4xx) counts
+   against it if another miner then answers the same request; the gateway has checked everything a miner checks, so
+   a refusal no other miner shares is also reported as refusing users (without opening its breaker), and the user
+   gets 503, not 400. A slow endpoint gets fewer requests on its own: they stay in flight longer. After 3 failures
+   in a row an endpoint's circuit breaker opens for 5 s; one probe request then decides, and each failed probe
+   doubles the time (up to 120 s).
 7. **Response.** The answers, the input tokens the miner signed in its receipt (at most one per byte of the
    request; the auditor checks sampled counts against its reference), the receipt itself and the request id. Usage is counted per account, key, model and day, and written every 5 s.
 8. **Report.** Every 5 s the gateway tells the auditor, per endpoint and second, the user requests it sent it and
-   those it answered (with input tokens and durations), how often it considered it for a request (drew it), and how often it was not ready then (busy,
-   behind an open breaker, or its latest answer or timed-out attempt took at least twice the latency bound it
-   declared its capacity at, `max_latency_s`, 2 s) or refused the request (answered busy or failed, or refused a
-   request another miner answered). An answer counts in the second its request was sent. Drawn while full at speed counts neither
-   way. Requests that are not user traffic (admin requests not counted) are left out. The auditor publishes each endpoint's tally with its credit, and validators score it
-   (`SCORING.md`).
+   those it answered (with input tokens and durations), how often it considered it for a request (drew it), and how
+   often it was not ready then (busy, behind an open breaker, or its latest answer or timed-out attempt took at least
+   twice the latency bound it declared its capacity at, `max_latency_s`, 2 s) or refused the request (answered busy
+   or failed, refused a request another miner answered, or refused one alone). An answer counts in the second its
+   request was sent. Drawn while full at speed counts neither way. Requests that are not user traffic (admin
+   requests not counted) are left out. The auditor publishes each endpoint's tally with its credit, and validators
+   score it (`SCORING.md`).
 
 ## Answer checks
 
@@ -238,7 +241,7 @@ curl -s https://<gateway>/v1/systemone -H "Authorization: Bearer $KEY" -H "Conte
   last 15 minutes' user requests were answered or more than half the endpoints are failing; else `operational`.
 - `latency_ms`: of the answers to users in the last 15 minutes, retries included (null without answers).
 - `success_rate_1h`: answered among answered and failed user requests of the last hour (null under 20 requests;
-  `requests_1h` is their number); requests the miners refused as invalid do not count.
+  `requests_1h` is their number).
 - `availability_24h`: the share of minutes the model was not unavailable, of the minutes recorded.
 - In memory: the figures cover `since` (the process start) until now.
 
@@ -247,7 +250,7 @@ Every response carries `X-Request-Id` (the client's, if it sent a valid one). Er
 
 | Status | Type | When |
 |---|---|---|
-| 400 | `invalid_request` | not JSON (NaN and infinities included), not a SystemOne request, or refused by the miners |
+| 400 | `invalid_request` | not JSON (NaN and infinities included), or not a SystemOne request |
 | 401 | `unauthorized` | missing, unknown, revoked or expired key, or a suspended account |
 | 402 | `insufficient_credit` | a prepaid account's balance is used up |
 | 404 | `model_not_found` | not an active model of the catalog |
@@ -256,7 +259,7 @@ Every response carries `X-Request-Id` (the client's, if it sent a valid one). Er
 | 429 | `quota_exceeded` | the month's quota is used up |
 | 500 | `internal` | a fault of the gateway |
 | 503 | `busy` | no capacity free for the model now; `Retry-After` |
-| 503 | `unavailable` | no miner serves the model right now, none answered in time, every miner of the model is failing (`Retry-After: 30`), or accounts cannot be checked; `Retry-After` |
+| 503 | `unavailable` | no miner serves the model right now, none answered in time or the miners refused the request, every miner of the model is failing (`Retry-After: 30`), or accounts cannot be checked; `Retry-After` |
 
 ## Accounts and keys
 

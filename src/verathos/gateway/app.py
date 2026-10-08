@@ -10,7 +10,7 @@
 Every response carries ``X-Request-Id`` (the client's, if it sent a valid one). Errors are
 ``{"error": {"type": ..., "message": ...}}``; 429 and 503 carry ``Retry-After``.
 
-    400 invalid_request     not JSON (NaN and infinities included), not a SystemOne request, or refused by the miners
+    400 invalid_request     not JSON (NaN and infinities included), or not a SystemOne request
     401 unauthorized        missing, unknown, revoked or expired key, or a suspended account
     402 insufficient_credit a prepaid account's balance is used up
     404 model_not_found     not an active model of the catalog
@@ -19,8 +19,8 @@ Every response carries ``X-Request-Id`` (the client's, if it sent a valid one). 
     429 quota_exceeded      over the account's monthly quota
     500 internal            a fault of the gateway
     503 busy                no capacity free for the model right now
-    503 unavailable         no miner serves the model right now, the miners failed within the request's deadline, every
-                            miner of the model is failing, or accounts cannot be checked
+    503 unavailable         no miner serves the model right now, the miners failed or refused the request within its
+                            deadline, every miner of the model is failing, or accounts cannot be checked
 """
 
 from __future__ import annotations
@@ -170,7 +170,7 @@ class Checked:
 
 
 NO_ANSWER = {  # why a forwarded request got no answer -> the API error
-    "rejected": (400, "invalid_request", "the miners refused this request", None),
+    "rejected": (503, "unavailable", "the miners of {model} refused this request", 1),
     "busy": (503, "busy", "no capacity free for {model} right now", 1),
     "failed": (503, "unavailable", "no miner answered {model} in time", 1),
     "down": (503, "unavailable", "no miner of {model} answers right now", 30),
@@ -215,12 +215,15 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
                   counted: bool = True) -> Exchange | str:
     """Up to ``max_attempts`` attempts, each at another miner, within the request's deadline. -> the exchange (with
     its attempt's duration), or why there is none: busy (no endpoint could take it), rejected (the miners refused the
-    request itself) or failed. A failure whose cause is unclear counts against a miner only once another miner has
-    answered. ``attempts`` collects what each attempt did; ``counted``: the request is user traffic, so the miners'
-    refusals of it are reported."""
+    request, 4xx) or failed. A failure whose cause is unclear counts against a miner only once another miner has
+    answered. A refusal is unclear too, but the gateway has checked everything a miner checks, so one miner refusing a
+    request no other miner refused or answered is reported as refusing users (its breaker is not touched).
+    ``attempts`` collects what each attempt did; ``counted``: the request is user traffic, so the miners' refusals of
+    it are reported."""
     model_id, deadline = checked.parsed.model, started + g.config.request_timeout_s
     tried: set[str] = set()
     unclear: list[Endpoint] = []
+    rejected: list[Endpoint] = []
     result = "busy"
     for attempt in range(g.config.max_attempts):
         remaining = deadline - g.clock()
@@ -252,8 +255,9 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
                 outcome, result = Outcome.FAILED, "failed"
             elif failure.blame == "busy":
                 outcome = Outcome.BUSY
-            elif failure.blame == "rejected":  # the request's fault, unless another miner answers it
+            elif failure.blame == "rejected":
                 unclear.append(endpoint)
+                rejected.append(endpoint)
                 result = "rejected" if result != "failed" else result
             else:
                 unclear.append(endpoint)
@@ -275,6 +279,8 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
             g.router.penalize(other, observe=counted)
         metrics.UPSTREAM_SECONDS.labels(model_id).observe(seconds)
         return dataclasses.replace(exchange, seconds=seconds)
+    if len(rejected) == 1:
+        g.router.refused(rejected[0], observe=counted)
     return result
 
 
@@ -435,8 +441,7 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
             g.served.record(outcome.route, outcome.input_tokens, outcome.seconds)
             metrics.REQUESTS.labels(model, "answered").inc()
             return response
-        if outcome != "rejected":  # the request's own fault says nothing about the model
-            g.stats.record(model, answered=False)
+        g.stats.record(model, answered=False)
         g.meter.record(principal, model, answered=False)
         status, kind, message, retry = NO_ANSWER[outcome]
         return reject(status, kind, message.format(model=model), request_id, retry, model=model)

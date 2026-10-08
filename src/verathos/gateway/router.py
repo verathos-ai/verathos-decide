@@ -234,6 +234,10 @@ class Router:
     def penalize(self, endpoint: Endpoint, *, observe: bool = True) -> None:
         """Count a failure whose cause was unclear, once another miner has answered the same request."""
         self._breaker(endpoint, lambda: endpoint.breaker.failed(self.clock()))
+        self.refused(endpoint, observe=observe)
+
+    def refused(self, endpoint: Endpoint, *, observe: bool = True) -> None:
+        """Report that the endpoint refused a user request, without a breaker failure."""
         if observe and self.observer is not None:
             self.observer.refused(endpoint.route)
 

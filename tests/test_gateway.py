@@ -720,6 +720,25 @@ def test_a_miner_refusing_requests_another_miner_answers_is_counted(tmp_path) ->
     assert sum(n.refused for (hk, _, _), n in s.served._counts.items() if hk == bad.ss58_address) >= 1
 
 
+def test_a_miner_refusing_requests_no_other_miner_takes_is_counted_and_users_are_not_blamed(tmp_path) -> None:
+    """The gateway checked everything a miner checks: a lone refusal is the miner's, not an invalid request."""
+    s = Setup(tmp_path, {"10.0.0.2": MockEngine("kev-4b")})
+    refuser, bad = FastAPI(), kp()
+
+    @refuser.post("/e/gpu0/v1/systemone")
+    async def refuse():
+        return JSONResponse({"error": "not today"}, status_code=400)
+
+    s.client._transport._t["10.0.0.7"] = httpx.ASGITransport(app=refuser)
+    s.router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=2, catalog_digest="0" * 64,
+                           routes=[route(bad, "10.0.0.7", 1000.0)]))
+    r = asyncio.run(s.post())
+    assert r.status_code == 503 and r.json()["error"]["type"] == "unavailable" and "Retry-After" in r.headers
+    assert sum(n.refused for (hk, _, _), n in s.served._counts.items() if hk == bad.ss58_address) >= 1
+    assert s.gateway.stats.requests("kev-4b", 60) == (0, 1)
+    assert not s.router._pools["kev-4b"].endpoints[0].breaker.failures  # not a breaker failure on its own
+
+
 def test_served_counts_are_kept_while_the_auditor_cannot_be_found() -> None:
     async def unknown():
         raise RuntimeError("chain unreachable")

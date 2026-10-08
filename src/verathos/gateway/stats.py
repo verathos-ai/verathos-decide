@@ -37,7 +37,7 @@ class ModelStats:
         return counts
 
     def record(self, model: str, *, answered: bool, seconds: float = 0.0) -> None:
-        """One user request's outcome; requests the miners refused as invalid are not recorded."""
+        """One user request's outcome."""
         self._minute(model)[0 if answered else 1] += 1
         if answered:
             self._latencies.setdefault(model, collections.deque(maxlen=MAX_LATENCIES)).append((self.clock(), seconds))
