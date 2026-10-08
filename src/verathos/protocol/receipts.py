@@ -40,7 +40,7 @@ class Receipt(BaseModel):
 
 class SignedReceipt(BaseModel):
     receipt: Receipt
-    signature: str
+    signature: str = Field(pattern=r"^[0-9a-f]{128}$")
 
     @classmethod
     def create(cls, receipt: Receipt, keypair: Keypair) -> SignedReceipt:
@@ -89,12 +89,13 @@ def too_deep(value: Any, limit: int) -> bool:
     return False
 
 
-def signed_answers(response: dict[str, Any], request: dict[str, Any], *, request_id: str, hotkey: str,
-                   endpoint_id: str, model_id: str, callers: Collection[str], netuid: int, mechid: int,
-                   request_sha256: str | None = None) -> Any:
-    """The answers of a response if its receipt is the miner's signature over exactly this request and these answers,
-    issued to one of ``callers`` for the request with nonce ``request_id``; None otherwise. ``request_sha256`` is the
-    request's digest if already known."""
+def signed_exchange(response: dict[str, Any], request: dict[str, Any], *, request_id: str, hotkey: str,
+                    endpoint_id: str, model_id: str, callers: Collection[str], netuid: int, mechid: int,
+                    request_sha256: str | None = None) -> tuple[Any, SignedReceipt] | None:
+    """(the answers, the receipt as validated) of a response if its receipt is the miner's signature over exactly this
+    request and these answers, issued to one of ``callers`` for the request with nonce ``request_id``; None
+    otherwise. ``request_sha256`` is the request's digest if already known. The validated receipt holds only what is
+    signed; the response's own receipt object may carry more."""
     try:
         answers = response["answers"]
         receipt = issued_receipt(response["receipt"], request_id=request_id, hotkey=hotkey, endpoint_id=endpoint_id,
@@ -103,7 +104,13 @@ def signed_answers(response: dict[str, Any], request: dict[str, Any], *, request
         return None
     if receipt is None or not receipt.binds(request, answers, request_sha256=request_sha256):
         return None
-    return answers
+    return answers, receipt
+
+
+def signed_answers(response: dict[str, Any], request: dict[str, Any], **binding: Any) -> Any:
+    """The answers of a response whose receipt binds them (see ``signed_exchange``); None otherwise."""
+    signed = signed_exchange(response, request, **binding)
+    return None if signed is None else signed[0]
 
 
 def issued_receipt(document: Any, *, request_id: str, hotkey: str, endpoint_id: str, model_id: str,

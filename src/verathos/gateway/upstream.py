@@ -23,7 +23,7 @@ from bittensor_wallet import Keypair
 
 from verathos.protocol.api import MAX_RESPONSE_BYTES, SystemOneRequest, well_formed
 from verathos.protocol.gateway import Route
-from verathos.protocol.receipts import parse_response, signed_answers
+from verathos.protocol.receipts import parse_response, signed_exchange
 from verathos.protocol.requests import HDR_NONCE, sign_request
 
 
@@ -33,7 +33,7 @@ class Exchange:
     request: dict[str, Any]
     response: str  # the response body as received
     answers: dict[str, Any]
-    receipt: dict[str, Any]
+    receipt: dict[str, Any]  # as validated: only what the miner signed
     input_tokens: int  # as the miner signed it
     seconds: float = 0.0  # the attempt's duration, set by the caller
 
@@ -82,16 +82,16 @@ class Upstream:
             raise UpstreamFailure("connect", "miner", type(exc).__name__) from None
         text = raw.decode("utf-8", errors="replace")
         response = parse_response(text)
-        answers = None if response is None else signed_answers(
+        signed = None if response is None else signed_exchange(
             response, request, request_id=headers[HDR_NONCE], hotkey=route.hotkey, endpoint_id=route.endpoint_id,
             model_id=route.model_id, callers={self.hotkey}, netuid=self.netuid, mechid=self.mechid,
             request_sha256=request_sha256)
-        if answers is None:
+        if signed is None:
             raise UpstreamFailure("receipt", "miner", "no receipt binding this request and these answers")
-        receipt = response["receipt"]
+        answers, receipt = signed
         # at most one token per byte of the request; the auditor checks sampled counts against its reference
-        tokens = min(max(int(receipt["receipt"].get("input_tokens", 0)), 0), len(body))
-        exchange = Exchange(route, request, text, answers, receipt, tokens)
+        tokens = min(max(receipt.receipt.input_tokens, 0), len(body))
+        exchange = Exchange(route, request, text, answers, receipt.model_dump(mode="json"), tokens)
         if not well_formed(parsed, answers):
             raise UpstreamFailure("malformed", "miner", "signed malformed answers", exchange=exchange)
         return exchange

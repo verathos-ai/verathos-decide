@@ -417,17 +417,18 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         outcome = await forward(g, checked, started)
         metrics.REQUEST_SECONDS.labels(model).observe(g.clock() - started)
         if isinstance(outcome, Exchange):
+            # rendered before anything is recorded: an answer that cannot be delivered is neither billed nor counted
+            response = JSONResponse({"id": request_id, "model": model, "answers": outcome.answers,
+                                     "usage": {"input_tokens": outcome.input_tokens}, "receipt": outcome.receipt},
+                                    headers={"X-Request-Id": request_id})
             g.stats.record(model, answered=True, seconds=g.clock() - started)
-        elif outcome != "rejected":  # the request's own fault says nothing about the model
-            g.stats.record(model, answered=False)
-        if isinstance(outcome, Exchange):
             g.meter.record(principal, model, answered=True, input_tokens=outcome.input_tokens, price=checked.price)
             g.sampler.offer(outcome)
             g.served.record(outcome.route, outcome.input_tokens, outcome.seconds)
             metrics.REQUESTS.labels(model, "answered").inc()
-            return JSONResponse({"id": request_id, "model": model, "answers": outcome.answers,
-                                 "usage": {"input_tokens": outcome.input_tokens}, "receipt": outcome.receipt},
-                                headers={"X-Request-Id": request_id})
+            return response
+        if outcome != "rejected":  # the request's own fault says nothing about the model
+            g.stats.record(model, answered=False)
         g.meter.record(principal, model, answered=False)
         status, kind, message, retry = NO_ANSWER[outcome]
         return reject(status, kind, message.format(model=model), request_id, retry, model=model)

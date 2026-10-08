@@ -263,6 +263,41 @@ def test_an_answer_without_a_binding_receipt_is_not_returned(tmp_path) -> None:
     assert r.status_code == 503 and r.json()["error"]["type"] == "unavailable"
 
 
+class Tampering(httpx.AsyncBaseTransport):
+    """A miner's responses, rewritten by ``tamper`` (the parsed body -> the body sent)."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport, tamper) -> None:
+        self.inner, self.tamper = inner, tamper
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        r = await self.inner.handle_async_request(request)
+        return httpx.Response(r.status_code, headers={"Content-Type": "application/json"},
+                              stream=httpx.ByteStream(self.tamper(json.loads(await r.aread()))))
+
+
+def test_users_get_only_what_the_miner_signed_of_its_receipt(tmp_path) -> None:
+    """Unsigned additions to a receipt (here a NaN, which no response can carry) never reach the user; the answer is
+    delivered, billed and counted once."""
+    def tamper(doc):
+        doc["receipt"]["note"] = "NOTE"
+        doc["receipt"]["receipt"]["unsigned"] = "\ud800"
+        return json.dumps(doc).replace('"NOTE"', "NaN").encode()
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    s.client._transport._t["10.0.0.1"] = Tampering(s.client._transport._t["10.0.0.1"], tamper)
+    r = asyncio.run(s.post())
+    assert r.status_code == 200
+    receipt = r.json()["receipt"]
+    assert set(receipt) == {"receipt", "signature"} and "unsigned" not in receipt["receipt"]
+    assert SignedReceipt.model_validate(receipt).signature_valid()
+    asyncio.run(s.meter.flush())
+    (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
+    assert usage["requests"] == 1 and s.sampler.pending()["picked"] == 1
+    spaced = {**receipt, "signature": " ".join(receipt["signature"])}  # still hex to bytes.fromhex
+    with pytest.raises(ValueError):
+        SignedReceipt.model_validate(spaced)
+
+
 def test_no_free_capacity_is_busy_not_a_failure(tmp_path) -> None:
     s = Setup(tmp_path, {"10.0.0.1": Slow("kev-4b", 0.3)}, credited=0.5)  # takes one request at a time
     codes = sorted(r.status_code for r in s.many(3))
