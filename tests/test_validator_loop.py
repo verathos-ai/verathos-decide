@@ -504,8 +504,10 @@ def test_credited_capacity() -> None:
                                                                       {"hkA/a": 1.0}, set())
     assert credited_capacity(endpoints, None, cat, "enforce") == ({}, {}, {}, {}, set())
     # observe mode counts declarations, but no more than a model's first test
+    cap = cat.get("kev-9b").first_test_rps
+    assert cap < 50.0  # the declaration exceeds it, so the cap is what is checked
     assert credited_capacity(endpoints, None, cat, "observe") == ({"hkA/a": 30.0, "hkA/b": 50.0, "hkA/c": 50.0,
-                                                                   "hkA/d": 25.0}, {}, {}, {}, set())
+                                                                   "hkA/d": cap}, {}, {}, {}, set())
     drifted = Verdicts(netuid=405, auditor="aud", epoch=9, invalid=[], credits=[
         credit("hkA", "a").model_copy(update={"credited_rps": 0.0, "drift": True})])
     assert credited_capacity(endpoints, drifted, cat, "enforce").drifted == {"hkA/a"}
