@@ -160,8 +160,8 @@ sampling window, drawn after the answers are in, signed by a gateway the catalog
 endpoints it tests, those whose receipt binds the request and the answers and names that gateway (up to 8 per
 endpoint and epoch; signed malformed answers always), and recomputes a random `gateway_checks_per_epoch` of them per
 endpoint and epoch, between tests (screen and fp32 reference as above). A wrong answer is evidence like one in a
-test; so is a receipt signing more input tokens than the reference counts (beyond 2% and 2 tokens), here and in
-tests, since users' input tokens set the models' emission shares. The differences form a drift tally of their own
+test; so is a receipt signing more or fewer input tokens than the reference counts (beyond 2% and 2 tokens), here
+and in tests, since users' input tokens are what they are billed and set the models' emission shares. The differences form a drift tally of their own
 over the last `drift_window_tests` epochs: an endpoint whose answers to users drift beyond the model's `mean_abs`
 loses its credit, however correct its test answers are. A
 gateway answer counts in the epoch its check finished, so an epoch's verdicts depend only on checks finished before

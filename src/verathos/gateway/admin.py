@@ -300,7 +300,7 @@ async def _to_target(g: Gateway, checked: Checked, target: Target, attempts: lis
     note: dict[str, Any] = {"endpoint": endpoint.key}
     try:
         exchange = await g.upstream.call(endpoint.route, checked.raw, checked.body, checked.request_sha256,
-                                         checked.parsed, g.config.request_timeout_s)
+                                         checked.parsed, g.config.request_timeout_s, min_tokens=checked.min_tokens)
         note["outcome"] = "answered"
         return dataclasses.replace(exchange, seconds=time.monotonic() - started)
     except UpstreamFailure as failure:

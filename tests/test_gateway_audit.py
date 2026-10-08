@@ -221,6 +221,31 @@ def test_input_tokens_signed_beyond_the_references_count_are_evidence(tmp_path) 
     assert evidence.hotkey == greedy_kp.ss58_address and evidence.reason.startswith("input tokens misreported")
 
 
+def test_input_tokens_signed_below_the_references_count_are_evidence(tmp_path) -> None:
+    """Users are billed the signed input tokens: a miner signing fewer than the reference counts (serving its users
+    for free) is caught as one signing more would be."""
+    class Deflating(MockEngine):
+        async def answer(self, request):
+            response = await super().answer(request)
+            return {**response, "usage": {"input_tokens": response["usage"]["input_tokens"] // 3}}
+
+    gateway, cheap_kp = kp(), kp()
+    cheap = miner(cheap_kp, Deflating("kev-4b"), gateway)
+    r = asyncio.run(exchange(cheap, gateway, cheap_kp, request(0)))
+    assert r.status_code == 200
+    auditor = _auditor(tmp_path, gateway_checks_per_epoch=2)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(cheap_kp.ss58_address, "gpu0", "http://x/e/gpu0", "kev-4b", 40.0)])
+    sample = GatewaySample(hotkey=cheap_kp.ss58_address, endpoint_id="gpu0", model_id="kev-4b", request=request(0),
+                           response=r.text)
+    assert auditor.accept_samples(gateway.ss58_address, [sample]) == 1
+    asyncio.run(auditor.check_samples(Checks({"kev-4b": MockEngine("kev-4b")}, {})))
+    auditor.chain.head_block = 4 * 180 + 1
+    auditor.follower.poll()
+    (evidence,) = auditor.verdicts(4).verdicts.invalid
+    assert evidence.hotkey == cheap_kp.ss58_address and evidence.reason.startswith("input tokens misreported")
+
+
 def test_drifted_gateway_answers_lose_the_credit_whatever_the_tests_show(tmp_path) -> None:
     """Correct test answers do not dilute drifted answers to users: the two are tallied apart."""
     auditor = _auditor(tmp_path)

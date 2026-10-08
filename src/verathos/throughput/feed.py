@@ -136,7 +136,7 @@ def readable(request: dict[str, Any], answers: Any) -> dict[str, Distribution] |
         return None
 
 
-TOKENS_SLACK = 0.02  # input tokens a miner may sign beyond the reference's count: this share of it ...
+TOKENS_SLACK = 0.02  # input tokens a miner's count may differ from the reference's by: this share of it ...
 TOKENS_SLACK_ABS = 2  # ... plus this many
 
 
@@ -162,12 +162,14 @@ def claimed_tokens(response: dict[str, Any] | None) -> int | None:
 
 
 def tokens_fault(claimed: int | None, comparison: RequestComparison | None) -> str | None:
-    """Why the signed input tokens are wrong: more than the reference counts (they set the users' demand per
-    model, and with it the models' emission shares). None if they are not, or cannot be told."""
+    """Why the signed input tokens are wrong: more or fewer than the reference counts, beyond the slack (they are
+    what users are billed, and they set the users' demand per model, and with it the models' emission shares). None
+    if they are not, or cannot be told."""
     if claimed is None or comparison is None or comparison.reference_input_tokens is None:
         return None
-    if claimed > comparison.reference_input_tokens * (1 + TOKENS_SLACK) + TOKENS_SLACK_ABS:
-        return f"input tokens misreported: signed {claimed}, the reference counts {comparison.reference_input_tokens}"
+    reference = comparison.reference_input_tokens
+    if abs(claimed - reference) > reference * TOKENS_SLACK + TOKENS_SLACK_ABS:
+        return f"input tokens misreported: signed {claimed}, the reference counts {reference}"
     return None
 
 
@@ -183,7 +185,7 @@ def fault_of(comparison: RequestComparison, tolerance: Tolerance) -> str | None:
 async def answer_fault(request: dict[str, Any], answers: Any, reference: Engine | None,
                        tolerance: Tolerance, claimed: int | None = None) -> str | None:
     """Why ``answers`` are wrong for ``request``: unreadable, or (with a reference engine) outside the model's hard
-    tolerance, or signed with more input tokens (``claimed``) than the reference counts. None if they pass, or if
+    tolerance, or signed with input tokens (``claimed``) off the reference's count. None if they pass, or if
     there is no reference engine. Raises ReferenceUnavailable."""
     got = readable(request, answers)
     if got is None:

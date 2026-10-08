@@ -121,7 +121,7 @@ class ServedCount(BaseModel):
     second: int  # unix time, whole seconds
     attempts: int = Field(0, ge=0, le=1_000_000)  # user requests sent to it in [second, second + 1)
     answered: int = Field(0, ge=0, le=1_000_000)  # of those, the ones it answered
-    input_tokens: int = Field(0, ge=0)  # of those requests, as the miner signed them (at most one per request byte)
+    input_tokens: int = Field(0, ge=0)  # of those requests, as billed (the miner's signed count within bounds)
     # of those, the input tokens of requests their account paid for (prepaid credit spent on them); None: this gateway
     # does not tell paid from unpaid. Only paid usage moves the models' emission shares.
     paid_input_tokens: int | None = Field(None, ge=0)

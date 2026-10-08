@@ -60,6 +60,9 @@ from verathos.protocol.gateway import Routes
 
 log = logging.getLogger(__name__)
 STATE_CHARS_PER_TOKEN = 4  # as the miners count it
+# An answer is billed at least one token per this many characters of the state, whatever the miner signs; these
+# models' tokens average far fewer characters, so an honest count is never raised.
+STATE_CHARS_PER_BILLED_TOKEN = 8
 FAILED_KEY_RATE, FAILED_KEY_BURST = 2.0, 20  # invalid keys per client address (IPv6: per /64)
 ANSWER_ENVELOPE_BYTES = 4096  # the receipt, the usage and the response's own fields
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -167,6 +170,7 @@ class Checked:
     parsed: SystemOneRequest
     request_sha256: str
     price: float  # the model's, USD per million input tokens
+    min_tokens: int  # billed at least, whatever the miner signs
 
 
 NO_ANSWER = {  # why a forwarded request got no answer -> the API error
@@ -208,7 +212,7 @@ def check_request(g: Gateway, body: bytes) -> Checked:
     if answer_bytes(parsed) > MAX_RESPONSE_BYTES:
         raise Rejected(413, "too_large", "the answers to these questions would exceed a response's size limit",
                        model=parsed.model)
-    return Checked(raw, body, parsed, request_sha256, model.price)
+    return Checked(raw, body, parsed, request_sha256, model.price, len(state) // STATE_CHARS_PER_BILLED_TOKEN)
 
 
 async def forward(g: Gateway, checked: Checked, started: float, attempts: list[dict[str, Any]] | None = None, *,
@@ -243,7 +247,8 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
         note = {"endpoint": endpoint.key}
         try:
             exchange = await g.upstream.call(endpoint.route, checked.raw, checked.body, checked.request_sha256,
-                                             checked.parsed, min(g.config.attempt_timeout_s, remaining))
+                                             checked.parsed, min(g.config.attempt_timeout_s, remaining),
+                                             min_tokens=checked.min_tokens)
             outcome = Outcome.ANSWERED
             note["outcome"] = "answered"
         except UpstreamFailure as failure:

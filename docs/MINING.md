@@ -262,8 +262,8 @@ well-formed answers (one distribution per question over its options, with the `n
 from it; fields other than an answer type's own are dropped before signing): an engine that returns anything else
 gets an error back to the caller, never a signed receipt. The auditor recomputes a sample of the
 answers given to the subnet's gateway, as it does test answers: serve users the same model, at the same precision.
-The input tokens a receipt signs are checked against the reference's count too: they set each model's share of the
-emission, and signing more than the reference counts is a wrong answer.
+The input tokens a receipt signs are checked against the reference's count too: users are billed for them and they
+set each model's share of the emission, so signing more or fewer than the reference counts is a wrong answer.
 
 ## Reading the log
 

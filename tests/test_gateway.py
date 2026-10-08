@@ -672,6 +672,23 @@ def test_usage_is_what_the_miner_signed_within_bounds(tmp_path) -> None:
     assert usage["input_tokens"] == tokens
 
 
+def test_an_answer_is_billed_at_least_its_states_length_in_tokens(tmp_path) -> None:
+    class Free(MockEngine):
+        async def answer(self, request):
+            return {**await super().answer(request), "usage": {"input_tokens": 0}}
+
+    s = Setup(tmp_path, {"10.0.0.1": Free("kev-4b")})
+    long = {**REQUEST, "state": "the customer asks about an invoice " * 40}
+    r = asyncio.run(s.post(long))
+    assert r.status_code == 200 and r.json()["usage"]["input_tokens"] == len(long["state"]) // 8
+    asyncio.run(s.meter.flush())
+    (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
+    assert usage["input_tokens"] == len(long["state"]) // 8 and usage["cost"] > 0
+    honest = Setup(tmp_path / "honest", {"10.0.0.1": MockEngine("kev-4b")})
+    signed = asyncio.run(MockEngine("kev-4b").answer(long))["usage"]["input_tokens"]
+    assert asyncio.run(honest.post(long)).json()["usage"]["input_tokens"] == signed  # an honest count is not raised
+
+
 def test_invalid_keys_are_limited_before_the_database(tmp_path) -> None:
     import secrets
 
