@@ -68,10 +68,12 @@ def describe_test(t: ThroughputOutcome) -> str:
 
 
 class StatusWatcher:
-    """Polls the auditor's status page for this hotkey and logs what changed."""
+    """Polls the auditor's status page for this hotkey, logs what changed and hands the test results to ``on_tests``
+    (the miner measures again an endpoint that fell short)."""
 
-    def __init__(self, *, hotkey: str, auditor_url: Callable[[], str | None], listed: Callable[[], list[str]]) -> None:
-        self.hotkey, self.auditor_url, self.listed = hotkey, auditor_url, listed
+    def __init__(self, *, hotkey: str, auditor_url: Callable[[], str | None], listed: Callable[[], list[str]],
+                 on_tests: Callable[[list[ThroughputOutcome]], None] = lambda tests: None) -> None:
+        self.hotkey, self.auditor_url, self.listed, self.on_tests = hotkey, auditor_url, listed, on_tests
         self._epoch: int | None = None
         self._tests_logged: set[tuple[int, str]] = set()
 
@@ -94,6 +96,7 @@ class StatusWatcher:
             get_json(base.rstrip("/") + STATUS_PATH.format(hotkey=self.hotkey), limit=1 << 20, timeout=15))
         for line in self.lines(status):
             log.info(line)
+        self.on_tests(status.tests)
 
     def lines(self, status: HotkeyStatus) -> list[str]:
         out, listed = [], self.listed()

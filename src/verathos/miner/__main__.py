@@ -2,11 +2,12 @@
 
 The miner starts its service, measures the capacity of its endpoints through it with each model's standard request
 mix (all endpoints at once), and declares it. Measurements are stored and reused until an endpoint's engine,
-configuration, model revision or request mix changes, or ``--remeasure`` is given. An endpoint that cannot be measured
-is withdrawn; the others are served. The primary (``role``) signs the hotkey's manifest, its own endpoints and its
-peers' (``miner.peers``), and publishes it; a worker serves its endpoints and what it declares
-(``GET /v1/endpoints``) and publishes nothing. Until the first measurement is done, a machine serves what it last
-served.
+configuration, model revision or request mix changes, or ``--remeasure`` is given. An endpoint whose last two
+throughput tests fell short is measured again and declares at most what it delivered in them (``shortfall``). An
+endpoint that cannot be measured is withdrawn; the others are served. The primary (``role``) signs the hotkey's
+manifest, its own endpoints and its peers' (``miner.peers``), and publishes it; a worker serves its endpoints and what
+it declares (``GET /v1/endpoints``) and publishes nothing. Until the first measurement is done, a machine serves what
+it last served.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import bittensor as bt
@@ -34,6 +35,7 @@ from verathos.miner.chain import PermitAuthorizer, build_host_endpoints, build_m
 from verathos.miner.config import EndpointConfig, MinerConfig
 from verathos.miner.engine import Engine, HttpEngine
 from verathos.miner.peers import Peers, merged
+from verathos.miner.shortfall import Shortfall, Shortfalls
 from verathos.miner.status import StatusWatcher
 from verathos.protocol.http import raise_open_file_limit
 from verathos.protocol.manifest import (
@@ -44,6 +46,7 @@ from verathos.protocol.manifest import (
     endpoint_host,
     is_public,
 )
+from verathos.protocol.status import ThroughputOutcome
 from verathos.subnet.chain import committed_catalog, current_catalog
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.measure import (
@@ -100,13 +103,16 @@ async def engine_fingerprint(e: EndpointConfig, cat: catalog.Catalog) -> str:
 class Publisher:
     """What this machine serves: its endpoints whose capacity is measured, and on the primary the hotkey's manifest,
     which lists them and the peers' (``miner.peers``). Rebuilt when the subnet owner commits a new catalog, an engine
-    changes or a peer's endpoints change; the manifest is published on chain."""
+    changes, an endpoint falls short in the throughput tests (``shortfall``) or a peer's endpoints change; the manifest
+    is published on chain."""
 
     def __init__(self, config: MinerConfig, wallet: bt.Wallet, cat: catalog.Catalog, *, publish_on_chain: bool,
                  subtensor: bt.Subtensor) -> None:
         self.config, self.wallet = config, wallet
         self.publish_on_chain = publish_on_chain and config.role == "primary"
         self.store = MeasurementStore(config.state_dir / "capacity.json")
+        self.shortfalls = Shortfalls(config.state_dir / "shortfalls.json")
+        self.tests: list[ThroughputOutcome] = []  # the hotkey's latest test results, as the auditor's status lists them
         state = config.state_dir.expanduser()
         self.manifest_path, self.endpoints_path = state / "manifest.json", state / "endpoints.json"
         self.admissions = {e.endpoint_id: Admission(e.max_concurrency) for e in config.endpoints}
@@ -154,6 +160,9 @@ class Publisher:
         within ``TEST_ARRIVING_S``."""
         return time.monotonic() - self.test_seen < TEST_ARRIVING_S
 
+    def note_tests(self, tests: list[ThroughputOutcome]) -> None:
+        self.tests = list(tests)
+
     def own_ids(self) -> list[str]:
         """The endpoints this machine serves, as it lists them."""
         return [e.endpoint_id for e in self.local.host.endpoints] if self.local is not None else []
@@ -185,7 +194,8 @@ class Publisher:
         return f"{axon_base(host, self.config.port)}/e/{endpoint_id}/v1/systemone"
 
     async def _measure(self, endpoints: list[EndpointConfig], cat: catalog.Catalog, remeasure: bool,
-                       stop: Callable[[], bool]) -> tuple[dict[str, Measurement], dict[str, str]]:
+                       stop: Callable[[], bool]) -> tuple[dict[str, Measurement], dict[str, str], bool]:
+        """-> (measurements, failures, whether they were measured now rather than reused)."""
         limits = httpx.Limits(max_connections=None, max_keepalive_connections=1024)
         async with httpx.AsyncClient(timeout=120.0, limits=limits) as client:
             targets = [Target(e.endpoint_id, e.model_id,
@@ -203,21 +213,22 @@ class Publisher:
             targets = [dataclasses.replace(t, fingerprint=await engine_fingerprint(by_id[t.endpoint_id], cat))
                        for t in targets if t.endpoint_id not in failures]
             if not targets:
-                return {}, failures
+                return {}, failures, False
             reuse = None if remeasure else stored(targets, self.store)
             if reuse is not None:
-                return reuse, failures
+                return reuse, failures, False
             if self.testing():
                 raise MeasurementInterrupted()  # a test is running: measuring now would distort both
             measured, failed = await measure_and_store(targets, self.store,
                                                        max_latency_s=cat.audit_policy().max_latency_s, stop=stop)
-            return measured, failures | failed
+            return measured, failures | failed, True
 
-    def adopt(self, cat: catalog.Catalog, *, remeasure: bool = False) -> bool:
+    def adopt(self, cat: catalog.Catalog, *, remeasure: bool = False, shortfalls: Sequence[Shortfall] = ()) -> bool:
         """Measure the endpoints ``cat`` serves (or reuse their stored measurements) through the running service and
         sign what this machine serves, and on the primary the manifest. A measurement neither starts nor continues
-        while the auditor's test traffic arrives. False if none could be measured or the measurement stepped aside
-        (``interrupted``); what is served stays."""
+        while the auditor's test traffic arrives. Measured for ``shortfalls``, their tests cap those endpoints'
+        declarations; measured for any other reason, the caps are released. False if none could be measured or the
+        measurement stepped aside (``interrupted``); what is served stays."""
         endpoints = servable(self.config, cat)
         if not endpoints:
             log.error("no configured endpoint serves a model of catalog %s", cat.digest()[:12])
@@ -229,11 +240,15 @@ class Publisher:
             self.admissions[e.endpoint_id].limit = e.max_concurrency
         started, self.interrupted = time.monotonic(), False
         try:
-            measured, failures = asyncio.run(self._measure(endpoints, cat, remeasure,
-                                                           stop=lambda: self.test_seen > started))
+            measured, failures, fresh = asyncio.run(self._measure(endpoints, cat, remeasure or bool(shortfalls),
+                                                                  stop=lambda: self.test_seen > started))
         except MeasurementInterrupted:
             log.info("a throughput test is running; measuring again after it")
-            measured, failures, self.interrupted = {}, {}, True
+            measured, failures, fresh, self.interrupted = {}, {}, False, True
+        if shortfalls and not self.interrupted:
+            self.shortfalls.record(shortfalls)  # also if nothing could be measured: not again before the cooldown
+        elif fresh:
+            self.shortfalls.release(measured)
         for endpoint_id, reason in sorted(failures.items()):
             log.error("endpoint %s withdrawn: %s", endpoint_id, reason)
         listed = [e for e in endpoints if e.endpoint_id in measured]
@@ -243,15 +258,16 @@ class Publisher:
                 self.admissions[k].limit = limit
             return False
         margin = cat.audit_policy().capacity_margin
+        declared = {}
         for e in listed:
-            m = measured[e.endpoint_id]
+            m, cap = measured[e.endpoint_id], self.shortfalls.cap(e.endpoint_id)
+            declared[e.endpoint_id] = m.declared(margin) if cap is None else min(m.declared(margin), cap.rps)
             self.admissions[e.endpoint_id].limit = m.concurrency
-            log.info("endpoint %s (%s): %.1f requests/s at concurrency %d (runs %s), declares %.1f", e.endpoint_id,
+            log.info("endpoint %s (%s): %.1f requests/s at concurrency %d (runs %s), declares %.1f%s", e.endpoint_id,
                      e.model_id, m.measured_rps, m.concurrency, ", ".join(f"{r:.1f}" for r in m.runs),
-                     m.declared(margin))
+                     declared[e.endpoint_id], "" if cap is None else ", " + cap.text())
         self.catalog = cat
-        own = own_endpoints(self.config, listed, {e.endpoint_id: measured[e.endpoint_id].declared(margin)
-                                                  for e in listed})
+        own = own_endpoints(self.config, listed, declared)
         self.local = build_host_endpoints(self.config, own, self.wallet.hotkey, cat.digest())
         self.endpoints_path.parent.mkdir(parents=True, exist_ok=True)
         self.endpoints_path.write_text(self.local.model_dump_json())
@@ -274,6 +290,19 @@ class Publisher:
             return False
 
         return asyncio.run(check())
+
+    def measure_shortfalls(self) -> bool:
+        """Measure again if an endpoint of this machine fell short in its last two throughput tests at the rate it
+        declares (``shortfall``); not while a test runs. True if it measured."""
+        if self.local is None or self.testing():
+            return False
+        due = self.shortfalls.due(self.tests, {e.endpoint_id: e.capacity_rps for e in self.local.host.endpoints})
+        if not due:
+            return False
+        for s in due:
+            log.warning(s.line())
+        self.adopt(self.catalog, shortfalls=due)
+        return True
 
     # ---- the primary: peers and publishing ----
 
@@ -307,38 +336,47 @@ class Publisher:
         self._published = True
 
     def watch(self, interval_s: float = POLICY_WATCH_S) -> None:
-        """Follow the owner's catalog commitment, the engines and, on the primary, the peers. A new catalog is adopted
-        at once (measuring again if it changed what a measurement depends on), so is a changed engine; on-chain
-        publication is retried until it succeeds."""
+        """Follow the owner's catalog commitment, the engines, the throughput tests and, on the primary, the peers
+        (``follow``), every ``interval_s``."""
 
         def run() -> None:
             store = catalog.CatalogStore(self.config.catalog_dir)
             st: bt.Subtensor | None = None
             while True:
                 time.sleep(interval_s)
-                try:
-                    st = st or bt.Subtensor(network=self.config.network)
-                    if committed_catalog(st, self.config.netuid) != self.catalog.digest():
-                        cat = current_catalog(st, self.config.netuid, store, self.config.catalog_mirrors)
-                        if self.adopt(cat):
-                            log.info("catalog %s committed; endpoints rebuilt", cat.digest()[:12])
-                        else:
-                            log.error("catalog %s committed but not adopted yet; keeping the current endpoints",
-                                      cat.digest()[:12])
-                    elif self.engines_changed():
-                        log.info("an engine changed; measuring again")
-                        self.adopt(self.catalog)
-                    if self.peers is not None and self.peers.peers:
-                        self.poll_peers()
-                    self.auditor = st.get_subnet_owner_hotkey(self.config.netuid)
-                    if self.publish_on_chain and not self._published:
-                        self.publish(st)
-                        log.info("manifest published")
-                except Exception:
-                    log.exception("catalog follow failed; retrying")
-                    st = None
+                st = self.follow(st, store)
 
         threading.Thread(target=run, name="catalog-watch", daemon=True).start()
+
+    def follow(self, st: bt.Subtensor | None, store: catalog.CatalogStore) -> bt.Subtensor | None:
+        """One round of ``watch``. A new catalog is adopted at once (measuring again if it changed what a measurement
+        depends on), so is a changed engine; otherwise an endpoint that fell short in its tests is measured again.
+        On-chain publication is retried until it succeeds. -> the chain connection for the next round (None after a
+        failure: a new one then)."""
+        try:
+            st = st or bt.Subtensor(network=self.config.network)
+            if committed_catalog(st, self.config.netuid) != self.catalog.digest():
+                cat = current_catalog(st, self.config.netuid, store, self.config.catalog_mirrors)
+                if self.adopt(cat):
+                    log.info("catalog %s committed; endpoints rebuilt", cat.digest()[:12])
+                else:
+                    log.error("catalog %s committed but not adopted yet; keeping the current endpoints",
+                              cat.digest()[:12])
+            elif self.engines_changed():
+                log.info("an engine changed; measuring again")
+                self.adopt(self.catalog)
+            else:
+                self.measure_shortfalls()
+            if self.peers is not None and self.peers.peers:
+                self.poll_peers()
+            self.auditor = st.get_subnet_owner_hotkey(self.config.netuid)
+            if self.publish_on_chain and not self._published:
+                self.publish(st)
+                log.info("manifest published")
+            return st
+        except Exception:
+            log.exception("catalog follow failed; retrying")
+            return None
 
 
 def permits(config: MinerConfig, publisher: Publisher) -> PermitAuthorizer:
@@ -451,8 +489,8 @@ def main() -> None:
     if not args.no_publish:
         publisher.watch()
         chain = SubtensorChainView(config.network, config.netuid)
-        StatusWatcher(hotkey=wallet.hotkey.ss58_address, auditor_url=chain.auditor_url,
-                      listed=publisher.own_ids).start()
+        StatusWatcher(hotkey=wallet.hotkey.ss58_address, auditor_url=chain.auditor_url, listed=publisher.own_ids,
+                      on_tests=publisher.note_tests).start()
     log.info(serving_line(config, publisher))
     service.join()
     os._exit(1)  # the service stopped

@@ -79,7 +79,7 @@ What it does:
 |---|---|
 | `~/verathos` | code and its Python environment |
 | `~/.verathos/miner.json` | configuration |
-| `~/.verathos/miner/` | capacity measurements, the last published manifest and the endpoints this machine serves |
+| `~/.verathos/miner/` | capacity measurements and the caps tests set on them, the last published manifest and the endpoints this machine serves |
 | `~/.verathos/engines/`, `~/.verathos/hf/` | engines (one per pinned revision) and model weights |
 | `/etc/systemd/system/verathos-*.service` | services; in a container `/etc/supervisor/conf.d/verathos-*.conf`, with logs in `/var/log/verathos/` |
 
@@ -272,7 +272,7 @@ CUDA_VISIBLE_DEVICES=2 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --rev
 | `gateway_hotkeys` | callers allowed in addition to validators with a permit |
 | `catalog_mirrors` | extra catalog sources, URL templates with `{digest}`, tried after the owner's axon |
 | `catalog_dir` | local catalog store (default `~/.verathos/catalog`) |
-| `state_dir` | capacity measurements and the last published manifest (default `~/.verathos/miner`) |
+| `state_dir` | capacity measurements and the caps tests set on them, and the last published manifest (default `~/.verathos/miner`) |
 
 ### 5. Run
 
@@ -297,8 +297,10 @@ On start the miner:
 5. checks the owner's commitment and its engines every minute; when the owner commits a new catalog it re-signs
    and re-publishes the manifest by itself, withdrawing endpoints whose model was retired and measuring again if the
    catalog changed what a measurement depends on (a model's request mix or `max_latency_s`); when an engine changed
-   (its version, weights or settings), it measures again. A failed measurement keeps the current manifest, and a
-   measurement that a throughput test interrupts is retried later.
+   (its version, weights or settings), it measures again; when an endpoint fell short in its last two throughput
+   tests, it measures again and declares at most what the endpoint delivered in them
+   ([Falling short](#falling-short)). A failed measurement keeps the current manifest, and a measurement that a
+   throughput test interrupts is retried later.
 
 Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted from
 hotkeys holding a validator permit and at least the catalog's `scoring.validator_min_stake` of stake (the
@@ -351,7 +353,7 @@ validator's epoch 45352:
 | Test outcome | Meaning |
 |---|---|
 | `passed` | delivered at least 95% of the tested rate; credited what it delivered |
-| `BELOW the tested rate` | delivered less than 95% of it; credited delivered x delivered / tested; the reason names the shortfall |
+| `BELOW the tested rate` | delivered less than 95% of it; credited delivered x delivered / tested; the reason names the shortfall. Two in a row lower the declaration ([Falling short](#falling-short)) |
 | `INVALID` | a sampled answer was wrong |
 | `not counted` | the test or this endpoint's result was void (the reason says why); earlier credit still counts |
 
@@ -363,7 +365,8 @@ most 2 s before the window opened, so an endpoint whose latency stays within 2 s
 needs to be done by hand, but:
 - keep the engines warm and their GPUs free of other work: a test delivers what the hardware has at that moment;
 - run `--remeasure` after changing an endpoint's hardware; the miner measures again by itself when the engine's
-  identity, the endpoint's configuration, the request mix or `max_latency_s` changes;
+  identity, the endpoint's configuration, the request mix or `max_latency_s` changes, and when the endpoint fell
+  short in two tests ([Falling short](#falling-short));
 - serve the catalog's precision: the auditor recomputes test answers, and an endpoint whose answers drift from the
   reference over several tests loses its credit;
 - an engine that just restarted runs slow for its first minutes, and a test then credits less;
@@ -373,6 +376,28 @@ needs to be done by hand, but:
   (busy, failing, or answering slower than twice `max_latency_s`) comes off its score, and its latency factor comes
   from the latency its users see. An endpoint that declares more than it serves is tested at about what it serves,
   and credited less than that.
+
+### Falling short
+
+The tests measure what an endpoint serves under real conditions, and their result counts over the miner's own
+measurement. When an endpoint's last two counted tests (confirmed, not void) were both `BELOW the tested rate`, with
+less delivered than the rate tested, at the rate it declares now, the miner measures again by itself: all the
+machine's endpoints in the same rounds, as at the start, while they keep serving (requests from gateways and
+validators go before the measurement's). The endpoint then declares the new measurement with the usual margin, but
+at most the higher rate it delivered in those two tests:
+
+```
+throughput test of epoch 45418 (block 8175283), gpu0: BELOW the tested rate, delivered 10.4 of 11.4 requests/s, p95 latency 1810 ms; credited 9.5 (delivered 10.4 of 11.4 requests/s asked)
+gpu0 fell short in tests 45417 and 45418 (delivered 10.5 and 10.4 of 11.4): measuring again
+measuring the capacity of 1 endpoints (about 3 minutes)
+endpoint gpu0 (kev-9b): 12.0 requests/s at concurrency 32 (runs 12.1, 11.9, 12.0, 12.0, 11.8), declares 10.5, at most the 10.5 it delivered in tests 45417 and 45418
+```
+
+The new declaration is published as any other (on a worker, the primary takes it from `GET /v1/endpoints`). The cap
+is kept across restarts and holds until the miner measures for another reason: an engine, an endpoint's
+configuration or the request mix changed, or the miner started with `--remeasure`, which is how to raise the
+declaration again once what slowed the endpoint is fixed. A further shortfall can only lower it. An endpoint makes the
+miner measure again at most once every 3 epochs, and never twice for the same tests.
 
 ## Updating
 

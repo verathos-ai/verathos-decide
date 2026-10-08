@@ -17,7 +17,7 @@ commits on chain.
 |---|---|
 | Schedule, policy, test sessions | `src/verathos/throughput/policy.py`, `throughput/follow.py` |
 | Standard request mix | `throughput/workload.py` |
-| The miner's measurement | `throughput/measure.py` |
+| The miner's measurement | `throughput/measure.py`, `miner/shortfall.py` (after tests fell short) |
 | Admission on the miner (tests yield to other traffic) | `miner/admission.py`, `miner/app.py` |
 | Auditor and load generator | `throughput/auditor.py`, `throughput/loadgen.py`, `native/loadgen` |
 | Verdicts | `throughput/feed.py`, `validator/throughput.py` |
@@ -40,7 +40,8 @@ do in a test:
    (default 2 s);
 3. five runs at each endpoint's knee: the lowest concurrency within 3% of its best throughput.
 
-The declared `capacity_rps` is `capacity_margin` (default 0.95) times the median of the five runs. A measurement
+The declared `capacity_rps` is `capacity_margin` (default 0.95) times the median of the five runs, at most what
+the endpoint delivered in tests it fell short in (below). A measurement
 takes a few minutes. It is stored in `state_dir/capacity.json` together with a fingerprint of what it depends on (the
 endpoint's model with its pinned weight and engine revisions, engine URL and `max_concurrency`, `max_latency_s`, the
 scalar fields of the engine's `GET /v1/models` document, and the request mix) and is reused until one of them
@@ -49,6 +50,15 @@ again, for example after a hardware change. A measurement steps aside when the a
 miner and is retried later. An endpoint whose engine does not answer, or answers a single request slower than
 `max_latency_s`, is withdrawn from the manifest; the others are served. Until its first measurement is done, a
 restarted miner serves the manifest it last published.
+
+A test measures under real conditions, and its result counts over the miner's measurement. The miner reads its test
+results from the auditor's status (`GET /v1/status/<hotkey>`). When an endpoint's last two counted tests (confirmed,
+not void) were both `partial` with less delivered than the rate tested, at the rate it declares now, the miner
+measures again (all its endpoints in the same rounds, as above) and declares at most the higher rate the endpoint
+delivered in those two tests. The cap is kept across restarts and holds until the miner measures for another reason
+(a fingerprint changed, or `--remeasure`); a further shortfall can only lower it, so a declaration falls only on the
+tests' evidence and rises only on a measurement they did not cause. An endpoint makes the miner measure again this
+way at most once every 3 epochs, never twice for the same test.
 
 The miner never sends an engine more requests at once than its knee concurrency; further requests wait in the
 miner (up to four per engine slot).
