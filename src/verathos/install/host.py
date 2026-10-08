@@ -30,11 +30,20 @@ class Gpu:
 
 
 def parse_gpus(csv: str) -> list[Gpu]:
-    """``nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader,nounits`` output."""
+    """``nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader,nounits`` output; a
+    memory nvidia-smi does not report (``[N/A]``) counts as none."""
+
+    def mib(value: str) -> int:
+        try:
+            return int(float(value)) * MiB
+        except ValueError:
+            return 0
+
     gpus = []
     for line in csv.strip().splitlines():
-        index, name, total, free = (part.strip() for part in line.split(","))
-        gpus.append(Gpu(int(index), name, int(float(total)) * MiB, int(float(free)) * MiB))
+        index, rest = line.split(",", 1)
+        name, total, free = rest.rsplit(",", 2)
+        gpus.append(Gpu(int(index), name.strip(), mib(total.strip()), mib(free.strip())))
     return gpus
 
 

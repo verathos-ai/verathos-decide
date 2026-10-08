@@ -48,9 +48,11 @@ def read_file(path: Path) -> str | None:
         return None
 
 
-def systemd_quote(arg: str) -> str:
-    """One word of an ExecStart= or Environment= line."""
-    escaped = arg.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
+def systemd_quote(arg: str, *, variables: bool = True) -> str:
+    """One word of an ExecStart= line, or (``variables`` False) of an Environment= line, where ``$`` is literal."""
+    escaped = arg.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    if variables:
+        escaped = escaped.replace("$", "$$")
     return f'"{escaped}"' if not arg or any(c.isspace() or c in "\"'\\;" for c in arg) else escaped
 
 
@@ -60,11 +62,29 @@ def supervisor_quote(arg: str) -> str:
     return f'"{escaped}"' if not arg or any(c.isspace() or c in "\"',\\" for c in arg) else escaped
 
 
-class Systemd:
+class Logs:
+    """Following a service's log: ``mark`` where to start, ``lines`` what came since, ``unread`` to give lines
+    back."""
+
+    def __init__(self) -> None:
+        self._pending: dict[str, list[str]] = {}
+
+    def lines(self, name: str) -> list[str]:
+        return self._pending.pop(name, []) + self.new_lines(name)
+
+    def unread(self, name: str, lines: list[str]) -> None:
+        self._pending[name] = lines + self._pending.get(name, [])
+
+    def new_lines(self, name: str) -> list[str]:
+        raise NotImplementedError
+
+
+class Systemd(Logs):
     name = "systemd"
     unit_dir = Path("/etc/systemd/system")
 
     def __init__(self) -> None:
+        super().__init__()
         self._marks: dict[str, tuple[float, int]] = {}
 
     @staticmethod
@@ -72,7 +92,7 @@ class Systemd:
         after = " ".join(["network-online.target", *(f"{a}.service" for a in s.after)])
         lines = ["[Unit]", f"Description={s.description}", f"After={after}", "Wants=network-online.target", "",
                  "[Service]", f"User={s.user}", f"WorkingDirectory={s.directory}"]
-        lines += [f"Environment={systemd_quote(f'{k}={v}')}" for k, v in sorted(s.environment.items())]
+        lines += [f"Environment={systemd_quote(f'{k}={v}', variables=False)}" for k, v in sorted(s.environment.items())]
         lines += [f"ExecStart={' '.join(systemd_quote(a) for a in s.command)}", "Restart=always", "RestartSec=10",
                   "TimeoutStopSec=60", "LimitNOFILE=1048576", "", "[Install]", "WantedBy=multi-user.target", ""]
         return "\n".join(lines)
@@ -103,6 +123,12 @@ class Systemd:
     def active(self, name: str) -> bool:
         return subprocess.run(["systemctl", "is-active", "--quiet", name]).returncode == 0
 
+    def pid(self, name: str) -> int:
+        """The service's process id, 0 while it is not running."""
+        out = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", name], capture_output=True,
+                             text=True).stdout.strip()
+        return int(out) if out.isdigit() else 0
+
     def stop(self, names: list[str]) -> None:
         if names:
             subprocess.run(privileged(["systemctl", "stop", *names]), check=True)
@@ -115,13 +141,14 @@ class Systemd:
             subprocess.run(privileged(["systemctl", "daemon-reload"]), check=True)
 
     def mark(self, name: str) -> None:
-        """Start following the service's log here: ``new_lines`` returns what it logs from now on."""
+        """Start following the service's log here: ``lines`` returns what it logs from now on."""
         self._marks[name] = (time.time(), 0)
 
     def new_lines(self, name: str) -> list[str]:
         since, seen = self._marks.setdefault(name, (time.time(), 0))
         out = subprocess.run(privileged(["journalctl", "-u", name, "-o", "cat", "--no-pager", "--since",
-                                         f"@{int(since)}"]), capture_output=True, text=True).stdout.splitlines()
+                                         f"@{int(since)}"]), capture_output=True, encoding="utf-8",
+                             errors="replace").stdout.splitlines()
         self._marks[name] = (since, len(out))
         return out[seen:]
 
@@ -135,13 +162,14 @@ class Systemd:
         return f"systemctl restart {' '.join(names)}"
 
 
-class Supervisor:
+class Supervisor(Logs):
     name = "supervisor"
     conf_dir = Path("/etc/supervisor/conf.d")
     main_conf = Path("/etc/supervisor/supervisord.conf")
     log_dir = Path("/var/log/verathos")
 
     def __init__(self) -> None:
+        super().__init__()
         self._offsets: dict[str, int] = {}
 
     @classmethod
@@ -210,6 +238,11 @@ class Supervisor:
         status = f" {self.ctl('status', name).stdout} "
         return " RUNNING " in status or " STARTING " in status
 
+    def pid(self, name: str) -> int:
+        """The program's process id, 0 while it is not running."""
+        out = self.ctl("pid", name).stdout.strip()
+        return int(out) if out.isdigit() else 0
+
     def stop(self, names: list[str]) -> None:
         if names:
             self.ctl("stop", *names)
@@ -226,7 +259,7 @@ class Supervisor:
             self.ctl("update")
 
     def mark(self, name: str) -> None:
-        """Start following the service's log here: ``new_lines`` returns what it logs from now on."""
+        """Start following the service's log here: ``lines`` returns what it logs from now on."""
         try:
             self._offsets[name] = self.log_path(name).stat().st_size
         except OSError:
@@ -235,6 +268,8 @@ class Supervisor:
     def new_lines(self, name: str) -> list[str]:
         try:
             with open(self.log_path(name), "rb") as f:
+                if f.seek(0, os.SEEK_END) < self._offsets.get(name, 0):
+                    self._offsets[name] = 0  # the log was rotated
                 f.seek(self._offsets.get(name, 0))
                 data = f.read()
         except OSError:

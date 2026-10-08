@@ -9,11 +9,11 @@ from verathos import catalog
 from verathos.install.host import GiB, Gpu
 
 # A serving engine holds the bfloat16 weights plus batches, CUDA graphs and its state cache; a reference holds the
-# float32 weights plus the activations of one request at a time.
+# float32 weights plus the activations of a request, and on a GPU its CUDA graphs and state cache too.
 MINER_WEIGHTS_FACTOR = 1.25
 MINER_FIXED = 4 * GiB
 REFERENCE_WEIGHTS_FACTOR = 1.1
-REFERENCE_FIXED = 2 * GiB
+REFERENCE_FIXED = {"cpu": 2 * GiB, "gpu": 8 * GiB}
 INSTALLABLE_ENGINES = ("kev",)
 
 
@@ -26,9 +26,10 @@ def miner_memory(parameters: int) -> int:
     return int(parameters * 2 * MINER_WEIGHTS_FACTOR) + MINER_FIXED
 
 
-def reference_memory(parameters: int) -> int:
-    """RAM or GPU memory a reference engine needs for a model of ``parameters`` in float32."""
-    return int(parameters * 4 * REFERENCE_WEIGHTS_FACTOR) + REFERENCE_FIXED
+def reference_memory(parameters: int, device: str) -> int:
+    """Memory a reference engine needs for a model of ``parameters`` in float32: RAM (``device`` "cpu") or GPU
+    memory ("gpu")."""
+    return int(parameters * 4 * REFERENCE_WEIGHTS_FACTOR) + REFERENCE_FIXED[device]
 
 
 def servable_models(cat: catalog.Catalog) -> list[catalog.CatalogModel]:
@@ -73,9 +74,9 @@ def choose_models(gpus: list[Gpu], offered: list[str], need: dict[str, int], req
     return chosen
 
 
-def place_references(need: dict[str, int], gpu_free: dict[int, int], ram_free: int, device: str,
+def place_references(parameters: dict[str, int], gpu_free: dict[int, int], ram_free: int, device: str,
                      keep: dict[str, str]) -> dict[str, str]:
-    """Where each reference engine runs: ``"cpu"`` or ``"cuda:<index>"``.
+    """Where the reference engine of each model (model -> parameters) runs: ``"cpu"`` or ``"cuda:<index>"``.
 
     A reference an earlier setup placed stays where it is if ``device`` allows it (its memory is already taken).
     The others go, smallest first, on the GPU with the most free memory while one has room (``device`` "auto" or
@@ -85,23 +86,24 @@ def place_references(need: dict[str, int], gpu_free: dict[int, int], ram_free: i
     placement: dict[str, str] = {}
     for model, where in keep.items():
         on_gpu = where.startswith("cuda:") and int(where.split(":", 1)[1]) in gpu_free
-        if model in need and ((where == "cpu" and device != "gpu") or (on_gpu and device != "cpu")):
+        if model in parameters and ((where == "cpu" and device != "gpu") or (on_gpu and device != "cpu")):
             placement[model] = where
     free, ram = dict(gpu_free), ram_free
-    for model in sorted((m for m in need if m not in placement), key=lambda m: (need[m], m)):
+    for model in sorted((m for m in parameters if m not in placement), key=lambda m: (parameters[m], m)):
+        gpu_need, cpu_need = reference_memory(parameters[model], "gpu"), reference_memory(parameters[model], "cpu")
         if device != "cpu" and free:
             index = max(free, key=lambda i: (free[i], -i))
-            if free[index] >= need[model]:
+            if free[index] >= gpu_need:
                 placement[model] = f"cuda:{index}"
-                free[index] -= need[model]
+                free[index] -= gpu_need
                 continue
-        if device != "gpu" and ram >= need[model]:
+        if device != "gpu" and ram >= cpu_need:
             placement[model] = "cpu"
-            ram -= need[model]
+            ram -= cpu_need
             continue
-        where = {"auto": "on a GPU or in RAM", "cpu": "in RAM", "gpu": "on a GPU"}[device]
-        raise PlanError(f"the {model} reference needs about {need[model] / GiB:.0f} GiB {where}; "
-                        f"not enough is free (RAM {ram / GiB:.0f} GiB"
+        needs = {"auto": f"{gpu_need / GiB:.0f} GiB on a GPU or {cpu_need / GiB:.0f} GiB of RAM",
+                 "cpu": f"{cpu_need / GiB:.0f} GiB of RAM", "gpu": f"{gpu_need / GiB:.0f} GiB on a GPU"}[device]
+        raise PlanError(f"the {model} reference needs about {needs}; not enough is free (RAM {ram / GiB:.0f} GiB"
                         + "".join(f", GPU {i} {f / GiB:.0f} GiB" for i, f in sorted(free.items())) + ")")
     return placement
 

@@ -48,7 +48,10 @@ def parser() -> argparse.ArgumentParser:
 def select_gpus(gpus: list[host.Gpu], value: str | None) -> list[host.Gpu]:
     if not value:
         return gpus
-    wanted = {int(v) for v in value.split(",") if v.strip()}
+    try:
+        wanted = {int(v) for v in value.split(",") if v.strip()}
+    except ValueError:
+        raise SystemExit(f"--gpus takes GPU numbers as nvidia-smi shows them, like 0,1; not {value!r}") from None
     unknown = wanted - {g.index for g in gpus}
     if unknown:
         raise SystemExit(f"no GPU {', '.join(map(str, sorted(unknown)))}; found "
@@ -96,7 +99,7 @@ def miner_config(existing: dict, *, network: str, netuid: int, wallet_name: str,
 def init(argv: list[str]) -> None:
     args = parser().parse_args(argv)
     ui = Prompter(args.yes)
-    home = args.home.expanduser()
+    home = args.home.expanduser().absolute()
     record = common.Record.load(home, "miner")
     config_path = (args.config or Path(record.config or home / "miner.json")).expanduser().absolute()
     existing = common.read_json(config_path)
@@ -245,9 +248,9 @@ def init(argv: list[str]) -> None:
         manager.mark(name)
     if stale:
         manager.remove(stale)
-    changed = manager.apply([*engine_services.values(), miner], restart={MINER})
     record.manager, record.services = manager.name, [*names, MINER]
-    record.save(home)
+    record.save(home)  # before the services exist, so uninstall finds them whatever happens next
+    changed = manager.apply([*engine_services.values(), miner], restart={MINER})
     info(f"{manager.name}: {', '.join(names + [MINER])}" + (f" (new or changed: {', '.join(sorted(changed))})"
                                                              if changed else ""))
     info("waiting for the engines to load their models")
@@ -272,7 +275,5 @@ def init(argv: list[str]) -> None:
     info(f"logs:    {manager.log_command(MINER)}")
     info(f"after editing the configuration: {manager.restart_command([MINER])}")
     info(f"check from another machine: curl http://{public_ip}:{port}/v1/manifest")
-    script = Path(catalog.__file__).parents[3] / "scripts" / "install.sh"
-    if script.exists():
-        again = " --no-publish" if args.no_publish else ""
-        info(f"update: bash {script} miner --yes{again}      uninstall: bash {script} uninstall")
+    for line in common.script_commands("miner", home, " --no-publish" if args.no_publish else ""):
+        info(line)

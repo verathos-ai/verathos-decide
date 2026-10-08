@@ -7,9 +7,11 @@ import argparse
 import getpass
 import json
 import os
+import shlex
 import shutil
 import sys
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -223,6 +225,15 @@ def manager_for(args: argparse.Namespace, record: Record) -> services.Manager | 
     return manager
 
 
+def script_commands(role: str, home: Path, options: str = "") -> list[str]:
+    """How to update and uninstall this setup with the installer of this checkout."""
+    script = Path(__file__).resolve().parents[3] / "scripts" / "install.sh"
+    if not script.exists():
+        return []
+    extra = "" if home == DEFAULT_HOME.expanduser() else f" --home {shlex.quote(str(home))}"
+    return [f"update:  bash {script} {role} --yes{options}{extra}", f"uninstall: bash {script} uninstall{extra}"]
+
+
 def engine_ready(port: int) -> bool:
     try:
         return httpx.get(f"http://127.0.0.1:{port}/v1/models", timeout=5).status_code == 200
@@ -237,26 +248,44 @@ def show_tail(manager: services.Manager, name: str, lines: list[str], count: int
     print(f"    full log: {manager.log_command(name)}")
 
 
+class Health:
+    """Whether a service keeps failing: a third process (it restarted twice), or a minute without one."""
+
+    DOWN_S = 60.0
+
+    def __init__(self, manager: services.Manager, name: str) -> None:
+        self.manager, self.name = manager, name
+        self.pids: set[int] = set()
+        self.down_since: float | None = None
+
+    def failing(self) -> bool:
+        pid = self.manager.pid(self.name)
+        if pid:
+            self.pids.add(pid)
+            self.down_since = None
+        elif self.down_since is None:
+            self.down_since = time.monotonic()  # the clock starts
+        elif time.monotonic() - self.down_since > self.DOWN_S:
+            return True
+        return len(self.pids) >= 3
+
+
 def wait_engines(manager: services.Manager, engines: dict[str, int], timeout_s: float) -> None:
-    """Wait until every engine (service name -> port) answers; stops with its log if one stopped twice."""
+    """Wait until every engine (service name -> port) answers; stops with its log if one keeps failing."""
     logs: dict[str, list[str]] = {name: [] for name in engines}
+    health = {name: Health(manager, name) for name in engines}
     pending = dict(engines)
-    deadline, stops, was_active = time.monotonic() + timeout_s, dict.fromkeys(engines, 0), dict.fromkeys(engines, True)
     started = time.monotonic()
     while pending:
         for name, port in list(pending.items()):
-            logs[name] += manager.new_lines(name)
+            logs[name] += manager.lines(name)
             if engine_ready(port):
                 info(f"{name} is ready ({time.monotonic() - started:.0f} s)")
                 del pending[name]
-                continue
-            active = manager.active(name)
-            stops[name] += was_active[name] and not active
-            was_active[name] = active
-            if stops[name] >= 2:
+            elif health[name].failing():
                 show_tail(manager, name, logs[name])
                 raise SystemExit(f"{name} keeps stopping")
-        if pending and time.monotonic() > deadline:
+        if pending and time.monotonic() - started > timeout_s:
             for name in pending:
                 show_tail(manager, name, logs[name])
             raise SystemExit(f"not ready after {timeout_s / 60:.0f} minutes: {', '.join(pending)}")
@@ -266,24 +295,23 @@ def wait_engines(manager: services.Manager, engines: dict[str, int], timeout_s: 
 
 def follow(manager: services.Manager, name: str, done: Callable[[str], bool], failed: Callable[[str], bool],
            timeout_s: float, required: bool = True, hide: Callable[[str], bool] = lambda line: False) -> bool:
-    """Show ``name``'s log (except lines to ``hide``) until a line ``done`` accepts (True). Stops the setup if a
-    line is ``failed`` or the service stopped twice; after ``timeout_s`` stops it too, or returns False if not
-    ``required``."""
-    deadline, stops, was_active, seen = time.monotonic() + timeout_s, 0, True, []
+    """Show ``name``'s log (except lines to ``hide``) until a line ``done`` accepts (True); the lines after it
+    stay for the next ``follow``. Stops the setup if a line is ``failed`` or the service keeps failing; after
+    ``timeout_s`` stops it too, or returns False if not ``required``."""
+    deadline, health, seen = time.monotonic() + timeout_s, Health(manager, name), []
     while True:
-        for line in manager.new_lines(name):
+        lines = manager.lines(name)
+        for i, line in enumerate(lines):
             seen.append(line)
             if not hide(line):
                 print(f"      {line}", flush=True)
             if done(line):
+                manager.unread(name, lines[i + 1:])
                 return True
             if failed(line):
                 print(f"    full log: {manager.log_command(name)}")
                 raise SystemExit(f"{name} failed")
-        active = manager.active(name)
-        stops += was_active and not active
-        was_active = active
-        if stops >= 2:
+        if health.failing():
             show_tail(manager, name, seen)
             raise SystemExit(f"{name} keeps stopping")
         if time.monotonic() > deadline:
@@ -313,6 +341,10 @@ def main(role: str, command: str, argv: list[str]) -> None:
     except KeyboardInterrupt:
         print(f"\nverathos-{role} {command}: interrupted; run it again to continue", file=sys.stderr)
         code = 130
+    except Exception:
+        traceback.print_exc()
+        print(f"\nverathos-{role} {command} failed; run it again once the cause is fixed", file=sys.stderr)
+        code = 1
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(code)
@@ -328,7 +360,7 @@ def uninstall(role: str, argv: list[str]) -> None:
     parser.add_argument("--home", type=Path, default=DEFAULT_HOME)
     parser.add_argument("--yes", "-y", action="store_true", help=argparse.SUPPRESS)  # nothing is asked
     args = parser.parse_args(argv)
-    home = args.home.expanduser()
+    home = args.home.expanduser().absolute()
     record = Record.load(home, role)
     manager = services.by_name(record.manager)
     if manager is not None and record.services:

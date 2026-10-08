@@ -17,9 +17,8 @@ from verathos.install.validator import validator_config
 from verathos.miner.config import MinerConfig
 from verathos.validator.config import ValidatorConfig
 
-KEV_4B, KEV_9B = 4_659_865_088, 9_653_104_368  # parameters of the Kev models' base models
-MINER_NEED = {"kev-4b": plan.miner_memory(KEV_4B), "kev-9b": plan.miner_memory(KEV_9B)}
-REFERENCE_NEED = {"kev-4b": plan.reference_memory(KEV_4B), "kev-9b": plan.reference_memory(KEV_9B)}
+KEV = {"kev-4b": 4_659_865_088, "kev-9b": 9_653_104_368}  # parameters of the Kev models' base models
+MINER_NEED = {m: plan.miner_memory(p) for m, p in KEV.items()}
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -31,6 +30,7 @@ def test_gpus_are_read_from_nvidia_smi() -> None:
     gpus = parse_gpus("0, NVIDIA A100 80GB PCIe, 81920, 81037\n1, NVIDIA GeForce RTX 5090, 32607, 32100\n")
     assert [g.index for g in gpus] == [0, 1]
     assert gpus[0].memory_total == 81920 * (1 << 20) and gpus[1].name == "NVIDIA GeForce RTX 5090"
+    assert parse_gpus("2, NVIDIA H100 80GB HBM3, [N/A], [N/A]\n")[0].memory_free == 0
 
 
 def test_the_kev_models_fit_the_gpus_they_are_known_to_run_on() -> None:
@@ -38,8 +38,9 @@ def test_the_kev_models_fit_the_gpus_they_are_known_to_run_on() -> None:
     assert plan.fitting(["kev-4b", "kev-9b"], MINER_NEED, rtx_4090) == ["kev-4b"]
     assert plan.fitting(["kev-4b", "kev-9b"], MINER_NEED, rtx_5090) == ["kev-4b", "kev-9b"]
     assert plan.fitting(["kev-4b", "kev-9b"], MINER_NEED, a100) == ["kev-4b", "kev-9b"]
-    # float32 references: about 16 and 36 GiB of weights
-    assert 16 * GiB < REFERENCE_NEED["kev-4b"] < 24 * GiB and 36 * GiB < REFERENCE_NEED["kev-9b"] < 44 * GiB
+    # float32 references, as measured on an A100 host: Kev-4B holds 26.2 GiB on the GPU, Kev-9B 33 GiB of RAM
+    assert plan.reference_memory(KEV["kev-4b"], "gpu") > 26.2 * GiB
+    assert 33 * GiB < plan.reference_memory(KEV["kev-9b"], "cpu") < 44 * GiB
 
 
 def test_each_gpu_gets_the_requested_model_or_keeps_its_model_or_the_first_that_fits() -> None:
@@ -62,28 +63,24 @@ def test_each_gpu_gets_the_requested_model_or_keeps_its_model_or_the_first_that_
 
 def test_references_go_on_a_gpu_smallest_first_and_the_rest_in_ram() -> None:
     # An A100 with a miner's engine on it: room for the Kev-4B reference, not for both.
-    assert plan.place_references(REFERENCE_NEED, {0: 60 * GiB}, 200 * GiB, "auto", {}) == {"kev-4b": "cuda:0",
-                                                                                          "kev-9b": "cpu"}
-    assert plan.place_references(REFERENCE_NEED, {0: 79 * GiB}, 8 * GiB, "auto", {}) == {"kev-4b": "cuda:0",
-                                                                                        "kev-9b": "cuda:0"}
+    assert plan.place_references(KEV, {0: 60 * GiB}, 200 * GiB, "auto", {}) == {"kev-4b": "cuda:0", "kev-9b": "cpu"}
+    assert plan.place_references(KEV, {0: 79 * GiB}, 8 * GiB, "auto", {}) == {"kev-4b": "cuda:0", "kev-9b": "cuda:0"}
     # Several GPUs: each reference on the one with the most free memory left.
-    assert plan.place_references(REFERENCE_NEED, {0: 50 * GiB, 1: 45 * GiB}, 0, "gpu", {}) == {"kev-4b": "cuda:0",
-                                                                                              "kev-9b": "cuda:1"}
-    assert plan.place_references(REFERENCE_NEED, {0: 80 * GiB}, 100 * GiB, "cpu", {}) == {"kev-4b": "cpu",
-                                                                                         "kev-9b": "cpu"}
-    with pytest.raises(plan.PlanError, match="kev-9b reference needs about .* in RAM"):
-        plan.place_references(REFERENCE_NEED, {}, 50 * GiB, "cpu", {})
+    assert plan.place_references(KEV, {0: 50 * GiB, 1: 50 * GiB}, 0, "gpu", {}) == {"kev-4b": "cuda:0",
+                                                                                   "kev-9b": "cuda:1"}
+    assert plan.place_references(KEV, {0: 80 * GiB}, 100 * GiB, "cpu", {}) == {"kev-4b": "cpu", "kev-9b": "cpu"}
+    with pytest.raises(plan.PlanError, match="kev-9b reference needs about .* of RAM"):
+        plan.place_references(KEV, {}, 50 * GiB, "cpu", {})
     with pytest.raises(plan.PlanError, match="on a GPU"):
-        plan.place_references(REFERENCE_NEED, {0: 30 * GiB}, 500 * GiB, "gpu", {})
+        plan.place_references(KEV, {0: 30 * GiB}, 500 * GiB, "gpu", {})
 
 
 def test_a_reference_placed_before_stays_where_it_is() -> None:
     """Its memory is taken by itself, so it is not counted again; a placement the device option excludes moves."""
     keep = {"kev-4b": "cuda:0", "kev-9b": "cpu"}
-    assert plan.place_references(REFERENCE_NEED, {0: 1 * GiB}, 1 * GiB, "auto", keep) == keep
-    assert plan.place_references(REFERENCE_NEED, {0: 1 * GiB}, 100 * GiB, "cpu", keep) == {"kev-4b": "cpu",
-                                                                                           "kev-9b": "cpu"}
-    assert plan.place_references(REFERENCE_NEED, {}, 100 * GiB, "auto", {"kev-4b": "cuda:3"})["kev-4b"] == "cpu"
+    assert plan.place_references(KEV, {0: 1 * GiB}, 1 * GiB, "auto", keep) == keep
+    assert plan.place_references(KEV, {0: 1 * GiB}, 100 * GiB, "cpu", keep) == {"kev-4b": "cpu", "kev-9b": "cpu"}
+    assert plan.place_references(KEV, {}, 100 * GiB, "auto", {"kev-4b": "cuda:3"})["kev-4b"] == "cpu"
 
 
 def test_ports_are_kept_and_new_ones_skip_busy_and_taken_ports() -> None:
@@ -139,6 +136,9 @@ def test_systemd_units_restart_the_service_and_quote_what_needs_it() -> None:
     assert "After=network-online.target verathos-engine-gpu1.service" in unit
     assert "WantedBy=multi-user.target" in unit
     assert services.systemd_quote("a b") == '"a b"' and services.systemd_quote("50%") == "50%%"
+    # $ expands variables in ExecStart= but is literal in Environment=
+    unit = services.Systemd.render(service(command=["/bin/x", "$HOME"], environment={"KEY": "a$b c"}))
+    assert "ExecStart=/bin/x $$HOME\n" in unit and 'Environment="KEY=a$b c"\n' in unit
 
 
 def test_supervisor_programs_restart_the_service_and_quote_what_needs_it() -> None:
@@ -162,6 +162,47 @@ def test_supervisor_logs_are_followed_from_the_mark(tmp_path, monkeypatch) -> No
         f.write(" line\n")
     assert manager.new_lines("verathos-miner") == ["partial line"]
     assert manager.new_lines("verathos-miner") == []
+    log.write_text("rotated\n")
+    assert manager.new_lines("verathos-miner") == ["rotated"]
+
+
+class FakeManager(services.Logs):
+    """A service whose log and process ids are given in advance."""
+
+    def __init__(self, batches: list[list[str]], pids: list[int]) -> None:
+        super().__init__()
+        self.batches, self.pids = batches, pids
+
+    def new_lines(self, name: str) -> list[str]:
+        return self.batches.pop(0) if self.batches else []
+
+    def pid(self, name: str) -> int:
+        return self.pids.pop(0) if len(self.pids) > 1 else self.pids[0]
+
+    def log_command(self, name: str) -> str:
+        return f"tail -f {name}.log"
+
+
+def test_following_a_log_leaves_the_lines_after_the_match_for_the_next_wait(monkeypatch) -> None:
+    monkeypatch.setattr(common.time, "sleep", lambda s: None)
+    manager = FakeManager([["starting", "started", "epoch 7: 3 miners"]], [101])
+    assert common.follow(manager, "v", done=lambda line: line == "started", failed=lambda line: False, timeout_s=5)
+    assert common.follow(manager, "v", done=lambda line: line.startswith("epoch"), failed=lambda line: False,
+                         timeout_s=5)
+    assert manager.lines("v") == []
+    with pytest.raises(SystemExit, match="failed"):
+        common.follow(FakeManager([["no endpoint could be measured"]], [101]), "m", done=lambda line: False,
+                      failed=lambda line: "no endpoint" in line, timeout_s=5)
+
+
+def test_a_service_that_keeps_restarting_or_stays_down_is_failing(monkeypatch) -> None:
+    restarting = common.Health(FakeManager([], [101, 0, 102, 0, 103]), "e")
+    assert [restarting.failing() for _ in range(5)] == [False, False, False, False, True]
+    healthy = common.Health(FakeManager([], [101]), "e")
+    assert not any(healthy.failing() for _ in range(10))
+    monkeypatch.setattr(common.Health, "DOWN_S", 0.0)
+    down = common.Health(FakeManager([], [0]), "e")
+    assert [down.failing() for _ in range(2)] == [False, True]
 
 
 def test_engine_commands_pin_the_revisions_and_the_precision(tmp_path) -> None:

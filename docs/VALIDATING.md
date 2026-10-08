@@ -64,10 +64,10 @@ What it does:
 4. places a float32 reference engine for every `active` model in the free memory: on a GPU while one has room,
    otherwise in RAM;
 
-   | Model | Memory of its float32 reference |
-   |---|---|
-   | Kev-4B | about 21 GiB |
-   | Kev-9B | about 42 GiB |
+   | Model | float32 reference in RAM | on a GPU |
+   |---|---|---|
+   | Kev-4B | about 21 GiB | about 27 GiB |
+   | Kev-9B | about 42 GiB | about 48 GiB |
 
 5. installs the Kev engine at `engine.revision`, without the fused kernels (they change float32 results), and
    downloads the weights at `hf_revision` and the base model at `base_revision`; the references run offline from

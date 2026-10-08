@@ -67,7 +67,7 @@ def validator_config(existing: dict, *, network: str, netuid: int, wallet_name: 
 def init(argv: list[str]) -> None:
     args = parser().parse_args(argv)
     ui = Prompter(args.yes)
-    home = args.home.expanduser()
+    home = args.home.expanduser().absolute()
     record = common.Record.load(home, "validator")
     config_path = (args.config or Path(record.config or home / "validator.json")).expanduser().absolute()
     existing = common.read_json(config_path)
@@ -111,16 +111,25 @@ def init(argv: list[str]) -> None:
                              "not install; set up its reference by hand (docs/VALIDATING.md)")
     models = {m.model_id: m for m in active}
     try:
-        need = {m: plan.reference_memory(engines.parameters(models[m])) for m in models}
+        parameters = {m: engines.parameters(models[m]) for m in models}
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
+    stale = [m for m in record.engines if m not in models]
+    if stale and manager is not None:
+        # Their memory is free for the active models' references.
+        manager.remove([service_name(m) for m in stale])
+        info(f"removed the references of {', '.join(stale)}, which the catalog no longer lists as active")
+        record.engines = {m: e for m, e in record.engines.items() if m in models}
+        record.services = [s for s in record.services if s not in {service_name(m) for m in stale}]
+        record.save(home)
     gpus = host.gpus()
     ram_total, ram_free = host.memory_available()
     info(f"RAM {ram_total / host.GiB:.0f} GiB ({ram_free / host.GiB:.0f} free)"
          + "".join(f"; {g.describe()} ({g.memory_free / host.GiB:.0f} free)" for g in gpus))
     keep = {m: e["device"] for m, e in record.engines.items()}
     try:
-        placement = plan.place_references(need, {g.index: g.memory_free for g in gpus}, ram_free, args.device, keep)
+        placement = plan.place_references(parameters, {g.index: g.memory_free for g in gpus}, ram_free, args.device,
+                                          keep)
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
     ports = plan.pick_ports(list(models), {m: e["port"] for m, e in record.engines.items()}, REFERENCE_PORT,
@@ -128,7 +137,8 @@ def init(argv: list[str]) -> None:
 
     step("Plan")
     for m in models:
-        info(f"{m}: float32 reference on {describe(placement[m])} (about {need[m] / host.GiB:.0f} GiB), "
+        need = plan.reference_memory(parameters[m], "cpu" if placement[m] == "cpu" else "gpu")
+        info(f"{m}: float32 reference on {describe(placement[m])} (about {need / host.GiB:.0f} GiB), "
              f"127.0.0.1:{ports[m]}")
     info(f"validator with hotkey {wallet_name}/{hotkey_name}" + (", dry run: no weights set" if dry_run else ""))
     info(f"configuration {config_path}; engines and weights in {home}")
@@ -174,7 +184,6 @@ def init(argv: list[str]) -> None:
                         command=[str(validator_bin), "--config", str(config_path)], directory=home,
                         user=common.operator(), environment={"HOME": str(Path.home())},
                         after=tuple(s.name for s in reference_services.values()))
-    stale = [service_name(m) for m in record.engines if m not in models]
 
     record.config = str(config_path)
     record.engines = {m: {"model": m, "device": placement[m], "port": ports[m]} for m in models}
@@ -193,11 +202,9 @@ def init(argv: list[str]) -> None:
     names = [s.name for s in reference_services.values()]
     for name in [*names, VALIDATOR]:
         manager.mark(name)
-    if stale:
-        manager.remove(stale)
-    changed = manager.apply([*reference_services.values(), validator], restart={VALIDATOR})
     record.manager, record.services = manager.name, [*names, VALIDATOR]
-    record.save(home)
+    record.save(home)  # before the services exist, so uninstall finds them whatever happens next
+    changed = manager.apply([*reference_services.values(), validator], restart={VALIDATOR})
     info(f"{manager.name}: {', '.join(record.services)}" + (f" (new or changed: {', '.join(sorted(changed))})"
                                                              if changed else ""))
     info("waiting for the references to load their models (float32 on CPU takes several minutes)")
@@ -223,6 +230,5 @@ def init(argv: list[str]) -> None:
     info(f"logs:    {manager.log_command(VALIDATOR)}")
     info("each epoch logs its miners and endpoints, one line per endpoint checked, and the weights set")
     info(f"after editing the configuration: {manager.restart_command([VALIDATOR])}")
-    script = Path(catalog.__file__).parents[3] / "scripts" / "install.sh"
-    if script.exists():
-        info(f"update: bash {script} validator --yes      uninstall: bash {script} uninstall")
+    for line in common.script_commands("validator", home):
+        info(line)

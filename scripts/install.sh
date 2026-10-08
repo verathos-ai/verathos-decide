@@ -9,11 +9,11 @@
 # `verathos-miner init` or `verathos-validator init`, which asks a few questions (or takes --yes and options) and
 # starts everything as system services. Run it again to update. It only uses a wallet's hotkey and coldkeypub.txt.
 #
-# Options:
+# The first argument is miner, validator or uninstall. Options:
 #   --source <src>  git URL, path to a git bundle, or path to a source tarball (default: the public repository;
 #                   when updating, where the installed code came from)
 #   --ref <ref>     branch, tag or commit to install (default: the source's default branch)
-#   --dir <dir>     where the code goes (default ~/verathos)
+#   --dir <dir>     where the code goes (default ~/verathos, or the checkout this script is in)
 #   --purge         with uninstall: also delete ~/.verathos (configuration, state, measurements)
 # Every other option goes to `verathos-<role> init`, for example:
 #   --yes --wallet <name> --hotkey <name> --network finney|test|<ws url> --netuid <n>
@@ -23,21 +23,28 @@ set -euo pipefail
 
 PUBLIC_REPOSITORY="https://github.com/<org>/verathos.git"
 PYTHON_VERSION="3.12"
+SOURCE_FILE=".install-source"  # where a checkout installed from a tarball came from
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nerror: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,/^set -euo/p' "$0" 2>/dev/null | sed '$d; s/^# \{0,1\}//' || true
+  if [ -f "${BASH_SOURCE[0]:-}" ]; then
+    sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
+  fi
   echo "usage: install.sh miner|validator|uninstall [options]"
 }
 
 main() {
-  local role="" source="" ref="" dir="$HOME/verathos" purge="" home="$HOME/.verathos"
+  local role="" source="" ref="" dir="" purge="" home="$HOME/.verathos"
   local -a init_args=()
+  case "${1:-}" in
+    miner|validator|uninstall) role="$1"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 2 ;;
+  esac
   while [ $# -gt 0 ]; do
     case "$1" in
-      miner|validator|uninstall) [ -z "$role" ] || die "one of miner, validator, uninstall"; role="$1" ;;
       --source) source="${2:?--source needs a value}"; shift ;;
       --source=*) source="${1#*=}" ;;
       --ref) ref="${2:?--ref needs a value}"; shift ;;
@@ -45,17 +52,19 @@ main() {
       --dir) dir="${2:?--dir needs a value}"; shift ;;
       --dir=*) dir="${1#*=}" ;;
       --purge) purge=1 ;;
-      --home) home="${2:?--home needs a value}"; init_args+=("$1" "$2"); shift ;;
+      --home) home="${2:?--home needs a value}"; shift ;;
+      --home=*) home="${1#*=}" ;;
       -h|--help) usage; exit 0 ;;
       *) init_args+=("$1") ;;
     esac
     shift
   done
-  [ -n "$role" ] || { usage; exit 2; }
-  dir="$(absolute "$dir")"
+  dir="$(realpath -m -- "${dir:-$(script_checkout || echo "$HOME/verathos")}")"
+  home="$(realpath -m -- "$home")"
+  [ "$home" = "$HOME/.verathos" ] || init_args+=(--home "$home")
   sudo_setup
   if [ "$role" = uninstall ]; then
-    uninstall "$dir" "$home" "$purge" "${init_args[@]+"${init_args[@]}"}"
+    uninstall "$dir" "$home" "$purge"
     return
   fi
   check_os
@@ -73,11 +82,16 @@ main() {
   fi
 }
 
-absolute() {
-  case "$1" in
-    /*) printf '%s' "$1" ;;
-    *) printf '%s/%s' "$PWD" "$1" ;;
-  esac
+is_checkout() {
+  [ -f "$1/pyproject.toml" ] && grep -q '^name = "verathos"' "$1/pyproject.toml"
+}
+
+script_checkout() {
+  # The checkout this script belongs to, when it runs from a file in one (as when updating).
+  local here
+  [ -f "${BASH_SOURCE[0]:-}" ] || return 1
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
+  is_checkout "$here" && printf '%s' "$here"
 }
 
 sudo_setup() {
@@ -144,41 +158,57 @@ fetch_code() {
   local dir="$1" source="$2" ref="$3"
   if [ -z "$source" ] && [ -d "$dir/.git" ]; then
     source="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+  elif [ -z "$source" ] && [ -f "$dir/$SOURCE_FILE" ]; then
+    source="$(cat "$dir/$SOURCE_FILE")"
   fi
   source="${source:-$PUBLIC_REPOSITORY}"
-  [ -e "$source" ] && source="$(absolute "$source")"
   case "$source" in
     *"<org>"*) die "no public repository is configured in this installer yet: pass --source <git url | git bundle | tarball>" ;;
   esac
-  [ -e "$dir" ] && [ ! -f "$dir/pyproject.toml" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ] \
-    && die "$dir exists and is not a Verathos checkout; choose another --dir"
+  if [ -e "$source" ]; then
+    source="$(realpath -- "$source")"
+  fi
+  if [ -e "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ] && ! is_checkout "$dir" && [ ! -d "$dir/.git" ]; then
+    die "$dir exists and is not a Verathos checkout; choose another --dir"
+  fi
   if is_tarball "$source"; then
-    say "Installing the code from $source in $dir"
-    local tmp root
-    tmp="$(mktemp -d)"
-    tar -xf "$source" -C "$tmp"
-    root="$(dirname "$(find "$tmp" -maxdepth 2 -name pyproject.toml | head -n 1)")"
-    [ -f "$root/pyproject.toml" ] || die "$source holds no pyproject.toml"
-    mkdir -p "$dir"
-    find "$dir" -mindepth 1 -maxdepth 1 ! -name .venv -exec rm -rf {} +
-    cp -a "$root"/. "$dir"/
-    rm -rf "$tmp"
+    install_tarball "$dir" "$source"
     return
   fi
+  local partial="$dir.partial"
   if [ ! -d "$dir/.git" ]; then
-    rm -rf "$dir.partial"
-    git clone --quiet --no-checkout "$source" "$dir.partial" || die "cannot clone $source"
-    [ -d "$dir/.venv" ] && mv "$dir/.venv" "$dir.partial/.venv"
+    rm -rf "$partial"
+    git clone --quiet --no-checkout "$source" "$partial" || die "cannot clone $source"
+    [ -n "$ref" ] || ref="$(default_ref "$partial" "$source")"
+    git -C "$partial" fetch --quiet --tags --force "$source" "$ref" || die "cannot fetch $ref from $source"
+    git -C "$partial" checkout --quiet --detach FETCH_HEAD || die "cannot check out $ref"
+    [ -d "$dir/.venv" ] && mv "$dir/.venv" "$partial/.venv"
     rm -rf "$dir"
-    mv "$dir.partial" "$dir"
+    mv "$partial" "$dir"
+  else
+    git -C "$dir" remote set-url origin "$source"
+    [ -n "$ref" ] || ref="$(default_ref "$dir" "$source")"
+    git -C "$dir" fetch --quiet --tags --force "$source" "$ref" || die "cannot fetch $ref from $source"
+    git -C "$dir" checkout --quiet --detach FETCH_HEAD \
+      || die "local changes in $dir stop the update; see: git -C $dir status"
   fi
-  git -C "$dir" remote set-url origin "$source"
-  [ -n "$ref" ] || ref="$(default_ref "$dir" "$source")"
-  say "Installing the code from $source ($ref) in $dir"
-  git -C "$dir" fetch --quiet --tags --force "$source" "$ref" || die "cannot fetch $ref from $source"
-  git -C "$dir" checkout --quiet --detach FETCH_HEAD \
-    || die "local changes in $dir stop the update; see: git -C $dir status"
+  say "Installed the code from $source ($ref) in $dir"
   echo "    $(git -C "$dir" log -1 --format='%h %s')"
+}
+
+install_tarball() {
+  local dir="$1" source="$2" tmp found
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064  # the directory is fixed now
+  trap "rm -rf '$tmp'" EXIT
+  tar -xf "$source" -C "$tmp"
+  found="$(find "$tmp" -maxdepth 2 -name pyproject.toml | head -n 1)"
+  [ -n "$found" ] && is_checkout "$(dirname "$found")" || die "$source holds no Verathos source tree"
+  mkdir -p "$dir"
+  find "$dir" -mindepth 1 -maxdepth 1 ! -name .venv -exec rm -rf {} +
+  cp -a "$(dirname "$found")"/. "$dir"/
+  printf '%s\n' "$source" > "$dir/$SOURCE_FILE"
+  say "Installed the code from $source in $dir"
 }
 
 python_environment() {
@@ -188,9 +218,13 @@ python_environment() {
   VIRTUAL_ENV="$dir/.venv" uv pip install --quiet -e "$dir[server,chain]"
 }
 
+command_dir() {
+  if [ "$(id -u)" -eq 0 ]; then echo /usr/local/bin; else echo "$HOME/.local/bin"; fi
+}
+
 link_commands() {
-  local dir="$1" bin="/usr/local/bin" c
-  [ "$(id -u)" -eq 0 ] || bin="$HOME/.local/bin"
+  local dir="$1" bin c
+  bin="$(command_dir)"
   mkdir -p "$bin"
   for c in verathos-miner verathos-validator; do
     ln -sf "$dir/.venv/bin/$c" "$bin/$c"
@@ -198,21 +232,28 @@ link_commands() {
 }
 
 uninstall() {
-  local dir="$1" home="$2" purge="$3"
-  shift 3
-  local role bin="/usr/local/bin" c
+  local dir="$1" home="$2" purge="$3" role bin c
+  local -a home_arg=()
+  [ "$home" = "$HOME/.verathos" ] || home_arg=(--home "$home")
   for role in miner validator; do
-    if [ -x "$dir/.venv/bin/verathos-$role" ] && [ -f "$home/install/$role.json" ]; then
+    if [ -f "$home/install/$role.json" ]; then
+      [ -x "$dir/.venv/bin/verathos-$role" ] || die "the $role was set up from another directory: pass its --dir"
       say "Removing the $role"
-      "$dir/.venv/bin/verathos-$role" uninstall ${purge:+--purge} "$@"
+      "$dir/.venv/bin/verathos-$role" uninstall ${purge:+--purge} "${home_arg[@]+"${home_arg[@]}"}"
     fi
   done
-  [ "$(id -u)" -eq 0 ] || bin="$HOME/.local/bin"
+  bin="$(command_dir)"
   for c in verathos-miner verathos-validator; do
-    [ -L "$bin/$c" ] && rm -f "$bin/$c"
+    if [ -L "$bin/$c" ] && [ "$(readlink "$bin/$c")" = "$dir/.venv/bin/$c" ]; then
+      rm -f "$bin/$c"
+    fi
   done
-  say "Removing the code in $dir"
-  rm -rf "$dir"
+  if is_checkout "$dir"; then
+    say "Removing the code in $dir"
+    rm -rf "$dir"
+  elif [ -e "$dir" ]; then
+    echo "    $dir is not a Verathos checkout; left as it is"
+  fi
   if [ -n "$purge" ]; then
     rm -rf "$home"
     echo "    removed $home"
