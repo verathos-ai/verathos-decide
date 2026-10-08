@@ -25,7 +25,7 @@ REFERENCE_PORT = 8101
 VALIDATOR = "verathos-validator"
 REFERENCE_READY_S = 2700.0
 STARTUP_S = 600.0
-FIRST_EPOCH_S = 120.0
+FIRST_EPOCH_S = 60.0
 
 
 def parser() -> argparse.ArgumentParser:
