@@ -42,7 +42,16 @@ from typing import Annotated, Any, Literal
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    ValidationError,
+    field_validator,
+)
 
 from verathos.gateway.accounts import Conflict
 from verathos.gateway.app import Checked, Gateway, Rejected, check_request, forward
@@ -51,6 +60,8 @@ from verathos.gateway.upstream import Exchange, UpstreamFailure
 log = logging.getLogger("verathos.gateway.admin")
 MIN_TOKEN_CHARS = 32
 NAME = r"^[A-Za-z0-9_.:@-]{1,128}$"
+MAX_CREDIT = 10**15  # micro-USD in one entry, either sign (a billion USD): balances stay far within 64 bits
+Rate = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 
 
 def read_token(path: Path) -> str:
@@ -80,7 +91,7 @@ class Command(BaseModel):
 class NewAccount(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: Annotated[str, Field(pattern=NAME)]
-    rate_rps: Annotated[float, Field(gt=0)]
+    rate_rps: Rate
     burst: Annotated[StrictInt, Field(ge=1)]
     monthly_quota: Annotated[StrictInt, Field(ge=1)] | None = None
     prepaid: StrictBool = False
@@ -89,7 +100,7 @@ class NewAccount(BaseModel):
 class AccountChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["active", "suspended"] | None = None
-    rate_rps: Annotated[float, Field(gt=0)] | None = None
+    rate_rps: Rate | None = None
     burst: Annotated[StrictInt, Field(ge=1)] | None = None
     monthly_quota: Annotated[StrictInt, Field(ge=1)] | None = None  # null: unlimited
     prepaid: StrictBool | None = None
@@ -103,10 +114,17 @@ class NewKey(BaseModel):
 
 class NewCredit(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    amount: StrictInt
+    amount: Annotated[StrictInt, Field(ge=-MAX_CREDIT, le=MAX_CREDIT)]
     kind: Literal["grant", "topup", "adjust"]
     reference: Annotated[str, Field(min_length=1, max_length=128)]
     note: Annotated[str, Field(max_length=256)] | None = None
+
+    @field_validator("amount")
+    @classmethod
+    def _not_zero(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("an entry is at least one micro-USD")
+        return value
 
 
 def error(status: int, kind: str, message: str) -> JSONResponse:

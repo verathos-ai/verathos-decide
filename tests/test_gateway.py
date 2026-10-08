@@ -692,6 +692,21 @@ def test_the_admin_cli_manages_accounts_and_keys(tmp_path, capsys) -> None:
     (account,) = cli("accounts", "list")
     assert account["prepaid"] is True and account["balance"] == 2_500_000
 
+    # what the admin API refuses, the CLI refuses too, before the database
+    for bad in (("accounts", "create", "--name", "zero", "--rate", "0", "--burst", "1"),
+                ("accounts", "create", "--name", "nan", "--rate", "nan", "--burst", "1"),
+                ("accounts", "create", "--name", "a/b", "--rate", "1", "--burst", "1"),
+                ("accounts", "set", "--name", "acme", "--rate", "-1"),
+                ("accounts", "set", "--name", "acme", "--monthly-quota", "0"),
+                ("credits", "add", "--account", "acme", "--usd", "1e30", "--kind", "topup", "--reference", "big"),
+                ("credits", "add", "--account", "acme", "--usd", "0.0000001", "--kind", "grant", "--reference", "dust"),
+                ("credits", "add", "--account", "acme", "--usd", "1", "--kind", "grant", "--reference", "r" * 200)):
+        with pytest.raises(SystemExit):
+            cli(*bad)
+        assert "error:" in capsys.readouterr().err
+    (account,) = cli("accounts", "list")
+    assert (account["rate_rps"], account["monthly_quota"], account["balance"]) == (5.0, None, 2_500_000)
+
 
 # ---- requests and responses that must not hurt anyone ----
 
@@ -1363,7 +1378,8 @@ def test_the_admin_api_signs_users_up_with_keys_and_credit(tmp_path) -> None:
     assert repeat.status_code == 200 and not repeat.json()["created"] and repeat.json()["balance"] == 1_000_000
     assert call("POST", "/admin/v1/accounts/u_42/credits", {**grant, "amount": 2}).status_code == 409
     for bad in ({**grant, "amount": "5"}, {**grant, "amount": -5, "reference": "n"}, {**grant, "kind": "gift"},
-                {"amount": 5, "kind": "grant"}):
+                {"amount": 5, "kind": "grant"}, {**grant, "amount": 2**70, "reference": "huge"},
+                {**grant, "amount": 0, "reference": "nothing"}):
         assert call("POST", "/admin/v1/accounts/u_42/credits", bad).status_code == 400
     answered = asyncio.run(s.post(LONG, key=key))
     assert answered.status_code == 200

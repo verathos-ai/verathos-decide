@@ -31,12 +31,20 @@ from typing import Any
 import bittensor as bt
 import httpx
 import uvicorn
+from pydantic import ValidationError
 
 from verathos import catalog as catalog_module
 from verathos.gateway import db
-from verathos.gateway.accounts import Accounts
-from verathos.gateway.admin import ByPort, admin_app, read_token
-from verathos.gateway.app import ACCOUNTS_WAIT_S, Gateway, create_app, final_writes, mark_states_forever
+from verathos.gateway.accounts import Accounts, Conflict
+from verathos.gateway.admin import AccountChange, ByPort, NewAccount, NewCredit, admin_app, read_token
+from verathos.gateway.app import (
+    ACCOUNTS_WAIT_S,
+    Gateway,
+    create_app,
+    final_writes,
+    mark_states_forever,
+    validation_message,
+)
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.router import Router
@@ -174,17 +182,18 @@ async def admin(config: GatewayConfig, args: argparse.Namespace) -> Any:
     engine = db.create_engine(config.database_url)
     accounts = Accounts(engine)
     try:
-        if args.command == "accounts":
+        if args.command == "accounts":  # checked as the admin API checks them
             if args.action == "create":
-                return {"id": await accounts.create_account(args.name, rate_rps=args.rate, burst=args.burst,
-                                                            monthly_quota=args.monthly_quota,
-                                                            prepaid=args.prepaid == "yes")}
+                new = NewAccount(name=args.name, rate_rps=args.rate, burst=args.burst,
+                                 monthly_quota=args.monthly_quota, prepaid=args.prepaid == "yes")
+                return {"id": await accounts.create_account(new.name, rate_rps=new.rate_rps, burst=new.burst,
+                                                            monthly_quota=new.monthly_quota, prepaid=new.prepaid)}
             if args.action == "set":
                 prepaid = None if args.prepaid is None else args.prepaid == "yes"
-                values = {k: v for k, v in (("rate_rps", args.rate), ("burst", args.burst),
-                                            ("monthly_quota", args.monthly_quota), ("status", args.status),
-                                            ("prepaid", prepaid)) if v is not None}
-                return {"updated": await accounts.set_account(args.name, **values)}
+                change = AccountChange(**{k: v for k, v in (
+                    ("rate_rps", args.rate), ("burst", args.burst), ("monthly_quota", args.monthly_quota),
+                    ("status", args.status), ("prepaid", prepaid)) if v is not None})
+                return {"updated": await accounts.set_account(args.name, **change.model_dump(exclude_unset=True))}
             return await accounts.list_accounts()
         if args.command == "keys":
             if args.action == "create":
@@ -199,8 +208,10 @@ async def admin(config: GatewayConfig, args: argparse.Namespace) -> Any:
             return await accounts.list_keys(args.account)
         if args.command == "credits":
             if args.action == "add":
-                entry, created = await accounts.add_credit(args.account, round(args.usd * 1_000_000), kind=args.kind,
-                                                           reference=args.reference, note=args.note)
+                new = NewCredit(amount=round(args.usd * 1_000_000), kind=args.kind, reference=args.reference,
+                                note=args.note)
+                entry, created = await accounts.add_credit(args.account, new.amount, kind=new.kind,
+                                                           reference=new.reference, note=new.note)
                 return {"credit": entry, "created": created}
             return {"balance": (await accounts.account(args.account) or {}).get("balance"),
                     "credits": await accounts.credits(args.account)}
@@ -255,7 +266,12 @@ def main() -> None:
             parser.error("accounts create needs --name, --rate and --burst")
         if args.command == "credits" and args.action == "add" and None in (args.usd, args.kind, args.reference):
             parser.error("credits add needs --usd, --kind and --reference")
-        print(json.dumps(run(admin(config, args)), indent=2, default=str))
+        try:
+            print(json.dumps(run(admin(config, args)), indent=2, default=str))
+        except ValidationError as exc:
+            parser.error(validation_message(exc))
+        except (ValueError, LookupError, Conflict) as exc:
+            parser.error(str(exc))
 
 
 if __name__ == "__main__":
