@@ -1749,6 +1749,97 @@ def test_the_networks_totals_count_every_answer_and_as_paid_only_what_bought_cre
     assert totals["since"]["last_24h"] == (hour - dt.timedelta(hours=23)).isoformat()
 
 
+def test_the_usage_series_gives_each_day_or_week_and_paid_usage_on_the_days_it_was_spent(tmp_path) -> None:
+    from sqlalchemy import insert, select
+
+    from verathos.gateway.db import api_keys, credits, usage_daily, usage_hourly
+
+    s = admin_setup(tmp_path)
+    now = dt.datetime(2026, 10, 8, 12, 30, tzinfo=dt.UTC)  # a Thursday
+
+    def at(day: str, hour: int = 0) -> dt.datetime:
+        return dt.datetime.combine(dt.date.fromisoformat(day), dt.time(hour), dt.UTC)
+
+    async def history():
+        async with s.engine.begin() as conn:
+            await conn.execute(insert(usage_hourly), [
+                {"model_id": model, "hour": at(day, hour), "requests": n, "input_tokens": tokens}
+                for model, day, hour, n, tokens in (("kev-4b", "2026-10-08", 10, 5, 500),
+                                                    ("kev-4b", "2026-10-07", 23, 2, 100),
+                                                    ("kev-9b", "2026-10-07", 1, 3, 300),
+                                                    ("kev-4b", "2026-10-01", 0, 1, 10),
+                                                    ("kev-4b", "2026-08-20", 5, 100, 9000))])
+
+    async def account(name: str, entries: list[tuple[str, int, str]], usage: list[tuple[int, str]]) -> None:
+        """Credit entries (kind, micro-USD, day) and usage (micro-USD, day) of a new account."""
+        account_id = await s.accounts.create_account(name, rate_rps=1.0, burst=1, prepaid=True)
+        await s.accounts.create_key(name, "k")
+        async with s.engine.begin() as conn:
+            key_id = (await conn.execute(select(api_keys.c.id).where(api_keys.c.account_id == account_id))).scalar()
+            await conn.execute(insert(credits), [
+                {"account_id": account_id, "amount": amount, "kind": kind, "reference": f"{name}:{kind}:{day}",
+                 "created_at": at(day, 15)} for kind, amount, day in entries])
+            await conn.execute(insert(usage_daily), [
+                {"account_id": account_id, "key_id": key_id, "model_id": "kev-4b", "day": dt.date.fromisoformat(day),
+                 "requests": 1, "failed": 0, "input_tokens": 1, "cost": cost} for cost, day in usage])
+
+    asyncio.run(history())
+    # its 1 USD grant pays the first 1 USD, then 1.5 USD paid on 09-03 and 1.5 USD on 10-08
+    asyncio.run(account("u_old", [("grant", 1_000_000, "2026-08-01"), ("topup", 5_000_000, "2026-08-29")],
+                        [(500_000, "2026-08-19"), (2_000_000, "2026-09-03"), (1_500_000, "2026-10-08")]))
+    asyncio.run(account("u_new", [("grant", 1_000_000, "2026-10-06"), ("topup", 2_000_000, "2026-10-07")],
+                        [(400_000, "2026-10-06"), (900_000, "2026-10-07")]))  # 0.3 USD paid on 10-07
+    asyncio.run(account("u_free", [("grant", 1_000_000, "2026-10-01")], [(900_000, "2026-10-07")]))
+    series = asyncio.run(s.accounts.series(7, "day", now))
+    assert (series["bucket"], series["since"], series["first_day"]) == ("day", "2026-10-02", "2026-08-20")
+    assert series["models"] == ["kev-4b", "kev-9b"]
+    days = {b["start"]: b for b in series["buckets"]}
+    assert list(days) == [f"2026-10-0{d}" for d in range(2, 9)]
+    assert days["2026-10-07"]["requests"] == {"kev-4b": 2, "kev-9b": 3}
+    assert days["2026-10-08"]["input_tokens"] == {"kev-4b": 500, "kev-9b": 0}
+    assert days["2026-10-02"]["requests"] == {"kev-4b": 0, "kev-9b": 0}
+    assert {d: b["paid_usage_micros"] for d, b in days.items() if b["paid_usage_micros"]} == {
+        "2026-10-07": 300_000, "2026-10-08": 1_500_000}
+    assert {d: b["topups_micros"] for d, b in days.items() if b["topups_micros"]} == {"2026-10-07": 2_000_000}
+
+    totals = asyncio.run(s.accounts.totals(now))
+    month = asyncio.run(s.accounts.series(30, "day", now))
+    assert len(month["buckets"]) == 30 and month["since"] == totals["since"]["last_30d"][:10]
+    for what in ("paid_usage_micros", "topups_micros"):  # the days add up to the totals
+        assert sum(b[what] for b in month["buckets"]) == totals[what]["last_30d"]
+    weeks = asyncio.run(s.accounts.series(30, "week", now))  # the weeks that hold the last 30 days, whole
+    assert [b["start"] for b in weeks["buckets"]] == ["2026-09-07", "2026-09-14", "2026-09-21", "2026-09-28",
+                                                      "2026-10-05"]
+    assert weeks["buckets"][-1]["requests"] == {"kev-4b": 7, "kev-9b": 3}
+    assert weeks["buckets"][-1]["paid_usage_micros"] == 1_800_000 and weeks["buckets"][0]["paid_usage_micros"] == 0
+
+    # a grant recorded after paid spending makes the earliest of it free: 1 of the 2 USD spent on 09-02
+    asyncio.run(account("u_late", [("topup", 3_000_000, "2026-09-01"), ("grant", 1_000_000, "2026-10-02")],
+                        [(2_000_000, "2026-09-02"), (500_000, "2026-10-03")]))
+    everything = asyncio.run(s.accounts.series(None, "week", now))
+    assert everything["since"] == "2026-08-17" and len(everything["buckets"]) == 8  # from 08-20's week
+    totals = asyncio.run(s.accounts.totals(now))
+    for what in ("requests", "input_tokens"):
+        assert sum(sum(b[what].values()) for b in everything["buckets"]) == totals[what]["all_time"]
+    for what in ("paid_usage_micros", "topups_micros"):
+        assert sum(b[what] for b in everything["buckets"]) == totals[what]["all_time"]
+    paid = {b["start"]: b["paid_usage_micros"] for b in everything["buckets"] if b["paid_usage_micros"]}
+    assert paid == {"2026-08-31": 2_500_000, "2026-09-28": 500_000, "2026-10-05": 1_800_000}
+    daily = asyncio.run(s.accounts.series(None, "day", now))
+    assert daily["since"] == "2026-08-20" and len(daily["buckets"]) == 50
+
+    def call(query: str) -> httpx.Response:
+        return asyncio.run(admin_call(s, "GET", f"/admin/v1/usage/series{query}", token=ACCOUNTS_TOKEN))
+
+    assert call("?days=30&bucket=week").status_code == 200
+    assert len(call("?days=400").json()["buckets"]) == 400
+    for refused in ("?days=401", "?days=0", "?days=-3", "?days=x", "?days=3.5", "?bucket=month",
+                    "?days=2801&bucket=week"):
+        response = call(refused)
+        assert response.status_code == 400 and response.json()["error"]["type"] == "invalid_request", refused
+    assert len(call("").json()["buckets"]) >= 50  # all time, by day
+
+
 def test_usage_written_before_the_hourly_totals_enters_them_at_its_days_first_hour(tmp_path) -> None:
     from alembic import command
     from sqlalchemy import text

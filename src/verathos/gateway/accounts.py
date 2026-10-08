@@ -19,9 +19,9 @@ paid from credit someone bought. The ledger does not tell which entry a request 
 had free credit (a grant: a sign-up, the demo) is unpaid, and one that topped up is paid from then on, grants
 included. Only paid usage moves the models' emission shares (``ServedCount.paid_input_tokens``).
 
-The network's totals (``totals``) count every account's answered requests. Their paid usage is stricter, money that
-came in: each account's usage cost beyond its free credit (counted as spent first), up to what it bought
-(``paid_cost``).
+The network's totals (``totals``) and their series per day or week (``series``) count every account's answered
+requests. Their paid usage is stricter, money that came in: each account's usage cost beyond its free credit (counted
+as spent first), up to what it bought (``paid_cost``).
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import case, exists, func, insert, select, update
+from sqlalchemy import Date, case, exists, func, insert, literal_column, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -56,6 +56,8 @@ MAX_CACHED = 100_000
 KEYS_RELOAD_S = 60.0
 UNLISTED_LOOKUPS_PER_S, UNLISTED_LOOKUPS_BURST = 20.0, 100  # keys not among the loaded hashes, all clients together
 CREDIT_KINDS = ("grant", "topup", "adjust")  # free credit, a payment, an operator's correction (either sign)
+SERIES_BUCKETS = {"day": 1, "week": 7}  # days per bucket of the usage series
+SERIES_MAX_BUCKETS = 400
 
 
 class Conflict(Exception):
@@ -84,6 +86,11 @@ def key_hash(key: str) -> str:
 
 def well_formed_key(key: str | None) -> bool:
     return key is not None and _KEY.fullmatch(key) is not None
+
+
+def bucket_start(day: dt.date, bucket: str) -> dt.date:
+    """The first day of the series bucket (``SERIES_BUCKETS``) holding ``day``: itself, or its week's Monday."""
+    return day - dt.timedelta(days=day.weekday()) if bucket == "week" else day
 
 
 def paid_cost(cost: int, grants: int, topups: int) -> int:
@@ -295,6 +302,97 @@ class Accounts:
                 "models": models,
                 **{what: {"all_time": pair[0], "last_30d": pair[1]} for what, pair in money.items()}}
 
+    async def series(self, days: int | None = None, bucket: str = "day", now: dt.datetime | None = None
+                     ) -> dict[str, Any]:
+        """The network's usage over time, per UTC day or week (Monday to Sunday): every account's answered requests and
+        input tokens per model, paid usage and top-ups (micro-USD). The buckets that hold the last ``days`` days,
+        whole, up to the current one; without ``days``, from the first holding usage or a top-up, at most
+        ``SERIES_MAX_BUCKETS`` (the latest). Raises ValueError for an unknown bucket or more buckets than that.
+
+        Paid usage is allocated to days per account, as the totals count it (``paid_cost``): of its usage cost in day
+        order, the first part, as much as its grants, is free, and the next, as much as its top-ups, is paid on the
+        days it was spent. The days add up to the totals' paid usage; a grant recorded after paid spending makes the
+        earliest of it free."""
+        if bucket not in SERIES_BUCKETS:
+            raise ValueError(f"bucket is one of {tuple(SERIES_BUCKETS)}")
+        now = now or dt.datetime.now(dt.UTC)
+        step, last = SERIES_BUCKETS[bucket], bucket_start(now.date(), bucket)
+        utc_day = self._utc_day
+        topups = credits.c.kind == "topup"
+        if days is not None:
+            if days < 1:
+                raise ValueError("days is at least 1")
+            start = bucket_start(now.date() - dt.timedelta(days=days - 1), bucket)
+            if (last - start).days // step + 1 > SERIES_MAX_BUCKETS:
+                raise ValueError(f"at most {SERIES_MAX_BUCKETS} buckets")
+        async with self.engine.connect() as conn:
+            first = min((_utc(t).astimezone(dt.UTC).date() for t in (
+                (await conn.execute(select(func.min(usage_hourly.c.hour)))).scalar(),
+                (await conn.execute(select(func.min(credits.c.created_at)).where(topups))).scalar())
+                if t is not None), default=None)
+            if days is None:
+                start = max(bucket_start(first or now.date(), bucket),
+                            last - dt.timedelta(days=step * (SERIES_MAX_BUCKETS - 1)))
+            since = dt.datetime.combine(start, dt.time(), dt.UTC)
+            answered_on = utc_day(usage_hourly.c.hour)
+            answered = await conn.execute(
+                select(usage_hourly.c.model_id, answered_on, func.sum(usage_hourly.c.requests),
+                       func.sum(usage_hourly.c.input_tokens))
+                .where(usage_hourly.c.hour >= since).group_by(usage_hourly.c.model_id, answered_on))
+            per_model = [(model, _date(day), int(n or 0), int(t or 0)) for model, day, n, t in answered]
+            credited = utc_day(credits.c.created_at)
+            bought = [(_date(day), int(amount or 0)) for day, amount in await conn.execute(
+                select(credited, func.sum(credits.c.amount)).where(topups, credits.c.created_at >= since)
+                .group_by(credited))]
+            topped = select(credits.c.account_id).where(topups)
+            ledger: dict[int, dict[str, int]] = {}
+            for account, kind, amount in await conn.execute(
+                    select(credits.c.account_id, credits.c.kind, func.sum(credits.c.amount))
+                    .where(credits.c.account_id.in_(topped), credits.c.kind.in_(("grant", "topup")))
+                    .group_by(credits.c.account_id, credits.c.kind)):
+                ledger.setdefault(account, {})[kind] = int(amount or 0)
+            spent = {account: int(cost or 0) for account, cost in await conn.execute(
+                select(usage_daily.c.account_id, func.sum(usage_daily.c.cost))
+                .where(usage_daily.c.account_id.in_(topped), usage_daily.c.day < start)
+                .group_by(usage_daily.c.account_id))}
+            costs = await conn.execute(
+                select(usage_daily.c.account_id, usage_daily.c.day, func.sum(usage_daily.c.cost))
+                .where(usage_daily.c.account_id.in_(topped), usage_daily.c.day >= start)
+                .group_by(usage_daily.c.account_id, usage_daily.c.day)
+                .order_by(usage_daily.c.account_id, usage_daily.c.day))
+            paid: list[tuple[dt.date, int]] = []
+            for account, day, cost in costs:
+                free = ledger.get(account, {}).get("grant", 0)
+                limit = free + ledger.get(account, {}).get("topup", 0)
+                before = spent.get(account, 0)
+                spent[account] = after = before + int(cost or 0)
+                paid.append((_date(day), max(0, min(after, limit) - max(before, free))))
+
+        models = sorted({model for model, *_ in per_model})
+        starts = [start + dt.timedelta(days=step * i) for i in range((last - start).days // step + 1)]
+        buckets = {s: {"start": s.isoformat(), "requests": dict.fromkeys(models, 0),
+                       "input_tokens": dict.fromkeys(models, 0), "paid_usage_micros": 0, "topups_micros": 0}
+                   for s in starts}
+
+        def at(day: dt.date) -> dict[str, Any] | None:
+            return buckets.get(bucket_start(day, bucket))
+        for model, day, requests, tokens in per_model:
+            if (b := at(day)) is not None:
+                b["requests"][model] += requests
+                b["input_tokens"][model] += tokens
+        for what, rows in (("topups_micros", bought), ("paid_usage_micros", paid)):
+            for day, amount in rows:
+                if (b := at(day)) is not None:
+                    b[what] += amount
+        return {"as_of": now.isoformat(timespec="seconds"), "bucket": bucket, "since": start.isoformat(),
+                "first_day": first and first.isoformat(), "models": models, "buckets": list(buckets.values())}
+
+    def _utc_day(self, column: Any) -> Any:
+        """The UTC day of a timestamp column, in SQL (PostgreSQL would take the session's time zone)."""
+        if self.engine.dialect.name == "postgresql":
+            return func.date(func.timezone(literal_column("'UTC'"), column), type_=Date)
+        return func.date(column, type_=Date)
+
     async def add_credit(self, account: str, amount: int, *, kind: str, reference: str,
                          note: str | None = None) -> tuple[dict[str, Any], bool]:
         """Record ``amount`` micro-USD for ``account`` once per ``reference``. -> (the entry, whether it is new).
@@ -340,6 +438,10 @@ class Accounts:
                  .where(accounts.c.name == account).order_by(credits.c.id.desc()).limit(limit))
         async with self.engine.connect() as conn:
             return [dict(r._mapping) for r in await conn.execute(query)]
+
+
+def _date(value: dt.date | str) -> dt.date:
+    return value if isinstance(value, dt.date) else dt.date.fromisoformat(value)
 
 
 def _utc(value: dt.datetime) -> dt.datetime:

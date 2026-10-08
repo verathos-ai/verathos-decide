@@ -367,13 +367,13 @@ umask 077; openssl rand -hex 32 > ~/.verathos/gateway/admin.token   # at least 3
 The gateway refuses to start with a shorter token or a file others can read. Every call is logged, wrong tokens
 with the caller's address, and every credit with the token and address that recorded it.
 
-The service that signs users up (the web app) gets a token of its own, `accounts_token_file` (made the same way, and
-not the admin token), whose scope is narrower: only the accounts named with `accounts_prefix` (`u_`), which it creates
+The service that signs users up (the web app) gets a token of its own, `accounts_token_file` (made the same way, and not
+the admin token), whose scope is narrower: only the accounts named with `accounts_prefix` (`u_`), which it creates
 prepaid; their keys, usage and ledger; changes other than `prepaid`; credit of kind `grant` or `topup`, at most
-`accounts_max_credit` per entry and `accounts_max_credit_per_hour` within an hour (per process; recording an entry
-again under its reference takes no more); and the network's usage totals. Anything else, including requests, state and
-routes, answers 403, and reaching a cap is logged as an error. A leaked web app token can then neither give an account
-unlimited service nor mint more than the hourly cap.
+`accounts_max_credit` per entry and `accounts_max_credit_per_hour` within an hour (per process; recording an entry again
+under its reference takes no more); and the network's usage totals and series. Anything else, including requests, state
+and routes, answers 403, and reaching a cap is logged as an error. A leaked web app token can then neither give an
+account unlimited service nor mint more than the hourly cap.
 
 | Call | Returns |
 |---|---|
@@ -390,6 +390,7 @@ unlimited service nor mint more than the hourly cap.
 | `POST /admin/v1/accounts/{name}/credits` | `{"amount" (micro-USD), "kind", "reference", "note"}` -> 201 with the entry and the new balance; 200 if `reference` already records this entry; 409 if it records another |
 | `GET /admin/v1/accounts/{name}/credits?limit=100` | the balance and the ledger, newest first |
 | `GET /admin/v1/usage/totals` | the network's totals, below |
+| `GET /admin/v1/usage/series?days=30&bucket=day` | the network's usage per day or week, below |
 
 Each gateway process serves the admin API on its own `admin_port`; with an active and a standby process, a client
 of the account calls tries the other one when one does not answer (a restart). Every write is in the shared
@@ -418,6 +419,27 @@ amounts in micro-USD:
   usage they pay are never counted.
 - `topups_micros`, `paying_accounts`: the top-ups recorded and the accounts with at least one, all time and in the
   last 30 days.
+
+`GET /admin/v1/usage/series` gives the same usage over time, per UTC day (`bucket=day`, the default) or week
+(`bucket=week`, Monday to Sunday): the buckets that hold the last `days` days, whole, up to the current one; without
+`days`, all time, from the bucket of the first usage or top-up. At most 400 buckets: more answers 400, and all time
+keeps the latest 400. Every bucket is listed, with every model answered in the range:
+
+```json
+{"as_of": "2026-10-08T17:42:10+00:00", "bucket": "day", "since": "2026-10-02", "first_day": "2026-08-20",
+ "models": ["kev-4b", "kev-9b"],
+ "buckets": [{"start": "2026-10-02", "requests": {"kev-4b": 31240, "kev-9b": 4410},
+              "input_tokens": {"kev-4b": 7100300, "kev-9b": 1200410},
+              "paid_usage_micros": 210000, "topups_micros": 5000000}]}
+```
+
+- `first_day`: the first UTC day with usage or a top-up; null before any.
+- `requests`, `input_tokens`: as in the totals, per model.
+- `paid_usage_micros`: per account, its usage cost in day order: the first part, as much as its grants, is free; the
+  next, as much as its top-ups, is paid, on the days it was spent. The days add up to the totals' all-time paid
+  usage, and to their last 30 days' unless a grant was recorded after paid spending: such a grant makes the earliest
+  paid spending free, after the fact.
+- `topups_micros`: the top-ups recorded in the bucket.
 
 ```bash
 curl -s http://127.0.0.1:8090/admin/v1/systemone -H "Authorization: Bearer $(cat ~/.verathos/gateway/admin.token)" \
