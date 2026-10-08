@@ -12,8 +12,8 @@ from verathos.install.host import GiB, Gpu
 # float32 weights plus the activations of a request, and on a GPU its CUDA graphs and state cache too.
 MINER_WEIGHTS_FACTOR = 1.25
 MINER_FIXED = 4 * GiB
-# The Clef engine references the bfloat16 weights without copies and its CUDA graphs share one pool: 9.4B parameters
-# peaked at 19.5 GB on an A100.
+# The Clef engine references the bfloat16 weights without copies and its CUDA graphs share one pool: Clef-flash (9.4B
+# parameters, 17.5 GiB) peaked at 19.1-20.3 GB allocated on an A100, an H100 and an RTX 4090 with 525-token requests.
 CLEF_MINER_FIXED = 3 * GiB
 REFERENCE_WEIGHTS_FACTOR = 1.1
 REFERENCE_FIXED = {"cpu": 2 * GiB, "gpu": 8 * GiB}

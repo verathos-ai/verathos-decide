@@ -201,6 +201,9 @@ def load(repo: str, revision: str, *, device: str, dtype: str, fast: bool | None
         raise RuntimeError("the bfloat16 GPU path needs flash-linear-attention at the version that "
                            "verathos/engine/qwen35.py pins (FLA_VERSION; install.sh miner installs it); "
                            "--dtype float32 runs the release's own code instead")
+    if not fast and dtype == "float32" and importlib.util.find_spec("fla") is not None:
+        log.warning("flash-linear-attention is installed here, so transformers runs the release's linear attention on "
+                    "its kernels: these float32 answers differ from validators' references, which run without it")
     path = Path(snapshot_download(repo, revision=revision))
     engine = FastEngine(path, device) if fast else ReferenceEngine(path, device, dtype)
     log.info("loaded %s@%s on %s (%s, %s)", repo, revision[:12], device, dtype, "fast" if fast else "reference")
