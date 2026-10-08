@@ -845,6 +845,61 @@ def test_a_miner_refusing_requests_no_other_miner_takes_is_counted_and_users_are
     assert not s.router._pools["kev-4b"].endpoints[0].breaker.failures  # not a breaker failure on its own
 
 
+class Dropping(httpx.AsyncBaseTransport):
+    """The auditor, reached through a connection that fails ``fails`` times: before the request is sent (a kept-alive
+    connection the server closed), or after the auditor took it (its answer lost)."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport, fails: int, *, taken: bool) -> None:
+        self.inner, self.fails, self.taken = inner, fails, taken
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if not self.fails:
+            return await self.inner.handle_async_request(request)
+        self.fails -= 1
+        if self.taken:
+            await self.inner.handle_async_request(request)
+            raise httpx.ReadTimeout("the answer was lost", request=request)
+        raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+
+
+def test_a_served_report_the_auditor_took_is_not_counted_twice_when_sent_again(tmp_path) -> None:
+    import time as time_module
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    for _ in range(3):
+        assert asyncio.run(s.post()).status_code == 200
+    s.served.clock = lambda: time_module.time() + 2  # those seconds are over
+    s.client._transport._t["auditor"] = Dropping(s.client._transport._t["auditor"], 1, taken=True)
+    asyncio.run(s.served.report())
+    assert s.served.pending() == 1  # failed as far as the gateway knows: sent again with the next report
+    asyncio.run(s.served.report())
+    assert s.served.pending() == 0
+    now, keypair = time_module.time(), s.miners["10.0.0.1"][0]
+    assert s.auditor.served_in(keypair.ss58_address, "gpu0", now - 60, now + 1) == pytest.approx(3.0)
+
+
+def test_a_post_on_a_connection_the_auditor_closed_is_sent_again_at_once(tmp_path) -> None:
+    import time as time_module
+
+    import uvicorn
+
+    from verathos.gateway.__main__ import KEEPALIVE_S
+
+    assert KEEPALIVE_S < uvicorn.Config(app=None).timeout_keep_alive  # idle connections expire on the gateway's side
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    for _ in range(3):
+        assert asyncio.run(s.post()).status_code == 200
+    s.served.clock = lambda: time_module.time() + 2
+    auditor = s.client._transport._t["auditor"]
+    s.client._transport._t["auditor"] = Dropping(auditor, 1, taken=False)
+    asyncio.run(s.served.report())
+    assert s.served.pending() == 0
+    s.client._transport._t["auditor"] = Dropping(auditor, 1, taken=False)
+    asyncio.run(s.sampler.flush())
+    assert s.sampler.pending() == {"picked": 0, "proofs": 0}
+    assert s.auditor.store._query("SELECT COUNT(*) FROM samples")[0][0] == 1
+
+
 def test_served_counts_are_kept_while_the_auditor_cannot_be_found() -> None:
     async def unknown():
         raise RuntimeError("chain unreachable")

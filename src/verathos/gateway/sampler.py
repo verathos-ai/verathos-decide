@@ -19,6 +19,7 @@ from bittensor_wallet import Keypair
 from verathos.gateway import metrics
 from verathos.gateway.upstream import Exchange
 from verathos.protocol.gateway import MAX_SAMPLES_BYTES, MAX_SAMPLES_PER_POST, SAMPLES_PATH, GatewaySample
+from verathos.protocol.http import post_idempotent
 from verathos.protocol.requests import sign_request
 
 log = logging.getLogger(__name__)
@@ -99,11 +100,12 @@ class Sampler:
             log.warning("auditor unknown: %d samples not submitted", len(batch))
             return False
         body = ('{"samples": [' + ",".join(batch) + "]}").encode()
-        headers = {"Content-Type": "application/json",
-                   **sign_request(self.keypair, "POST", SAMPLES_PATH, body, self.auditor_hotkey)}
-        try:
-            r = await self.client.post(url.rstrip("/") + SAMPLES_PATH, content=body, headers=headers, timeout=30.0)
-            r.raise_for_status()
+
+        def headers() -> dict[str, str]:
+            return {"Content-Type": "application/json",
+                    **sign_request(self.keypair, "POST", SAMPLES_PATH, body, self.auditor_hotkey)}
+        try:  # the auditor keeps a sample once, however often it arrives
+            r = await post_idempotent(self.client, url.rstrip("/") + SAMPLES_PATH, body, headers, timeout=30.0)
         except httpx.HTTPError as exc:
             metrics.SAMPLES.labels("failed").inc(len(batch))
             log.warning("submitting %d samples to the auditor failed: %s", len(batch), exc)

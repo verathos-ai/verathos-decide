@@ -6,6 +6,7 @@ import asyncio
 import json
 import resource
 import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -41,6 +42,23 @@ async def request_json(client: httpx.AsyncClient, method: str, url: str, *, limi
         return _parse(chunks)
 
     return await asyncio.wait_for(run(), timeout)
+
+
+async def post_idempotent(client: httpx.AsyncClient, url: str, body: bytes, headers: Callable[[], dict[str, str]], *,
+                          timeout: float) -> httpx.Response:
+    """POST ``body`` and raise for an error status; once more if the server closed the connection without an answer (a
+    kept-alive connection it closed as it was reused), so only for a post the server takes once however often it
+    arrives. ``headers`` gives each try's headers (a signed request's nonce is good once)."""
+    for retry in (False, True):
+        try:
+            r = await client.post(url, content=body, headers=headers(), timeout=timeout)
+        except httpx.RemoteProtocolError:
+            if retry:
+                raise
+            continue
+        r.raise_for_status()
+        return r
+    raise AssertionError("unreachable")
 
 
 def get_json(url: str, *, limit: int, timeout: float) -> Any:

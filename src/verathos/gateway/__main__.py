@@ -52,6 +52,9 @@ from verathos.throughput.chain import SubtensorChainView
 log = logging.getLogger("verathos.gateway")
 RESERVED_FILES = 512  # the database pool, the listeners, the metrics and log files
 MIN_OUTBOUND = 256
+# An idle connection to a miner or the auditor is closed after this, before their server (uvicorn, 5 s) closes it: a
+# connection the server closes as it is reused fails the request sent on it.
+KEEPALIVE_S = 3.0
 
 
 async def serve(config: GatewayConfig) -> None:
@@ -74,7 +77,7 @@ async def serve(config: GatewayConfig) -> None:
         log.warning("the open-file limit %d cannot hold max_in_flight %d and connections to the miners: raise it "
                     "(LimitNOFILE=65536 in the systemd unit) or lower max_in_flight", files, config.max_in_flight)
     outbound = max(outbound, MIN_OUTBOUND)
-    client = httpx.AsyncClient(limits=httpx.Limits(max_connections=outbound,
+    client = httpx.AsyncClient(limits=httpx.Limits(max_connections=outbound, keepalive_expiry=KEEPALIVE_S,
                                                    max_keepalive_connections=min(outbound, 4096)),
                                timeout=httpx.Timeout(30.0, connect=3.0))
     state_dir = config.state_dir.expanduser()
