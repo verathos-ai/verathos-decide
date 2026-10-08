@@ -8,8 +8,8 @@ Two tokens, two scopes. The admin token (``admin_token_file``) reaches everythin
 (``accounts_token_file``), for the web app that signs users up, reaches only the accounts named with
 ``accounts_prefix``, which it creates prepaid: their keys, usage and ledger, changes other than ``prepaid``, and
 credit of kind grant or top-up within ``accounts_max_credit`` per entry and ``accounts_max_credit_per_hour`` (per
-process; reaching a cap is logged as an error); and the network's usage totals. Requests, state and routes are the
-admin token's only.
+process; reaching a cap is logged as an error); and the network's usage totals and series. Requests, state and routes
+are the admin token's only.
 
     GET  /admin/v1/state       routes, catalog, and what is waiting to be written (usage) or sent (samples, counts)
     GET  /admin/v1/routes      every routable endpoint as the router sees it: capacity, cap, in flight, breaker
@@ -36,6 +36,8 @@ Accounts, for the service that signs users up (amounts in micro-USD; ``name``: `
     GET    /admin/v1/usage/totals                   every account's answered requests and input tokens (all time, 24
                                                     hours, 30 days; per model), paid usage, top-ups and the accounts
                                                     that topped up (``Accounts.totals``)
+    GET    /admin/v1/usage/series?days=&bucket=     the same per UTC day or week: requests and input tokens per model,
+                                                    paid usage and top-ups (``Accounts.series``)
 """
 
 from __future__ import annotations
@@ -175,8 +177,8 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
 
     def reaches(request: Request) -> bool:
         """Whether the caller's scope reaches this call: the account service only its own accounts' routes and the
-        totals."""
-        if request.state.scope == "admin" or request.url.path == "/admin/v1/usage/totals":
+        network's usage."""
+        if request.state.scope == "admin" or request.url.path in ("/admin/v1/usage/totals", "/admin/v1/usage/series"):
             return True
         parts = request.url.path.split("/")  # "", "admin", "v1", "accounts", name, ...
         return parts[1:4] == ["admin", "v1", "accounts"] and (
@@ -367,6 +369,15 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
     @app.get("/admin/v1/usage/totals")
     async def totals():
         return await accounts.totals()
+
+    @app.get("/admin/v1/usage/series")
+    async def series(days: str | None = None, bucket: str = "day"):
+        if days is not None and not (days.isascii() and days.isdigit() and len(days) <= 6):
+            return error(400, "invalid_request", "days is a whole number of days")
+        try:
+            return await accounts.series(None if days is None else int(days), bucket)
+        except ValueError as exc:
+            return error(400, "invalid_request", str(exc))
 
     @app.get("/admin/v1/accounts/{name}/credits")
     async def ledger(name: str, limit: int = 100):
