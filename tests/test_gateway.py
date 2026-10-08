@@ -285,6 +285,19 @@ def test_the_status_says_per_model_what_users_get(tmp_path) -> None:
     assert models["kev-4b"]["state"] == "unavailable" and models["kev-4b"]["availability_24h"] == 0.0
 
 
+def test_one_user_bursting_beyond_capacity_does_not_degrade_the_model(tmp_path) -> None:
+    from verathos.gateway.app import model_state
+
+    s = Setup(tmp_path, {"10.0.0.1": Slow("kev-4b", 0.05)}, credited=0.5)  # one request at a time
+    for _ in range(20):
+        assert asyncio.run(s.post()).status_code == 200
+    codes = [r.status_code for r in s.many(25)]
+    assert codes.count(503) >= 20
+    summary = s.gateway.stats.summary("kev-4b")
+    assert summary["success_rate_1h"] == 1.0 and summary["busy_rate_1h"] >= 20 / 45
+    assert model_state(s.gateway, "kev-4b") == "operational"
+
+
 def test_the_public_status_is_computed_at_most_every_few_seconds(tmp_path) -> None:
     from verathos.gateway.app import STATUS_TTL_S
 
@@ -867,7 +880,7 @@ def test_a_miner_refusing_requests_no_other_miner_takes_is_counted_and_users_are
     r = asyncio.run(s.post())
     assert r.status_code == 503 and r.json()["error"]["type"] == "unavailable" and "Retry-After" in r.headers
     assert sum(n.refused for (hk, _, _), n in s.served._counts.items() if hk == bad.ss58_address) >= 1
-    assert s.gateway.stats.requests("kev-4b", 60) == (0, 1)
+    assert s.gateway.stats.requests("kev-4b", 60) == (0, 1, 0)
     assert not s.router._pools["kev-4b"].endpoints[0].breaker.failures  # not a breaker failure on its own
 
 

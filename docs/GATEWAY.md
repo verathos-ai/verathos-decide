@@ -264,14 +264,16 @@ this gateway process:
 {"updated_at": "2026-10-07T17:40:00+00:00", "since": "2026-10-07T16:15:00+00:00",
  "models": [{"id": "kev-4b", "state": "operational", "endpoints": 3, "capacity_rps": 42.0,
              "latency_ms": {"p50": 251, "p95": 410, "window_s": 900},
-             "success_rate_1h": 0.998, "requests_1h": 5212, "availability_24h": 0.999}]}
+             "success_rate_1h": 0.998, "busy_rate_1h": 0.0, "requests_1h": 5212, "availability_24h": 0.999}]}
 ```
 
 - `state`: `unavailable` without a routable endpoint or with every endpoint failing; `degraded` when under 98% of the
-  last 15 minutes' user requests were answered or more than half the endpoints are failing; else `operational`.
+  last 15 minutes' user requests were answered (of those not refused for want of capacity) or more than half the
+  endpoints are failing; else `operational`.
 - `latency_ms`: of the answers to users in the last 15 minutes, retries included (null without answers).
-- `success_rate_1h`: answered among answered and failed user requests of the last hour (null under 20 requests;
-  `requests_1h` is their number).
+- `success_rate_1h`: answered among answered and failed user requests of the last hour (null under 20 of them);
+  `busy_rate_1h`: the share of the hour's user requests refused for want of free capacity (503 `busy`; null under 20
+  requests); `requests_1h`: answered, failed and busy.
 - `availability_24h`: the share of minutes the model was not unavailable, of the minutes recorded.
 - In memory: the figures cover `since` (the process start) until now.
 

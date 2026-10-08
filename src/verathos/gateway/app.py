@@ -322,7 +322,8 @@ async def final_writes(g: Gateway) -> None:
 
 def model_state(g: Gateway, model_id: str) -> str:
     """unavailable: no routable endpoint, or every one failing; degraded: under DEGRADED_SUCCESS of the last 15
-    minutes' requests answered, or more than half the endpoints failing; else operational."""
+    minutes' requests answered (of those not refused for want of capacity), or more than half the endpoints failing;
+    else operational."""
     health = g.router.health(model_id)
     if not health["endpoints"] or g.router.down(model_id):
         return "unavailable"
@@ -510,13 +511,13 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
             response = JSONResponse({"id": request_id, "model": model, "answers": outcome.answers,
                                      "usage": {"input_tokens": outcome.input_tokens}, "receipt": outcome.receipt},
                                     headers={"X-Request-Id": request_id})
-            g.stats.record(model, answered=True, seconds=g.clock() - started)
+            g.stats.record(model, "answered", g.clock() - started)
             g.meter.record(principal, model, answered=True, input_tokens=outcome.input_tokens, price=checked.price)
             g.sampler.offer(outcome)
             g.served.record(outcome.route, outcome.input_tokens, outcome.seconds)
             metrics.REQUESTS.labels(model, "answered").inc()
             return response
-        g.stats.record(model, answered=False)
+        g.stats.record(model, "busy" if outcome == "busy" else "failed")
         g.meter.record(principal, model, answered=False)
         status, kind, message, retry = NO_ANSWER[outcome]
         return reject(status, kind, message.format(model=model), request_id, retry, model=model)
