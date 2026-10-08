@@ -9,7 +9,8 @@ An answer costs its input tokens times the model's price (USD per million tokens
 is written with the usage, rounded to whole micro-USD per row, and taken from the account's balance in the same
 transaction. A prepaid account is served while its balance is positive: as read from the database at most
 ``BALANCE_TTL_S`` ago (so other processes' charges and new credit apply within that time), minus what this process
-charged since. Answers in flight when it runs out are still charged, so a balance can end slightly below zero.
+charged since and what its requests in flight may cost at most (``reserve``, settled when they end). A balance can
+therefore end below zero by at most one request's cost per process.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ class UsageMeter:
         self._unwritten: dict[int, int] = {}  # account -> answered, not written yet
         self._balance: dict[int, list] = {}  # prepaid account -> [balance as read or written, when read]
         self._uncharged: dict[int, float] = {}  # account -> cost not written yet
+        self._reserved: dict[int, float] = {}  # prepaid account -> the most its requests in flight may cost
         self._lock = asyncio.Lock()
 
     def record(self, principal: Principal, model_id: str, *, answered: bool, input_tokens: int = 0,
@@ -83,14 +85,34 @@ class UsageMeter:
         return state[1] + self._unwritten.get(principal.account_id, 0) < principal.monthly_quota
 
     async def has_credit(self, principal: Principal) -> bool:
-        """Whether the account may be served: always, unless it is prepaid and its balance is used up."""
+        """Whether the account may be served: always, unless it is prepaid and its balance, less what is charged and
+        reserved, is used up."""
+        return not principal.prepaid or await self._available(principal.account_id) > 0
+
+    async def reserve(self, principal: Principal, cost: float) -> bool:
+        """``has_credit``, and if so ``cost`` (the most the request may cost) is reserved until ``release``."""
         if not principal.prepaid:
             return True
-        state = self._balance.get(principal.account_id)
+        if await self._available(principal.account_id) <= 0:  # nothing awaited from here on: check and reserve at once
+            return False
+        self._reserved[principal.account_id] = self._reserved.get(principal.account_id, 0.0) + cost
+        return True
+
+    def release(self, principal: Principal, cost: float) -> None:
+        """End a reservation; the request's real cost, if any, is ``record``ed first."""
+        if principal.prepaid:
+            left = self._reserved.get(principal.account_id, 0.0) - cost
+            if left > 1e-9:
+                self._reserved[principal.account_id] = left
+            else:
+                self._reserved.pop(principal.account_id, None)
+
+    async def _available(self, account_id: int) -> float:
+        state = self._balance.get(account_id)
         if state is None or self.clock() - state[1] >= self.balance_ttl_s:
-            await self.read_balance(principal.account_id)
-            state = self._balance[principal.account_id]
-        return state[0] - self._uncharged.get(principal.account_id, 0.0) > 0
+            await self.read_balance(account_id)
+            state = self._balance[account_id]
+        return state[0] - self._uncharged.get(account_id, 0.0) - self._reserved.get(account_id, 0.0)
 
     async def read_balance(self, account_id: int) -> None:
         async with self._lock:

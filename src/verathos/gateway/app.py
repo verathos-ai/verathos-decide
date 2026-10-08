@@ -45,7 +45,7 @@ from pydantic import ValidationError
 
 from verathos import catalog as catalog_module
 from verathos.gateway import metrics
-from verathos.gateway.accounts import Accounts, well_formed_key
+from verathos.gateway.accounts import Accounts, Principal, well_formed_key
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.router import Endpoint, Outcome, Router
@@ -432,6 +432,20 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
             checked = check_request(g, bytes(body))
         except Rejected as r:
             return reject(r.status, r.kind, r.message, request_id, r.retry_after, model=r.model)
+        most = len(checked.body) * checked.price  # the most the answer may cost: one token per byte of the request
+        try:
+            funded = await g.meter.reserve(principal, most)
+        except Exception:
+            log.exception("balance lookup failed")
+            return reject(503, "unavailable", "accounts cannot be checked right now", request_id, 5)
+        if not funded:
+            return reject(402, "insufficient_credit", "the account's credit is used up", request_id)
+        try:
+            return await answer(principal, checked, started, request_id)
+        finally:
+            g.meter.release(principal, most)
+
+    async def answer(principal: Principal, checked: Checked, started: float, request_id: str):
         model = checked.parsed.model
         outcome = await forward(g, checked, started)
         metrics.REQUEST_SECONDS.labels(model).observe(g.clock() - started)

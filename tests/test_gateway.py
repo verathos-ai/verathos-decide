@@ -902,7 +902,7 @@ def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
     assert asyncio.run(s.post(long)).status_code == 200  # new credit applies at once in this process
     assert asyncio.run(s.post(long)).status_code == 402  # charged, though not written yet
     asyncio.run(s.meter.flush())
-    assert balance() == 1 - cost  # the answer in flight is charged: slightly below zero
+    assert balance() == 1 - cost  # the answer accepted with credit left is charged: below zero by one answer
 
     again, created = asyncio.run(s.accounts.add_credit("acme", cost + 1, kind="grant", reference="signup:acme"))
     assert not created and again["id"] == entry["id"] and balance() == 1 - cost  # recorded once
@@ -917,6 +917,24 @@ def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
     assert asyncio.run(s.post(long)).status_code == 200
     ledger = asyncio.run(s.accounts.credits("acme"))
     assert [(c["kind"], c["reference"]) for c in ledger] == [("topup", "pay-1"), ("grant", "signup:acme")]
+
+
+def test_concurrent_requests_cannot_overdraw_a_prepaid_account(tmp_path) -> None:
+    """Each request reserves the most it may cost until it ends: a burst cannot pass the credit check together."""
+    s = Setup(tmp_path, {"10.0.0.1": Slow("kev-4b", 0.3)}, credited=200.0)
+    most = len(json.dumps(REQUEST)) * catalog.load().get("kev-4b").price
+
+    async def run():
+        await s.accounts.set_account("acme", prepaid=True)
+        await s.accounts.add_credit("acme", 1, kind="grant", reference="g")
+        codes = [r.status_code for r in await asyncio.gather(*(s.post() for _ in range(30)))]
+        assert codes.count(200) == 1 and codes.count(402) == 29
+        await s.meter.flush()
+        assert -most < (await s.accounts.account("acme"))["balance"] < 1
+        assert s.meter._reserved == {}  # every reservation released
+        await s.accounts.add_credit("acme", 1_000_000, kind="topup", reference="t")
+        assert {r.status_code for r in await asyncio.gather(*(s.post() for _ in range(5)))} == {200}
+    asyncio.run(run())
 
 
 def test_another_process_charges_and_credit_apply_within_the_balance_ttl(tmp_path) -> None:

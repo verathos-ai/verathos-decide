@@ -289,9 +289,11 @@ correction, the only kind that may be negative) and a `reference` naming the pay
 reference is recorded once: adding the same entry again changes nothing, and a reference already used for another
 entry is refused. So a payment processor's retries never add a payment twice.
 
-Each process reads a prepaid account's balance at most 5 s before using it and subtracts what it charged since. New
-credit, and other processes' charges, therefore apply within 5 s; requests in flight when the balance runs out are
-still answered and charged, so a balance can end slightly below zero.
+Each process reads a prepaid account's balance at most 5 s before using it and subtracts what it charged since and
+what its requests in flight may cost at most (one token per byte of the request), reserved when a request is accepted
+and settled to its real cost when it ends. New credit therefore applies within 5 s (at once when recorded through
+this process), and other processes' charges within about 10 s (they write every 5 s). A request is accepted while
+that remainder is positive, so a balance ends below zero by at most one request's cost per process.
 
 ## Admin API
 
