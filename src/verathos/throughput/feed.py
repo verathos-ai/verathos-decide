@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
-from verathos.protocol.api import Distribution, distributions
+from verathos.protocol.api import Distribution, SystemOneRequest, distributions, well_formed
 from verathos.protocol.http import request_json
 from verathos.validator.compare import RequestComparison, Tolerance, compare_request
 
@@ -127,10 +127,11 @@ async def fetch(client: httpx.AsyncClient, auditor_url: str | None, *, auditor_h
     return v
 
 
-def readable(answers: Any) -> dict[str, Distribution] | None:
-    """The answers' distributions, or None if they cannot be read."""
+def readable(request: dict[str, Any], answers: Any) -> dict[str, Distribution] | None:
+    """The answers' distributions, or None if they are not well formed for the request (``api.well_formed``: one
+    distribution per question over its options, and the fields users read derived from it)."""
     try:
-        return distributions(answers)
+        return distributions(answers) if well_formed(SystemOneRequest.model_validate(request), answers) else None
     except Exception:  # whatever a miner signed, unreadable answers are wrong answers
         return None
 
@@ -184,7 +185,7 @@ async def answer_fault(request: dict[str, Any], answers: Any, reference: Engine 
     """Why ``answers`` are wrong for ``request``: unreadable, or (with a reference engine) outside the model's hard
     tolerance, or signed with more input tokens (``claimed``) than the reference counts. None if they pass, or if
     there is no reference engine. Raises ReferenceUnavailable."""
-    got = readable(answers)
+    got = readable(request, answers)
     if got is None:
         return MALFORMED
     if reference is None:

@@ -35,7 +35,10 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    requests in flight per unit of capacity takes the request. In this process an endpoint takes at most
    `credited rps x max_latency_s / instances` requests at once, what it serves within the latency bound.
 5. **Miner.** The request is signed with the gateway's hotkey for that miner. The answer counts only if the miner's
-   receipt binds this request and these answers and names the gateway as caller, and the answers are well formed.
+   receipt binds this request and these answers and names the gateway as caller, and the answers are well formed:
+   one distribution per question over its options, the `noul`, `choice` and `score` users read derived from it (p(true),
+   the most likely option, the expected level, within the engines' rounding to 4 decimals), and no fields beyond an
+   answer type's own (`protocol/api.py`).
 6. **Retries.** A failed attempt is retried on another miner, up to `max_attempts` within `request_timeout_s`;
    decision requests have no side effects. A failure that is the miner's (no connection, a response without a valid
    receipt, a compressed or oversized response, a refusal of the gateway) counts against it at once; one that the

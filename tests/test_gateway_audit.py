@@ -54,10 +54,11 @@ def request(i: int) -> dict:
 def add_test_samples(auditor, test: ScheduledTest, slots) -> None:
     """The gateways' sample of each endpoint's answers to users in the test: well formed, and no reference to
     recompute them."""
+    answers = asyncio.run(MockEngine("kev-4b").answer(REQUEST))["answers"]
     for s in slots:
         assert auditor.store.add_sample(sample_id=f"t-{s.key}", epoch=test.epoch, gateway="gw", hotkey=s.hotkey,
                                         endpoint_id=s.endpoint_id, model_id=s.model_id, request_id="n",
-                                        request=REQUEST, response=json.dumps({"answers": {"q": {"noul": 0.5}}}),
+                                        request=REQUEST, response=json.dumps({"answers": answers}),
                                         proof=False, test_id=test.test_id)
 
 

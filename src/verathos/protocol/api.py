@@ -9,7 +9,9 @@ Request: a state (text or JSON) and named typed questions.
   noul:   yes/no; answer is the probability of yes.
 
 Every answer reduces to one probability distribution per question, keyed by ``question_keys``. Verification
-compares those distributions, so the derived fields (choice, score, confidence) are not trusted.
+compares those distributions; the fields users read (noul, choice, score) are functions of it (``derived``), and an
+answer whose fields disagree with its own distribution is malformed. An answer carries only its type's fields
+(``ANSWER_FIELDS``); confidence and legend are the engine's own and only checked for their form.
 """
 
 from __future__ import annotations
@@ -22,6 +24,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 JSONContent = str | dict | list | int | float | bool | None
 MAX_OPTIONS = 255
 MAX_RESPONSE_BYTES = 64 << 10  # a response (answers and receipt) larger than this is not a valid answer
+ANSWER_FIELDS = {"noul": {"type", "noul", "probabilities", "confidence"},
+                 "choice": {"type", "choice", "probabilities", "confidence"},
+                 "score": {"type", "score", "probabilities", "confidence", "legend"}}
+ROUNDING = 5e-5  # engines report probabilities, and the values derived from them, to 4 decimals
+DERIVED_TOLERANCE = 1e-3  # a derived value may differ by this much from the one its distribution gives
 
 
 class Noul(BaseModel):
@@ -82,16 +89,24 @@ class SystemOneResponse(BaseModel):
 Distribution = dict[str, float]
 
 
-def probability(value: Any) -> float:
-    """A JSON number in [0, 1]; raises ValueError for anything else (strings, booleans, NaN, infinities)."""
+def number(value: Any) -> float:
+    """A finite JSON number; raises ValueError for anything else (strings, booleans, NaN, infinities)."""
     if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError("probability must be a number")
+        raise ValueError("not a number")
     try:
-        p = float(value)
+        x = float(value)
     except OverflowError:
-        raise ValueError("probability out of range") from None
-    if not (math.isfinite(p) and 0.0 <= p <= 1.0):
-        raise ValueError("probability must be finite and within [0, 1]")
+        raise ValueError("number out of range") from None
+    if not math.isfinite(x):
+        raise ValueError("not a finite number")
+    return x
+
+
+def probability(value: Any) -> float:
+    """A JSON number in [0, 1]; raises ValueError for anything else."""
+    p = number(value)
+    if not 0.0 <= p <= 1.0:
+        raise ValueError("probability must be within [0, 1]")
     return p
 
 
@@ -117,12 +132,61 @@ def distributions(answers: Any) -> dict[str, Distribution]:
     return {qid: answer_distribution(a) for qid, a in answers.items()}
 
 
+def derived(question: Noul | Choice | Score, distribution: Distribution) -> dict[str, Any]:
+    """The field users read, as the engines derive it from the distribution: noul p(true), choice the first most
+    likely option, score the expected level."""
+    if isinstance(question, Noul):
+        return {"noul": distribution["true"]}
+    keys = question_keys(question)
+    if isinstance(question, Choice):
+        return {"choice": max(keys, key=distribution.__getitem__)}
+    return {"score": sum(i * distribution[k] for i, k in enumerate(keys))}
+
+
+def consistent(question: Noul | Choice | Score, answer: dict[str, Any], distribution: Distribution) -> bool:
+    """Whether an answer carries only its type's fields, in their form, and the field users read agrees with its
+    distribution (``derived``) within the engines' rounding: a chosen option within ``DERIVED_TOLERANCE`` of the most
+    likely one, a noul within it of p(true), a score within it plus the rounding of the probabilities it sums."""
+    kind = question.type
+    if not set(answer) <= ANSWER_FIELDS[kind] or answer.get("type", kind) != kind:
+        return False
+    [(field, expected)] = derived(question, distribution).items()
+    legend = answer.get("legend", distribution)
+    if field not in answer or not (isinstance(legend, dict) and set(legend) == set(distribution)):
+        return False
+    try:
+        if "confidence" in answer:
+            probability(answer["confidence"])
+        if kind == "choice":
+            chosen = answer["choice"]
+            return chosen in distribution and distribution[chosen] >= distribution[expected] - DERIVED_TOLERANCE
+        slack = DERIVED_TOLERANCE + (ROUNDING * len(distribution) * (len(distribution) - 1) / 2 if kind == "score"
+                                     else 0.0)
+        return abs(number(answer[field]) - expected) <= slack
+    except (ValueError, TypeError):
+        return False
+
+
 def well_formed(request: SystemOneRequest, answers: Any) -> bool:
-    """Whether the answers give one valid distribution per question, over the question's own options. A miner signs
-    nothing else: a signed malformed answer counts as a wrong answer."""
+    """Whether the answers give one valid distribution per question, over the question's own options, and agree with
+    it (``consistent``). A miner signs nothing else: a signed malformed answer counts as a wrong answer."""
     try:
         got = distributions(answers)
     except Exception:
         return False
-    return set(got) == set(request.questions) and all(set(got[qid]) == set(question_keys(q))
-                                                       for qid, q in request.questions.items())
+    return set(got) == set(request.questions) and all(
+        set(got[qid]) == set(question_keys(q)) and consistent(q, answers[qid], got[qid])
+        for qid, q in request.questions.items())
+
+
+def known_fields(request: SystemOneRequest, answers: Any) -> Any:
+    """The answers with each answer object reduced to its question type's fields (``ANSWER_FIELDS``); anything else
+    as it is, for ``well_formed`` to judge."""
+    if not isinstance(answers, dict):
+        return answers
+    out = {}
+    for qid, answer in answers.items():
+        q = request.questions.get(qid)
+        out[qid] = ({k: v for k, v in answer.items() if k in ANSWER_FIELDS[q.type]}
+                    if q is not None and isinstance(answer, dict) else answer)
+    return out

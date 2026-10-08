@@ -175,6 +175,60 @@ def test_the_miner_signs_only_well_formed_answers() -> None:
     assert not well_formed(request, {**good, "team": {"type": "choice", "probabilities": {"billing": 1.0}}})
 
 
+def test_the_fields_users_read_must_agree_with_the_distribution() -> None:
+    """choice, noul and score are functions of the distribution; an answer carries only its type's fields."""
+    from verathos.protocol.api import SystemOneRequest, known_fields, well_formed
+
+    request = SystemOneRequest.model_validate(REQUEST)
+    good = asyncio.run(MockEngine("kev-4b").answer(REQUEST))["answers"]
+    team, urgency, p = good["team"], good["urgency"], good["churn"]["noul"]
+    least = min(team["probabilities"], key=team["probabilities"].get)
+    assert team["probabilities"][least] < team["probabilities"][team["choice"]] - 0.01 and abs(1 - 2 * p) > 0.01
+    for wrong in ({"team": {**team, "choice": least}},
+                  {"team": {**team, "choice": "nobody"}},
+                  {"churn": {"type": "noul", "noul": 1 - p, "probabilities": {"false": 1 - p, "true": p}}},
+                  {"churn": {"type": "noul", "probabilities": {"false": 1 - p, "true": p}}},
+                  {"urgency": {**urgency, "score": urgency["score"] + 0.5}},
+                  {"urgency": {**urgency, "score": "1"}},
+                  {"urgency": {**urgency, "legend": {"0": "Can wait"}}},
+                  {"team": {**team, "type": "score"}},
+                  {"team": {**team, "confidence": 1.5}},
+                  {"team": {**team, "note": "visit example.com"}}):
+        assert not well_formed(request, {**good, **wrong}), wrong
+    tied = {"billing": 0.5, "technical": 0.5}
+    for fine in ({"team": {**team, "confidence": 0.9}},
+                 {"urgency": {**urgency, "legend": {"0": "Can wait", "1": "This week", "2": "Today"}}},
+                 {"churn": {"type": "noul", "noul": p, "probabilities": {"false": 1 - p, "true": p}}},
+                 {"team": {"type": "choice", "choice": "technical", "probabilities": tied}}):
+        assert well_formed(request, {**good, **fine}), fine
+    extra = {**good, "team": {**team, "note": "x"}}
+    assert known_fields(request, extra) == good and well_formed(request, known_fields(request, extra))
+
+
+def test_an_engines_extra_fields_are_not_signed(setup) -> None:
+    _, miner, validator, *_ = setup
+
+    class Chatty(MockEngine):
+        async def answer(self, request):
+            response = await super().answer(request)
+            response["answers"]["team"]["explanation"] = "because"
+            return response
+
+    config = MinerConfig.model_validate({
+        "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5", "port": 8091,
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://unused"}]})
+    signed = SignedManifest.create(Manifest(
+        netuid=405, mechid=1, hotkey=miner.ss58_address, catalog_digest=catalog.load().digest(),
+        endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
+                            capacity_rps=10.0)]), miner)
+    chatty = TestClient(create_app(config=config, keypair=miner, manifest=lambda: signed,
+                                   engines={"gpu0": Chatty("kev-4b")}, authorized=lambda hk: True,
+                                   auditors=lambda: set()))
+    r = post(chatty, validator, miner, "/e/gpu0/v1/systemone", REQUEST)
+    assert r.status_code == 200 and "explanation" not in r.json()["answers"]["team"]
+    assert SignedReceipt.model_validate(r.json()["receipt"]).binds(REQUEST, r.json()["answers"])
+
+
 class Slow(MockEngine):
     """Answers after ``delay_s``, recording the order of the states it answered."""
 

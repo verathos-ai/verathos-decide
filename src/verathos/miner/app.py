@@ -32,7 +32,7 @@ from verathos.miner.admission import BEHIND_TESTS, REGULAR, TEST, Admission
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
-from verathos.protocol.api import SystemOneRequest, well_formed
+from verathos.protocol.api import SystemOneRequest, known_fields, well_formed
 from verathos.protocol.canonical import canonical_json, digest
 from verathos.protocol.manifest import SignedManifest
 from verathos.protocol.receipts import Receipt, SignedReceipt
@@ -232,7 +232,7 @@ def create_app(
             return error(502, "engine failure")
         finally:
             admission.release()
-        answers = response.get("answers")
+        answers = known_fields(parsed, response.get("answers"))  # an engine's extra fields are not signed
         if not well_formed(parsed, answers):
             log.warning("engine %s returned malformed answers; not signed", endpoint_id)
             return error(502, "engine returned malformed answers")

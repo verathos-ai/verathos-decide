@@ -11,7 +11,7 @@ import random
 import httpx
 import pytest
 from bittensor_wallet import Keypair
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from tests.mock_engine import MockEngine
@@ -35,7 +35,7 @@ from verathos.miner.engine import EngineError
 from verathos.protocol.gateway import Route, Routes, SignedRoutes
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest
 from verathos.protocol.receipts import SignedReceipt
-from verathos.throughput.auditor import Checks
+from verathos.throughput.auditor import Checks, Slot
 
 
 class Clock:
@@ -98,7 +98,6 @@ class Setup:
                                     max_attempts=max_attempts, attempt_timeout_s=attempt_timeout_s)
         self.auditor = _auditor(tmp_path)
         self.auditor.follower.poll()
-        from verathos.throughput.auditor import Slot
         self.auditor.update_slots([Slot(keypair.ss58_address, "gpu0", f"http://{host}:8091/e/gpu0", "kev-4b", 40.0)
                                    for host, (keypair, _) in self.miners.items()])
         auditor_app = FastAPI()
@@ -296,6 +295,57 @@ def test_users_get_only_what_the_miner_signed_of_its_receipt(tmp_path) -> None:
     spaced = {**receipt, "signature": " ".join(receipt["signature"])}  # still hex to bytes.fromhex
     with pytest.raises(ValueError):
         SignedReceipt.model_validate(spaced)
+
+
+def signing_miner(keypair: Keypair, answers) -> FastAPI:
+    """A miner that signs whatever ``answers`` (the request -> the answers) gives, with a valid receipt."""
+    from verathos.protocol.canonical import digest
+    from verathos.protocol.receipts import Receipt
+    from verathos.protocol.requests import HDR_HOTKEY, HDR_NONCE
+
+    app = FastAPI()
+
+    @app.post("/e/gpu0/v1/systemone")
+    async def answer(request: Request):
+        raw = json.loads(await request.body())
+        given = await answers(raw)
+        receipt = Receipt(netuid=405, mechid=1, miner_hotkey=keypair.ss58_address, endpoint_id="gpu0",
+                          model_id="kev-4b", catalog_digest=catalog.load().digest(),
+                          caller_hotkey=request.headers[HDR_HOTKEY], request_nonce=request.headers[HDR_NONCE],
+                          request_sha256=digest(raw), answers_sha256=digest(given), received_ms=0, responded_ms=0,
+                          input_tokens=10)
+        return {"answers": given, "receipt": SignedReceipt.create(receipt, keypair).model_dump(mode="json")}
+
+    return app
+
+
+def test_answers_whose_visible_fields_disagree_with_their_distribution_are_proof(tmp_path) -> None:
+    """The right probabilities with the least likely option as the choice, and a noul of 1 - p(true): users never get
+    them, and the signed answers prove the miner wrong."""
+    async def lying(request):
+        answers = (await MockEngine("kev-4b").answer(request))["answers"]
+        team, p = answers["team"], answers["churn"]["noul"]
+        team["choice"] = min(team["probabilities"], key=team["probabilities"].get)
+        answers["churn"] = {"type": "noul", "noul": 1 - p, "probabilities": {"false": 1 - p, "true": p}}
+        return answers
+
+    s = Setup(tmp_path, {"10.0.0.2": MockEngine("kev-4b")})
+    liar = kp()
+    s.client._transport._t["10.0.0.7"] = httpx.ASGITransport(app=signing_miner(liar, lying))
+    s.auditor.update_slots([*s.auditor._slots, Slot(liar.ss58_address, "gpu0", "http://10.0.0.7:8091/e/gpu0",
+                                                    "kev-4b", 40.0)])
+    s.router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=2, catalog_digest="0" * 64, routes=[
+        route(liar, "10.0.0.7", 1000.0), route(s.miners["10.0.0.2"][0], "10.0.0.2", 20.0)]))
+    honest = asyncio.run(MockEngine("kev-4b").answer(REQUEST))["answers"]
+    for r in s.many(4):
+        assert r.status_code == 200 and r.json()["answers"] == honest
+    assert s.sampler.pending()["proofs"] >= 1
+    asyncio.run(s.sampler.flush())
+    asyncio.run(s.auditor.check_samples(Checks({"kev-4b": MockEngine("kev-4b")}, {})))
+    s.auditor.chain.head_block = 4 * 180 + 1
+    s.auditor.follower.poll()
+    (evidence,) = s.auditor.verdicts(4).verdicts.invalid
+    assert evidence.hotkey == liar.ss58_address and evidence.reason == "malformed answers"
 
 
 def test_no_free_capacity_is_busy_not_a_failure(tmp_path) -> None:

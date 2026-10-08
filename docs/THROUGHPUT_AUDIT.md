@@ -95,10 +95,11 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
    Requests time out after `request_timeout_s`.
 4. **Samples.** For `samples_per_test` (10) random delivered responses per endpoint the auditor checks the receipt:
    signed by the miner, binding the request and the answers, naming the auditor and the request id. Delivered is
-   scaled by the share of valid receipts. Every signed answer must be well formed, and the auditor recomputes
-   `answer_checks_per_test` (2) of them, picked at random: an answer that fails the hard check (`SCORING.md`) is a
-   wrong answer, proven by the miner's own signature. The request and the response as received (answers and
-   receipt) are kept as evidence. A wrong model is wrong on every request, so two recomputes per endpoint suffice.
+   scaled by the share of valid receipts. Every signed answer must be well formed (its visible fields derived from
+   its distribution, `GATEWAY.md`), and the auditor recomputes `answer_checks_per_test` (2) of them, picked at
+   random: an answer that fails the hard check (`SCORING.md`) is a wrong answer, proven by the miner's own
+   signature. The request and the response as received (answers and receipt) are kept as evidence. A wrong model
+   is wrong on every request, so two recomputes per endpoint suffice.
    The auditor may recompute on a bf16 screen (`audit_screens`, about three times faster than fp32); Kev bounds
    bf16 within about 0.03 of fp32, so two bf16 runs can differ by about 0.06, and an answer the screen flags counts
    only once the fp32 reference confirms it. The recomputed answers' differences are also tallied per endpoint: over

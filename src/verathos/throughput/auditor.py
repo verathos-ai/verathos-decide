@@ -276,7 +276,7 @@ class Recomputes:
 
     async def _check(self, model_id: str, request: dict[str, Any], answers: Any, tolerance: Tolerance,
                      recompute_answers: bool, rank: float) -> tuple[str | None, RequestComparison | None]:
-        got = readable(answers)
+        got = readable(request, answers)
         if got is None:
             return MALFORMED, None
         reference = self.checks.references.get(model_id)
@@ -1166,7 +1166,8 @@ class Auditor:
                             "relays what it is sent through the gateway", s.hotkey, s.endpoint_id)
             kept += self.store.add_sample(sample_id=sample_id, epoch=epoch, gateway=gateway, hotkey=s.hotkey,
                                           endpoint_id=s.endpoint_id, model_id=s.model_id, request_id=nonce,
-                                          request=s.request, response=s.response, proof=readable(answers) is None,
+                                          request=s.request, response=s.response,
+                                          proof=readable(s.request, answers) is None,
                                           test_id=s.test_id if s.test_id and self.store.known(s.test_id) else None)
         return kept
 
