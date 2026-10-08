@@ -344,7 +344,7 @@ with the caller's address.
 | Call | Returns |
 |---|---|
 | `GET /admin/v1/state` | the routes in use (epoch, age, endpoints, catalog), active models, limits, and what waits to be written or sent (usage rows, samples, served counts) |
-| `GET /admin/v1/routes` | every routable endpoint as the router sees it: credited rate, latency, cap, in flight, busy time, breaker |
+| `GET /admin/v1/routes` | every routable endpoint as the router sees it: credited rate, latency, cap, in flight, busy time, breaker, its latest failure |
 | `POST /admin/v1/systemone` | a SystemOne request, served as described below |
 | `POST /admin/v1/accounts` | `{"name", "rate_rps", "burst", "monthly_quota", "prepaid"}` -> 201 and the account; 409 if the name is taken. Names: `[A-Za-z0-9_.:@-]{1,128}` |
 | `GET /admin/v1/accounts/{name}` | the account: limits, status, `prepaid`, `balance` (micro-USD, as written) |
@@ -381,3 +381,7 @@ curl -s http://127.0.0.1:8090/admin/v1/systemone -H "Authorization: Bearer $(cat
 `gateway_upstream_failures_total{kind}`, `gateway_retries_total`, `gateway_in_flight`, `gateway_routes{model}`,
 `gateway_routes_age_seconds`, `gateway_breakers_open`, `gateway_usage_flush_failures_total`,
 `gateway_samples_total{outcome}`.
+
+The log says when an endpoint's breaker opens (with its latest failure: the kind and a status or exception class)
+and closes, and each kind of failed attempt per endpoint at most once a minute, with how often it happened; it never
+holds a key or what a user sent.

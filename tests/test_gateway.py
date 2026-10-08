@@ -216,6 +216,23 @@ class Unreachable(httpx.AsyncBaseTransport):
         raise httpx.ConnectError("No route to host", request=request)
 
 
+def test_failing_endpoints_and_their_breakers_are_logged_without_repeating(tmp_path, caplog) -> None:
+    import logging
+
+    caplog.set_level(logging.INFO, logger="verathos.gateway")
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": MockEngine("kev-4b")})
+    s.client._transport._t["10.0.0.1"] = Unreachable()
+    assert {r.status_code for r in s.many(12)} == {200}
+    dead = next(e for e in s.router._pools["kev-4b"].endpoints if e.route.url.startswith("http://10.0.0.1"))
+    opened = [r.message for r in caplog.records if r.message.startswith(f"the breaker of {dead.key} opened")]
+    attempts = [r.message for r in caplog.records if r.message.startswith(f"an attempt at {dead.key} failed")]
+    assert len(opened) == 1 and opened[0].endswith("the latest: connect: ConnectError")
+    assert len(attempts) == 1 and dead.breaker.failures >= BREAKER_FAILURES  # once a minute, with how often
+    assert REQUEST["state"] not in caplog.text and s.key not in caplog.text
+    (described,) = [e for e in s.router.describe() if e["endpoint"] == dead.key]
+    assert described["last_failure"] == "connect: ConnectError"
+
+
 def test_a_model_whose_every_miner_fails_is_unavailable_not_busy(tmp_path) -> None:
     s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": MockEngine("kev-4b")})
     for host in ("10.0.0.1", "10.0.0.2"):  # the miners' host died

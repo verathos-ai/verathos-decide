@@ -272,6 +272,9 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
             note["outcome"] = "answered"
         except UpstreamFailure as failure:
             metrics.UPSTREAM_FAILURES.labels(failure.kind).inc()
+            if times := _throttled(f"{endpoint.key} {failure.kind}"):
+                log.info("an attempt at %s failed: %s, blamed on %s (%d times since last logged)", endpoint.key,
+                         failure, failure.blame, times)
             note.update(outcome="failed", kind=failure.kind, blame=failure.blame, detail=str(failure))
             if failure.exchange is not None:
                 g.sampler.proof(failure.exchange)
@@ -298,7 +301,7 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
             continue
         finally:
             seconds = g.clock() - attempt_started
-            g.router.finished(endpoint, outcome, seconds, observe=counted)
+            g.router.finished(endpoint, outcome, seconds, observe=counted, why=note.get("detail", ""))
             note["ms"] = round(1000 * seconds, 1)
             if attempts is not None:
                 attempts.append(note)

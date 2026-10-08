@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import bisect
 import itertools
+import logging
 import math
 import random
 import time
@@ -29,7 +30,10 @@ from enum import Enum
 from typing import Protocol
 
 from verathos.gateway import metrics
+from verathos.gateway.logs import Throttle
 from verathos.protocol.gateway import Route, Routes
+
+log = logging.getLogger(__name__)
 
 BREAKER_FAILURES = 3
 OPEN_S = 5.0
@@ -88,6 +92,7 @@ class Endpoint:
     in_flight: int = 0
     busy_until: float = 0.0  # it refused work: no requests until then
     slow: bool = False  # its latest answer took more than SLOW_FACTOR x max_latency_s
+    last_failure: str = ""  # how its latest failed attempt failed (kind and status or exception class, no content)
 
     @property
     def key(self) -> str:
@@ -116,6 +121,7 @@ class Router:
         self.rng, self.clock, self.observer = rng or random.Random(), clock, observer
         self._pools: dict[str, Pool] = {}
         self._current: set[int] = set()
+        self._throttled = Throttle(clock=clock)
 
     def update(self, routes: Routes) -> None:
         """Adopt a new table; endpoints that stay keep their load and breaker."""
@@ -149,7 +155,7 @@ class Router:
         now = self.clock()
         return [{"model": model, "endpoint": e.key, "url": e.route.url, "credited_rps": e.route.credited_rps,
                  "latency_ms": e.route.latency_ms, "cap": e.cap, "in_flight": e.in_flight,
-                 "busy_for_s": round(max(e.busy_until - now, 0.0), 1), "slow": e.slow,
+                 "busy_for_s": round(max(e.busy_until - now, 0.0), 1), "slow": e.slow, "last_failure": e.last_failure,
                  "breaker": {"open": e.breaker.is_open, "failures": e.breaker.failures, "probing": e.breaker.probing,
                              "open_for_s": round(max(e.breaker.open_until - now, 0.0), 1) if e.breaker.is_open
                              else 0.0}}
@@ -214,10 +220,11 @@ class Router:
             self.observer.attempted(endpoint.route)
 
     def finished(self, endpoint: Endpoint, outcome: Outcome | None, seconds: float | None = None, *,
-                 observe: bool = True) -> None:
+                 observe: bool = True, why: str = "") -> None:
         """One attempt is over after ``seconds``; ``outcome`` None: it counts neither way yet, until ``penalize`` or
         ``settled`` (a probe stays the breaker's one probe until then, so a failed one doubles the open time)."""
         endpoint.in_flight -= 1
+        endpoint.last_failure = why or endpoint.last_failure
         slow = seconds is not None and seconds >= SLOW_FACTOR * self.max_latency_s
         if outcome is Outcome.ANSWERED or slow:  # a timeout at the attempt's limit is slow too
             endpoint.slow = slow
@@ -248,5 +255,12 @@ class Router:
     def _breaker(self, endpoint: Endpoint, change: Callable[[], None]) -> None:
         was_open = endpoint.breaker.is_open
         change()
-        if endpoint.breaker.is_open != was_open and id(endpoint) in self._current:
+        if endpoint.breaker.is_open == was_open:
+            return
+        if id(endpoint) in self._current:
             metrics.BREAKERS_OPEN.inc() if endpoint.breaker.is_open else metrics.BREAKERS_OPEN.dec()
+        if endpoint.breaker.is_open and (times := self._throttled(f"{endpoint.key} opened")):
+            log.warning("the breaker of %s opened (%d times since last logged) after %d failures, the latest: %s",
+                        endpoint.key, times, endpoint.breaker.failures, endpoint.last_failure or "unknown")
+        elif not endpoint.breaker.is_open and (times := self._throttled(f"{endpoint.key} closed")):
+            log.info("the breaker of %s closed (%d times since last logged)", endpoint.key, times)
