@@ -262,5 +262,5 @@ If the validator's hotkey is the auditor, it also:
   (`POST /v1/gateway/samples`, signed by a catalog gateway), which it checks between tests (`GATEWAY.md`).
 
 The auditor database is `state_dir/throughput.sqlite`. Keep the auditor running continuously: a test it misses is
-not run, and endpoints keep the credit of their last test for `credit_ttl_epochs`. A test running when it restarts
-is void.
+not run, and endpoints keep the credit of their last test for `credit_ttl_epochs` (the gateway's routes keep it
+until the next confirmed test). A test running when it restarts is void.

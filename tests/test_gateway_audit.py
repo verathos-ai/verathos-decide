@@ -197,6 +197,30 @@ def test_routes_list_the_credited_endpoints_a_gateway_may_use(tmp_path) -> None:
                                                                                25.0, 350.0)
 
 
+def test_routes_outlive_epochs_without_a_confirmed_test(tmp_path) -> None:
+    """An auditor that missed two tests (it was down, or they were void) scores no endpoint for a while, but keeps
+    routing users to the endpoints of its latest confirmed test, without hotkeys proven wrong since."""
+    from verathos.throughput.feed import Evidence
+
+    auditor = _auditor(tmp_path)
+    slots = [Slot(f"hk-{name}", "gpu0", f"http://{name}/e/gpu0", "kev-4b", 30.0) for name in ("good", "wrong")]
+    test = ScheduledTest(3, 560, block_hash(560).hex(), 565)
+    auditor.store.add_test(test)
+    auditor.store.add_results(test.test_id, [Result(Target(s, 30.0), "passed", "", 30.0, 25.0, 350.0) for s in slots])
+    auditor.store.set_state(test.test_id, "confirmed")
+    auditor.store.add_sample(sample_id="s", epoch=4, gateway="gw", hotkey="hk-wrong", endpoint_id="gpu0",
+                             model_id="kev-4b", request_id="n", request={}, response="{}", proof=False)
+    auditor.store.finish_sample("s", "checked", "wrong", Evidence(
+        hotkey="hk-wrong", endpoint_id="gpu0", model_id="kev-4b", test_id=f"{GATEWAY_EVIDENCE}-n", reason="wrong",
+        request_id="n", request={}, response="{}"), checked_epoch=4)
+    auditor.update_slots(slots)
+    auditor.chain.head_block = 7 * 180 + 1  # epochs 5 and 6 had no confirmed test
+    auditor.follower.poll()
+    assert auditor.verdicts(7).verdicts.credits == []  # nothing is scored on a test that old
+    (route,) = auditor.routes(lambda: []).routes.routes
+    assert (route.hotkey, route.credited_rps) == ("hk-good", 25.0)
+
+
 def test_the_auditor_service_takes_samples_only_from_catalog_gateways(tmp_path) -> None:
     from fastapi import FastAPI
     from fastapi.testclient import TestClient

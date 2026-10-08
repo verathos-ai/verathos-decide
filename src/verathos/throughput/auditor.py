@@ -609,6 +609,16 @@ def _beyond(total: float, count: int, tolerance: Tolerance) -> bool:
     return count >= tolerance.min_probabilities and total / count > tolerance.mean_abs
 
 
+def _tolerance_in(cat: catalog_module.Catalog) -> Callable[[str], Tolerance | None]:
+    """A model's tolerance in ``cat``; None for a model it does not list."""
+
+    def tolerance_of(model_id: str) -> Tolerance | None:
+        model = cat.get(model_id)
+        return model.tolerance if model is not None else None
+
+    return tolerance_of
+
+
 def planned_rate(slot: Slot, first_test_rps: float, last_delivered: float | None, policy: AuditPolicy,
                  fell_short: bool = False) -> float:
     """The rate an endpoint is tested at, before its hotkey's budget; ``fell_short``: one of its last
@@ -1124,10 +1134,6 @@ class Auditor:
             return None
         self.close_epoch(current)
 
-        def tolerance_of(model_id: str) -> Tolerance | None:
-            model = cat.get(model_id)
-            return model.tolerance if model is not None else None
-
         users = self.store.users(epoch - 1)
 
         def with_users(c: Credit) -> Credit:
@@ -1139,7 +1145,8 @@ class Auditor:
                                         "user_latency_ms": round(latency_median_ms(t.latency) or 0.0, 1)})
 
         verdicts = Verdicts(netuid=self.netuid, auditor=self.hotkey, epoch=epoch,
-                            credits=[with_users(c) for c in self.store.credits(first, epoch - 1, policy, tolerance_of)],
+                            credits=[with_users(c) for c in self.store.credits(first, epoch - 1, policy,
+                                                                               _tolerance_in(cat))],
                             invalid=self.store.evidence(first, epoch - 1), demand=self.store.demand_ema(epoch - 1))
         signed = SignedVerdicts.create(verdicts, self.keypair)
         self.store.serve_verdicts(epoch, signed.model_dump_json())
@@ -1149,7 +1156,11 @@ class Auditor:
     def routes(self, probation: Callable[[], Collection[str]]) -> SignedRoutes | None:
         """The endpoints the gateways may route to (``protocol.gateway``), signed; None until there are verdicts and
         the miners have been discovered once (a gateway keeps its last table meanwhile). ``probation`` gives the
-        endpoint keys on probation at the owner's validator. Rebuilt at most every ``ROUTES_TTL_S``."""
+        endpoint keys on probation at the owner's validator. Rebuilt at most every ``ROUTES_TTL_S``.
+
+        The credits come from the verdicts; while they cover no confirmed test (the auditor missed tests, or they were
+        void), from the latest confirmed test the auditor holds, whatever its age, leaving out hotkeys with a wrong
+        answer proven since: an endpoint's score needs a recent test, routing users to it does not."""
         if not self._discovered:
             return None
         now = time.monotonic()
@@ -1162,7 +1173,11 @@ class Auditor:
         v = signed.verdicts
         excluded = {key.split("/", 1)[0] for key in probation()}  # probation covers the whole hotkey
         invalid = {e.hotkey for e in v.invalid} | self.store.offenders(current - 1)
-        credits = {(c.hotkey, c.endpoint_id, c.model_id): c for c in v.credits
+        credited = v.credits
+        if not credited:
+            credited = self.store.credits(0, current, self.policy, _tolerance_in(cat))
+            invalid |= self.store.offenders(min((c.test_epoch for c in credited), default=current))
+        credits = {(c.hotkey, c.endpoint_id, c.model_id): c for c in credited
                    if c.qualified and c.credited_rps > 0 and not c.drift}
         routes = []
         for s in self._slots:
