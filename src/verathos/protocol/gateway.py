@@ -122,6 +122,9 @@ class ServedCount(BaseModel):
     attempts: int = Field(0, ge=0, le=1_000_000)  # user requests sent to it in [second, second + 1)
     answered: int = Field(0, ge=0, le=1_000_000)  # of those, the ones it answered
     input_tokens: int = Field(0, ge=0)  # of those requests, as the miner signed them (at most one per request byte)
+    # of those, the input tokens of requests their account paid for (prepaid credit spent on them); None: this gateway
+    # does not tell paid from unpaid. Only paid usage moves the models' emission shares.
+    paid_input_tokens: int | None = Field(None, ge=0)
     offered: int = Field(0, ge=0, le=10_000_000)  # times the router considered it for a user request (drew it)
     refused: int = Field(0, ge=0, le=10_000_000)  # of those, it was not ready (busy, open breaker, slow), plus
     # requests it answered busy, refused or failed
@@ -137,6 +140,8 @@ class ServedCount(BaseModel):
             raise ValueError("more latencies than answers")
         if self.input_tokens > self.answered * MAX_REQUEST_BYTES:
             raise ValueError("more input tokens than the requests' bytes")
+        if (self.paid_input_tokens or 0) > self.input_tokens:
+            raise ValueError("more paid input tokens than input tokens")
         return self
 
 

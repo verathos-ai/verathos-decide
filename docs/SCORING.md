@@ -80,11 +80,14 @@ Per endpoint and epoch:
 
 Each `active` model has a pool: a share of the epoch's emission. Its endpoints split it as above; `candidate` models
 have none. The pools follow what users pay for each model through the subnet's gateway:
-- demand: the input tokens of the users' requests per model (as the miners signed them), averaged over epochs
-  (`demand_ema_alpha`, 0.1: about six hours), published by the auditor with its verdicts;
+- demand: the input tokens of the users' requests per model (as the miners signed them), once the gateways tell
+  paid from unpaid only those users paid for, averaged over epochs (`demand_ema_alpha`, 0.1: about six hours);
 - revenue: demand x the model's `price` (USD per million input tokens, what users pay);
 - share: the model's revenue share, blended toward the catalog's `anchor_share` while the total demand is below
-  `demand_full_tokens_s` (10,000 input tokens/s), and at least `min_model_share` (0.1) for every active model.
+  `demand_full_tokens_s` (10,000 input tokens/s), and at least `min_model_share` (0.1) for every active model;
+- the auditor publishes the shares with its verdicts, moved from the previous epoch's toward these by at most
+  `max_share_step` (0.05) for any model, so a burst of demand shifts the emission over hours, not at once.
+  Validators score with the shares published for the models they score, else from the published demand.
 
 Without demand the pools are the anchor shares, each at least `min_model_share`. Miners choose which models to serve: a model with few endpoints
 splits its pool among few, and a crowded one among many, so capacity moves to where users pay. No conversion between

@@ -25,7 +25,7 @@ import bittensor as bt
 import httpx
 
 from verathos import catalog
-from verathos.throughput.feed import Credit, Verdicts
+from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator import chain, status
 from verathos.validator.audit import audit_epoch
@@ -107,6 +107,15 @@ def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | 
     return proven
 
 
+def epoch_shares(verdicts: Verdicts | None, cat: catalog.Catalog) -> dict[str, float]:
+    """The active models' emission shares: as the auditor publishes them (bounded per epoch, from paid demand once
+    the gateways tell it apart), or, from an auditor that does not or for other models, from its demand."""
+    published = published_shares(verdicts) if verdicts is not None else None
+    if published is not None and set(published) == set(cat.anchor_shares()):
+        return published
+    return model_shares(verdicts.demand if verdicts is not None else {}, cat)
+
+
 def missing_references(cfg: ValidatorConfig, cat: catalog.Catalog) -> list[str]:
     return [m.model_id for m in cat.models if m.status == "active" and m.model_id not in cfg.references]
 
@@ -182,7 +191,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     proven = credited_capacity(endpoints, verdicts, cat, policy.mode)
     credited = proven.credited
     record_window(state, results, sc.statistical_window_epochs)
-    shares = model_shares(verdicts.demand if verdicts is not None else {}, cat)
+    shares = epoch_shares(verdicts, cat)
     log.info("  emission shares: %s", ", ".join(f"{m} {s:.1%}" for m, s in sorted(shares.items())))
     scores, failed = epoch_scores(results, shares=shares, credited=credited, latency_ms=proven.latency_ms, state=state,
                                   failed_hotkeys=invalid_hotkeys, user_latency_ms=proven.user_latency_ms,

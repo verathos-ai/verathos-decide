@@ -67,6 +67,10 @@ class Evidence(BaseModel):
 
 
 class Verdicts(BaseModel):
+    """Fields added since are extra fields, so the documents of auditors without them verify unchanged: ``shares``,
+    each active model's emission share (``published_shares``), and ``paid_demand``, the users' input tokens/s they
+    paid for per model (EMA over epochs), once the gateways tell paid from unpaid."""
+
     model_config = ConfigDict(extra="allow")  # a newer auditor's fields stay signed
     netuid: int
     auditor: str
@@ -74,6 +78,15 @@ class Verdicts(BaseModel):
     credits: list[Credit]
     invalid: list[Evidence]
     demand: dict[str, float] = {}  # model -> the users' input tokens/s through the gateways (EMA over epochs)
+
+
+def published_shares(verdicts: Verdicts) -> dict[str, float] | None:
+    """The models' emission shares the verdicts state, if the auditor publishes them and they sum to 1."""
+    raw = (verdicts.model_extra or {}).get("shares")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    shares = {m: s for m, s in raw.items() if isinstance(s, float | int) and not isinstance(s, bool) and 0 <= s <= 1}
+    return shares if len(shares) == len(raw) and abs(sum(shares.values()) - 1.0) < 1e-6 else None
 
 
 class SignedVerdicts(BaseModel):

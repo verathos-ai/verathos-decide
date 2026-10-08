@@ -202,7 +202,8 @@ For scoring epoch `E` the auditor publishes, signed by its hotkey, at `GET /v1/t
   signed receipt (user requests are not published).
 
 They also state each model's user demand: the input tokens per second the gateways reported answered, averaged over
-epochs, which sets the models' emission shares (`SCORING.md`).
+epochs (`demand`), and of them those users paid for once the gateways tell them apart (`paid_demand`); and the
+models' emission shares that follow (`shares`, `SCORING.md`), moved by at most `max_share_step` per epoch.
 
 The verdicts for the current epoch and the two before are served once their tests are settled (404 otherwise);
 once served, an epoch's verdicts do not change.

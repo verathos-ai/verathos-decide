@@ -80,6 +80,8 @@ class Scoring(BaseModel):
                                         "the anchor shares")
     min_model_share: float = Field(0.1, ge=0, le=1, description="Emission share every active model keeps, whatever "
                                    "its demand")
+    max_share_step: float = Field(0.05, gt=0, le=1, description="Most a model's emission share moves per epoch "
+                                  "toward what demand sets")
     user_offers_prior: int = Field(20, ge=1, description="Ready offers every hotkey's endpoints of a model start an "
                                    "epoch with, so a few offers move its availability to users little")
     user_latency_min_answers: int = Field(50, ge=1, description="Answers to users an endpoint needs in an epoch for "

@@ -623,6 +623,70 @@ def test_user_demand_per_model_is_published_with_the_verdicts(tmp_path) -> None:
     assert auditor.store.demand_ema(4) == {"kev-4b": pytest.approx(0.9 * 2.0), "kev-9b": pytest.approx(0.9 * 0.5)}
 
 
+def test_the_models_shares_follow_paid_demand_and_move_a_step_per_epoch(tmp_path) -> None:
+    """A burst of demand for one model, paid or not, moves the published shares by at most ``max_share_step`` per
+    epoch; once the gateways tell paid from unpaid, unpaid traffic moves them not at all."""
+    import time as time_module
+
+    from verathos.protocol.gateway import ServedCount
+    from verathos.throughput.feed import published_shares
+    from verathos.validator.__main__ import epoch_shares
+
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()  # epoch 3
+    auditor.update_slots([Slot("a", "gpu0", "http://a/e/gpu0", "kev-4b", 50.0),
+                          Slot("b", "gpu0", "http://b/e/gpu0", "kev-9b", 50.0)])
+    step, epoch_s = catalog.load().scoring.max_share_step, 180 * 12.0
+
+    def epoch(number: int, paid: int | None, unpaid: int) -> dict[str, float]:
+        """The verdicts' shares for epoch ``number`` after users sent kev-9b ``paid`` and ``unpaid`` input tokens/s
+        in the epoch before (``paid`` None: the gateway does not tell them apart)."""
+        tokens = int(epoch_s * ((paid or 0) + unpaid))
+        auditor.accept_served([ServedCount(hotkey="b", endpoint_id="gpu0", second=int(time_module.time()),
+                                           answered=10_000, input_tokens=tokens,
+                                           paid_input_tokens=None if paid is None else int(epoch_s * paid))])
+        auditor.chain.head_block = number * 180 + 1
+        auditor.follower.poll()
+        return published_shares(auditor.verdicts(number).verdicts)
+
+    first = epoch(4, None, 1_000_000)  # far beyond demand_full_tokens_s, none of it told paid or not
+    assert first == pytest.approx({"kev-4b": 0.5 - step, "kev-9b": 0.5 + step})
+    second = epoch(5, None, 0)
+    assert second["kev-9b"] == pytest.approx(0.5 + 2 * step)
+    third = epoch(6, 0, 1_000_000)  # the gateways tell paid from unpaid now: none of this is paid
+    assert auditor.verdicts(6).verdicts.model_extra["paid_demand"] == {}
+    assert third["kev-9b"] == pytest.approx(0.5 + step)  # back toward the anchors, a step at a time
+    fourth = epoch(7, 1_000_000, 0)
+    assert fourth["kev-9b"] == pytest.approx(0.5 + 2 * step)
+    assert epoch_shares(auditor.verdicts(7).verdicts, catalog.load()) == fourth  # what every validator scores with
+
+
+def test_shares_move_along_the_line_to_their_target() -> None:
+    from verathos.validator.scoring import bounded_shares
+
+    moved = bounded_shares({"a": 0.5, "b": 0.3, "c": 0.2}, {"a": 0.1, "b": 0.5, "c": 0.4}, 0.1)
+    assert moved == pytest.approx({"a": 0.4, "b": 0.35, "c": 0.25}) and sum(moved.values()) == pytest.approx(1.0)
+    assert bounded_shares({"a": 0.5, "b": 0.5}, {"a": 0.52, "b": 0.48}, 0.05) == {"a": 0.52, "b": 0.48}
+    assert bounded_shares({"a": 1.0}, {"a": 0.6, "b": 0.4}, 0.05) == {"a": 0.6, "b": 0.4}  # a model activated
+
+
+def test_validators_score_with_the_shares_the_auditor_publishes_or_its_demand() -> None:
+    from verathos.throughput.feed import Verdicts
+    from verathos.validator.__main__ import epoch_shares
+    from verathos.validator.scoring import model_shares
+
+    cat = catalog.load()
+    demand = {"kev-4b": 30_000.0, "kev-9b": 10_000.0}
+    old_auditor = Verdicts(netuid=405, auditor="aud", epoch=9, credits=[], invalid=[], demand=demand)
+    assert epoch_shares(old_auditor, cat) == model_shares(demand, cat)
+    published = Verdicts.model_validate({**old_auditor.model_dump(), "shares": {"kev-4b": 0.55, "kev-9b": 0.45}})
+    assert epoch_shares(published, cat) == {"kev-4b": 0.55, "kev-9b": 0.45}
+    for bad in ({"kev-4b": 0.9, "kev-9b": 0.9}, {"kev-4b": 1.0}, {"kev-4b": "1", "kev-9b": 0}):
+        assert epoch_shares(Verdicts.model_validate({**old_auditor.model_dump(), "shares": bad}), cat) == \
+            model_shares(demand, cat)
+    assert epoch_shares(None, cat) == model_shares({}, cat)
+
+
 def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -> None:
     import sqlite3
 
@@ -630,8 +694,9 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
 
     Store(tmp_path / "old.sqlite", epoch_blocks=180)  # today's, less what versions 5 on added
     db = sqlite3.connect(tmp_path / "old.sqlite")
-    db.executescript("DROP TABLE demand; DROP TABLE users; DROP TABLE meta; DROP INDEX results_by_endpoint; "
-                     "DROP INDEX samples_by_test; ALTER TABLE samples DROP COLUMN test_id; "
+    db.executescript("DROP TABLE demand; DROP TABLE users; DROP TABLE meta; DROP TABLE shares; "
+                     "DROP INDEX results_by_endpoint; DROP INDEX samples_by_test; "
+                     "ALTER TABLE samples DROP COLUMN test_id; "
                      "INSERT INTO tests VALUES ('kept', 3, 560, 'h', 565, 'confirmed', ''); "
                      "PRAGMA user_version = 4;")
     db.close()

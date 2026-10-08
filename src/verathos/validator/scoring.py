@@ -118,10 +118,11 @@ def weighted_median(values: list[tuple[float, float]]) -> float:
 def model_shares(demand: Mapping[str, float], cat: Catalog) -> dict[str, float]:
     """Each active model's share of the epoch's emission, summing to 1.
 
-    ``demand`` is each model's user demand in input tokens/s through the gateway, as the auditor publishes it. A
-    model's share follows what its users pay (demand x ``price``), blended toward the catalog's anchor shares while
-    the total demand is below ``scoring.demand_full_tokens_s``; every active model keeps at least
-    ``scoring.min_model_share``."""
+    ``demand`` is each model's user demand in input tokens/s through the gateway: what users paid for, once the
+    gateways tell paid from unpaid. A model's share follows what its users pay (demand x ``price``), blended toward
+    the catalog's anchor shares while the total demand is below ``scoring.demand_full_tokens_s``; every active model
+    keeps at least ``scoring.min_model_share``. The auditor moves the published shares toward this by at most
+    ``scoring.max_share_step`` per epoch (``bounded_shares``)."""
     anchors = cat.anchor_shares()
     if not anchors:
         return {}
@@ -133,6 +134,17 @@ def model_shares(demand: Mapping[str, float], cat: Catalog) -> dict[str, float]:
     demanded = {m: revenue[m] / paid if paid > 0 else anchors[m] for m in anchors}
     shares = {m: (1 - confidence) * anchors[m] + confidence * demanded[m] for m in anchors}
     return _with_floor(shares, min(cat.scoring.min_model_share, 1.0 / len(anchors)))
+
+
+def bounded_shares(previous: Mapping[str, float], target: Mapping[str, float], step: float) -> dict[str, float]:
+    """The shares moved from ``previous`` toward ``target`` by at most ``step`` for any model, along the straight
+    line between them, so they still sum to 1 and keep the floor. When the active models change, ``target`` at
+    once."""
+    if not previous or set(previous) != set(target):
+        return dict(target)
+    gap = max(abs(target[m] - previous[m]) for m in target)
+    moved = 1.0 if gap <= step else step / gap
+    return {m: previous[m] + moved * (target[m] - previous[m]) for m in target}
 
 
 def _with_floor(shares: dict[str, float], floor: float) -> dict[str, float]:
