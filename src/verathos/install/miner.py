@@ -14,7 +14,6 @@ import argparse
 import hashlib
 import ipaddress
 import re
-import shlex
 import sys
 import time
 from collections.abc import Callable, Collection
@@ -378,14 +377,17 @@ def init(argv: list[str]) -> None:
     record.paths = sorted(str(d) for d in installs)
 
     if manager is None:
+        previous = [s for s in record.services if s not in names and s != MINER]
+        record.manager, record.services = None, [*names, MINER]
         record.save(home)
-        step("Run (no services installed)")
-        info("start each engine, then the miner, under your supervisor:")
-        for s in [*engine_services.values(), miner]:
-            env = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(s.environment.items()) if k != "HOME")
-            print(f"      cd {shlex.quote(str(s.directory))} && {env + ' ' if env else ''}{shlex.join(s.command)}")
-        info("the miner measures its capacity when it starts (a few minutes), then "
+        common.show_run("each engine and the miner", [*engine_services.values(), miner])
+        if previous:
+            info(f"stop the engines no longer served (pm2: pm2 delete {' '.join(previous)})")
+        info("the miner waits for its engines, measures its capacity (a few minutes), then "
              + ("serves its endpoints to its primary" if role == "worker" else "publishes its manifest"))
+        for line in common.script_commands("miner", home, " --no-service"
+                                           + (" --no-publish" if args.no_publish else "")):
+            info(line)
         return
 
     step("Services")

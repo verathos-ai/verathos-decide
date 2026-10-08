@@ -30,7 +30,8 @@ Light validators follow the auditor's results; full validators check answers ind
 ([Two modes](docs/VALIDATING.md#two-modes)).
 
 The command installs what the machine needs, asks a few questions (each has a default), and runs everything as
-system services. Run it again to update. What it asks, what it installs, how to check, update and uninstall, and
+system services; with `--no-service` it needs no root and prints the commands for pm2 or another process manager.
+Run it again to update. What it asks, what it installs, how to check, update and uninstall, and
 the manual installation: [Mining](docs/MINING.md#quick-start-one-command),
 [Validating](docs/VALIDATING.md#quick-start-one-command).
 

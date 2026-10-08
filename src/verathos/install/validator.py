@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import shlex
 import sys
 from pathlib import Path
 
@@ -299,13 +298,16 @@ def init(argv: list[str]) -> None:
     record.paths = sorted(str(d) for d in installs)
 
     if manager is None:
+        run = [*reference_services.values(), validator]
+        previous = [s for s in record.services if s not in {r.name for r in run}]
+        record.manager, record.services = None, [s.name for s in run]
         record.save(home)
-        step("Run (no services installed)")
-        info("start each reference engine, then the validator, under your supervisor:" if reference_services else
-             "start the validator under your supervisor (it starts the references itself):")
-        for s in [*reference_services.values(), validator]:
-            env = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(s.environment.items()) if k != "HOME")
-            print(f"      cd {shlex.quote(str(s.directory))} && {env + ' ' if env else ''}{shlex.join(s.command)}")
+        common.show_run("each reference engine and the validator, which waits for them" if reference_services else
+                        "the validator (it starts the references itself)", run)
+        if previous:
+            info(f"stop the references no longer run as their own process (pm2: pm2 delete {' '.join(previous)})")
+        for line in common.script_commands("validator", home, " --no-service"):
+            info(line)
         return
 
     step("Services")
@@ -435,11 +437,14 @@ def init_light(ui: Prompter, manager: Manager | None, record: common.Record, exi
     record.config, record.engines = str(config_path), {}
 
     if manager is None:
+        previous = [s for s in record.services if s != VALIDATOR]
+        record.manager, record.services = None, [VALIDATOR]
         record.save(home)
-        step("Run (no services installed)")
-        info("start the validator under your supervisor" + (" (the references it ran with are not needed)"
-                                                            if stale else "") + ":")
-        print(f"      cd {shlex.quote(str(validator.directory))} && {shlex.join(validator.command)}")
+        common.show_run("the validator", [validator])
+        if previous:
+            info(f"stop the references it ran with (pm2: pm2 delete {' '.join(previous)})")
+        for line in common.script_commands("validator", home, " --no-service"):
+            info(line)
         return
 
     step("Services")

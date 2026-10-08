@@ -3,6 +3,8 @@
 
 ``init`` checks the wallet and the chain, installs each catalog model's engine at its pinned revision, downloads the
 pinned weights, writes the configuration and runs everything as system services (systemd, or supervisord where
-there is no systemd, as in most containers). It keeps what it set up in ``<home>/install/<role>.json``, so running
-it again updates the machine with the previous answers as defaults, and ``uninstall`` removes exactly that.
+there is no systemd, as in most containers); with ``--no-service``, which needs no root, it prints how to run them
+under a process manager the operator runs (pm2 or another). It keeps what it set up in
+``<home>/install/<role>.json``, so running it again updates the machine with the previous answers as defaults, and
+``uninstall`` removes exactly that.
 """

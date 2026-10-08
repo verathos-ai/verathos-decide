@@ -6,6 +6,7 @@ Both restart a process that exits, start the services at boot (supervisord: when
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -289,6 +290,23 @@ class Supervisor(Logs):
 
 
 Manager = Systemd | Supervisor
+
+
+def _environment(s: Service) -> str:
+    return "".join(f"{k}={shlex.quote(v)} " for k, v in sorted(s.environment.items()) if k != "HOME")
+
+
+def shell_command(s: Service) -> str:
+    """The service as one shell command, for any process manager."""
+    return f"cd {shlex.quote(str(s.directory))} && {_environment(s)}{shlex.join(s.command)}"
+
+
+def pm2_command(s: Service) -> str:
+    """The service under pm2: its program run directly (``--interpreter none``; pm2 would run a script without an
+    extension it knows under node), in its directory, with its environment."""
+    args = f" -- {shlex.join(s.command[1:])}" if s.command[1:] else ""
+    return (f"{_environment(s)}pm2 start {shlex.quote(s.command[0])} --name {s.name} --interpreter none "
+            f"--cwd {shlex.quote(str(s.directory))}{args}")
 
 
 def detect() -> Manager | None:

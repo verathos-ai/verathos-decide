@@ -139,7 +139,8 @@ runs only if its start fits in the recheck's time; else the auditor's word stand
 
 Copy the hotkey and the coldkey's public key to the validator machine:
 `~/.bittensor/wallets/<wallet>/hotkeys/<hotkey>` and `~/.bittensor/wallets/<wallet>/coldkeypub.txt`. The installer
-never creates, imports or reads a coldkey. Then, on Ubuntu 22.04 or 24.04, as root or a user with sudo:
+never creates, imports or reads a coldkey. Then, on Ubuntu 22.04 or 24.04, as root or a user with sudo (as any
+user with `--no-service`: [Without root](#without-root-pm2-or-another-process-manager)):
 
 ```bash
 # light (the default for a hotkey that is not the subnet owner's)
@@ -167,10 +168,12 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--candidates` | also run references for the catalog's candidate models, in the memory the active ones leave; a later run keeps them, `--no-candidates` removes them |
 | `--dry-run` | compute weights without setting them; `--no-dry-run` sets them again |
 | `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
-| `--no-service`, `--source`, `--ref`, `--dir` | as for miners (`MINING.md`) |
+| `--no-service` | no root, no system packages and no services: print the commands to run under a process manager you run ([Without root](#without-root-pm2-or-another-process-manager)) |
+| `--source`, `--ref`, `--dir` | as for miners (`MINING.md`) |
 
 What it does (a full validator; light, see below):
-1. installs `git`, `curl` and, in a container without systemd, `supervisor`; then uv and Python 3.12;
+1. installs `git`, `curl` and, in a container without systemd, `supervisor` (with `--no-service`, nothing); then
+   uv and Python 3.12 in the user's home;
 2. puts the code in `~/verathos-decide` (an install from before in `~/verathos` stays there) with its Python
    environment, and `verathos-validator` on the `PATH`;
 3. checks the hotkey, its registration and validator permit, and reads the catalog the subnet owner commits;
@@ -204,6 +207,29 @@ Code, engines, weights and services live where they do for miners (`MINING.md`).
 In light mode it skips steps 4 and 5, writes `mode: light` and no references, and starts only the validator. On a
 machine that ran a full validator, it removes the reference services; their engines and weights stay until uninstall.
 Running it again with `--yes` keeps the mode; `--full` or `--light` changes it.
+
+### Without root (pm2 or another process manager)
+
+With `--no-service` the installer needs neither root nor sudo: it installs no system packages and no services, and
+puts uv, Python, the code and its environment in the user's home. `git` and `curl` must be there (a miner also needs
+a C compiler, `build-essential`); it names what is missing before it changes anything. It ends with the commands to
+run each service under a process manager you run, which restarts it when it exits. For pm2:
+
+```bash
+pm2 start ~/verathos-decide/.venv/bin/verathos-validator --name verathos-validator --interpreter none \
+    --cwd ~/.verathos -- --config ~/.verathos/validator.json
+pm2 save
+```
+
+`--interpreter none` runs the program itself, which pm2 would otherwise run under node. To update by hand, run the
+installer again with `--no-service`, then `pm2 restart verathos-validator`. System services set up before are
+refused (uninstall them first, the configuration and state stay), so one copy runs; `uninstall` names the processes
+to stop. Light validator, unattended:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --light \
+    --yes --no-service --wallet validator --hotkey default
+```
 
 ### Check that it works
 

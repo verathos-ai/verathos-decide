@@ -23,6 +23,7 @@ from verathos.install import host, services
 DEFAULT_HOME = Path("~/.verathos")
 TESTNET_NETUID = 405
 MAINNET_NETUID = 96
+INSTALLER = Path(__file__).resolve().parents[3] / "scripts" / "install.sh"  # the installer of this checkout
 
 
 # ---- output and questions ----
@@ -89,8 +90,8 @@ def common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hotkey", help="Hotkey name in that wallet")
     parser.add_argument("--network", help="finney (default), test, or a subtensor websocket URL")
     parser.add_argument("--netuid", type=int, help=f"Subnet (default {MAINNET_NETUID}; {TESTNET_NETUID} on test)")
-    parser.add_argument("--no-service", action="store_true", help="Set up and print the commands to run, without "
-                        "installing services")
+    parser.add_argument("--no-service", action="store_true", help="Install no system services and need no root: "
+                        "set up, then print the commands to run under a process manager you run (pm2 or another)")
     parser.add_argument("--home", type=Path, default=DEFAULT_HOME, help="Configuration, state, engines and weights "
                         "(default ~/.verathos)")
 
@@ -103,7 +104,7 @@ class Record:
     ``uninstall`` removes."""
 
     role: str
-    manager: str | None = None
+    manager: str | None = None  # None: the services, if any, run under a process manager the operator runs
     services: list[str] = field(default_factory=list)
     config: str = ""
     engines: dict[str, dict] = field(default_factory=dict)  # per endpoint or model: model, device, port
@@ -212,20 +213,45 @@ def operator() -> str:
 
 
 def manager_for(args: argparse.Namespace, record: Record) -> services.Manager | None:
+    """The service manager to install the services with; None with ``--no-service``, which needs no root. One copy
+    of each service runs: system services set up before are refused with ``--no-service``, and replaced by those of
+    another manager otherwise."""
+    previous = services.by_name(record.manager)
     if args.no_service:
+        present = [n for n in record.services if previous is not None and previous.path(n).exists()]
+        if present:
+            raise SystemExit(f"the {record.role} runs as {previous.name} services set up before ({', '.join(present)}):"
+                             f" remove them first ({uninstall_command(record.role)}; the configuration and state "
+                             "stay), or run this without --no-service to keep them")
         return None
     manager = services.detect()
     if manager is None:
         raise SystemExit("neither systemd nor supervisord found: install supervisor (apt-get install supervisor) or "
-                         "pass --no-service and run the printed commands under your own supervisor")
-    if record.manager and record.manager != manager.name:
-        previous = services.by_name(record.manager)
-        if previous is not None:
-            previous.remove(record.services)
+                         "pass --no-service and run the printed commands under your own process manager")
+    if previous is not None and previous.name != manager.name:
+        previous.remove(record.services)
+    elif previous is None and record.services:
+        warn(f"set up before to run under a process manager of your own: stop {', '.join(record.services)} there "
+             f"(pm2 delete {' '.join(record.services)}), or two copies run")
     return manager
 
 
-INSTALLER = Path(__file__).resolve().parents[3] / "scripts" / "install.sh"  # the installer of this checkout
+def uninstall_command(role: str) -> str:
+    return f"bash {INSTALLER} uninstall" if INSTALLER.exists() else f"verathos-{role} uninstall"
+
+
+def show_run(what: str, run: list[services.Service]) -> None:
+    """How to run ``run`` under a process manager the operator runs, which restarts each when it exits."""
+    step("Run (no services installed)")
+    info(f"start {what} under your process manager, which restarts each when it exits; with pm2:")
+    for s in run:
+        print(f"      {services.pm2_command(s)}", flush=True)
+    print("      pm2 save", flush=True)
+    info("with another, each as:")
+    for s in run:
+        print(f"      {services.shell_command(s)}", flush=True)
+    info(f"after an update by hand or a change of the configuration, restart them (pm2 restart "
+         f"{' '.join(s.name for s in run)})")
 
 
 def script_commands(role: str, home: Path, options: str = "") -> list[str]:
@@ -369,6 +395,8 @@ def uninstall(role: str, argv: list[str]) -> None:
     if manager is not None and record.services:
         manager.remove(record.services)
         info(f"removed services: {', '.join(record.services)}")
+    elif record.services:
+        info(f"stop what runs under your process manager (pm2: pm2 delete {' '.join(record.services)})")
     other = Record.load(home, "validator" if role == "miner" else "miner")
     still_used = set(other.paths)
     for path in record.paths:

@@ -27,7 +27,8 @@ chain does not pay out (`SCORING.md`).
 
 Register the hotkey first ([1. Register](#1-register)) and copy the hotkey and the coldkey's public key to the
 miner machine: `~/.bittensor/wallets/<wallet>/hotkeys/<hotkey>` and `~/.bittensor/wallets/<wallet>/coldkeypub.txt`.
-The installer never creates, imports or reads a coldkey. Then, on the miner machine, as root or a user with sudo:
+The installer never creates, imports or reads a coldkey. Then, on the miner machine, as root or a user with sudo
+(as any user with `--no-service`):
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
@@ -60,12 +61,12 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--no-publish` | try the machine before registering: the miner serves and measures, but writes nothing on chain; once the hotkey is registered, run the command again without it |
 | `--worker`, `--name` | this machine serves its GPUs for the hotkey's primary machine; its endpoint ids start with `--name` (default: its IP address) ([One hotkey, several GPUs and machines](#one-hotkey-several-gpus-and-machines)) |
 | `--peers` | on the primary: every worker's public `ip:port`, comma-separated; replaces the list (`''` for none) |
-| `--no-service` | set everything up, and print the commands to run instead of installing services |
+| `--no-service` | no root, no system packages and no services: set everything up in the user's home and print the commands to run under pm2 or another process manager you run; `git`, `curl` and a C compiler (`build-essential`) must be there ([Without root](VALIDATING.md#without-root-pm2-or-another-process-manager)) |
 | `--source`, `--ref`, `--dir` | the code from another git URL, git bundle or tarball; a branch, tag or commit; another directory than `~/verathos-decide`, which must be missing, empty or a checkout of this code (another checkout is never changed) |
 
 What it does:
 1. installs `git`, `curl`, `build-essential` (the engine compiles its GPU kernels on first use) and, in a container
-   without systemd, `supervisor`; then uv and Python 3.12;
+   without systemd, `supervisor` (with `--no-service`, nothing); then uv and Python 3.12 in the user's home;
 2. puts the code in `~/verathos-decide` (an install from before in `~/verathos` stays there) with its Python
    environment, and `verathos-miner` and `verathos-validator` on the
    `PATH`;

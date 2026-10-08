@@ -8,6 +8,9 @@
 # Installs the system packages it needs, uv, the code (in ~/verathos-decide) and its Python environment, then runs
 # `verathos-miner init` or `verathos-validator init`, which asks a few questions (or takes --yes and options) and
 # starts everything as system services. Run it again to update. It only uses a wallet's hotkey and coldkeypub.txt.
+# With --no-service it needs no root and no sudo: it installs nothing system-wide (git and curl must be there; a
+# miner also needs a C compiler), sets everything up in the user's home and prints the commands to run the services
+# under a process manager the user runs (pm2 or another).
 #
 # The first argument is miner, validator or uninstall. Options:
 #   --source <src>  git URL, path to a git bundle, or path to a source tarball (default: the public repository;
@@ -17,6 +20,7 @@
 #                   install put this code there, else ~/verathos-decide); another checkout there is never touched
 #   --purge         with uninstall: also delete what the setups keep in ~/.verathos (configuration, state,
 #                   measurements); other files there stay
+#   --no-service    no system packages, services or sudo; print the commands to run instead
 # Every other option goes to `verathos-<role> init`, for example:
 #   --yes --wallet <name> --hotkey <name> --network finney|test|<ws url> --netuid <n>
 #   validator mode: --light (the default, except for the subnet owner's hotkey: sets the auditor's published weights;
@@ -47,7 +51,7 @@ usage() {
 }
 
 main() {
-  local role="" source="" ref="" dir="" purge="" home="$HOME/.verathos"
+  local role="" source="" ref="" dir="" purge="" no_service="" home="$HOME/.verathos"
   local -a init_args=()
   case "${1:-}" in
     miner|validator|uninstall) role="$1"; shift ;;
@@ -63,6 +67,7 @@ main() {
       --dir) dir="${2:?--dir needs a value}"; shift ;;
       --dir=*) dir="${1#*=}" ;;
       --purge) purge=1 ;;
+      --no-service) no_service=1; init_args+=("$1") ;;
       --home) home="${2:?--home needs a value}"; shift ;;
       --home=*) home="${1#*=}" ;;
       -h|--help) usage; exit 0 ;;
@@ -78,9 +83,13 @@ main() {
     return
   fi
   check_dir "$dir"
-  sudo_setup
-  check_os
-  system_packages "$role"
+  if [ -n "$no_service" ]; then
+    user_tools "$role"
+  else
+    sudo_setup
+    check_os
+    system_packages "$role"
+  fi
   install_uv
   fetch_code "$dir" "$source" "$ref"
   python_environment "$dir"
@@ -126,12 +135,27 @@ check_dir() {
   die "$1 exists and holds other files; choose another --dir"
 }
 
+NO_ROOT="or pass --no-service to set up without root, under a process manager you run (pm2 or another)"
+
 sudo_setup() {
   SUDO=()
-  if [ "$(id -u)" -ne 0 ]; then
-    command -v sudo >/dev/null || die "run this as root, or install sudo"
-    SUDO=(sudo)
+  [ "$(id -u)" -eq 0 ] && return
+  command -v sudo >/dev/null || die "system services need root: run this as root or with sudo, $NO_ROOT"
+  if ! sudo -n true 2>/dev/null && ! (exec </dev/tty) 2>/dev/null; then
+    die "sudo asks for a password and there is no terminal to type it in: run this as root, $NO_ROOT"
   fi
+  SUDO=(sudo)
+}
+
+user_tools() {
+  # Without services nothing is installed system-wide: the tools the setup uses must be there.
+  local -a missing=()
+  command -v git >/dev/null || missing+=(git)
+  command -v uv >/dev/null || [ -x "$HOME/.local/bin/uv" ] || command -v curl >/dev/null || missing+=(curl)
+  # Miners: the fused engine kernels are compiled on first use.
+  [ "$1" = miner ] && ! command -v cc >/dev/null && missing+=(build-essential)
+  [ ${#missing[@]} -eq 0 ] && return
+  die "missing: ${missing[*]}. With --no-service nothing is installed system-wide: have them installed (apt-get install -y ${missing[*]}), or run this without --no-service as root or with sudo"
 }
 
 check_os() {
@@ -167,7 +191,8 @@ install_uv() {
   export PATH="$HOME/.local/bin:$PATH"
   command -v uv >/dev/null && return
   say "Installing uv"
-  curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh >/dev/null
+  # In the user's home, as any user: ~/.local/bin/uv
+  curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh >/dev/null
   command -v uv >/dev/null || die "uv was not installed"
 }
 

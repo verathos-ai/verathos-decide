@@ -282,6 +282,61 @@ def test_supervisor_programs_restart_the_service_and_quote_what_needs_it() -> No
     assert services.supervisor_quote("a,b") == '"a,b"' and services.supervisor_quote("50%") == "50%%"
 
 
+def test_without_services_the_commands_run_the_program_directly_under_pm2_or_any_manager() -> None:
+    engine = service(environment={"CUDA_VISIBLE_DEVICES": "", "HOME": "/home/miner", "HF_HOME": "/a b"})
+    assert services.pm2_command(engine) == (
+        "CUDA_VISIBLE_DEVICES='' HF_HOME='/a b' pm2 start /opt/kev/.venv/bin/python --name verathos-engine-gpu0 "
+        "--interpreter none --cwd /opt/kev -- -m kev.serve --run a/b@c --port 8008")
+    assert services.shell_command(engine) == ("cd /opt/kev && CUDA_VISIBLE_DEVICES='' HF_HOME='/a b' "
+                                              "/opt/kev/.venv/bin/python -m kev.serve --run a/b@c --port 8008")
+    alone = service(command=["/opt/v/.venv/bin/verathos-validator"], environment={})
+    assert services.pm2_command(alone).endswith("--interpreter none --cwd /opt/kev")
+
+
+def test_no_service_refuses_system_services_set_up_before_so_one_copy_runs(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(services.Systemd, "unit_dir", tmp_path)
+    monkeypatch.setattr(services, "detect", lambda: services.Systemd())
+    record = common.Record(role="validator", manager="systemd", services=["verathos-validator"])
+    (tmp_path / "verathos-validator.service").touch()
+    with pytest.raises(SystemExit, match="runs as systemd services set up before .verathos-validator.: remove them"):
+        common.manager_for(argparse.Namespace(no_service=True), record)
+    (tmp_path / "verathos-validator.service").unlink()  # removed
+    assert common.manager_for(argparse.Namespace(no_service=True), record) is None
+    own = common.Record(role="validator", manager=None, services=["verathos-validator"])
+    assert common.manager_for(argparse.Namespace(no_service=False), own).name == "systemd"
+    assert "stop verathos-validator there (pm2 delete verathos-validator), or two copies run" in capsys.readouterr().out
+
+
+def test_install_script_without_services_installs_nothing_system_wide(tmp_path) -> None:
+    """--no-service never runs sudo or apt-get: it names what is missing. Without it, a user without sudo, or whose
+    sudo asks for a password without a terminal, is told about --no-service before anything changes."""
+    bin_dir, calls = tmp_path / "bin", tmp_path / "calls"
+    bin_dir.mkdir()
+    for tool in ("bash", "realpath", "ls", "grep", "sed", "dirname", "cat", "head", "id", "env"):
+        (bin_dir / tool).symlink_to(next(Path(d) / tool for d in ("/usr/bin", "/bin") if (Path(d) / tool).exists()))
+    for tool in ("sudo", "apt-get"):
+        (bin_dir / tool).write_text(f"#!/bin/sh\necho {tool} \"$@\" >> {calls}\nexit 1\n")
+        (bin_dir / tool).chmod(0o755)
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([str(bin_dir / "bash"), "-s", "--", *args],
+                              input=(ROOT / "scripts" / "install.sh").read_text(), capture_output=True, text=True,
+                              env={"HOME": str(tmp_path), "PATH": str(bin_dir)}, timeout=60, start_new_session=True)
+
+    light = run("validator", "--no-service", "--yes", "--light")
+    assert light.returncode != 0 and "missing: git curl. With --no-service nothing is installed" in light.stderr
+    assert "missing: git curl build-essential" in run("miner", "--no-service").stderr
+    assert not calls.exists()
+    if os.geteuid() != 0:
+        (bin_dir / "sudo").unlink()
+        assert "or pass --no-service to set up without root" in run("validator", "--yes").stderr
+        (bin_dir / "sudo").write_text(f"#!/bin/sh\necho sudo \"$@\" >> {calls}\nexit 1\n")
+        (bin_dir / "sudo").chmod(0o755)
+        refused = run("validator", "--yes")
+        assert "sudo asks for a password and there is no terminal" in refused.stderr
+        assert calls.read_text() == "sudo -n true\n"  # asked whether it needs one, nothing else
+
+
 def test_supervisor_logs_are_followed_from_the_mark(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(services.Supervisor, "log_dir", tmp_path)
     log = tmp_path / "verathos-miner.log"
@@ -575,6 +630,22 @@ def test_a_light_setup_runs_the_validator_alone_and_stops_the_references_of_a_fu
             "SystemExit: this is the subnet owner's hotkey: its validator is the auditor"]]), saved,
             common.read_json(config_path), config_path, home, False, cat=catalog.load(), network="finney", netuid=96,
             wallet_name="v", hotkey_name="default")
+
+
+def test_a_light_setup_without_services_says_how_to_run_it_and_how_to_update_it(tmp_path, capsys) -> None:
+    import sys
+
+    from verathos.install.validator import VALIDATOR, init_light
+
+    config_path = tmp_path / "validator.json"
+    init_light(common.Prompter(assume_yes=True), None, common.Record(role="validator"), {}, config_path, tmp_path,
+               False, cat=catalog.load(), network="finney", netuid=96, wallet_name="v", hotkey_name="default")
+    out = capsys.readouterr().out
+    assert (f"pm2 start {sys.prefix}/bin/verathos-validator --name {VALIDATOR} --interpreter none --cwd {tmp_path} "
+            f"-- --config {config_path}\n      pm2 save\n") in out
+    assert f"update:  bash {common.INSTALLER} validator --yes --no-service" in out
+    saved = common.Record.load(tmp_path, "validator")
+    assert (saved.manager, saved.services) == (None, [VALIDATOR])  # uninstall says what to stop
 
 
 def test_references_run_one_at_a_time_when_the_active_ones_do_not_all_fit() -> None:
