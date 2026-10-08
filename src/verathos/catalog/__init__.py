@@ -89,6 +89,9 @@ class Scoring(BaseModel):
                                    "epoch with, so a few offers move its availability to users little")
     user_latency_min_answers: int = Field(50, ge=1, description="Answers to users an endpoint needs in an epoch for "
                                           "its latency factor to come from them; with fewer, from its test")
+    validator_min_stake: float = Field(0.0, ge=0, description="Stake a validator needs for miners to answer it, as "
+                                       "the metagraph's S (alpha plus weighted TAO), the stake validator permits "
+                                       "follow; 0: every validator with a permit")
 
 
 class Catalog(BaseModel):

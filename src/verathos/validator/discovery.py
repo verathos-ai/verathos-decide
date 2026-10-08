@@ -50,6 +50,8 @@ class Neuron:
     axon_ip: str
     axon_port: int
     commitment: str | None
+    stake: float = 0.0  # the metagraph's S
+    permit: bool = False  # a validator permit
 
 
 @dataclass(frozen=True)

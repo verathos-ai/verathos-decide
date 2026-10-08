@@ -20,6 +20,7 @@ from verathos.protocol.manifest import (
     commitment_value,
 )
 from verathos.subnet.chain import serve_axon
+from verathos.throughput.policy import BLOCK_TIME_S
 
 log = logging.getLogger(__name__)
 
@@ -61,25 +62,33 @@ def publish(subtensor: bt.Subtensor, wallet: bt.Wallet, config: MinerConfig, sig
 
 
 class PermitAuthorizer:
-    """Allows validators with a validator permit (refreshed in the background over its own chain connection) and the
-    gateways ``gateways`` names at the time of the request."""
+    """Allows validators with a validator permit and at least ``min_stake()`` of stake, the metagraph's S (both
+    refreshed in the background over its own chain connection), and the callers ``allowed`` names at the time of the
+    request (the gateways and the auditor). It also follows the chain's head, for the epoch requests are counted in
+    (``epoch``)."""
 
-    def __init__(self, network: str, netuid: int, gateways: Callable[[], Collection[str]],
-                 refresh_s: float = 600.0) -> None:
-        self._subtensor, self._netuid, self._gateways = bt.Subtensor(network=network), netuid, gateways
-        self._permitted: set[str] = set()
-        self._logged = False
+    def __init__(self, network: str, netuid: int, allowed: Callable[[], Collection[str]],
+                 min_stake: Callable[[], float] = lambda: 0.0, refresh_s: float = 600.0) -> None:
+        self._subtensor, self._netuid, self._allowed = bt.Subtensor(network=network), netuid, allowed
+        self._min_stake = min_stake
+        self._stake: dict[str, float] = {}  # validators with a permit -> their stake
+        self._head = (0, time.monotonic())  # (block, when it was read)
+        self._logged: tuple[int, ...] | None = None
         self._refresh_s = refresh_s
         self.refresh()
         threading.Thread(target=self._loop, daemon=True).start()
 
     def refresh(self) -> None:
         mg = self._subtensor.metagraph(self._netuid, lite=True)
-        permitted = {hk for hk, permit in zip(mg.hotkeys, mg.validator_permit) if bool(permit)}
-        if permitted != self._permitted or not self._logged:
-            log.info("accepting requests from %d validators and %d gateways", len(permitted), len(self._gateways()))
-            self._logged = True
-        self._permitted = permitted
+        self._stake = {hk: float(s) for hk, permit, s in zip(mg.hotkeys, mg.validator_permit, mg.S) if bool(permit)}
+        self._head = (int(mg.block), time.monotonic())
+        floor = self._min_stake()
+        counts = (sum(s >= floor for s in self._stake.values()), sum(s < floor for s in self._stake.values()))
+        if counts != self._logged:
+            log.info("accepting requests from %d validators, the gateways and the auditor%s", counts[0],
+                     f"; refusing {counts[1]} validators with a permit but less stake than validator_min_stake "
+                     f"{floor:,.0f}" if counts[1] else "")
+            self._logged = counts
 
     def _loop(self) -> None:
         while True:
@@ -90,4 +99,12 @@ class PermitAuthorizer:
                 log.exception("permit refresh failed; keeping the previous set")
 
     def __call__(self, hotkey: str) -> bool:
-        return hotkey in self._permitted or hotkey in self._gateways()
+        stake = self._stake.get(hotkey)
+        return (stake is not None and stake >= self._min_stake()) or hotkey in self._allowed()
+
+    def epoch(self, epoch_blocks: int) -> tuple[int, float]:
+        """(the current epoch of ``epoch_blocks`` blocks, seconds until the next), from the head last read."""
+        block, read = self._head
+        now = block + (time.monotonic() - read) / BLOCK_TIME_S
+        epoch = int(now // epoch_blocks)
+        return epoch, ((epoch + 1) * epoch_blocks - now) * BLOCK_TIME_S

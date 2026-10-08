@@ -158,8 +158,9 @@ Validators, the auditor and the gateways send each endpoint's traffic, the throu
 machine: each machine needs the bandwidth of its own endpoints only, and a machine that is down costs only its own.
 
 A worker is protected exactly like a single miner: it runs the same miner service, which answers only validators
-holding a permit in the metagraph (read again every 10 minutes), the catalog's gateways and the auditor's signed test
-sessions, refuses anyone else with 403 before reading the request, and applies the same per-caller limits. Engines
+holding a permit and the catalog's minimum stake in the metagraph (read again every 10 minutes), the auditor, the
+catalog's gateways and the auditor's signed test sessions, refuses anyone else with 403 before reading the request,
+and applies the same per-caller limits. Engines
 listen on 127.0.0.1 only. `GET /v1/endpoints` is read-only and holds nothing the manifest does not publish.
 
 Set up the workers first, then the primary with every worker's address:
@@ -300,8 +301,10 @@ On start the miner:
    measurement that a throughput test interrupts is retried later.
 
 Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted from
-hotkeys holding a validator permit, from the subnet's gateways (the catalog's `gateways`) and the miner's own
-`gateway_hotkeys`, and as test traffic under a session the auditor signed. Other callers are refused before their
+hotkeys holding a validator permit and at least the catalog's `scoring.validator_min_stake` of stake (the
+metagraph's `S`: alpha stake plus TAO stake weighted as for permits; both read every 10 minutes), from the auditor
+whatever its stake, from the subnet's gateways (the catalog's `gateways`) and the miner's own `gateway_hotkeys`, and
+as test traffic under a session the auditor signed. Other callers are refused before their
 request body is read; bodies are capped at 1 MiB and must arrive within 10 s, and a request's state, question ids,
 instructions and criteria together may hold at most 4 characters per token of the model's `max_state_tokens`. A
 validator gets one request at once per endpoint (HTTP 429 beyond that), each no larger than the largest request of

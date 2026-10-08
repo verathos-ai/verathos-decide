@@ -12,11 +12,11 @@ log = logging.getLogger(__name__)
 
 
 def snapshot(subtensor: bt.Subtensor, netuid: int) -> tuple[list[Neuron], dict[int, str]]:
-    """Neurons with axon and current commitment, plus hotkey per UID."""
+    """Neurons with axon, current commitment, stake and validator permit, plus hotkey per UID."""
     mg = subtensor.metagraph(netuid, lite=True)
     commitments = subtensor.get_all_commitments(netuid)
-    neurons = [Neuron(uid, hk, ax.ip, ax.port, commitments.get(hk))
-               for uid, (hk, ax) in enumerate(zip(mg.hotkeys, mg.axons))]
+    neurons = [Neuron(uid, hk, ax.ip, ax.port, commitments.get(hk), float(stake), bool(permit))
+               for uid, (hk, ax, stake, permit) in enumerate(zip(mg.hotkeys, mg.axons, mg.S, mg.validator_permit))]
     return neurons, dict(enumerate(mg.hotkeys))
 
 

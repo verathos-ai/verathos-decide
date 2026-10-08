@@ -328,6 +328,43 @@ def test_a_validator_notices_when_the_subnet_owner_hotkey_moves() -> None:
     assert auditor_moved(chain(None), 405, "old") is None  # the chain did not say
 
 
+def test_a_validator_the_miners_refuse_says_so_and_sets_no_weights(caplog, monkeypatch) -> None:
+    """Miners answer validators with a permit and at least the catalog's validator_min_stake (the metagraph's S), and
+    the auditor whatever its stake. A validator they refuse would score every endpoint zero: it sends nothing and
+    sets no weights, and says why."""
+    from types import SimpleNamespace
+
+    from verathos.validator import __main__ as validator_main
+
+    cat = catalog.load()
+    floor = cat.scoring.validator_min_stake
+    assert floor == 10_000 and catalog.Scoring().validator_min_stake == 0  # a catalog without it: a permit suffices
+    neurons = [Neuron(0, "owner", "8.8.8.8", 80, None, 0.0, False), Neuron(1, "big", "8.8.8.8", 80, None, floor, True),
+               Neuron(2, "small", "8.8.8.8", 80, None, floor - 1, True),
+               Neuron(3, "unpermitted", "8.8.8.8", 80, None, 1e6, False)]
+    assert validator_main.refused_by_miners(neurons, "big", "owner", cat) is None
+    assert validator_main.refused_by_miners(neurons, "owner", "owner", cat) is None
+    assert "below validator_min_stake 10,000" in validator_main.refused_by_miners(neurons, "small", "owner", cat)
+    assert "no validator permit" in validator_main.refused_by_miners(neurons, "unpermitted", "owner", cat)
+    lenient = cat.model_copy(update={"scoring": cat.scoring.model_copy(update={"validator_min_stake": 0.0})})
+    assert validator_main.refused_by_miners(neurons, "small", "owner", lenient) is None
+
+    st = SimpleNamespace(metagraph=lambda netuid, lite=True: SimpleNamespace(
+        hotkeys=[n.hotkey for n in neurons], axons=[SimpleNamespace(ip=n.axon_ip, port=n.axon_port) for n in neurons],
+        S=[n.stake for n in neurons], validator_permit=[n.permit for n in neurons]),
+        get_all_commitments=lambda netuid: {})
+    weights_set = []
+    monkeypatch.setattr(validator_main, "set_weights", lambda *args: weights_set.append(args))
+    cfg = SimpleNamespace(netuid=405, mechid=1)
+    asyncio.run(validator_main.run_epoch(
+        cfg, st, SimpleNamespace(hotkey=SimpleNamespace(ss58_address="small")), b"k" * 32, ScoreState(), 7, 100,
+        SimpleNamespace(auditor_hotkey="owner"), SimpleNamespace(catalog=cat, for_epoch=lambda st, block: cat),
+        board=None))
+    assert weights_set == []
+    assert any(r.levelname == "CRITICAL" and "miners refuse validators below validator_min_stake" in r.message
+               for r in caplog.records)
+
+
 def test_weights_ignore_reassigned_uids() -> None:
     state = ScoreState(ema={"hkA/gpu0": 0.5, "hkB/gpu0": 0.5}, uid_of={"hkA/gpu0": 1, "hkB/gpu0": 2})
     assert weights(state, {1: "hkA", 2: "someone-else"}) == {1: pytest.approx(1.0)}

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "revision": "2026-10-06b",
+  "revision": "2026-10-08",
   "epoch_blocks": 180,
   "models": [
     {
@@ -221,6 +221,7 @@
     "ema_alpha": 0.2,
     "probation_epochs": 6,
     "user_offers_prior": 20,
-    "user_latency_min_answers": 50
+    "user_latency_min_answers": 50,
+    "validator_min_stake": 10000
   }
 }

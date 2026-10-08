@@ -42,6 +42,12 @@ endpoints together; later tests grow from what was delivered.
 the per-caller limit, and the auditor checks a sample of their answers. Rotating a gateway hotkey is a catalog
 commit.
 
+`scoring.validator_min_stake` is the stake a validator needs for miners to answer it, in the unit of the
+metagraph's `S` (alpha stake plus TAO stake weighted as for validator permits); 0, or a catalog without it, means any
+validator with a permit. Miners apply it once they adopt the committed catalog (within a minute) and read the
+validators' stakes every 10 minutes. It keeps validators with little stake from using miners as a free inference
+service; the auditor is answered whatever its stake.
+
 The auditor is the validator of the subnet owner hotkey. After the subnet owner hotkey changes on chain, every
 validator exits at the start of its next epoch so that its supervisor restarts it under the new auditor (the new
 owner's validator then runs the tests); miners follow within a minute.

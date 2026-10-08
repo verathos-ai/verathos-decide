@@ -30,7 +30,7 @@ from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator import chain, status
 from verathos.validator.audit import audit_epoch
 from verathos.validator.config import ReferenceEngine, ValidatorConfig
-from verathos.validator.discovery import DiscoveredEndpoint, discover
+from verathos.validator.discovery import DiscoveredEndpoint, Neuron, discover
 from verathos.validator.follow import CatalogFollower
 from verathos.validator.references import transitioning, wrong_revision
 from verathos.validator.scoring import (
@@ -126,6 +126,22 @@ def auditor_moved(st: bt.Subtensor, netuid: int, auditor_hotkey: str) -> str | N
     return owner if owner and owner != auditor_hotkey else None
 
 
+def refused_by_miners(neurons: list[Neuron], hotkey: str, auditor: str, cat: catalog.Catalog) -> str | None:
+    """Why miners refuse this validator's requests, by the rule they apply: no validator permit, or less stake (the
+    metagraph's S) than the catalog's ``validator_min_stake``; the auditor is always answered. None if they answer
+    it."""
+    if hotkey == auditor:
+        return None
+    own = next((n for n in neurons if n.hotkey == hotkey), None)
+    if own is None or not own.permit:
+        return "this hotkey holds no validator permit"
+    floor = cat.scoring.validator_min_stake
+    if own.stake < floor:
+        return (f"miners refuse validators below validator_min_stake {floor:,.0f}; this hotkey's stake (the "
+                f"metagraph's S) is {own.stake:,.0f}")
+    return None
+
+
 def missing_references(cfg: ValidatorConfig, cat: catalog.Catalog) -> list[str]:
     return [m.model_id for m in cat.models if m.status == "active" and m.model_id not in cfg.references]
 
@@ -165,6 +181,10 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     cat = current.for_epoch(st, epoch * current.catalog.epoch_blocks)
     sc, policy = cat.scoring, cat.audit_policy()
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
+    if why := refused_by_miners(neurons, wallet.hotkey.ss58_address, throughput.auditor_hotkey, cat):
+        log.critical("epoch %d: %s. Every miner refuses this validator, so it sends no canaries and sets no weights "
+                     "this epoch", epoch, why)
+        return
     transition = transitioning(state.pins, cat, epoch)
     if transition:
         log.warning("  %s: the pinned weights or engine changed in place; answers are not checked for %d epochs after",
@@ -290,6 +310,10 @@ def main() -> None:
                                   current=lambda: current.catalog, st=st, wallet=wallet, references=cfg.references,
                                   screens=cfg.audit_screens, state_dir=state_dir)
     board = StatusBoard(state_dir / "status.json")
+    if why := refused_by_miners(chain.snapshot(st, cfg.netuid)[0], wallet.hotkey.ss58_address,
+                                throughput.auditor_hotkey, current.catalog):
+        log.critical("%s. Every miner refuses this validator's requests, and it sets no weights until that changes",
+                     why)
     is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)
     if is_owner or throughput.auditor is not None:
         if not cfg.public_host:

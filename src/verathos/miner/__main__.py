@@ -341,6 +341,13 @@ class Publisher:
         threading.Thread(target=run, name="catalog-watch", daemon=True).start()
 
 
+def permits(config: MinerConfig, publisher: Publisher) -> PermitAuthorizer:
+    """Who this machine answers: validators with a permit and the catalog's ``validator_min_stake``, the gateways and
+    the auditor, whatever its stake (the subnet owner's validator runs the tests every miner needs)."""
+    return PermitAuthorizer(config.network, config.netuid, lambda: publisher.gateways() | publisher.auditors(),
+                            lambda: publisher.catalog.scoring.validator_min_stake)
+
+
 def build_app(config: MinerConfig, keypair, publisher: Publisher, authorized: Callable[[str], bool],
               engines: dict[str, Engine]) -> FastAPI:
     """This machine's miner service, primary or worker alike: callers are permitted validators (``authorized``),
@@ -419,7 +426,7 @@ def main() -> None:
     subtensor = bt.Subtensor(network=config.network)
     cat = catalog.load() if args.no_publish else resolve_catalog(subtensor, config)
     publisher = Publisher(config, wallet, cat, publish_on_chain=not args.no_publish, subtensor=subtensor)
-    authorizer = PermitAuthorizer(config.network, config.netuid, publisher.gateways)
+    authorizer = permits(config, publisher)
     engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key, max_connections=e.max_concurrency)
                for e in config.endpoints}
     app = build_app(config, wallet.hotkey, publisher, authorizer, engines)

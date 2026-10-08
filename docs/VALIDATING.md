@@ -11,7 +11,11 @@ role at startup from the chain.
 ## Requirements
 
 - Linux (the one-command install: Ubuntu 22.04 or 24.04), Python 3.12, `git`.
-- A hotkey registered on the subnet with a validator permit.
+- A hotkey registered on the subnet with a validator permit and at least the catalog's
+  `scoring.validator_min_stake` of stake (10,000 in the shipped catalog), counted as the metagraph's `S`: alpha stake
+  plus TAO stake weighted as for validator permits. Miners refuse any other validator; one below logs a CRITICAL line
+  at its start and every epoch, and sends no requests and sets no weights while it stays below. The auditor (the
+  subnet owner's validator) is answered whatever its stake.
 - One reference engine per catalog model. The reference is the model run in fp32; CPU is enough because each
   canary is computed once per epoch and reused for every endpoint, so the reference work does not grow with the
   number of miners: 16 canaries per model and epoch (`canary_pool_size`). They are computed within 30% of the
@@ -128,6 +132,7 @@ stops and removes the services, the code, the engines and the weights. The confi
 | Problem | What to do |
 |---|---|
 | `UID ... has no validator permit yet` | miners answer only validators with a permit, which follows the stake |
+| `miners refuse validators below validator_min_stake` | add stake to the hotkey until its `S` reaches the catalog's minimum; miners see it within 10 minutes |
 | `the kev-9b reference needs about 42 GiB ...; not enough is free` | free memory or add some; `--device` chooses between GPU and RAM |
 | `... of 16 canaries without a reference answer this epoch` | the reference's log: it is down, or too slow to compute the canaries within the epoch's reference time ([Requirements](#requirements)) |
 | `no reference engine configured for the active models` | the catalog activated a model: run the command again |

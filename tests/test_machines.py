@@ -27,7 +27,7 @@ from tests.mock_engine import MockEngine
 from verathos import catalog
 from verathos.miner import __main__ as miner_main
 from verathos.miner import chain as miner_chain
-from verathos.miner.chain import PermitAuthorizer, build_host_endpoints, own_endpoints
+from verathos.miner.chain import build_host_endpoints, own_endpoints
 from verathos.miner.config import MinerConfig, peer_url
 from verathos.miner.peers import Peers, merged
 from verathos.protocol.manifest import (
@@ -84,14 +84,14 @@ def test_peers_are_machines_base_urls_and_a_worker_has_none(tmp_path) -> None:
 
 
 class FakeSubtensor:
-    """The metagraph the miner reads permits from, and the subnet owner (the auditor)."""
+    """The metagraph the miner reads permits and stakes from, and the subnet owner (the auditor)."""
 
-    def __init__(self, permitted: list[str], auditor: str, *args, **kwargs) -> None:
+    def __init__(self, permitted: dict[str, float], auditor: str, *args, **kwargs) -> None:
         self.permitted, self.auditor = permitted, auditor
 
     def metagraph(self, netuid: int, lite: bool = True):
-        return SimpleNamespace(hotkeys=self.permitted + ["unpermitted"], validator_permit=[True] * len(self.permitted)
-                               + [False])
+        return SimpleNamespace(hotkeys=[*self.permitted, "unpermitted"], validator_permit=[True] * len(self.permitted)
+                               + [False], S=[*self.permitted.values(), 1e6], block=5 * 180 + 7)
 
     def get_subnet_owner_hotkey(self, netuid: int) -> str:
         return self.auditor
@@ -101,14 +101,15 @@ def test_a_worker_runs_the_full_miner_service_and_reveals_no_more_than_the_manif
     """Callers are checked on a worker as on any miner: validators with a permit from the metagraph, the catalog's and
     the configured gateways, the auditor's signed test sessions, nobody else; its endpoints document is read-only,
     signed by the hotkey and holds only what the manifest publishes."""
-    miner, validator, gateway, auditor, stranger = kp(), kp(), kp(), kp(), kp()
-    chain = FakeSubtensor([validator.ss58_address], auditor.ss58_address)
+    miner, validator, small, gateway, auditor, stranger = kp(), kp(), kp(), kp(), kp(), kp()
+    floor = CATALOG.scoring.validator_min_stake
+    chain = FakeSubtensor({validator.ss58_address: floor, small.ss58_address: floor - 1}, auditor.ss58_address)
     monkeypatch.setattr(miner_chain.bt, "Subtensor", lambda *a, **k: chain)
     cfg = config("198.51.100.7", 20017, ["w-gpu0"], tmp_path, role="worker", gateway_hotkeys=[gateway.ss58_address])
     publisher = miner_main.Publisher(cfg, SimpleNamespace(hotkey=miner), CATALOG, publish_on_chain=True,
                                      subtensor=chain)
     assert not publisher.publish_on_chain and publisher.signed is None and publisher.local is None
-    authorizer = PermitAuthorizer(cfg.network, cfg.netuid, publisher.gateways)
+    authorizer = miner_main.permits(cfg, publisher)
     client = TestClient(miner_main.build_app(cfg, miner, publisher, authorizer, {"w-gpu0": MockEngine("kev-4b")}))
     assert client.get(ENDPOINTS_PATH).status_code == 404  # nothing measured yet
     publisher.local = build_host_endpoints(cfg, own_endpoints(cfg, cfg.endpoints, {"w-gpu0": 18.9}), miner,
@@ -131,8 +132,10 @@ def test_a_worker_runs_the_full_miner_service_and_reveals_no_more_than_the_manif
         r = call(caller)
         assert r.status_code == 200 and SignedReceipt.model_validate(r.json()["receipt"]).signature_valid()
     assert call(validator, "/e/w-gpu0/v1/identity", {"challenge": "ab" * 16}).status_code == 200
-    assert call(stranger).status_code == 403  # neither a validator with a permit nor a gateway
-    assert call(stranger, "/e/w-gpu0/v1/identity", {"challenge": "ab" * 16}).status_code == 403
+    assert call(auditor, "/e/w-gpu0/v1/identity", {"challenge": "ab" * 16}).status_code == 200  # whatever its stake
+    for caller in (stranger, small):  # no permit; a permit but less stake than validator_min_stake
+        assert call(caller).status_code == 403
+        assert call(caller, "/e/w-gpu0/v1/identity", {"challenge": "ab" * 16}).status_code == 403
     assert call(validator, payload={**REQUEST, "state": "x" * 100_000}).status_code == 413  # the per-caller limits
     session = Session(netuid=405, auditor=auditor.ss58_address, miner_hotkey=miner.ss58_address, endpoint_id="w-gpu0",
                       test_id="t" * 64, not_after_ms=int(time.time() * 1000) + 30_000)
@@ -240,7 +243,8 @@ def test_two_machines_end_to_end(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(miner_main, "wait_ready", functools.partial(measure.wait_ready, timeout_s=2.0))
     monkeypatch.setattr(auditor_module, "SERVED_WAIT_S", 0.0)  # no gateway reports these users' answers
     hotkey, validator, auditor_kp = kp(), kp(), kp()
-    chain = FakeSubtensor([validator.ss58_address, auditor_kp.ss58_address], auditor_kp.ss58_address)
+    chain = FakeSubtensor({validator.ss58_address: 1e6}, auditor_kp.ss58_address)
+    monkeypatch.setattr(miner_chain.bt, "Subtensor", lambda *a, **k: chain)
     ports = {"primary": free_port(), "worker": free_port()}
     configs = {"worker": config("127.0.0.1", ports["worker"], ["w-gpu0", "w-gpu1"], tmp_path, role="worker"),
                "primary": config("127.0.0.1", ports["primary"], ["gpu0"], tmp_path,
@@ -250,7 +254,7 @@ def test_two_machines_end_to_end(tmp_path, monkeypatch) -> None:
     for role, cfg in configs.items():
         publishers[role] = miner_main.Publisher(cfg, SimpleNamespace(hotkey=hotkey), CATALOG, publish_on_chain=False,
                                                 subtensor=chain)
-        app = miner_main.build_app(cfg, hotkey, publishers[role], lambda hk: hk in chain.permitted,
+        app = miner_main.build_app(cfg, hotkey, publishers[role], miner_main.permits(cfg, publishers[role]),
                                    {e.endpoint_id: engines[e.endpoint_id] for e in cfg.endpoints})
         server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=cfg.port, log_level="warning"))
         threading.Thread(target=server.run, daemon=True).start()
