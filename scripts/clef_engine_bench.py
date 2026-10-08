@@ -60,7 +60,8 @@ def latency(engine, items: list) -> float:
 
 
 def throughput(engine, items: list, batch: int) -> float:
-    engine.run(items[:batch])
+    for start in range(0, len(items), batch):  # first pass captures the CUDA graphs these shapes need
+        engine.run(items[start : start + batch])
     torch.cuda.synchronize()
     t = time.perf_counter()
     for start in range(0, len(items), batch):
@@ -76,6 +77,9 @@ def main() -> None:
     ap.add_argument("--drift", type=int, default=300)
     ap.add_argument("--throughput", type=int, default=1000)
     ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--paths", default="reference float32,reference bfloat16,fast bfloat16")
+    ap.add_argument("--reference-cache", type=Path, default=Path("clef-reference-float32.json"),
+                    help="float32 reference answers, reused when present for the same requests")
     args = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -83,8 +87,15 @@ def main() -> None:
     print(f"{torch.cuda.get_device_name(0)}, {len(bodies)} requests", flush=True)
 
     results = {}
-    for name, dtype, fast in (("reference float32", "float32", False), ("reference bfloat16", "bfloat16", False),
-                              ("fast bfloat16", "bfloat16", True)):
+    if args.reference_cache.exists():
+        cached = json.loads(args.reference_cache.read_text())
+        if cached["requests"] == bodies[: args.drift]:
+            results["reference float32"] = cached["answers"]
+    paths = (("reference float32", "float32", False), ("reference bfloat16", "bfloat16", False),
+             ("fast bfloat16", "bfloat16", True))
+    for name, dtype, fast in paths:
+        if name not in args.paths.split(",") or name in results:
+            continue
         engine = clef.load(REPO, args.revision, device="cuda", dtype=dtype, fast=fast)
         items = [engine.prepare(b) for b in bodies]
         with torch.inference_mode():
@@ -93,11 +104,14 @@ def main() -> None:
                 chunk = items[start : min(start + args.batch, args.drift)]
                 answers += [distributions(r["answers"]) for r in engine.run(chunk)]
             results[name] = answers
-            ms = latency(engine, items)
-            rps = throughput(engine, items[: args.throughput], args.batch if fast else 1)
-        print(f"{name}: latency p50 {ms:.1f} ms, throughput {rps:.1f} req/s, "
-              f"peak memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB", flush=True)
-        if name != "reference float32":
+            if dtype != "float32":  # the float32 reference only supplies the answers drift is measured against
+                ms = latency(engine, items)
+                rps = throughput(engine, items[: args.throughput], args.batch if fast else 1)
+                print(f"{name}: latency p50 {ms:.1f} ms, throughput {rps:.1f} req/s, "
+                      f"peak memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB", flush=True)
+        if name == "reference float32":
+            args.reference_cache.write_text(json.dumps({"requests": bodies[: args.drift], "answers": answers}))
+        else:
             drift(f"{name} vs float32", answers, results["reference float32"])
         del engine, items
         gc.collect()

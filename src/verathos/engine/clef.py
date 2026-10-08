@@ -8,7 +8,8 @@ Two paths:
 - ``reference``: the release's own ``systemone`` on one request at a time, any device and dtype. Validators run it in
   float32 on CPU as the reference.
 - ``fast`` (CUDA, bfloat16): the backbone runs as ``verathos.engine.qwen35.Backbone`` on right-padded batches replayed
-  from CUDA graphs (``verathos.engine.graphs``); the head runs per request on its rows. Requests are tokenized as they
+  from CUDA graphs (``verathos.engine.graphs``); the head runs for the whole pass at once
+  (``verathos.engine.clef_head``). Requests are tokenized as they
   arrive and batched by length under a token budget.
 """
 
@@ -84,8 +85,8 @@ class FastEngine:
         *,
         max_length: int = 16384,
         max_batch_tokens: int = 8192,
-        batch_sizes: tuple[int, ...] = (1, 2, 4, 8),
-        length_step: int = 128,
+        batch_sizes: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8),
+        length_step: int = 32,
         graph_max_length: int = 2048,
     ) -> None:
         import torch
@@ -143,6 +144,7 @@ class FastEngine:
         return groups
 
     def _pass(self, records: list[Any]) -> list[list[Any]]:
+        from verathos.engine.clef_head import batched_head
         from verathos.engine.graphs import bucket_batch, bucket_length
 
         torch = self.torch
@@ -155,7 +157,8 @@ class FastEngine:
             mask[row, : len(record.input_ids)] = 1
         ids = ids.to(self.device, non_blocking=True)
         hidden = self.forward(ids)
-        return self.head(hidden, ids, mask.to(self.device), records, self.output_embedding)
+        lengths = mask.sum(1).to(self.device, non_blocking=True)
+        return batched_head(self.head, hidden, ids, lengths, records, self.output_embedding)
 
     def run(self, items: list[Prepared]) -> list[dict[str, Any]]:
         out: list[dict[str, Any] | None] = [None] * len(items)

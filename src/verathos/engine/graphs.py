@@ -35,8 +35,8 @@ class GraphedForward:
         dtype: torch.dtype,
         device: torch.device,
         *,
-        batch_sizes: tuple[int, ...] = (1, 2, 4, 8),
-        length_step: int = 128,
+        batch_sizes: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8),
+        length_step: int = 32,
         max_length: int = 2048,
         max_tokens: int = 8192,
     ) -> None:
