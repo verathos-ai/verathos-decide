@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from verathos import catalog
 from verathos.protocol.status import NETWORK_DOMAIN, NETWORK_PATH, STATUS_MAX_AGE_S, NetworkStatus, sign_document
+from verathos.validator import chain as validator_chain
 from verathos.validator import light
 from verathos.validator.config import ValidatorConfig
 from verathos.validator.scoring import ScoreState
@@ -47,7 +48,14 @@ class Chain:
         self.owner, self.block = owner, block
         self.neurons = {owner: neuron(0, *SOURCE_AXON), own: neuron(5)}
         self.set: list[dict] = []
-        self.substrate = SimpleNamespace(query=lambda module, item, params: SimpleNamespace(value=7))
+        self.last_update: list[int] = []  # per UID, on mechanism 1
+        self.substrate = SimpleNamespace(query=self.query)
+
+    def query(self, module: str, item: str, params: list):
+        if item == "LastUpdate":
+            assert params == [4096 + 405]  # mechanism 1's, not the subnet's mechanism 0
+            return SimpleNamespace(value=self.last_update)
+        return SimpleNamespace(value=7)  # the weights version key
 
     def get_current_block(self) -> int:
         return self.block
@@ -61,10 +69,17 @@ class Chain:
     def get_mechanism_count(self, netuid: int) -> int:
         return 2
 
-    def set_weights(self, wallet, netuid, uids, weights, mechid, version_key):
-        self.set.append({"netuid": netuid, "uids": uids, "weights": weights, "mechid": mechid,
-                         "version_key": version_key})
-        return SimpleNamespace(success=True, message="")
+    def get_uid_for_hotkey_on_subnet(self, hotkey: str, netuid: int) -> int | None:
+        return self.neurons[hotkey].uid if hotkey in self.neurons else None
+
+    def commit_reveal_enabled(self, netuid: int) -> bool:
+        return True
+
+    def weights_rate_limit(self, netuid: int) -> int:
+        return 100
+
+    def set_weights(self, *args, **kwargs):
+        raise AssertionError("the SDK's set_weights checks the rate limit of mechanism 0 only")
 
     def close(self) -> None:
         pass
@@ -74,6 +89,18 @@ class Chain:
 
     def get_all_commitments(self, *args, **kwargs):
         raise AssertionError("a light validator reads no commitments")
+
+
+@pytest.fixture(autouse=True)
+def commits(monkeypatch) -> None:
+    """Weights are committed (the subnet has commit-reveal on) into the fake chain's ``set``."""
+    def commit(subtensor, wallet, netuid, mechid, uids, weights, **kwargs):
+        subtensor.set.append({"netuid": netuid, "uids": uids, "weights": weights, "mechid": mechid,
+                              "version_key": kwargs["version_key"]})
+        return SimpleNamespace(success=True, message="")
+
+    monkeypatch.setattr(validator_chain, "commit_timelocked_weights_extrinsic", commit)
+    monkeypatch.setattr(validator_chain, "set_weights_extrinsic", lambda *a, **k: pytest.fail("commit-reveal is on"))
 
 
 def config(tmp_path, **changes) -> ValidatorConfig:
@@ -348,3 +375,29 @@ def test_a_light_configuration_needs_no_references(tmp_path) -> None:
     assert ValidatorConfig.model_validate({"netuid": 96, "wallet_name": "v", "hotkey_name": "h"}).mode == "full"
     with pytest.raises(ValueError):
         ValidatorConfig.model_validate({"netuid": 96, "wallet_name": "v", "hotkey_name": "h", "mode": "half"})
+
+
+def test_weights_wait_out_the_rate_limit_of_their_own_mechanism(tmp_path, monkeypatch, caplog) -> None:
+    """The chain limits how often a UID sets weights, per mechanism: a set it would refuse waits the blocks left of
+    this mechanism's limit (the fake chain answers only mechanism 1's last sets), one it allows goes at once."""
+    from verathos.validator import __main__ as validator_main
+
+    caplog.set_level(logging.INFO, logger="verathos.validator")
+    owner, own = kp(), kp()
+    chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET)
+    slept: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        chain.block += round(seconds / light.BLOCK_TIME_S)
+
+    monkeypatch.setattr(validator_main.time, "sleep", sleep)
+    chain.last_update = [0] * 6
+    chain.last_update[5] = chain.block - 70  # 30 of the 100 blocks left
+    settings, wallet = config(tmp_path), SimpleNamespace(hotkey=own)
+    assert validator_main.set_weights(settings, chain, wallet, WEIGHTS)
+    assert slept == [30 * light.BLOCK_TIME_S] and len(chain.set) == 1
+    assert "the chain allows this UID's next weights on mechanism 1 in 30 blocks; setting them then" in caplog.messages
+    chain.last_update[5] = chain.block - 100
+    slept.clear()
+    assert validator_main.set_weights(settings, chain, wallet, WEIGHTS) and slept == [] and len(chain.set) == 2

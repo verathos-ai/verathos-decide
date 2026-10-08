@@ -358,15 +358,24 @@ def weights_to_set(w: dict[int, float], hotkey_of_uid: dict[int, str], owner_hot
 
 
 def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: dict[int, float]) -> bool:
-    """Set ``w`` on the configured mechanism, retried once per block up to ``WEIGHT_ATTEMPTS`` times; in a dry run, or
-    before the mechanism exists on chain, only logged. Whether that is done (with nothing to set, it is)."""
+    """Set ``w`` on the configured mechanism once the chain's weights rate limit allows, retried once per block up to
+    ``WEIGHT_ATTEMPTS`` times; in a dry run, or before the mechanism exists on chain, only logged. Whether that is done
+    (with nothing to set, it is)."""
     if not w:
         return True
     if cfg.dry_run or not chain.mechanism_ready(st, cfg.netuid, cfg.mechid):
         log.info("dry run (mechanism %d %s): weights %s", cfg.mechid,
                  "not enabled on chain" if not cfg.dry_run else "configured dry", w)
         return True
+    uid = st.get_uid_for_hotkey_on_subnet(wallet.hotkey.ss58_address, cfg.netuid)
+    if uid is None:
+        log.warning("weights not set: this hotkey holds no UID on netuid %d", cfg.netuid)
+        return False
     for attempt in range(1, WEIGHT_ATTEMPTS + 1):
+        if wait := chain.weights_wait(st, cfg.netuid, cfg.mechid, uid):
+            log.info("the chain allows this UID's next weights on mechanism %d in %d blocks; setting them then",
+                     cfg.mechid, wait)
+            time.sleep(wait * BLOCK_TIME_S)
         if chain.submit_weights(st, wallet, cfg.netuid, cfg.mechid, w):
             return True
         log.warning("setting weights failed (attempt %d of %d); retrying in one block", attempt, WEIGHT_ATTEMPTS)
