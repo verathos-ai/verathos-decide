@@ -20,7 +20,8 @@ what their tokens do, however they fall into writes), and taken from the account
 A prepaid account is served while its balance is positive: as read from the database at most ``BALANCE_TTL_S`` ago
 (so other processes' charges and new credit apply within that time), minus what this process charged since and what
 its requests in flight may cost at most (``reserve``, settled when they end). A balance can therefore end below zero
-by at most one request's cost per process.
+by at most one request's cost per process. An answer is paid (``paid``) once the account's free credit is spent: its
+balance, read with its top-ups, is no more than they are.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from verathos.gateway import metrics
-from verathos.gateway.db import accounts, usage_daily, usage_flushes, usage_hourly
+from verathos.gateway.db import accounts, credits, usage_daily, usage_flushes, usage_hourly
 
 if TYPE_CHECKING:
     from verathos.gateway.accounts import Principal
@@ -85,7 +86,7 @@ class UsageMeter:
         self._hours: dict[Hour, list] = {}  # -> [answered, input tokens], all accounts
         self._month: dict[int, list] = {}  # account -> [month start, answered as read or written]
         self._unwritten: dict[int, int] = {}  # account -> answered, counted since the last batch
-        self._balance: dict[int, list] = {}  # prepaid account -> [balance as read or written, when read]
+        self._balance: dict[int, list] = {}  # prepaid account -> [balance as read or written, when read, top-ups]
         self._uncharged: dict[int, float] = {}  # account -> cost counted since the last batch
         self._reserved: dict[int, float] = {}  # prepaid account -> the most its requests in flight may cost
         self._fractions: dict[Key, float] = {}  # row -> the fraction of a micro-USD of cost not written yet
@@ -155,6 +156,16 @@ class UsageMeter:
             else:
                 self._reserved.pop(principal.account_id, None)
 
+    def paid(self, principal: Principal) -> bool:
+        """Whether the account's next answer is paid with credit it bought: it topped up (``Principal.paid``) and its
+        free credit is spent, its balance, less what this process charged since, no more than its top-ups (grants are
+        spent first, as ``accounts.paid_cost`` counts them). False while its balance is not read."""
+        state = self._balance.get(principal.account_id)
+        if not principal.paid or state is None:
+            return False
+        waiting = sum(b.charged.get(principal.account_id, 0) for b in self._waiting)
+        return state[0] - self._uncharged.get(principal.account_id, 0.0) - waiting <= state[2]
+
     async def _available(self, account_id: int) -> float:
         state = self._balance.get(account_id)
         if state is None or self.clock() - state[1] >= self.balance_ttl_s:
@@ -172,8 +183,11 @@ class UsageMeter:
         await asyncio.shield(reading)
 
     async def _read_balance(self, account_id: int) -> None:
-        balance = await self._read(select(accounts.c.balance).where(accounts.c.id == account_id))
-        self._balance[account_id] = [int(balance or 0), self.clock()]
+        topups = select(func.coalesce(func.sum(credits.c.amount), 0)).where(
+            credits.c.account_id == account_id, credits.c.kind == "topup").scalar_subquery()
+        row = await self._read(select(accounts.c.balance, topups).where(accounts.c.id == account_id), row=True)
+        balance, bought = row if row is not None else (0, 0)
+        self._balance[account_id] = [int(balance or 0), self.clock(), int(bought or 0)]
 
     def _read_done(self, account_id: int, done: asyncio.Future[None]) -> None:
         del self._reading[account_id]
@@ -190,16 +204,17 @@ class UsageMeter:
             usage_daily.c.account_id == account_id, usage_daily.c.day >= month))
         self._month[account_id] = [month, int(used)]
 
-    async def _read(self, query: Any) -> Any:
-        """The query's scalar, read again until no write overlapped the read: a write's counts would otherwise be in
-        the result and in the meter both, or in neither."""
+    async def _read(self, query: Any, *, row: bool = False) -> Any:
+        """The query's scalar (``row``: its first row), read again until no write overlapped the read: a write's counts
+        would otherwise be in the result and in the meter both, or in neither."""
         while True:
             if self._writing:
                 await asyncio.sleep(READ_RETRY_S)
                 continue
             writes = self._writes
             async with self.engine.connect() as conn:
-                value = (await conn.execute(query)).scalar()
+                result = await conn.execute(query)
+                value = result.first() if row else result.scalar()
             if not self._writing and self._writes == writes:
                 return value
 

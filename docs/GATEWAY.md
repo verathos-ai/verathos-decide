@@ -64,14 +64,14 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    too many or too few being a wrong answer), the receipt itself and the request id. Usage is counted per account,
    key, model and day, and written every 5 s, with every account's answered requests and input tokens per model and
    hour (the network's totals).
-8. **Report.** Every 5 s the gateway tells the auditor, per endpoint and second, the user requests it sent it and
-   those it answered (with input tokens and durations), how often it considered it for a request (drew it), and how
-   often it was not ready then (busy, behind an open breaker, or its latest answer or timed-out attempt took at least
-   twice the latency bound it declared its capacity at, `max_latency_s`, 2 s) or refused the request (answered busy
-   or failed, refused a request another miner answered, or refused one alone). An answer counts in the second its
-   request was sent. Drawn while full counts neither way while its latest answer came within `max_latency_s`; full
-   beyond it, it serves less than its capacity at the bound, so it was not ready. Requests that are not user traffic
-   (admin requests not counted) are left out. The auditor publishes each endpoint's tally with its credit, and
+8. **Report.** Every 5 s the gateway tells the auditor, per endpoint and second, the user requests it sent it and those
+   it answered (with input tokens, the paid ones apart, and durations), how often it considered it for a request (drew
+   it), and how often it was not ready then (busy, behind an open breaker, or its latest answer or timed-out attempt
+   took at least twice the latency bound it declared its capacity at, `max_latency_s`, 2 s) or refused the request
+   (answered busy or failed, refused a request another miner answered, or refused one alone). An answer counts in the
+   second its request was sent. Drawn while full counts neither way while its latest answer came within `max_latency_s`;
+   full beyond it, it serves less than its capacity at the bound, so it was not ready. Requests that are not user
+   traffic (admin requests not counted) are left out. The auditor publishes each endpoint's tally with its credit, and
    validators score it (`SCORING.md`).
 
 ## Answer checks
@@ -101,10 +101,11 @@ The gateway also reports, every 5 s, how many requests each endpoint answered it
 Miners serve the gateway before the auditor's test traffic; what an endpoint answers the gateway inside a test's
 measured window counts as delivered, so serving users never costs a miner credit (`THROUGHPUT_AUDIT.md`). The input
 tokens per model are the users' demand; of them, the paid ones (`paid_input_tokens`) set, at each model's catalog
-`price`, the models' emission shares (`SCORING.md`). Usage is paid when its account is prepaid and has topped up at
-least once: the ledger does not tell which entry a request spends, so an account that only ever had free credit (a
-sign-up grant, the demo) is unpaid, one that bought credit is paid from then on (grants included), and accounts that
-are not prepaid (invoiced, internal) are unpaid.
+`price`, the models' emission shares, and per endpoint its part of the usage pool (`SCORING.md`). Usage is paid
+when its account is prepaid, has topped up, and its free credit is spent: its balance is no more than its top-ups.
+Free credit (a sign-up grant, the demo) is spent first, as the totals count paid usage, so an account that only ever
+had free credit is unpaid, one that bought credit is paid once its grants are used, and accounts that are not prepaid
+(invoiced, internal) are unpaid. Admin requests are never paid.
 
 ## Privacy of user requests
 

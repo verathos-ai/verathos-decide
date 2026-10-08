@@ -6,8 +6,10 @@ weights, and set those weights on the catalog's mechanism, or the configured ``m
 exists).
 
 Every full validator takes part in the throughput audit (see ``validator.throughput``): the auditor runs the tests,
-the others apply its signed verdicts; endpoints score in proportion to the capacity they proved. A light validator
-(``mode: light``, ``validator.light``) does none of this: it sets the weights its source validator publishes.
+the others apply its signed verdicts; endpoints score in proportion to the capacity they proved. With the catalog's
+usage pool, the hotkeys that served paying users get weight on top, from the period record the verdicts state
+(``validator.usage``). A light validator (``mode: light``, ``validator.light``) does none of this: it sets the weights
+its source validator publishes.
 """
 
 from __future__ import annotations
@@ -31,7 +33,8 @@ from verathos import __version__, catalog, release
 from verathos import update as self_update
 from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
-from verathos.validator import chain, light, status
+from verathos.throughput.usage import contradiction
+from verathos.validator import chain, light, status, usage
 from verathos.validator.audit import EndpointResult, audit_epoch
 from verathos.validator.config import ReferenceEngine, ValidatorConfig
 from verathos.validator.discovery import DiscoveredEndpoint, Neuron, discover
@@ -330,6 +333,15 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     log.info("  emission shares: %s", ", ".join(f"{m} {s:.1%}" for m, s in sorted(shares.items())))
     miner_share = sc.miner_share_at(epoch)
     log.info("  miner share %.6f: the miners' weights sum to it, the subnet owner's UID gets the rest", miner_share)
+    record = usage.take(state, verdicts, cat, epoch, check=lambda r: None if throughput.auditor is not None else
+                        contradiction(r, st, cfg.netuid))  # the auditor's own record is not checked again
+    usage_by_uid = usage.usage_weights(record, cat, epoch, hotkey_of_uid)
+    usage_share = round(sum(usage_by_uid.values()), catalog.SHARE_DIGITS) if sc.usage_pool is not None else None
+    if sc.usage_pool is not None and record is None:
+        log.info("  usage pool: no record of period %d: nothing paid", sc.usage_pool.period(epoch) - 1)
+    elif record is not None:
+        log.info("  usage pool: period %d sized %.6f (%s), paid %.6f to %d UIDs", record.period, record.share,
+                 record.mode, usage_share, len(usage_by_uid))
     scores, failed, held, factors = score_epoch(state, endpoints, results, taken=taken, shares=shares, proven=proven,
                                                 invalid_hotkeys=invalid_hotkeys, sc=sc,
                                                 max_latency_s=policy.max_latency_s)
@@ -342,15 +354,16 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                  credited.get(key, 0.0), proven.user_availability.get(key, 1.0), scores.get(key, 0.0),
                  f" errors={sorted(set(r.errors))}" if r.errors else "")
     # What the board publishes is exactly what is set: light validators set the same.
-    uid_weights = weights_to_set(weights(state, hotkey_of_uid), hotkey_of_uid, throughput.auditor_hotkey, miner_share)
+    uid_weights = weights_to_set(weights(state, hotkey_of_uid), hotkey_of_uid, throughput.auditor_hotkey, miner_share,
+                                 usage_by_uid)
     board.publish(status.build(
         epoch=epoch, epoch_blocks=cat.epoch_blocks, endpoints=endpoints, results=results, scores=scores, failed=failed,
         invalid_hotkeys=invalid_hotkeys, credited=credited,
         scored_models={m.model_id for m in cat.models if m.status == "active"}, state=state, model_shares=shares,
         weights=uid_weights, drifted=proven.drifted, user_availability=proven.user_availability,
-        latency_factors=factors, taken=taken.status if taken else None, miner_share=miner_share), epoch=epoch,
-        epoch_blocks=cat.epoch_blocks, model_shares=shares, weights=uid_weights, miner_share=miner_share,
-        mechanism=mechanism)
+        latency_factors=factors, taken=taken.status if taken else None, miner_share=miner_share,
+        usage_share=usage_share, usage_weights=usage_by_uid), epoch=epoch, epoch_blocks=cat.epoch_blocks,
+        model_shares=shares, weights=uid_weights, miner_share=miner_share, mechanism=mechanism, usage_share=usage_share)
     # The epoch is scored; a failure from here on must not run it again.
     try:
         set_weights(cfg, st, wallet, uid_weights, mechanism)
@@ -359,24 +372,37 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
 
 
 def weights_to_set(w: dict[int, float], hotkey_of_uid: dict[int, str], owner_hotkey: str,
-                   miner_share: float = 1.0) -> dict[int, float]:
-    """The miners' weights ``w`` (summing to 1) scaled to sum to ``miner_share``, and the rest on the subnet owner's
-    UID, whose incentive the chain does not pay out; all on the owner's UID if no miner has a positive score. If the
-    owner hotkey holds no UID there is nothing to put the rest on: the miners get it all (nothing if none scores)."""
+                   miner_share: float = 1.0, usage_by_uid: Mapping[int, float] | None = None) -> dict[int, float]:
+    """The miners' weights ``w`` (summing to 1) scaled to sum to ``miner_share``, the usage pool's weights added (they
+    sum to at most ``1 - miner_share``, ``validator.usage``), and the rest on the subnet owner's UID, whose incentive
+    the chain does not pay out; all on the owner's UID if no miner has a positive score or usage weight. If the owner
+    hotkey holds no UID there is nothing to put the rest on: the miners get it all, in those proportions (nothing if
+    none has a weight)."""
+    extra = {uid: value for uid, value in (usage_by_uid or {}).items() if value > 0}
     owner = next((uid for uid, hotkey in hotkey_of_uid.items() if hotkey == owner_hotkey), None)
     if owner is None:
-        if not w:
+        if not w and not extra:
             log.warning("no miner has a positive score and the subnet owner hotkey holds no UID; no weights set")
         elif miner_share < 1:
             log.warning("the subnet owner hotkey holds no UID: the miners get all of the weights, not miner_share "
                         "%.6f", miner_share)
-        return w
-    if not w:
+        if not extra:
+            return w
+        out = {uid: value * miner_share for uid, value in w.items()}
+        for uid, value in extra.items():
+            out[uid] = out.get(uid, 0.0) + value
+        total = sum(out.values())
+        return {uid: value / total for uid, value in out.items()}
+    if not w and not extra:
         return {owner: 1.0}
-    if miner_share >= 1:
+    if miner_share >= 1 and not extra:
         return w
     out = {uid: value * miner_share for uid, value in w.items()}
-    out[owner] = out.get(owner, 0.0) + 1.0 - miner_share
+    for uid, value in extra.items():
+        out[uid] = out.get(uid, 0.0) + value
+    rest = 1.0 - (miner_share if w else 0.0) - sum(extra.values())
+    if rest > 1e-9:
+        out[owner] = out.get(owner, 0.0) + rest
     return out
 
 

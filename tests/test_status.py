@@ -127,6 +127,10 @@ def test_miner_logs_each_epoch_once_and_each_final_test_once() -> None:
         "  miner share 59.00%: the scores below are shares of it; the subnet owner's UID gets the rest of the miners' "
         "emission")
     assert not any("miner share" in line for line in watching([]).lines(shared.model_copy(update={"miner_share": 1})))
+    pooled = shared.model_copy(update={"miner_share": 0.59, "usage_share": 0.05, "usage_weight": 0.0125})
+    assert watching([]).lines(pooled)[3] == ("  usage pool 5.00% of the miners' emission, to the hotkeys that served "
+                                             "paying users: this hotkey's part 1.2500%")
+    assert not any("usage pool" in line for line in watching([]).lines(shared.model_copy(update={"usage_share": 0})))
     assert lines[4] == ("throughput test of epoch 12 (block 2200), gpu1: passed, delivered 46.2 of 45.0 requests/s, "
                         "p95 latency 830 ms; credited 45.0")
     assert watcher.lines(doc) == []  # nothing new; the unconfirmed test is not final yet

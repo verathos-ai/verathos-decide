@@ -259,6 +259,10 @@ At the end of each epoch it logs the emission shares, the miner share, a line pe
 dry run (mechanism 0 configured dry): weights {0: 0.41, 1: 0.3363, 12: 0.2537}
 ```
 
+With the catalog's usage pool it also logs the period it pays and what it pays
+(`usage pool: period 412 sized 0.061235 (burned), paid 0.058870 to 9 UIDs`), and an error if it refuses the auditor's
+record of a period.
+
 A validator restarted in an epoch it already scored (or, light, whose weights it set) starts with the next one.
 
 | | systemd | supervisord (containers) |
@@ -476,9 +480,9 @@ Per epoch a full validator:
    and latency), each model's user demand, and any proven wrong answers;
 6. one at a time: takes the source's results for the models it did not check;
 7. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
-   probation, scales the miners' weights to the catalog's miner share for the epoch and gives the subnet owner's UID
-   the rest (`SCORING.md`), and sets weights on the catalog's mechanism, or `mechid` (retried once per block, up to
-   10 times).
+   probation, scales the miners' weights to the catalog's miner share for the epoch, adds the usage pool's weights
+   from the period record the verdicts state (checked against its node), gives the subnet owner's UID the rest
+   (`SCORING.md`), and sets weights on the catalog's mechanism, or `mechid` (retried once per block, up to 10 times).
 
 Nothing a miner returns can stop the epoch: replies are size- and time-bounded and every malformed reply is
 recorded against that endpoint. Chain errors are retried every block, and an epoch that fails part way leaves no
@@ -505,8 +509,9 @@ endpoint the state in the last epoch (scored, qualifying, candidate, drifted, fa
 checks, declared and proven capacity, how ready users found it, its latency factor and scores, and the hotkey's
 results in the auditor's last 10 tests (at most 64 endpoints each). `GET /v1/network` serves every hotkey's status of
 the last epoch at once (without the test results, built once per epoch), `weights`, per UID exactly the weights the
-validator set after the epoch (the subnet owner's UID's included), `mechanism`, the mechanism they are set on, and
-`miner_share`, the epoch's miner share, for network dashboards and light validators. The validator publishes it
+validator set after the epoch (the subnet owner's UID's included), `mechanism`, the mechanism they are set on,
+`miner_share`, the epoch's miner share, and `usage_share`, the usage pool's (`SCORING.md`), for network dashboards and
+light validators. The validator publishes it
 before it sets those weights, and a restarted one serves the last epoch's until its next.
 
 Both documents are signed with the validator's hotkey: the status's fields plus `netuid`, `auditor` (the signing

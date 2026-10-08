@@ -4,7 +4,7 @@ considered them for a request, and how often they were not ready then or refused
 
 Miners serve the gateway before the auditor's test traffic; the auditor counts what an endpoint answered the gateway
 inside a test's measured window as delivered too, so serving users never costs a miner credit, and refusing users
-during a test costs it. The input tokens are the users' demand per model; those of paid usage (``Principal.paid``)
+during a test costs it. The input tokens are the users' demand per model; those of paid usage (``UsageMeter.paid``)
 set the models' emission shares.
 Refusals and durations are scored: what users get between tests. Every ``REPORT_S`` the counts of finished seconds
 are posted (signed by the gateway) under a report id the auditor takes once; a failed post is sent again as it is,
@@ -66,8 +66,8 @@ class ServedCounter:
         return self._counts.setdefault((route.hotkey, route.endpoint_id, int(self.clock())), _Second())
 
     def record(self, route: Route, input_tokens: int, seconds: float = 0.0, *, paid: bool = False) -> None:
-        """A user request the endpoint answered after ``seconds`` (the attempt's duration), ``paid`` from credit
-        bought (``Principal.paid``). It counts in the second its request was sent, so an answer held back cannot be
+        """A user request the endpoint answered after ``seconds`` (the attempt's duration), ``paid`` with credit
+        bought (``UsageMeter.paid``). It counts in the second its request was sent, so an answer held back cannot be
         moved into a test's window."""
         counts = self._counts.setdefault((route.hotkey, route.endpoint_id, int(self.clock() - seconds)), _Second())
         counts.answered += 1

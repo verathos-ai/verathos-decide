@@ -34,8 +34,9 @@ COMMITMENT_PREFIX = "verathos/catalog/v1 sha256:"
 CATALOG_PATH = "/v1/catalog/{digest}"
 DEFAULT_CACHE_DIR = Path("~/.verathos/catalog")
 MAX_CATALOG_BYTES = 1 << 20
-SHARE_DIGITS = 6  # decimals of the miners' share an epoch's weights are formed with
+SHARE_DIGITS = 6  # decimals of the miners' and the usage pool's shares an epoch's weights are formed with
 DEFAULT_MECHANISM = 1  # of a catalog that names none
+MAX_PERIOD_EPOCHS = 400
 
 
 class Engine(BaseModel):
@@ -86,6 +87,37 @@ class MinerShareChange(BaseModel):
         return self.from_ + (self.to - self.from_) * min(epoch - self.start_epoch, self.epochs) / self.epochs
 
 
+class UsagePool(BaseModel):
+    """Weight on top of the scores' for the hotkeys whose endpoints answered paying users, in proportion to the paid
+    input tokens they answered in a period, sized from that period and set over each epoch of the next. ``burned``:
+    the alpha ``buyback_coldkey`` burned on the subnet in the period; ``revenue``: the period's paid usage in USD at
+    the models' prices, converted to alpha. Either times ``fraction``, as a share of the mechanism's miner emission
+    over a period, at most what the miner share leaves."""
+
+    mode: Literal["burned", "revenue"]
+    fraction: float = Field(gt=0, le=1, description="Share of the period's burned alpha (burned) or of its revenue in "
+                            "alpha (revenue) the pool pays")
+    period_epochs: int = Field(40, ge=1, le=MAX_PERIOD_EPOCHS, description="Epochs per period: each period's pool is "
+                               "paid over the epochs of the next")
+    buyback_coldkey: str | None = Field(None, description="The coldkey whose AlphaBurned events on the subnet count "
+                                        "(burned mode)")
+    excluded: list[str] = Field(default_factory=list, max_length=256, description="Hotkeys and coldkeys whose "
+                                "endpoints get no usage pay; their part stays on the subnet owner's UID")
+
+    @model_validator(mode="after")
+    def _check(self) -> UsagePool:
+        if self.mode == "burned" and not self.buyback_coldkey:
+            raise ValueError("usage_pool in burned mode names its buyback_coldkey")
+        for key in [k for k in (self.buyback_coldkey, *self.excluded) if k is not None]:
+            if not is_ss58(key):
+                raise ValueError(f"usage_pool: {key!r} is not an ss58 address")
+        return self
+
+    def period(self, epoch: int) -> int:
+        """The period ``epoch`` falls in: epochs ``period x period_epochs`` up to the next period's first."""
+        return epoch // self.period_epochs
+
+
 class Scoring(BaseModel):
     """Scoring settings every validator applies."""
 
@@ -108,6 +140,8 @@ class Scoring(BaseModel):
         1.0, description="Share of the mechanism's miner emission the scores pay the miners; the rest is weight on "
         "the subnet owner's UID, whose incentive the chain does not pay out. A number, or a linear change "
         "{from, to, start_epoch, epochs}")
+    usage_pool: UsagePool | None = Field(None, description="Usage weight for the hotkeys that served paying users, "
+                                         "out of what the miner share leaves; absent: none")
     revision_transition_epochs: int = Field(3, ge=0, description="Epochs after a model's pinned weights or engine "
                                             "change in place during which its answers are not checked, while miners "
                                             "and references update")
@@ -204,6 +238,8 @@ class Catalog(BaseModel):
         if isinstance(scoring.get("miner_share"), dict):
             known = {f.alias or name for name, f in MinerShareChange.model_fields.items()}
             unknown += [f"scoring.miner_share.{k}" for k in scoring["miner_share"] if k not in known]
+        if isinstance(scoring.get("usage_pool"), dict):
+            unknown += [f"scoring.usage_pool.{k}" for k in scoring["usage_pool"] if k not in UsagePool.model_fields]
         for m in doc.get("models") or []:
             unknown += [f"models.{m.get('model_id', '?')}.{k}" for k in m if k not in CatalogModel.model_fields]
         return unknown

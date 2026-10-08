@@ -148,6 +148,9 @@ class StatusWatcher:
             if status.miner_share is not None and status.miner_share < 1:
                 out.append(f"  miner share {status.miner_share:.2%}: the scores below are shares of it; the subnet "
                            "owner's UID gets the rest of the miners' emission")
+            if status.usage_share:
+                out.append(f"  usage pool {status.usage_share:.2%} of the miners' emission, to the hotkeys that served "
+                           f"paying users: this hotkey's part {status.usage_weight:.4%}")
             seen = set()
             for e in status.endpoints:
                 if e.endpoint_id in listed:

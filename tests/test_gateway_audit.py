@@ -713,6 +713,58 @@ def test_user_demand_per_model_is_published_with_the_verdicts(tmp_path) -> None:
     assert auditor.store.demand_ema(4) == {"kev-4b": pytest.approx(0.9 * 2.0), "kev-9b": pytest.approx(0.9 * 0.5)}
 
 
+def test_the_paid_input_tokens_each_endpoint_answered_are_summed_over_the_gateways_and_published(tmp_path) -> None:
+    """Every catalog gateway reports per endpoint and second; the auditor sums the paid input tokens per endpoint and
+    epoch and states the epoch before's with the verdicts, signed: what the usage pool splits by."""
+    import time as time_module
+
+    from verathos.protocol.gateway import ServedCount
+    from verathos.throughput.feed import PaidServed, SignedVerdicts, paid_served
+
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()  # epoch 3
+    auditor.update_slots([Slot("a", "gpu0", "http://a/e/gpu0", "kev-4b", 50.0),
+                          Slot("a", "gpu1", "http://a/e/gpu1", "kev-4b", 50.0),
+                          Slot("b", "gpu0", "http://b/e/gpu0", "kev-9b", 50.0)])
+    now = int(time_module.time())
+    first_gateway = [ServedCount(hotkey="a", endpoint_id="gpu0", second=now, answered=3, input_tokens=900,
+                                 paid_input_tokens=600),
+                     ServedCount(hotkey="b", endpoint_id="gpu0", second=now, answered=1, input_tokens=300,
+                                 paid_input_tokens=0),
+                     ServedCount(hotkey="c", endpoint_id="gpu0", second=now, answered=9, input_tokens=900,
+                                 paid_input_tokens=900)]  # an endpoint the auditor does not test: not counted
+    second_gateway = [ServedCount(hotkey="a", endpoint_id="gpu0", second=now + 1, answered=1, input_tokens=100,
+                                  paid_input_tokens=100),
+                      ServedCount(hotkey="a", endpoint_id="gpu1", second=now, answered=2, input_tokens=400,
+                                  paid_input_tokens=400),
+                      ServedCount(hotkey="b", endpoint_id="gpu0", second=now, answered=2, input_tokens=500)]
+    assert auditor.accept_served(first_gateway, report_id="g1") == 2
+    assert auditor.accept_served(second_gateway, report_id="g2") == 3
+    assert auditor.accept_served(second_gateway, report_id="g2") == 0  # the same report again adds nothing
+    auditor.chain.head_block = 4 * 180 + 1
+    auditor.follower.poll()
+    signed = auditor.verdicts(4)
+    assert paid_served(signed.verdicts) == [PaidServed(hotkey="a", endpoint_id="gpu0", model_id="kev-4b",
+                                                       input_tokens=700),
+                                            PaidServed(hotkey="a", endpoint_id="gpu1", model_id="kev-4b",
+                                                       input_tokens=400)]
+    assert signed.verdicts.model_extra["paid_demand"]["kev-4b"] > 0
+    assert SignedVerdicts.model_validate_json(signed.model_dump_json()).verdicts == signed.verdicts  # as served
+    assert auditor.store.paid(3, 3) == {("a", "gpu0", "kev-4b"): 700, ("a", "gpu1", "kev-4b"): 400}
+    auditor.chain.head_block = 5 * 180 + 1  # an epoch without paid traffic
+    auditor.follower.poll()
+    assert paid_served(auditor.verdicts(5).verdicts) == []
+
+
+def test_verdicts_without_paid_served_read_as_none_paid() -> None:
+    from verathos.throughput.feed import Verdicts, paid_served
+
+    plain = Verdicts(netuid=405, auditor="x", epoch=4, credits=[], invalid=[])
+    assert paid_served(plain) == []
+    malformed = Verdicts(netuid=405, auditor="x", epoch=4, credits=[], invalid=[], paid_served=[{"hotkey": "a"}])
+    assert paid_served(malformed) == [] and malformed.model_extra["paid_served"]  # not well formed
+
+
 def test_the_models_shares_follow_paid_demand_and_move_a_step_per_epoch(tmp_path) -> None:
     """A burst of demand for one model, paid or not, moves the published shares by at most ``max_share_step`` per
     epoch; once the gateways tell paid from unpaid, unpaid traffic moves them not at all."""
@@ -785,7 +837,8 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
 
     Store(tmp_path / "old.sqlite", epoch_blocks=180)  # today's, less what versions 5 on added
     db = sqlite3.connect(tmp_path / "old.sqlite")
-    db.executescript("DROP TABLE demand; DROP TABLE users; DROP TABLE meta; DROP TABLE shares; "
+    db.executescript("DROP TABLE demand; DROP TABLE users; DROP TABLE meta; DROP TABLE shares; DROP TABLE paid; "
+                     "DROP TABLE burns; DROP TABLE unscanned; DROP TABLE usage; "
                      "DROP INDEX results_by_endpoint; DROP INDEX samples_by_test; "
                      "ALTER TABLE samples DROP COLUMN test_id; "
                      "INSERT INTO tests VALUES ('kept', 3, 560, 'h', 565, 'confirmed', ''); "
@@ -796,6 +849,7 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
     assert store._query("PRAGMA user_version")[0][0] == SCHEMA_VERSION
     assert store.demand_ema(10) == {}
     assert "test_id" in {column[1] for column in store._query("PRAGMA table_info(samples)")}
+    assert store.paid(0, 10) == {}
 
 
 def test_verdicts_take_a_few_queries_whatever_the_number_of_endpoints(tmp_path) -> None:

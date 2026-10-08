@@ -225,7 +225,28 @@ For scoring epoch `E` the auditor publishes, signed by its hotkey, at `GET /v1/t
 
 They also state each model's user demand: the input tokens per second the gateways reported answered, averaged over
 epochs (`demand`), and of them those users paid for once the gateways tell them apart (`paid_demand`); and the
-models' emission shares that follow (`shares`, `SCORING.md`), moved by at most `max_share_step` per epoch.
+models' emission shares that follow (`shares`, `SCORING.md`), moved by at most `max_share_step` per epoch. Once the
+gateways tell paid from unpaid, they list per endpoint the input tokens of the answers it gave paying users in epoch
+`E - 1`, summed over every catalog gateway's reports (`paid_served`: hotkey, endpoint, model, input tokens).
+
+With the catalog's usage pool (`SCORING.md`), the verdicts of every epoch of a period state the record of the period
+before (`usage`), closed once its end block is final; the first verdicts of a period wait up to 20 blocks after its
+start for it, then come without it. The record lists:
+
+- `served`: per hotkey, the paid input tokens its endpoints answered in the period (the epochs' `paid_served`), with
+  its coldkey at the end block; `paid_input_tokens`, the same per model;
+- `emission`: the chain's state at the end block that sets the mechanism's miner emission per block (the subnet's
+  alpha out per block, the owner cut if the subnet has it on, the mechanism count and split; miners get half of what
+  the owner cut leaves), and `period_emission`, that over the period's blocks in alpha;
+- `burned` mode: `burns`, every `AlphaBurned` event of `buyback_coldkey` on the subnet in the period (block, position
+  among the block's events, hotkey, amount in rao), and `unscanned`, block ranges the auditor's node no longer held
+  when it read them (their burns do not count); `revenue` mode: `prices` per model, `revenue_usd`, `tao_usd` (TAO in
+  USD, read from CoinGecko when the period closed) and `alpha_tao` (the subnet's `SubnetMovingPrice` at the end
+  block);
+- `basis` (alpha), `fraction` and `share`, the period's usage share.
+
+A validator recomputes `period_emission`, `basis` and `share` from these, and checks against its own node the burns
+and the end block's state that it still holds.
 
 The verdicts for the current epoch and the two before are served once their tests are settled (404 otherwise);
 once served, an epoch's verdicts do not change.
@@ -297,7 +318,10 @@ The auditor needs:
   screen can run on another machine behind https with a key; while it is unreachable, recomputes are skipped and
   receipts are still checked;
 - a public IP and port for its service, and an uplink for the whole network's test traffic in one burst: about
-  6 KB per request, so 1,000 endpoints at 20,000 requests/s take about 1 Gbit/s, and 2-3 CPU cores.
+  6 KB per request, so 1,000 endpoints at 20,000 requests/s take about 1 Gbit/s, and 2-3 CPU cores;
+- with a usage pool in `burned` mode, a node that holds the state of the last 200 blocks: the auditor reads every
+  block's events as it is finalized, over a connection of its own; blocks it falls further behind on are recorded as
+  unscanned. In `revenue` mode it reads TAO's price in USD from CoinGecko once per period.
 
 Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers), `verdicts`
 (as served), `demand` (users' input tokens per model) and `users` (what users got from each endpoint), the last 30
