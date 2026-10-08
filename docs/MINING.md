@@ -90,7 +90,7 @@ What it does:
 |---|---|---|---|---|
 | `kev-4b` | active | about 15 GiB | Kev | 1.0 |
 | `kev-9b` | active | about 26 GiB | Kev | 0.85 |
-| `clef-flash` | active | about 21 GiB | `verathos-engine` (Clef) | 1.3 (estimate) |
+| `clef-flash` | active | about 21 GiB | `verathos-engine` (Clef) | 0.64 |
 
 These are the shipped catalog's models; the installer reads the catalog on chain and lists its models with the
 memory each needs. All three are active from the start and share the emission equally while users pay for none of
@@ -119,7 +119,7 @@ active model that adds most, and the GPUs after it count it, so a machine with s
 where that pays more. For example, with each model at a third of the emission and 300, 120 and 400 requests/s
 proven on kev-4b, kev-9b and clef-flash, an A100 whose measurement declares 13.9 requests/s of kev-4b adds about
 `0.333 x 13.9 / 313.9 = 1.5%` there, `0.333 x 11.8 / 131.8 = 3.0%` on kev-9b (11.8 = 13.9 x 0.85) and
-`0.333 x 18.1 / 418.1 = 1.4%` on clef-flash (18.1 = 13.9 x 1.3): it serves kev-9b.
+`0.333 x 8.9 / 408.9 = 0.7%` on clef-flash (8.9 = 13.9 x 0.64): it serves kev-9b.
 
 On an update, a GPU keeps the model it serves unless another pays at least 1.2 times as much: a switch downloads the
 model and measures again, and the numbers move with every epoch. When another pays at least 1.1 times as much, the

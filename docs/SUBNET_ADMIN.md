@@ -49,7 +49,7 @@ values, on an H100 80GB, relative to kev-4b:
 |---|---|---|
 | `kev-4b` | 1.0 | 28-30 requests/s of the standard mix within 2 s |
 | `kev-9b` | 0.85 | 24.5-27 requests/s in the same runs (0.55 on an RTX 5090: 11.7 against 21.5) |
-| `clef-flash` | 1.3, an estimate | not with the standard mix: 58-62 requests/s over HTTP with requests of 525 tokens and five questions; the standard mix's states average about 700 tokens, with six questions, which scales that to about 38. The same estimate gives about 0.95 on an A100 (21-23 requests/s of those requests, scaled the same way, against kev-4b's 14.6 of the standard mix) |
+| `clef-flash` | 0.64 | on an A100 80GB SXM4, not yet on the H100: 9.5 requests/s of the standard mix within 2 s against kev-4b's 14.2-15.1 on the same machine's other GPUs (its standard mix, about 700 tokens and six questions, costs it far more than the 525-token requests with one or two questions behind the engine's figures in `MINING.md`) |
 
 The ratio differs by GPU: a larger model costs relatively less on a larger GPU. Re-measure on the reference GPU when
 an engine gets faster, and replace an estimate once the model's standard mix is measured.
