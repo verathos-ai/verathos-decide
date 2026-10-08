@@ -22,7 +22,9 @@ Per endpoint and epoch:
   test, compared among those, and then at most 1 while users measure others of the model. Every validator reads the
   same figures from the auditor's verdicts. Candidate models score zero.
 An endpoint that could not be audited (no usable reference answers) keeps its average for at most ``MAX_HELD_EPOCHS``
-epochs in a row. Per UID: the sum of its endpoints' EMAs. Weights: UID values normalised to 1.
+epochs in a row. A validator running its references one at a time takes the epoch's results of the models it does
+not check from its source (``validator.fallback``); they enter the averages, probation and weights as its own do.
+Per UID: the sum of its endpoints' EMAs. Weights: UID values normalised to 1.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ class ScoreState:
     evidence_seen: dict[str, int] = field(default_factory=dict)  # evidence id -> epoch it was applied
     held: dict[str, int] = field(default_factory=dict)  # key -> epochs in a row its average was held
     pins: dict[str, list] = field(default_factory=dict)  # model -> [what the catalog pins, the epoch that changed it]
+    waited: dict[str, int] = field(default_factory=dict)  # references one at a time: model -> epochs in a row not run
     last_epoch: int | None = None  # the last epoch scored, so a restart does not score it again
     scale: int = SCORE_SCALE
 
@@ -230,13 +233,16 @@ def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, flo
 
 def update(state: ScoreState, results: dict[str, EndpointResult], scores: dict[str, float], failed: set[str],
            *, alpha: float = 0.2, probation_epochs: int = 6, held: Collection[str] = (),
-           reset_hotkeys: Collection[str] = ()) -> None:
+           reset_hotkeys: Collection[str] = (), taken: Mapping[str, int] | None = None) -> None:
     """Fold one epoch into the state. ``held`` endpoints were discovered but could not be audited this epoch (no
-    usable reference answers); their EMA is kept. Other endpoints absent this epoch decay toward zero and are
-    forgotten once their EMA is negligible. Every endpoint of a hotkey with a failed endpoint or in ``reset_hotkeys``
-    starts probation with its average reset to zero and its statistical window cleared."""
+    usable reference answers); their EMA is kept. ``taken`` endpoints (key -> UID) have their epoch's result from the
+    source (``validator.fallback``) and count as audited, as those in ``results``. Other endpoints absent this epoch
+    decay toward zero and are forgotten once their EMA is negligible. Every endpoint of a hotkey with a failed
+    endpoint or in ``reset_hotkeys`` starts probation with its average reset to zero and its statistical window
+    cleared."""
+    audited = {key: r.endpoint.uid for key, r in results.items()} | dict(taken or {})
     reset = set(reset_hotkeys) | {key.split("/", 1)[0] for key in failed}
-    for key in set(state.ema) | set(results) | set(held) | set(state.window):
+    for key in set(state.ema) | set(audited) | set(held) | set(state.window):
         if key.split("/", 1)[0] in reset:
             state.probation[key] = probation_epochs
             state.ema[key] = 0.0
@@ -247,10 +253,11 @@ def update(state: ScoreState, results: dict[str, EndpointResult], scores: dict[s
     for key, remaining in state.probation.items():
         hotkey = key.split("/", 1)[0]
         on_probation[hotkey] = max(on_probation.get(hotkey, 0), remaining)
-    for key, r in results.items():
-        if key not in state.ema and key not in state.probation and on_probation.get(r.endpoint.hotkey):
-            state.probation[key] = on_probation[r.endpoint.hotkey]
-        state.uid_of[key] = r.endpoint.uid
+    for key, uid in audited.items():
+        hotkey = key.split("/", 1)[0]
+        if key not in state.ema and key not in state.probation and on_probation.get(hotkey):
+            state.probation[key] = on_probation[hotkey]
+        state.uid_of[key] = uid
     for key in set(state.ema) | set(scores) | set(state.probation):
         if key in held and key not in scores and key not in state.probation:
             continue
@@ -261,17 +268,18 @@ def update(state: ScoreState, results: dict[str, EndpointResult], scores: dict[s
         state.ema[key] = alpha * current + (1 - alpha) * state.ema.get(key, 0.0)
     state.probation = {k: v for k, v in state.probation.items() if v > 0}
     for key in [k for k, v in state.ema.items()
-                if v < PRUNE_BELOW and k not in results and k not in state.probation and k not in held]:
+                if v < PRUNE_BELOW and k not in audited and k not in state.probation and k not in held]:
         del state.ema[key]
         state.uid_of.pop(key, None)
         state.window.pop(key, None)
 
 
 def weights(state: ScoreState, hotkey_of_uid: dict[int, str]) -> dict[int, float]:
-    """Normalised weight per UID from the sum of its endpoints' EMAs. Endpoints whose UID now belongs to another
-    hotkey are ignored."""
+    """Normalised weight per UID from the sum of its endpoints' EMAs, summed in key order (so states that hold the
+    same averages give the same weights to the last digit). Endpoints whose UID now belongs to another hotkey are
+    ignored."""
     values: dict[int, float] = {}
-    for key, value in state.ema.items():
+    for key, value in sorted(state.ema.items()):
         uid = state.uid_of.get(key)
         hotkey = key.split("/", 1)[0]
         if uid is None or hotkey_of_uid.get(uid) != hotkey or value <= 0:

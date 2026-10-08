@@ -17,20 +17,30 @@ from verathos.protocol.manifest import public_ip
 
 class ReferenceEngine(BaseModel):
     """An engine serving ``POST /v1/systemone``: on this machine, or remote behind TLS with a bearer key (the Kev
-    server takes one from ``KEV_API_KEY``)."""
+    server takes one from ``KEV_API_KEY``). With a ``command`` (references one at a time), the validator starts it
+    on this machine when it needs it and stops it after; without one, the engine is taken as running."""
 
     url: str = Field(pattern=r"^https?://")
     api_key: str | None = None
+    command: list[str] | None = Field(None, min_length=1, description="References one at a time: the command that "
+                                      "serves the engine at url (the installer writes it)")
+    directory: str | None = Field(None, description="Working directory of command")
+    environment: dict[str, str] = Field(default_factory=dict, description="Environment variables of command, over "
+                                        "the validator's")
+
+    def local(self) -> bool:
+        host = urlsplit(self.url).hostname or ""
+        try:
+            return host == "localhost" or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
 
     @model_validator(mode="after")
     def _key_needs_tls(self) -> ReferenceEngine:
-        host = urlsplit(self.url).hostname or ""
-        try:
-            local = host == "localhost" or ipaddress.ip_address(host).is_loopback
-        except ValueError:
-            local = False
-        if self.api_key and self.url.startswith("http://") and not local:
+        if self.api_key and self.url.startswith("http://") and not self.local():
             raise ValueError(f"{self.url}: a key for a remote engine needs https")
+        if self.command and not self.local():
+            raise ValueError(f"{self.url}: an engine the validator starts serves on this machine (127.0.0.1)")
         return self
 
     def engine(self, timeout_s: float = 120.0) -> HttpEngine:
@@ -53,10 +63,18 @@ class ValidatorConfig(BaseModel):
     mode: Literal["full", "light"] = Field("full", description="full: check the miners and score them; light: set the "
                                            "weights a source validator publishes each epoch, without contacting "
                                            "miners (not for the subnet owner's validator, the auditor)")
-    source_hotkey: str | None = Field(None, description="Light mode: the validator whose published weights to set, "
-                                      "if not the subnet owner's; it must hold a validator permit")
+    source_hotkey: str | None = Field(None, description="The validator whose published results to follow, if not "
+                                      "the subnet owner's: light mode sets its weights; full mode with references "
+                                      "one at a time takes its results for the models it does not check in an "
+                                      "epoch. It must hold a validator permit")
     references: dict[str, ReferenceEngine] = Field(default_factory=dict, description="Full mode: model_id -> the "
-                                                   "model's reference engine in fp32 (a URL, or {url, api_key})")
+                                                   "model's reference engine in fp32 (a URL, or {url, api_key, "
+                                                   "command, directory, environment})")
+    reference_mode: Literal["resident", "sequential"] = Field("resident", description="Full mode: resident (every "
+                                                              "reference runs all the time) or sequential (one at a "
+                                                              "time: the validator starts each for its model's "
+                                                              "canaries and stops it, and takes the source's results "
+                                                              "for the models it cannot check in an epoch)")
     audit_screens: dict[str, ReferenceEngine] = Field(default_factory=dict, description="Auditor only: model_id -> a "
                                                       "faster bf16 engine that screens sampled answers; an answer it "
                                                       "flags counts only once the fp32 reference confirms it")

@@ -28,12 +28,15 @@ def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint],
           credited: dict[str, float], scored_models: Collection[str], state: ScoreState,
           model_shares: dict[str, float] | None = None, weights: dict[int, float] | None = None,
           drifted: Collection[str] = (), user_availability: Mapping[str, float] | None = None,
-          latency_factors: Mapping[str, float] | None = None) -> dict[str, HotkeyStatus]:
+          latency_factors: Mapping[str, float] | None = None,
+          taken: Mapping[str, EndpointStatus] | None = None) -> dict[str, HotkeyStatus]:
     """Status per hotkey after ``update`` has folded the epoch into ``state``; ``weights``: per UID, as set;
-    ``drifted``, ``user_availability`` and ``latency_factors`` per endpoint key, as scored."""
+    ``drifted``, ``user_availability`` and ``latency_factors`` per endpoint key, as scored; ``taken``: the source's
+    status of the endpoints whose results it gave (``validator.fallback``), whose checks and state they show."""
     out: dict[str, HotkeyStatus] = {}
     for ep in endpoints:
         key, r = ep.key, results.get(ep.key)
+        source = (taken or {}).get(key) if r is None else None
         status = EndpointStatus(endpoint_id=ep.endpoint.endpoint_id, model_id=ep.endpoint.model_id,
                                 state="scored", declared_rps=ep.endpoint.capacity_rps,
                                 credited_rps=credited.get(key, 0.0), score=scores.get(key, 0.0),
@@ -43,12 +46,17 @@ def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint],
         if r is not None:
             status.sent, status.answered, status.mean_abs = r.sent, r.answered, r.tally.mean_abs
             status.verdict, status.errors = windowed_verdict(state, key, r).value, sorted(set(r.errors))
+        elif source is not None:
+            status.sent, status.answered, status.mean_abs = source.sent, source.answered, source.mean_abs
+            status.verdict, status.errors = source.verdict, list(source.errors)
         if ep.hotkey in invalid_hotkeys:
             status.state = "invalid"
         elif key in failed:
             status.state = "failed"
         elif status.probation_epochs:
             status.state = "probation"
+        elif source is not None:
+            status.state = source.state
         elif r is None:
             status.state = "not_audited"
         elif key in drifted:

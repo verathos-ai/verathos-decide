@@ -71,7 +71,9 @@ FILL = {
 }
 
 
-def _rng(secret: bytes, *parts: object) -> random.Random:
+def seeded(secret: bytes, *parts: object) -> random.Random:
+    """A random generator drawn from the validator's secret and ``parts``: reproducible by the validator,
+    unpredictable without the secret."""
     seed = hmac.new(secret, "|".join(str(p) for p in parts).encode(), hashlib.sha256).digest()
     return random.Random(int.from_bytes(seed, "big"))
 
@@ -87,7 +89,7 @@ def canary_pool(secret: bytes, epoch: int, model_id: str, size: int) -> list[dic
     """``size`` SystemOne requests for ``model_id`` in ``epoch``."""
     pool = []
     for i in range(size):
-        rng = _rng(secret, "canary", epoch, model_id, i)
+        rng = seeded(secret, "canary", epoch, model_id, i)
         domain = DOMAINS[rng.choice(sorted(DOMAINS))]
         issues = rng.sample(domain["issues"], 2)
         state = " ".join(x for x in [rng.choice(domain["openers"]), _fill(issues[0], rng.choice) + ".",
@@ -142,4 +144,5 @@ def max_request_bytes(model_id: str) -> int:
 
 def assignment(secret: bytes, epoch: int, endpoint_key: str, pool_size: int, per_endpoint: int) -> list[int]:
     """Indices of the pool this endpoint receives this epoch."""
-    return sorted(_rng(secret, "assign", epoch, endpoint_key).sample(range(pool_size), k=min(per_endpoint, pool_size)))
+    rng = seeded(secret, "assign", epoch, endpoint_key)
+    return sorted(rng.sample(range(pool_size), k=min(per_endpoint, pool_size)))

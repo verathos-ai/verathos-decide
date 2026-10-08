@@ -74,6 +74,23 @@ def check(document: Any, *, source: str, netuid: int, epoch: int, epoch_blocks: 
     return network
 
 
+def find_source(st: bt.Subtensor, netuid: int, owner: str | None, source_hotkey: str | None) -> tuple[str, str]:
+    """The source hotkey (``source_hotkey``, else the subnet owner's, ``owner``) and its axon's URL, from the chain:
+    registered, with a validator permit unless it is the owner's, serving an axon. Raises Refused."""
+    source = source_hotkey or owner
+    if not source:
+        raise Refused("the subnet owner hotkey is not known")
+    neuron = st.get_neuron_for_pubkey_and_subnet(source, netuid)
+    if neuron is None or neuron.is_null:
+        raise Refused(f"the source hotkey {source} is not registered on netuid {netuid}")
+    if source != owner and not neuron.validator_permit:
+        raise Refused(f"the source hotkey {source} holds no validator permit")
+    ip, port = neuron.axon_info.ip, neuron.axon_info.port
+    if ip in ("", "0.0.0.0") or not port:
+        raise Refused(f"the source hotkey {source} serves no axon")
+    return source, axon_base(ip, port)
+
+
 def describe(weights: dict[int, float]) -> str:
     """The number of UIDs and the highest weights."""
     top = sorted(weights.items(), key=lambda item: (-item[1], item[0]))[:TOP_WEIGHTS]
@@ -121,22 +138,10 @@ class LightValidator:
     def source(self) -> tuple[str, str]:
         """The source hotkey and its axon's URL, from the chain. Raises Refused, or SystemExit once this hotkey is the
         subnet owner's."""
-        netuid = self.cfg.netuid
-        owner = self.st.get_subnet_owner_hotkey(netuid)
+        owner = self.st.get_subnet_owner_hotkey(self.cfg.netuid)
         if owner == self.hotkey:
             raise SystemExit(OWNER_IS_FULL)
-        source = self.cfg.source_hotkey or owner
-        if not source:
-            raise Refused("the subnet owner hotkey is not known")
-        neuron = self.st.get_neuron_for_pubkey_and_subnet(source, netuid)
-        if neuron is None or neuron.is_null:
-            raise Refused(f"the source hotkey {source} is not registered on netuid {netuid}")
-        if source != owner and not neuron.validator_permit:
-            raise Refused(f"the source hotkey {source} holds no validator permit")
-        ip, port = neuron.axon_info.ip, neuron.axon_info.port
-        if ip in ("", "0.0.0.0") or not port:
-            raise Refused(f"the source hotkey {source} serves no axon")
-        return source, axon_base(ip, port)
+        return find_source(self.st, self.cfg.netuid, owner, self.cfg.source_hotkey)
 
     def permit(self) -> str | None:
         """Why this hotkey cannot set weights; None if it can."""

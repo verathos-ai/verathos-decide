@@ -19,8 +19,9 @@ import os
 import secrets
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import bittensor as bt
 import httpx
@@ -29,10 +30,12 @@ from verathos import catalog
 from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator import chain, light, status
-from verathos.validator.audit import audit_epoch
+from verathos.validator.audit import EndpointResult, audit_epoch
 from verathos.validator.config import ReferenceEngine, ValidatorConfig
 from verathos.validator.discovery import DiscoveredEndpoint, Neuron, discover
+from verathos.validator.fallback import Taken, source_results, take
 from verathos.validator.follow import CatalogFollower
+from verathos.validator.light import Refused
 from verathos.validator.references import transitioning, wrong_revision
 from verathos.validator.scoring import (
     ScoreState,
@@ -44,6 +47,7 @@ from verathos.validator.scoring import (
     weighted_median,
     weights,
 )
+from verathos.validator.sequential import Runner, Sequence, coverage_order, overdue, waited_after
 from verathos.validator.service import start_service
 from verathos.validator.status import StatusBoard
 from verathos.validator.throughput import Throughput
@@ -52,6 +56,10 @@ log = logging.getLogger("verathos.validator")
 WEIGHT_ATTEMPTS = 10
 REFERENCE_WAIT_S = 900.0  # the most the first epoch waits for reference engines still loading their models
 EVIDENCE_SHARE = 0.1  # of the epoch, the most rechecking the auditor's evidence may take
+OWNER_RESIDENT = ("this is the subnet owner's hotkey: its validator is the auditor, which checks test answers at any "
+                  "time and every model each epoch; its references stay resident: set reference_mode to resident "
+                  "(scripts/install.sh validator --full --references resident)")
+SOURCE_MARGIN_S = 120.0  # references one at a time: the source's results are awaited until this long before the end
 
 
 def load_secret(state_dir: Path) -> bytes:
@@ -176,9 +184,50 @@ def wait_for_references(references: dict[str, ReferenceEngine], timeout_s: float
         time.sleep(poll_s)
 
 
+def score_epoch(state: ScoreState, endpoints: list[DiscoveredEndpoint], results: dict[str, EndpointResult], *,
+                taken: Taken | None, shares: dict[str, float], proven: Proven, invalid_hotkeys: set[str],
+                sc: catalog.Scoring, max_latency_s: float) -> tuple[dict[str, float], set[str], set[str],
+                                                                    dict[str, float]]:
+    """Score the epoch and fold it into ``state``: this validator's ``results``, and for the models it took from its
+    source the source's (``taken``, ``validator.fallback``), which enter the averages, probation and weights as its
+    own do. Endpoints without either keep their averages. -> (scores, failed, held, latency factors)"""
+    record_window(state, results, sc.statistical_window_epochs)
+    factors: dict[str, float] = {}
+    scores, failed = epoch_scores(results, shares=shares, credited=proven.credited, latency_ms=proven.latency_ms,
+                                  state=state, failed_hotkeys=invalid_hotkeys, user_latency_ms=proven.user_latency_ms,
+                                  user_availability=proven.user_availability, max_latency_s=max_latency_s,
+                                  factors=factors)
+    taken = taken or Taken()
+    scored = {key: taken.uids[key] for key in taken.scores if key not in results}  # its own check comes first
+    scores |= {key: taken.scores[key] for key in scored}
+    failed |= taken.failed & set(scored)
+    held = ({e.key for e in endpoints} | taken.held) - set(results) - set(scored)
+    update(state, results, scores, failed, alpha=sc.ema_alpha, probation_epochs=sc.probation_epochs, held=held,
+           reset_hotkeys=invalid_hotkeys, taken=scored)
+    return scores, failed, held, factors
+
+
+def coverage_line(epoch: int, served: list[str], sequence: Sequence, why: Mapping[str, str], source: str | None,
+                  refused: str | None) -> tuple[int, str]:
+    """The epoch's line on references one at a time: the models checked, and those taken from the source (or, without
+    its results, kept) and why; a warning when a model was not checked."""
+    checked = [m for m in served if m in sequence.checked]
+    others = [f"{m} ({sequence.why.get(m) or why.get(m) or 'not drawn'})" for m in served if m not in checked]
+    line = f"epoch {epoch}: references one at a time: checked {', '.join(checked) or 'none'}"
+    if not others:
+        return logging.INFO, line
+    if source is not None:
+        return logging.WARNING, line + f"; taken from {source}: {', '.join(others)}"
+    return logging.WARNING, line + (f"; not checked, their averages kept (no results of the source: {refused}): "
+                                    f"{', '.join(others)}")
+
+
 async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, secret: bytes, state: ScoreState,
                     epoch: int, blocks_left: int, throughput: Throughput, current: CatalogFollower,
-                    board: StatusBoard) -> None:
+                    board: StatusBoard, runner: Runner | None = None) -> None:
+    """Score one epoch. With a ``runner``, the references run one at a time and the models not checked take the
+    source's results."""
+    started = time.monotonic()
     cat = current.for_epoch(st, epoch * current.catalog.epoch_blocks)
     sc, policy = cat.scoring, cat.audit_policy()
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
@@ -190,60 +239,91 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     if transition:
         log.warning("  %s: the pinned weights or engine changed in place; answers are not checked for %d epochs after",
                     ", ".join(sorted(transition)), sc.revision_transition_epochs)
-    references = {m: r.engine() for m, r in cfg.references.items()
-                  if cat.get(m) is not None and cat.get(m).status != "retired" and m not in transition}
-    for m, engine in list(references.items()):
-        if why := await wrong_revision(engine, cat.get(m)):
-            log.error("  the %s reference engine is not used: %s; its endpoints are not audited", m, why)
-            await references.pop(m).close()
+    usable = [m for m in cfg.references
+              if cat.get(m) is not None and cat.get(m).status != "retired" and m not in transition]
+    if runner is None:
+        references: dict[str, Any] = {m: cfg.references[m].engine() for m in usable}
+        for m, engine in list(references.items()):
+            if why := await wrong_revision(engine, cat.get(m)):
+                log.error("  the %s reference engine is not used: %s; its endpoints are not audited", m, why)
+                await references.pop(m).close()
+    else:  # each started when its model is checked, and checked against the pins then
+        references = runner.references(cfg.references, cat, usable)
     tolerances = {m.model_id: m.tolerance for m in cat.models}
-    # No pool limit: a miner's hanging connections must not delay requests to the others.
-    limits = httpx.Limits(max_connections=None, max_keepalive_connections=256)
-    async with httpx.AsyncClient(limits=limits) as client:
-        miners = await discover(neurons, cfg.netuid, cfg.mechid, client, {cat.digest(), *current.accepted()},
-                                throughput.manifests)
-        throughput.update_slots(miners, neurons, epoch)
-        endpoints = [e for m in miners for e in m.endpoints() if e.endpoint.tier == "open"
-                     and cat.get(e.endpoint.model_id) is not None and cat.get(e.endpoint.model_id).status != "retired"]
-        log.info("epoch %d: %d miners, %d open endpoints", epoch, len(miners), len(endpoints))
-        results = await audit_epoch(endpoints, epoch=epoch, secret=secret, keypair=wallet.hotkey,
-                                    references=references, tolerances=tolerances, client=client, netuid=cfg.netuid,
-                                    mechid=cfg.mechid, pool_size=sc.canary_pool_size,
-                                    per_endpoint=sc.canaries_per_endpoint,
-                                    budget_s=blocks_left * BLOCK_TIME_S * sc.canary_spread_fraction,
-                                    holding=throughput.holding, request_timeout_s=policy.request_timeout_s,
-                                    identities=throughput.identities)
-        verdicts = None if policy.mode == "observe" else await throughput.verdicts(client, epoch)
-        evidence = []
-        if verdicts is not None:
-            fresh = new_evidence(state, [f"{e.test_id}/{e.hotkey}/{e.endpoint_id}" for e in verdicts.invalid],
-                                 epoch, policy.credit_ttl_epochs + 1)
-            evidence = await throughput.proven_invalid(
-                [e for e in verdicts.invalid if f"{e.test_id}/{e.hotkey}/{e.endpoint_id}" in fresh], references, cat,
-                budget_s=EVIDENCE_SHARE * blocks_left * BLOCK_TIME_S)
-    for e in references.values():
-        await e.close()
+    sequence, evidence, verdicts = None, [], None
+    try:
+        # No pool limit: a miner's hanging connections must not delay requests to the others.
+        limits = httpx.Limits(max_connections=None, max_keepalive_connections=256)
+        async with httpx.AsyncClient(limits=limits) as client:
+            miners = await discover(neurons, cfg.netuid, cfg.mechid, client, {cat.digest(), *current.accepted()},
+                                    throughput.manifests)
+            throughput.update_slots(miners, neurons, epoch)
+            endpoints = [e for m in miners for e in m.endpoints() if e.endpoint.tier == "open"
+                         and cat.get(e.endpoint.model_id) is not None
+                         and cat.get(e.endpoint.model_id).status != "retired"]
+            log.info("epoch %d: %d miners, %d open endpoints", epoch, len(miners), len(endpoints))
+            if runner is not None:
+                checkable = sorted({e.endpoint.model_id for e in endpoints} & set(references))
+                sequence = Sequence(references, coverage_order(checkable, state.waited, secret, epoch),
+                                    overdue=overdue(checkable, state.waited), per_endpoint=sc.canaries_per_endpoint,
+                                    timings=runner.timings)
+            results = await audit_epoch(endpoints, epoch=epoch, secret=secret, keypair=wallet.hotkey,
+                                        references=references, tolerances=tolerances, client=client,
+                                        netuid=cfg.netuid, mechid=cfg.mechid, pool_size=sc.canary_pool_size,
+                                        per_endpoint=sc.canaries_per_endpoint,
+                                        budget_s=blocks_left * BLOCK_TIME_S * sc.canary_spread_fraction,
+                                        holding=throughput.holding, request_timeout_s=policy.request_timeout_s,
+                                        identities=throughput.identities, one_at_a_time=sequence)
+            verdicts = None if policy.mode == "observe" else await throughput.verdicts(client, epoch)
+            if verdicts is not None:
+                fresh = new_evidence(state, [f"{e.test_id}/{e.hotkey}/{e.endpoint_id}" for e in verdicts.invalid],
+                                     epoch, policy.credit_ttl_epochs + 1)
+                pending = [e for e in verdicts.invalid if f"{e.test_id}/{e.hotkey}/{e.endpoint_id}" in fresh]
+                budget_s = EVIDENCE_SHARE * blocks_left * BLOCK_TIME_S
+                if runner is not None:  # a reference started for a recheck must fit in the time
+                    pending.sort(key=lambda e: e.model_id)  # one start per model
+                    for reference in references.values():
+                        reference.deadline = time.monotonic() + budget_s
+                evidence = await throughput.proven_invalid(pending, references, cat, budget_s=budget_s)
+    finally:
+        for e in references.values():
+            await e.close()
     if policy.mode != "observe" and verdicts is None:
         log.warning("  no throughput verdicts: no endpoint has proven capacity this epoch")
     for e in evidence:
         where = "gateway traffic" if e.from_gateway else f"throughput test {e.test_id[:12]}"
         log.info("  %s/%s gave a wrong answer in %s: %s", e.hotkey, e.endpoint_id, where, e.reason)
     invalid_hotkeys = {e.hotkey for e in evidence}
+    taken = None
+    if sequence is not None:
+        served = sorted({e.endpoint.model_id for e in endpoints})
+        source = refused = None
+        if any(m not in sequence.checked for m in served):  # the source's results for the others
+            unchecked = {m.model_id for m in cat.models if m.status != "retired"} - set(sequence.checked)
+            try:
+                source_hotkey, network = await source_results(
+                    st, netuid=cfg.netuid, hotkey=wallet.hotkey.ss58_address, source_hotkey=cfg.source_hotkey,
+                    epoch=epoch, epoch_blocks=cat.epoch_blocks,
+                    deadline=started + blocks_left * BLOCK_TIME_S - SOURCE_MARGIN_S)
+            except Refused as exc:
+                refused = str(exc)
+            else:
+                taken = take(network, unchecked)
+                source = (f"the validator {source_hotkey}" if cfg.source_hotkey
+                          else f"the subnet owner's validator {source_hotkey}")
+        reasons = {m: "its pinned weights changed in place" if m in transition else "no reference"
+                   for m in served if m not in references}
+        log.log(*coverage_line(epoch, served, sequence, reasons, source, refused))
+        state.waited = waited_after(state.waited, sequence.order, sequence.tried, {m.model_id for m in cat.models})
     proven = credited_capacity(endpoints, verdicts, cat, policy.mode)
     credited = proven.credited
-    record_window(state, results, sc.statistical_window_epochs)
     shares = epoch_shares(verdicts, cat)
     log.info("  emission shares: %s", ", ".join(f"{m} {s:.1%}" for m, s in sorted(shares.items())))
-    factors: dict[str, float] = {}
-    scores, failed = epoch_scores(results, shares=shares, credited=credited, latency_ms=proven.latency_ms, state=state,
-                                  failed_hotkeys=invalid_hotkeys, user_latency_ms=proven.user_latency_ms,
-                                  user_availability=proven.user_availability, max_latency_s=policy.max_latency_s,
-                                  factors=factors)
-    held = {e.key for e in endpoints} - set(results)
+    scores, failed, held, factors = score_epoch(state, endpoints, results, taken=taken, shares=shares, proven=proven,
+                                                invalid_hotkeys=invalid_hotkeys, sc=sc,
+                                                max_latency_s=policy.max_latency_s)
     if held:
         log.info("  %d endpoints not audited this epoch (no usable reference answers); scores held", len(held))
-    update(state, results, scores, failed, alpha=sc.ema_alpha, probation_epochs=sc.probation_epochs, held=held,
-           reset_hotkeys=invalid_hotkeys)
     for key, r in sorted(results.items()):
         log.info("  %s epoch_verdict=%s answered=%d/%d identity=%s mean_abs=%.4f proven_rps=%.1f users=%.2f "
                  "score=%.3f%s",
@@ -257,7 +337,8 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         invalid_hotkeys=invalid_hotkeys, credited=credited,
         scored_models={m.model_id for m in cat.models if m.status == "active"}, state=state, model_shares=shares,
         weights=uid_weights, drifted=proven.drifted, user_availability=proven.user_availability,
-        latency_factors=factors), epoch=epoch, epoch_blocks=cat.epoch_blocks, model_shares=shares, weights=uid_weights)
+        latency_factors=factors, taken=taken.status if taken else None), epoch=epoch, epoch_blocks=cat.epoch_blocks,
+        model_shares=shares, weights=uid_weights)
     # The epoch is scored; a failure from here on must not run it again.
     try:
         set_weights(cfg, st, wallet, uid_weights)
@@ -323,6 +404,17 @@ def main() -> None:
     state = ScoreState.load(state_path)
     if missing := missing_references(cfg, current.catalog):
         raise SystemExit(f"no reference engine configured for the active models {missing}")
+    runner = None
+    if cfg.reference_mode == "sequential":
+        if wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid):
+            raise SystemExit(OWNER_RESIDENT)
+        if cfg.source_hotkey == wallet.hotkey.ss58_address:
+            raise SystemExit("source_hotkey is this validator's own hotkey: name the validator whose results the "
+                             "models it does not check take")
+        runner = Runner.at(state_dir)
+        source = f"the validator {cfg.source_hotkey}" if cfg.source_hotkey else "the subnet owner's validator"
+        log.info("references one at a time: %s, each started for its model's canaries and stopped after; a model not "
+                 "checked in an epoch takes the results of %s", ", ".join(sorted(cfg.references)), source)
     throughput = Throughput.start(network=cfg.network, netuid=cfg.netuid, mechid=cfg.mechid,
                                   current=lambda: current.catalog, st=st, wallet=wallet, references=cfg.references,
                                   screens=cfg.audit_screens, state_dir=state_dir)
@@ -351,8 +443,10 @@ def main() -> None:
         for m in cat.models:
             if m.model_id in cfg.references and pinned.get(m.model_id, (m.hf_revision, m.engine.revision)) != (
                     m.hf_revision, m.engine.revision):
-                log.critical("catalog %s pins %s at weights %s and engine %s: restart its reference engine on them "
-                             "within %d epochs", cat.digest()[:12], m.model_id, m.hf_revision, m.engine.revision,
+                log.critical("catalog %s pins %s at weights %s and engine %s: %s within %d epochs",
+                             cat.digest()[:12], m.model_id, m.hf_revision, m.engine.revision,
+                             "restart its reference engine on them" if runner is None else
+                             "update this validator's references to them (scripts/install.sh validator --yes)",
                              cat.scoring.revision_transition_epochs)
             pinned[m.model_id] = (m.hf_revision, m.engine.revision)
         throughput.set_policy(cat.audit_policy())
@@ -360,7 +454,7 @@ def main() -> None:
     current.on_change.append(adopt)
     current.start()
     throughput.start_slot_refresh(cfg.network, current.accepted)
-    wait_for_references(cfg.references)
+    wait_for_references({m: r for m, r in cfg.references.items() if runner is None or not r.command})
 
     done = state.last_epoch
     while True:
@@ -377,7 +471,7 @@ def main() -> None:
                 blocks_left = max(next_start - block, 1)
                 trial = copy.deepcopy(state)  # an epoch that fails part way leaves no trace for its retry
                 asyncio.run(run_epoch(cfg, st, wallet, secret, trial, epoch, 1 if args.once else blocks_left,
-                                      throughput, current, board))
+                                      throughput, current, board, runner))
                 state = trial
                 done = state.last_epoch = epoch
                 state.save(state_path)
