@@ -100,32 +100,40 @@ def bearer(header: str | None) -> str | None:
     return header[7:].strip() or None
 
 
-def client_address(request: Request, trusted: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> str:
-    """The client's address: the peer, or, behind trusted proxies, the last X-Forwarded-For hop not among them."""
-    peer = request.client.host if request.client else ""
+def ip_address(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """``text`` as an address, an IPv4 address mapped into IPv6 (``::ffff:a.b.c.d``) as the IPv4 one; None if it is
+    not one."""
     try:
-        address = ipaddress.ip_address(peer)
+        ip = ipaddress.ip_address(text)
     except ValueError:
+        return None
+    return getattr(ip, "ipv4_mapped", None) or ip
+
+
+def client_address(request: Request, trusted: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> str:
+    """The client's address (see ``ip_address``): the peer, or, behind trusted proxies, the last X-Forwarded-For hop
+    not among them."""
+    peer = request.client.host if request.client else ""
+    address = ip_address(peer)
+    if address is None:
         return peer
     if not any(address in network for network in trusted):
-        return peer
+        return str(address)
     for hop in reversed([h.strip() for h in request.headers.get("x-forwarded-for", "").split(",") if h.strip()]):
-        try:
-            hop_address = ipaddress.ip_address(hop)
-        except ValueError:
+        hop_address = ip_address(hop)
+        if hop_address is None:
             return hop
         if not any(hop_address in network for network in trusted):
-            return hop
-    return peer
+            return str(hop_address)
+    return str(address)
 
 
 def address_group(address: str) -> str:
-    """The unit invalid keys are limited by: an IPv4 address, or an IPv6 /64."""
-    try:
-        ip = ipaddress.ip_address(address)
-    except ValueError:
+    """The unit invalid keys are limited by: an IPv4 address (also one mapped into IPv6), or an IPv6 /64."""
+    ip = ip_address(address)
+    if ip is None:
         return address
-    return str(ipaddress.ip_network(f"{ip}/64", strict=False)) if ip.version == 6 else address
+    return str(ipaddress.ip_network(f"{ip}/64", strict=False)) if ip.version == 6 else str(ip)
 
 
 def answer_bytes(request: SystemOneRequest) -> int:

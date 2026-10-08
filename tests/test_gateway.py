@@ -549,6 +549,17 @@ def test_the_client_address_is_believed_only_from_trusted_proxies() -> None:
     assert address("127.0.0.1", "198.51.100.7") == "198.51.100.7"
     assert address("127.0.0.1", "203.0.113.1, 198.51.100.7, 127.0.0.1") == "198.51.100.7"
     assert address("198.51.100.9", "203.0.113.1") == "198.51.100.9"
+    # IPv4 clients seen through an IPv6 socket (::ffff:a.b.c.d) are IPv4 clients, the proxy among them too
+    assert address("::ffff:127.0.0.1", "::ffff:198.51.100.7") == "198.51.100.7"
+    assert address("::ffff:198.51.100.9", "203.0.113.1") == "198.51.100.9"
+
+
+def test_invalid_keys_are_limited_per_ipv4_address_also_when_mapped_into_ipv6() -> None:
+    from verathos.gateway.app import address_group
+
+    assert address_group("::ffff:1.2.3.4") == "1.2.3.4" != address_group("::ffff:203.0.113.9")
+    assert address_group("2001:db8::1") == address_group("2001:db8::2") == "2001:db8::/64"
+    assert address_group("not an address") == "not an address"
 
 
 def test_the_admin_cli_manages_accounts_and_keys(tmp_path, capsys) -> None:
