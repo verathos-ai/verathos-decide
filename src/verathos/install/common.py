@@ -265,14 +265,16 @@ def wait_engines(manager: services.Manager, engines: dict[str, int], timeout_s: 
 
 
 def follow(manager: services.Manager, name: str, done: Callable[[str], bool], failed: Callable[[str], bool],
-           timeout_s: float, required: bool = True) -> bool:
-    """Show ``name``'s log until a line ``done`` accepts (True). Stops the setup if a line is ``failed`` or the
-    service stopped twice; after ``timeout_s`` stops it too, or returns False if not ``required``."""
+           timeout_s: float, required: bool = True, hide: Callable[[str], bool] = lambda line: False) -> bool:
+    """Show ``name``'s log (except lines to ``hide``) until a line ``done`` accepts (True). Stops the setup if a
+    line is ``failed`` or the service stopped twice; after ``timeout_s`` stops it too, or returns False if not
+    ``required``."""
     deadline, stops, was_active, seen = time.monotonic() + timeout_s, 0, True, []
     while True:
         for line in manager.new_lines(name):
             seen.append(line)
-            print(f"      {line}", flush=True)
+            if not hide(line):
+                print(f"      {line}", flush=True)
             if done(line):
                 return True
             if failed(line):

@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import httpx
@@ -41,6 +42,7 @@ def uv() -> str:
 
 def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     """Run a step, its output shown; a failure stops the setup."""
+    sys.stdout.flush()
     result = subprocess.run(cmd, cwd=cwd, env={**os.environ, **(env or {})})
     if result.returncode != 0:
         raise SystemExit(f"failed ({result.returncode}): {' '.join(cmd)}")
@@ -130,12 +132,15 @@ def download(python: Path, model: catalog.CatalogModel, hf_home: Path) -> None:
     pins = [(model.hf_repo, model.hf_revision)]
     if model.base_repo and model.base_revision:
         pins.append((model.base_repo, model.base_revision))
+    env = {"HF_HOME": str(hf_home)}
+    if not sys.stdout.isatty():
+        env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
     for repo, revision in pins:
         done = hf_home / "verathos-complete" / f"{repo.replace('/', '--')}@{revision}"
         if done.exists():
-            print(f"    {repo}@{revision[:12]}: already downloaded")
+            print(f"    {repo}@{revision[:12]}: already downloaded", flush=True)
             continue
-        print(f"    {repo}@{revision[:12]}: downloading")
-        run([str(python), "-c", DOWNLOAD, repo, revision], env={"HF_HOME": str(hf_home)})
+        print(f"    {repo}@{revision[:12]}: downloading", flush=True)
+        run([str(python), "-c", DOWNLOAD, repo, revision], env=env)
         done.parent.mkdir(parents=True, exist_ok=True)
         done.touch()

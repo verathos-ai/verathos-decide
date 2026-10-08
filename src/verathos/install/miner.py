@@ -250,9 +250,11 @@ def init(argv: list[str]) -> None:
 
     step("Capacity")
     info("the miner measures its endpoints' capacity (or reuses the stored measurement), then serves")
+    # The miner probes its engines through its own service while they load; those failures are expected.
     common.follow(manager, MINER, done=lambda line: " endpoints on port " in line and "serving" in line,
                   failed=lambda line: "no endpoint could be measured" in line or "no configured endpoint" in line,
-                  timeout_s=MEASURE_S)
+                  timeout_s=MEASURE_S,
+                  hide=lambda line: "engine unreachable" in line or "waiting for the engine" in line)
 
     step("Done")
     for g in gpus:
