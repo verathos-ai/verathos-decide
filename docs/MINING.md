@@ -171,10 +171,10 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
     --yes --wallet miner --hotkey default --port 8091
 # on the primary
 curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner --yes \
-    --wallet miner --hotkey default --port 8091 --peers 154.54.100.137:8091,198.51.100.7:8091
+    --wallet miner --hotkey default --port 8091 --peers 203.0.113.7:8091,198.51.100.7:8091
 ```
 
-A worker's endpoint ids start with its name (`--name`, default its IP address, as in `154-54-100-137-gpu0`): ids
+A worker's endpoint ids start with its name (`--name`, default its IP address, as in `203-0-113-7-gpu0`): ids
 must be unique across the hotkey's machines. At its end the worker's setup prints the line for the primary. Running
 `install.sh miner --yes --peers ...` again on the primary replaces its list; `peers` in its `miner.json` and a
 restart of its miner do the same.

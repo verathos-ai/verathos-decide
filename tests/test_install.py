@@ -120,9 +120,9 @@ def test_the_role_comes_from_the_options_or_the_configuration(tmp_path) -> None:
     assert choose_role(ui, options(), {}) == "primary"
     assert choose_role(ui, options(), {"role": "worker"}) == "worker"
     assert choose_role(ui, options(worker=True), {}) == "worker"
-    assert choose_role(ui, options(peers="154.54.100.137:20017"), {"role": "worker"}) == "primary"
+    assert choose_role(ui, options(peers="9.9.9.9:20017"), {"role": "worker"}) == "primary"
     with pytest.raises(SystemExit, match="not both"):
-        choose_role(ui, options(worker=True, peers="154.54.100.137:20017"), {})
+        choose_role(ui, options(worker=True, peers="9.9.9.9:20017"), {})
 
 
 def test_a_worker_and_its_primary_are_configured_for_one_hotkey(tmp_path) -> None:
@@ -130,9 +130,9 @@ def test_a_worker_and_its_primary_are_configured_for_one_hotkey(tmp_path) -> Non
     workers' public addresses, kept on the next run unless --peers replaces them."""
     from verathos.install.miner import endpoint_prefix, parse_peers
 
-    prefix = endpoint_prefix("worker", None, "154.54.100.137", [])
-    assert prefix == "154-54-100-137-"
-    assert endpoint_prefix("worker", None, "8.8.8.8", ["154-54-100-137-gpu0", "154-54-100-137-gpu1"]) == prefix
+    prefix = endpoint_prefix("worker", None, "9.9.9.9", [])
+    assert prefix == "9-9-9-9-"
+    assert endpoint_prefix("worker", None, "8.8.8.8", ["9-9-9-9-gpu0", "9-9-9-9-gpu1"]) == prefix
     assert endpoint_prefix("worker", "a100-sxm", "8.8.8.8", [prefix + "gpu0"]) == "a100-sxm-"
     assert endpoint_prefix("worker", None, "2606:4700::1111", []).startswith("v6-")
     assert endpoint_prefix("primary", None, "8.8.8.8", [prefix + "gpu0"]) == ""
@@ -148,13 +148,13 @@ def test_a_worker_and_its_primary_are_configured_for_one_hotkey(tmp_path) -> Non
         MinerConfig.model_validate(config)
         return config
 
-    worker = configure({}, "worker", "154.54.100.137", [prefix + "gpu0", prefix + "gpu1"], None)
+    worker = configure({}, "worker", "9.9.9.9", [prefix + "gpu0", prefix + "gpu1"], None)
     assert worker["role"] == "worker" and "peers" not in worker
-    assert [e["endpoint_id"] for e in worker["endpoints"]] == ["154-54-100-137-gpu0", "154-54-100-137-gpu1"]
+    assert [e["endpoint_id"] for e in worker["endpoints"]] == ["9-9-9-9-gpu0", "9-9-9-9-gpu1"]
 
-    peers = parse_peers("154.54.100.137:20017, [2606:4700::1111]:8091")
-    assert peers == ["http://154.54.100.137:20017", "http://[2606:4700::1111]:8091"]
-    for bad in ("10.0.0.1:8091", "154.54.100.137", "localhost:8091", "[::ffff:8.8.8.8]:80"):
+    peers = parse_peers("9.9.9.9:20017, [2606:4700::1111]:8091")
+    assert peers == ["http://9.9.9.9:20017", "http://[2606:4700::1111]:8091"]
+    for bad in ("10.0.0.1:8091", "9.9.9.9", "localhost:8091", "[::ffff:8.8.8.8]:80"):
         with pytest.raises(SystemExit, match="--peers"):
             parse_peers(bad)
     primary = configure({}, "primary", "40.119.45.15", ["gpu0"], peers)

@@ -21,7 +21,7 @@ from verathos.protocol.manifest import (
 )
 
 
-@pytest.mark.parametrize("address", ["8.8.8.8", "1.2.3.4", "154.54.100.137", "2606:4700::1111", "2a01:4f8::1"])
+@pytest.mark.parametrize("address", ["8.8.8.8", "1.2.3.4", "9.9.9.9", "2606:4700::1111", "2a01:4f8::1"])
 def test_public_unicast_addresses(address: str) -> None:
     assert public_unicast(ipaddress.ip_address(address)) and is_public(address)
 

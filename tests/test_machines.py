@@ -69,9 +69,9 @@ def config(host: str, port: int, endpoints: list[str], tmp_path, **fields) -> Mi
 
 
 def test_peers_are_machines_base_urls_and_a_worker_has_none(tmp_path) -> None:
-    assert peer_url("154.54.100.137:20017") == "http://154.54.100.137:20017"
+    assert peer_url("9.9.9.9:20017") == "http://9.9.9.9:20017"
     assert peer_url(" http://[2606:4700:0::1111]:8091/") == "http://[2606:4700::1111]:8091"
-    for bad in ("154.54.100.137", "miner.example:80", "1.2.3.4:0", "1.2.3.4:65536", "http://1.2.3.4:80/x", ""):
+    for bad in ("9.9.9.9", "miner.example:80", "1.2.3.4:0", "1.2.3.4:65536", "http://1.2.3.4:80/x", ""):
         with pytest.raises(ValueError):
             peer_url(bad)
     primary = config("203.0.113.5", 8091, ["gpu0"], tmp_path, peers=["198.51.100.7:20017"])
