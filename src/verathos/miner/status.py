@@ -1,8 +1,12 @@
 """The miner's own standing, read from the throughput auditor's status page and written to the log.
 
 Once per epoch the log gets one line per endpoint this machine serves (scored, qualifying, failed, ...), and one line
-for every throughput test of those endpoints once its outcome is final. The status page itself lists every endpoint
-of the hotkey, on all its machines.
+for every throughput test of those endpoints once its outcome is final (after a start, the latest of each endpoint).
+The status page itself lists every endpoint of the hotkey, on all its machines.
+
+The miner acts on the test results (``shortfall``) only from a status the subnet owner hotkey signed for this hotkey
+and netuid, recently and no earlier than one it read before (``protocol.status.unverified``). Any other status is
+logged all the same, with one warning line until a status verifies again.
 """
 
 from __future__ import annotations
@@ -11,9 +15,18 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from typing import Any
 
 from verathos.protocol.http import get_json
-from verathos.protocol.status import STATUS_PATH, EndpointStatus, HotkeyStatus, ThroughputOutcome
+from verathos.protocol.status import (
+    MAX_STATUS_BYTES,
+    STATUS_DOMAIN,
+    STATUS_PATH,
+    EndpointStatus,
+    HotkeyStatus,
+    ThroughputOutcome,
+    unverified,
+)
 
 log = logging.getLogger("verathos.miner.status")
 POLL_S = 120.0
@@ -68,14 +81,20 @@ def describe_test(t: ThroughputOutcome) -> str:
 
 
 class StatusWatcher:
-    """Polls the auditor's status page for this hotkey, logs what changed and hands the test results to ``on_tests``
-    (the miner measures again an endpoint that fell short)."""
+    """Polls the auditor's status page for this hotkey, logs what changed and hands the test results of a verified
+    status to ``on_tests`` (the miner measures again an endpoint that fell short). ``auditor_hotkey``: the subnet
+    owner hotkey, as read from the chain."""
 
-    def __init__(self, *, hotkey: str, auditor_url: Callable[[], str | None], listed: Callable[[], list[str]],
-                 on_tests: Callable[[list[ThroughputOutcome]], None] = lambda tests: None) -> None:
-        self.hotkey, self.auditor_url, self.listed, self.on_tests = hotkey, auditor_url, listed, on_tests
+    def __init__(self, *, hotkey: str, netuid: int, auditor_url: Callable[[], str | None],
+                 auditor_hotkey: Callable[[], str | None], listed: Callable[[], list[str]],
+                 on_tests: Callable[[list[ThroughputOutcome]], None] = lambda tests: None,
+                 clock: Callable[[], float] = time.time) -> None:
+        self.hotkey, self.netuid, self.auditor_url, self.auditor_hotkey = hotkey, netuid, auditor_url, auditor_hotkey
+        self.listed, self.on_tests, self.clock = listed, on_tests, clock
         self._epoch: int | None = None
-        self._tests_logged: set[tuple[int, str]] = set()
+        self._tests_logged: set[tuple[int, str]] | None = None  # None until the first status
+        self._issued_ms = 0  # when the latest verified status was signed
+        self._refused: str | None = None  # why the latest status was not acted on
 
     def start(self, interval_s: float = POLL_S) -> None:
         def run() -> None:
@@ -92,11 +111,31 @@ class StatusWatcher:
         base = self.auditor_url()
         if not base:
             return
-        status = HotkeyStatus.model_validate(
-            get_json(base.rstrip("/") + STATUS_PATH.format(hotkey=self.hotkey), limit=1 << 20, timeout=15))
+        document = get_json(base.rstrip("/") + STATUS_PATH.format(hotkey=self.hotkey), limit=MAX_STATUS_BYTES,
+                            timeout=15)
+        status = HotkeyStatus.model_validate(document)
         for line in self.lines(status):
             log.info(line)
-        self.on_tests(status.tests)
+        why = self.refused(document, status)
+        if why is None:
+            if self._refused is not None:
+                log.info("the auditor's status verifies again: the miner acts on its test results")
+            self._refused, self._issued_ms = None, document["issued_ms"]
+            self.on_tests(status.tests)
+        elif why != self._refused:
+            self._refused = why
+            log.warning("the auditor's status is logged but not acted on: %s. Until a status verifies, its test "
+                        "results never make the miner measure again or cap a declaration", why)
+
+    def refused(self, document: Any, status: HotkeyStatus) -> str | None:
+        """Why the miner does not act on ``document`` (as received; ``status``: as read); None if it does."""
+        why = unverified(document, domain=STATUS_DOMAIN, auditor=self.auditor_hotkey(), netuid=self.netuid,
+                         now_ms=int(self.clock() * 1000))
+        if why is None and status.hotkey != self.hotkey:
+            return "it is another hotkey's status"
+        if why is None and document["issued_ms"] < self._issued_ms:
+            return "it was signed before a status already read"
+        return why
 
     def lines(self, status: HotkeyStatus) -> list[str]:
         out, listed = [], self.listed()
@@ -115,9 +154,13 @@ class StatusWatcher:
                 if endpoint_id not in seen:
                     out.append(f"  {endpoint_id}: not in that epoch (manifest not accepted yet, or published after "
                                "the epoch started)")
-        for t in sorted(status.tests, key=lambda t: (t.epoch, t.endpoint_id)):
+        final = sorted((t for t in status.tests if t.state in FINAL_STATES), key=lambda t: (t.epoch, t.endpoint_id))
+        if self._tests_logged is None:  # the first status: earlier tests than each endpoint's latest go unlogged
+            latest = {t.endpoint_id: (t.epoch, t.endpoint_id) for t in final}
+            self._tests_logged = {(t.epoch, t.endpoint_id) for t in final} - set(latest.values())
+        for t in final:
             key = (t.epoch, t.endpoint_id)
-            if t.endpoint_id in listed and key not in self._tests_logged and t.state in FINAL_STATES:
+            if t.endpoint_id in listed and key not in self._tests_logged:
                 self._tests_logged.add(key)
                 out.append(describe_test(t))
         return out

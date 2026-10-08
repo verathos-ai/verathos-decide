@@ -21,6 +21,7 @@ commits on chain.
 | Admission on the miner (tests yield to other traffic) | `miner/admission.py`, `miner/app.py` |
 | Auditor and load generator | `throughput/auditor.py`, `throughput/loadgen.py`, `native/loadgen` |
 | Verdicts | `throughput/feed.py`, `validator/throughput.py` |
+| A hotkey's signed status (its test results) | `protocol/status.py`, `validator/service.py`, `miner/status.py` |
 
 ## Declared capacity
 
@@ -52,15 +53,17 @@ miner and is retried later. An endpoint whose engine does not answer, or answers
 restarted miner serves the manifest it last published.
 
 A test measures under real conditions, and its result counts over the miner's measurement. The miner reads its test
-results from the auditor's status (`GET /v1/status/<hotkey>`). When an endpoint's last two counted tests (confirmed,
-not void) were both `partial` with less delivered than the rate tested, at the rate it declares now, the miner
-measures again (all its endpoints in the same rounds, as above) and declares at most the higher rate the endpoint
-delivered in those two tests. The cap is kept across restarts and holds until the miner measures for another reason
-(a fingerprint changed, or `--remeasure`); a further shortfall can only lower it, so a declaration falls only on the
-tests' evidence and rises only on a measurement they did not cause. Tests in which the endpoint delivered less than
-half the rate tested, both of them, show an outage rather than its capacity: the miner measures again but sets no cap
-from them. An endpoint makes the miner measure again this way at most once every 3 epochs, never twice for the same
-test.
+results from the auditor's status (`GET /v1/status/<hotkey>`, its results in the auditor's last 10 tests) and acts on
+them only once the status verifies: signed by the subnet owner hotkey, for its hotkey and netuid, within 5 minutes of
+its clock and not before a status it already read (`protocol/status.py`). When an endpoint's last two counted tests
+(confirmed, not void) were both `partial` with less delivered than the rate tested, at the rate it declares now, the
+miner measures again (all its endpoints in the same rounds, as above) and declares at most the higher rate the
+endpoint delivered in those two tests. The cap is kept across restarts and holds until the miner measures for another
+reason (a fingerprint changed, or `--remeasure`); a further shortfall can only lower it, so a declaration falls only
+on the tests' evidence and rises only on a measurement they did not cause. Tests in which the endpoint delivered less
+than half the rate tested, both of them, show an outage rather than its capacity: the miner measures again but sets
+no cap from them. An endpoint makes the miner measure again this way at most once every 3 epochs, never twice for the
+same test.
 
 The miner never sends an engine more requests at once than its knee concurrency; further requests wait in the
 miner (up to four per engine slot).
@@ -295,6 +298,6 @@ The auditor needs:
 
 Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers), `verdicts`
 (as served), `demand` (users' input tokens per model) and `users` (what users got from each endpoint), the last 30
-epochs). A catalog with another `epoch_blocks` renumbers it (a test by its selection block, the rest by the first
-block of its epoch; the verdicts served for the old epochs are dropped), so credits, test rates, demand and wrong
-answers carry on.
+epochs, more than the last 10 tests a hotkey's status lists). A catalog with another `epoch_blocks` renumbers it (a
+test by its selection block, the rest by the first block of its epoch; the verdicts served for the old epochs are
+dropped), so credits, test rates, demand and wrong answers carry on.

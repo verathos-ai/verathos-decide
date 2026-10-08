@@ -67,8 +67,9 @@ from verathos.protocol.gateway import (
     SignedRoutes,
     latency_median_ms,
 )
+from verathos.protocol.manifest import MAX_ENDPOINTS
 from verathos.protocol.receipts import parse_response, signed_answers
-from verathos.protocol.status import ThroughputOutcome
+from verathos.protocol.status import STATUS_TESTS, ThroughputOutcome
 from verathos.throughput import loadgen
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.feed import (
@@ -114,7 +115,7 @@ USER_RATE_LAG_S = 10.0  # ... ending this long before the test (the gateways rep
 MIN_TEST_SHARE = 0.1  # a test sends at least this share of the tested rate itself
 USERS_BEFORE_S = (80.0, 20.0)  # an endpoint's usual user rate: [window start - 80 s, window start - 20 s)
 SERVED_KEEP_S = 900
-KEEP_EPOCHS = 30
+KEEP_EPOCHS = 30  # at least STATUS_TESTS: with a test every epoch, the tests a status lists are all kept
 SCHEMA_VERSION = 10
 _DEMAND_SCHEMA = """
 CREATE TABLE demand (epoch INTEGER NOT NULL, model_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
@@ -367,9 +368,11 @@ _SCRUB = "request = '{}', response = ''"  # a user's request and answers are kep
 class Store:
     """Tests, results and sampled gateway exchanges, kept for ``KEEP_EPOCHS`` epochs, numbered by epochs of
     ``epoch_blocks`` (a new epoch length renumbers them: ``renumber``). A database of another schema version is
-    started over."""
+    started over. ``revision`` changes whenever a test or a result is recorded, confirmed, voided, renumbered or
+    pruned: what ``outcomes`` lists can have changed."""
 
     def __init__(self, path: Path, *, epoch_blocks: int) -> None:
+        self.revision = 0
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._db.execute("PRAGMA secure_delete = ON")  # a scrubbed request leaves nothing in the file
         self._lock = threading.Lock()
@@ -429,6 +432,7 @@ class Store:
                                       for key, t in users.items()])
                 log.info("auditor database renumbered from epochs of %d blocks to epochs of %d", old, new)
             self._db.execute("COMMIT")
+            self.revision += 1
         self.epoch_blocks = new
 
     def known(self, test_id: str) -> bool:
@@ -448,9 +452,11 @@ class Store:
                     "VALUES (?, ?, ?, ?, ?, 'running')",
                     (test.test_id, test.selection_block // self.epoch_blocks, test.selection_block,
                      test.selection_hash, test.start_block))
+        self.revision += 1
 
     def set_state(self, test_id: str, state: str, reason: str = "") -> None:
         self._query("UPDATE tests SET state = ?, reason = ? WHERE test_id = ?", (state, reason, test_id))
+        self.revision += 1
 
     def add_results(self, test_id: str, results: list[Result]) -> None:
         rows = [(test_id, r.target.slot.hotkey, r.target.slot.endpoint_id, r.target.slot.model_id,
@@ -463,6 +469,7 @@ class Store:
                                  "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
             self._db.execute("UPDATE tests SET state = 'unconfirmed' WHERE test_id = ?", (test_id,))
             self._db.execute("COMMIT")
+            self.revision += 1
 
     def unconfirmed(self) -> list[tuple[str, int, str]]:
         """-> [(test_id, selection_block, selection_hash)]"""
@@ -721,16 +728,19 @@ class Store:
     def serve_verdicts(self, epoch: int, document: str) -> None:
         self._query("INSERT OR IGNORE INTO verdicts (epoch, document) VALUES (?, ?)", (epoch, document))
 
-    def outcomes(self, hotkey: str, since_epoch: int) -> list[ThroughputOutcome]:
+    def outcomes(self, hotkey: str, tests: int = STATUS_TESTS) -> list[ThroughputOutcome]:
+        """The hotkey's results in the last ``tests`` tests (whatever their state), oldest first: at most
+        ``MAX_ENDPOINTS`` per test, as a manifest lists."""
         rows = self._query(
             "SELECT r.endpoint_id, t.epoch, t.start_block, t.state, r.outcome, "
             "CASE WHEN t.state = 'void' THEN t.reason ELSE r.reason END, r.declared_rps, r.tested_rps, "
             "r.delivered_rps, r.credited_rps, r.latency_p50_ms, r.latency_p95_ms "
-            "FROM results r JOIN tests t USING (test_id) WHERE r.hotkey = ? AND t.epoch >= ? "
-            "ORDER BY t.epoch, r.endpoint_id", (hotkey, since_epoch))
+            "FROM results r JOIN tests t USING (test_id) WHERE r.hotkey = ? AND t.test_id IN "
+            "(SELECT test_id FROM tests ORDER BY start_block DESC LIMIT ?) "
+            "ORDER BY t.start_block DESC, r.endpoint_id DESC LIMIT ?", (hotkey, tests, tests * MAX_ENDPOINTS))
         keys = ("endpoint_id", "epoch", "start_block", "state", "outcome", "reason", "declared_rps", "tested_rps",
                 "delivered_rps", "credited_rps", "latency_p50_ms", "latency_p95_ms")
-        return [ThroughputOutcome(**dict(zip(keys, row))) for row in rows]
+        return [ThroughputOutcome(**dict(zip(keys, row))) for row in reversed(rows)]
 
     def prune(self, before_epoch: int) -> None:
         """Forget epochs before ``before_epoch``."""
@@ -743,6 +753,7 @@ class Store:
             self._db.execute("DELETE FROM demand WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM users WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM shares WHERE epoch < ?", (before_epoch,))
+            self.revision += 1
 
 
 def _beyond(total: float, count: int, tolerance: Tolerance) -> bool:
@@ -1429,6 +1440,11 @@ class Auditor:
         self._routes = (now, SignedRoutes.create(table, self.keypair))
         return self._routes[1]
 
-    def outcomes(self, hotkey: str, epoch: int) -> list[ThroughputOutcome]:
-        """The hotkey's test results since ``credit_ttl_epochs + 1`` epochs before ``epoch``."""
-        return self.store.outcomes(hotkey, epoch - self.policy.credit_ttl_epochs - 1)
+    def outcomes(self, hotkey: str) -> list[ThroughputOutcome]:
+        """The hotkey's results in the last ``STATUS_TESTS`` tests, for its status."""
+        return self.store.outcomes(hotkey)
+
+    @property
+    def revision(self) -> int:
+        """Changes whenever what ``outcomes`` lists may have (``Store.revision``)."""
+        return self.store.revision

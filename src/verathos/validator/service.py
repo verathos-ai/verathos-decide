@@ -4,21 +4,33 @@ The subnet owner's validator serves catalogs by digest (``GET /v1/catalog/{diges
 fetch a newly committed catalog; as the throughput auditor it serves its signed verdicts
 (``GET /v1/throughput/{epoch}``), and to the subnet's gateways the routes and the intake for sampled exchanges
 (``protocol.gateway``). It serves each hotkey's status (``GET /v1/status/{hotkey}``, see ``validator.status``) and all
-of them at once (``GET /v1/network``). Other validators run no service.
+of them at once (``GET /v1/network``), both signed with its hotkey (``protocol.status``). Other validators run no
+service.
+
+A hotkey's signed status is built at most once per ``STATUS_CACHE_S`` (sooner once the board publishes an epoch or the
+auditor records, confirms or voids a test), and may be cached as long. A client address (an IPv4 address, or an IPv6
+/64) gets a burst of ``STATUS_BURST`` status requests, then one per ``STATUS_EVERY_S``; beyond, HTTP 429 with
+``Retry-After``. Miners poll their status every 2 minutes per machine, so one address holds about 24 machines' polls.
+Behind a reverse proxy on the same host, the address is the client's from ``X-Forwarded-For``, which uvicorn takes
+from loopback peers only.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
+import math
 import re
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Collection
 
 import bittensor as bt
 import uvicorn
+from bittensor_wallet import Keypair
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
@@ -33,7 +45,14 @@ from verathos.protocol.gateway import (
     ServedReport,
 )
 from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, verify_request
-from verathos.protocol.status import NETWORK_PATH, STATUS_PATH, HotkeyStatus
+from verathos.protocol.status import (
+    NETWORK_DOMAIN,
+    NETWORK_PATH,
+    STATUS_DOMAIN,
+    STATUS_PATH,
+    HotkeyStatus,
+    sign_document,
+)
 from verathos.subnet.chain import serve_axon
 from verathos.throughput.auditor import Auditor
 from verathos.throughput.feed import VERDICTS_PATH
@@ -42,6 +61,11 @@ from verathos.validator.status import StatusBoard
 log = logging.getLogger(__name__)
 INTAKE_BODY_S = 10.0
 INTAKE_CONCURRENCY = 4
+STATUS_CACHE_S = 30.0
+STATUS_CACHE_ENTRIES = 1024  # hotkeys whose signed status is kept at once (a subnet has 256 UIDs)
+STATUS_BURST, STATUS_EVERY_S = 10, 5.0
+MAX_ADDRESSES = 4096  # client addresses the status limit tracks at once
+MAX_HOTKEY_CHARS = 64  # an SS58 address has 48
 
 
 class _DropInvalidRequests(logging.Filter):
@@ -51,21 +75,88 @@ class _DropInvalidRequests(logging.Filter):
         return "Invalid HTTP request" not in record.getMessage()
 
 
-def add_status_route(app: FastAPI, board: StatusBoard, auditor: Auditor | None) -> None:
+def address_group(host: str) -> str:
+    """The unit requests are limited by: an IPv4 address (also one mapped into IPv6), or an IPv6 /64."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return str(ipaddress.ip_network(f"{ip}/64", strict=False)) if ip.version == 6 else str(ip)
+
+
+class AddressLimit:
+    """Per key, a burst of ``burst`` requests, then one per ``every_s`` (the generic cell rate algorithm). At most
+    ``max_keys`` keys are tracked: beyond, the one allowed a request longest ago is forgotten and starts afresh."""
+
+    def __init__(self, burst: int = STATUS_BURST, every_s: float = STATUS_EVERY_S,
+                 max_keys: int = MAX_ADDRESSES) -> None:
+        self.burst, self.every_s, self.max_keys = burst, every_s, max_keys
+        self._tat: OrderedDict[str, float] = OrderedDict()  # key -> theoretical arrival time of its next request
+        self._lock = threading.Lock()
+
+    def check(self, key: str, now: float) -> float:
+        """0.0 if a request of ``key`` is allowed now (and counts it); otherwise the seconds until it would be."""
+        with self._lock:
+            tat = max(self._tat.get(key, now), now)
+            wait = tat - now - (self.burst - 1) * self.every_s
+            if wait > 0:
+                return wait
+            self._tat[key] = tat + self.every_s
+            self._tat.move_to_end(key)
+            while len(self._tat) > self.max_keys:
+                self._tat.popitem(last=False)
+            return 0.0
+
+
+def add_status_route(app: FastAPI, board: StatusBoard, auditor: Auditor | None, keypair: Keypair, netuid: int, *,
+                     clock: Callable[[], float] = time.monotonic) -> None:
+    """``GET /v1/status/{hotkey}``: the board's status of the hotkey and its results in the auditor's last tests,
+    signed; cached and limited per client address (see the module)."""
+    limit, lock = AddressLimit(), threading.Lock()
+    cache: OrderedDict[str, tuple[float, tuple[int, int], bytes]] = OrderedDict()  # -> (built, revisions, body)
+
     @app.get(STATUS_PATH)
-    def get_status(hotkey: str):
-        status = board.get(hotkey) or HotkeyStatus(hotkey=hotkey)
-        if auditor is not None:
-            epoch = auditor.follower.head // auditor.policy.epoch_blocks
-            status = status.model_copy(update={"tests": auditor.outcomes(hotkey, epoch)})
-        return status.model_dump()
+    def get_status(hotkey: str, request: Request):
+        now = clock()
+        wait = limit.check(address_group(request.client.host if request.client else ""), now)
+        if wait:
+            return JSONResponse({"error": "too many status requests from this address"}, status_code=429,
+                                headers={"Retry-After": str(max(1, math.ceil(wait)))})
+        if len(hotkey) > MAX_HOTKEY_CHARS:
+            return JSONResponse({"error": "not a hotkey"}, status_code=404)
+        revisions = (board.revision, auditor.revision if auditor is not None else 0)
+        with lock:
+            cached = cache.get(hotkey)
+        if cached is None or cached[1] != revisions or now - cached[0] >= STATUS_CACHE_S:
+            status = board.get(hotkey) or HotkeyStatus(hotkey=hotkey)
+            if auditor is not None:
+                status = status.model_copy(update={"tests": auditor.outcomes(hotkey)})
+            document = sign_document(status.model_dump(mode="json"), keypair, netuid=netuid, domain=STATUS_DOMAIN,
+                                     now_ms=int(time.time() * 1000))
+            cached = (now, revisions, json.dumps(document, separators=(",", ":")).encode())
+            with lock:
+                cache[hotkey] = cached
+                cache.move_to_end(hotkey)
+                while len(cache) > STATUS_CACHE_ENTRIES:
+                    cache.popitem(last=False)
+        return Response(cached[2], media_type="application/json",
+                        headers={"Cache-Control": f"public, max-age={STATUS_CACHE_S:.0f}"})
 
 
-def add_network_route(app: FastAPI, board: StatusBoard) -> None:
+def add_network_route(app: FastAPI, board: StatusBoard, keypair: Keypair, netuid: int) -> None:
+    """``GET /v1/network``: every hotkey's status of the board's epoch, signed once per epoch."""
+    signed: list[tuple[int, bytes]] = []  # [(board revision, signed body)]
+
     @app.get(NETWORK_PATH)
     def get_network():
-        return Response(board.network(), media_type="application/json",
-                        headers={"Cache-Control": "public, max-age=30"})
+        revision, body = board.versioned_network()
+        if not signed or signed[0][0] != revision:
+            document = sign_document(json.loads(body), keypair, netuid=netuid, domain=NETWORK_DOMAIN,
+                                     now_ms=int(time.time() * 1000))
+            signed[:] = [(revision, json.dumps(document, separators=(",", ":")).encode())]
+        return Response(signed[0][1], media_type="application/json",
+                        headers={"Cache-Control": f"public, max-age={STATUS_CACHE_S:.0f}"})
 
 
 def add_verdicts_route(app: FastAPI, auditor: Auditor) -> None:
@@ -152,8 +243,8 @@ def start_service(*, st: bt.Subtensor, wallet: bt.Wallet, netuid: int, public_ho
                   probation: Callable[[], Collection[str]] = frozenset,
                   gateways: Callable[[], Collection[str]] = frozenset) -> None:
     app = FastAPI(title="verathos validator", docs_url=None, redoc_url=None, openapi_url=None)
-    add_status_route(app, board, auditor)
-    add_network_route(app, board)
+    add_status_route(app, board, auditor, wallet.hotkey, netuid)
+    add_network_route(app, board, wallet.hotkey, netuid)
 
     if store is not None:
         @app.get(CATALOG_PATH)

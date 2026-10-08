@@ -27,7 +27,7 @@ from verathos.miner.status import StatusWatcher
 from verathos.protocol.manifest import Endpoint
 from verathos.protocol.receipts import SignedReceipt
 from verathos.protocol.requests import sign_request
-from verathos.protocol.status import ThroughputOutcome
+from verathos.protocol.status import STATUS_DOMAIN, HotkeyStatus, ThroughputOutcome, sign_document
 from verathos.throughput import measure
 from verathos.throughput.measure import Measurement, MeasurementInterrupted
 
@@ -286,14 +286,26 @@ def test_a_changed_declaration_is_published_by_the_primary_and_served_by_a_worke
     assert [(e.endpoint_id, e.capacity_rps) for e in primary_lists()] == [("w-gpu0", 10.5)]
 
 
-def test_the_status_poll_hands_the_tests_to_the_miner(monkeypatch) -> None:
-    tests = [outcome(45417), outcome(45418)]
-    monkeypatch.setattr(miner_status, "get_json", lambda url, **kwargs: {
-        "hotkey": "hkA", "tests": [t.model_dump() for t in tests]})
-    got = []
-    watcher = StatusWatcher(hotkey="hkA", auditor_url=lambda: "http://x", listed=lambda: ["gpu0"], on_tests=got.extend)
+def test_only_tests_in_a_status_the_subnet_owner_signed_make_the_miner_measure_again(tmp_path, monkeypatch) -> None:
+    publisher, calls = publisher_with(tmp_path, {"gpu0": 12.0})
+    assert publisher.adopt(CATALOG)
+    owner, hotkey = kp(), publisher.wallet.hotkey.ss58_address
+    publisher.auditor = owner.ss58_address
+    status = HotkeyStatus(hotkey=hotkey, tests=[outcome(45417), outcome(45418)]).model_dump(mode="json")
+    served = [status]  # an auditor of an older release: unsigned
+    monkeypatch.setattr(miner_status, "get_json", lambda url, **kwargs: served[-1])
+    watcher = StatusWatcher(hotkey=hotkey, netuid=405, auditor_url=lambda: "http://192.0.2.1:8091",
+                            auditor_hotkey=lambda: publisher.auditor, listed=publisher.own_ids,
+                            on_tests=publisher.note_tests)
     watcher.poll_once()
-    assert got == tests
+    assert publisher.tests == [] and not publisher.measure_shortfalls() and len(calls) == 1
+    served.append(sign_document(status, kp(), netuid=405, domain=STATUS_DOMAIN, now_ms=int(time.time() * 1000)))
+    watcher.poll_once()  # signed, but not by the subnet owner
+    assert publisher.tests == [] and not publisher.measure_shortfalls() and len(calls) == 1
+    served.append(sign_document(status, owner, netuid=405, domain=STATUS_DOMAIN, now_ms=int(time.time() * 1000)))
+    watcher.poll_once()
+    assert publisher.tests == [outcome(45417), outcome(45418)]
+    assert publisher.measure_shortfalls() and declared(publisher) == {"gpu0": 10.5}
 
 
 def test_users_are_served_while_an_endpoint_that_fell_short_is_measured_again(tmp_path, monkeypatch, caplog) -> None:

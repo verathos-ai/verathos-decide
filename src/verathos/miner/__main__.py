@@ -112,7 +112,7 @@ class Publisher:
         self.publish_on_chain = publish_on_chain and config.role == "primary"
         self.store = MeasurementStore(config.state_dir / "capacity.json")
         self.shortfalls = Shortfalls(config.state_dir / "shortfalls.json")
-        self.tests: list[ThroughputOutcome] = []  # the hotkey's latest test results, as the auditor's status lists them
+        self.tests: list[ThroughputOutcome] = []  # the hotkey's latest test results, from a verified status
         state = config.state_dir.expanduser()
         self.manifest_path, self.endpoints_path = state / "manifest.json", state / "endpoints.json"
         self.admissions = {e.endpoint_id: Admission(e.max_concurrency) for e in config.endpoints}
@@ -491,7 +491,8 @@ def main() -> None:
     if not args.no_publish:
         publisher.watch()
         chain = SubtensorChainView(config.network, config.netuid)
-        StatusWatcher(hotkey=wallet.hotkey.ss58_address, auditor_url=chain.auditor_url, listed=publisher.own_ids,
+        StatusWatcher(hotkey=wallet.hotkey.ss58_address, netuid=config.netuid, auditor_url=chain.auditor_url,
+                      auditor_hotkey=lambda: publisher.auditor, listed=publisher.own_ids,
                       on_tests=publisher.note_tests).start()
     log.info(serving_line(config, publisher))
     service.join()

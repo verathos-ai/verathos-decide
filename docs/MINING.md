@@ -322,9 +322,10 @@ set each model's share of the emission, so signing more or fewer than the refere
 
 ## Reading the log
 
-The miner logs its setup once, then what happens to its endpoints. Every two minutes it reads its status from the
-auditor's validator (`GET /v1/status/<hotkey>` on its axon, that validator's view of the last epoch) and logs it
-once per epoch, plus every throughput test of the hotkey once it is final:
+The miner logs its setup once, then what happens to its endpoints. Every two minutes each machine reads the hotkey's
+status from the auditor's validator (`GET /v1/status/<hotkey>` on its axon, that validator's view of the last epoch,
+with the hotkey's results in the auditor's last 10 throughput tests) and logs it once per epoch, plus every
+throughput test of its endpoints once it is final (after a start, the latest of each endpoint):
 
 ```
 measuring the capacity of 1 endpoints (about 3 minutes)
@@ -357,6 +358,20 @@ validator's epoch 45352:
 | `INVALID` | a sampled answer was wrong |
 | `not counted` | the test or this endpoint's result was void (the reason says why); earlier credit still counts |
 
+The auditor signs each status with the subnet owner hotkey. The miner checks the signature against the owner hotkey
+it reads from the chain, and that the status is for its hotkey and netuid, signed within 5 minutes of the machine's
+clock (keep it synchronised) and not before a status it already read. Only the test results of such a status count
+for [Falling short](#falling-short). Any other status, such as an unsigned one from an auditor of an older release, is
+logged all the same, with one warning until a status verifies again:
+
+```
+the auditor's status is logged but not acted on: it is not signed (the auditor runs an older release). Until a status verifies, its test results never make the miner measure again or cap a declaration
+```
+
+The auditor builds a hotkey's status at most every 30 s (sooner after an epoch or a test) and answers each client
+address (an IPv4 address, or an IPv6 /64) a burst of 10 status requests, then one every 5 s, with HTTP 429 and
+`Retry-After` beyond: room for about 24 machines polling every two minutes behind one address.
+
 ## Throughput tests
 
 Once per epoch, at a block nobody knows in advance, every endpoint gets its declared rate for 19-22 s: a warmup
@@ -380,10 +395,10 @@ needs to be done by hand, but:
 ### Falling short
 
 The tests measure what an endpoint serves under real conditions, and their result counts over the miner's own
-measurement. When an endpoint's last two counted tests (confirmed, not void) were both `BELOW the tested rate`, with
-less delivered than the rate tested, at the rate it declares now, the miner measures again by itself: all the
-machine's endpoints in the same rounds, as at the start, while they keep serving (requests from gateways and
-validators go before the measurement's). The endpoint then declares the new measurement with the usual margin, but
+measurement. When, in a status the subnet owner signed ([Reading the log](#reading-the-log)), an endpoint's last two
+counted tests (confirmed, not void) were both `BELOW the tested rate`, with less delivered than the rate tested, at
+the rate it declares now, the miner measures again by itself: all the machine's endpoints in the same rounds, as at
+the start, while they keep serving (requests from gateways and validators go before the measurement's). The endpoint then declares the new measurement with the usual margin, but
 at most the higher rate it delivered in those two tests:
 
 ```

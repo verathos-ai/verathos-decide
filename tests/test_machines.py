@@ -356,7 +356,7 @@ def test_two_machines_end_to_end(tmp_path, monkeypatch) -> None:
         auditor.follower.poll()
         asyncio.run(auditor.run_test(ScheduledTest(5, selection, block_hash(selection).hex(), fake_chain.head_block),
                                      Checks({"kev-4b": MockEngine("kev-4b")}, {})))
-        outcomes = {o.endpoint_id: o for o in auditor.store.outcomes(hotkey.ss58_address, 0)}
+        outcomes = {o.endpoint_id: o for o in auditor.store.outcomes(hotkey.ss58_address)}
         assert set(outcomes) == set(engines)
         assert all(o.outcome == "passed" and o.credited_rps > 0 for o in outcomes.values()), outcomes
     finally:

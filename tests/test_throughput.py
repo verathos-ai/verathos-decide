@@ -402,7 +402,7 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
     assert "differ from the reference" in verdicts.invalid[0].reason
     assert len(accepted) == 1 and agrees == [] and forged == []
 
-    outcomes = {o.outcome for o in auditor.outcomes(keys["over"].ss58_address, 4)}
+    outcomes = {o.outcome for o in auditor.outcomes(keys["over"].ss58_address)}
     assert outcomes == {"partial"}
     assert auditor.store.last_delivered()[f"{keys['honest'].ss58_address}/gpu0"][1] == pytest.approx(40, rel=0.2)
     # the over-declarer is probed next only 10% beyond what it delivered, the honest endpoint up to twice
@@ -524,7 +524,7 @@ def test_auditor_with_the_load_generator_over_tcp(tmp_path) -> None:
     finally:
         for server in servers:
             server.should_exit = True
-    honest, over = (auditor.store.outcomes(m.hotkey, 0)[0] for m in miners)
+    honest, over = (auditor.store.outcomes(m.hotkey)[0] for m in miners)
     assert honest.outcome == "passed" and honest.credited_rps == pytest.approx(40.0, rel=0.05), honest
     # delivers what is left after the warmup backlog, about 17 of 40, and is credited 17 x 17 / 40
     assert over.outcome == "partial" and 3 < over.credited_rps < 12, over
@@ -724,6 +724,41 @@ def test_a_new_epoch_length_renumbers_the_auditors_history_instead_of_wiping_it(
     restarted = Auditor(netuid=405, mechid=1, keypair=auditor.keypair, chain=chain, policy=AuditPolicy(),
                         catalog=catalog.load, references={}, db_path=tmp_path / "t.sqlite")  # back to 180
     assert restarted.store._query("SELECT epoch FROM tests") == [(100,)]
+
+
+def test_a_hotkeys_status_lists_its_results_of_the_last_ten_tests_which_the_auditor_keeps(tmp_path) -> None:
+    from verathos.protocol.manifest import MAX_ENDPOINTS
+    from verathos.protocol.status import MAX_STATUS_BYTES, STATUS_TESTS, HotkeyStatus
+    from verathos.throughput.auditor import KEEP_EPOCHS, Result, Target
+
+    chain = FakeChain(head=40 * 180 + 1)
+    auditor = Auditor(netuid=405, mechid=1, keypair=kp(), chain=chain, policy=AuditPolicy(), catalog=catalog.load,
+                      references={}, db_path=tmp_path / "t.sqlite")
+    slots = [Slot(kp().ss58_address, f"gpu{i}", f"http://x/e/gpu{i}", "kev-4b", 50.0) for i in range(MAX_ENDPOINTS)]
+    slots = [dataclasses.replace(s, hotkey=slots[0].hotkey) for s in slots]  # one hotkey's full manifest
+    reason = ("delivered 21.0 of 40.0 requests/s asked (12.3 of them to the gateway), 3 of 10 sampled responses "
+              "without a valid receipt; its answers to users in the test are unchecked: credited only its replies")
+    for epoch in range(40):
+        block = epoch * 180 + 40
+        test = ScheduledTest(epoch, block, block_hash(block).hex(), block + 5)
+        revision = auditor.revision
+        auditor.store.add_test(test)
+        assert auditor.revision != revision  # what the status lists changed: built again
+        auditor.store.add_results(test.test_id, [Result(Target(s, 50.0), "partial", reason, 21.0, 11.02, 410.5,
+                                                        1830.25) for s in slots])
+        revision = auditor.revision
+        auditor.store.set_state(test.test_id, "confirmed")
+        assert auditor.revision != revision
+    auditor.follower.poll()
+    auditor.settle()  # forgets the epochs before 40 - KEEP_EPOCHS
+    assert auditor.store._query("SELECT MIN(epoch) FROM tests") == [(40 - KEEP_EPOCHS,)]
+    listed = auditor.outcomes(slots[0].hotkey)
+    assert sorted({t.epoch for t in listed}) == list(range(40 - STATUS_TESTS, 40)) and KEEP_EPOCHS >= STATUS_TESTS
+    assert len(listed) == STATUS_TESTS * MAX_ENDPOINTS and listed == sorted(listed, key=lambda t: t.start_block)
+    status = HotkeyStatus(hotkey=slots[0].hotkey, epoch=40, epoch_blocks=180, tests=listed, endpoints=[
+        {"endpoint_id": s.endpoint_id, "model_id": s.model_id, "state": "scored", "errors": [reason]} for s in slots])
+    assert len(status.model_dump_json()) < MAX_STATUS_BYTES / 2  # the most a status holds, well within a miner's read
+    assert auditor.outcomes("another") == []
 
 
 def test_an_auditor_database_of_another_schema_starts_over(tmp_path) -> None:

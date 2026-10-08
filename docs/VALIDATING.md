@@ -271,10 +271,23 @@ capacities, up to the model's `first_test_rps`, and fetches nothing.
 Validators that run a service (the subnet owner's and the auditor's) also serve each hotkey's status for its miners
 at `GET /v1/status/<hotkey>`: the UID and its share of the weights set, per endpoint the state in the last epoch
 (scored, qualifying, candidate, drifted, failed, invalid, probation), its checks, declared and proven capacity, how
-ready users found it, its latency factor and scores, and the auditor's recent test results for the hotkey.
-`GET /v1/network` serves every hotkey's status of the last epoch at once (without the test results, built once per
-epoch), for network dashboards. These routes are public and share the auditor's process and uplink: on the auditor,
-put a rate-limiting reverse proxy in front of them.
+ready users found it, its latency factor and scores, and the hotkey's results in the auditor's last 10 tests (at
+most 64 endpoints each). `GET /v1/network` serves every hotkey's status of the last epoch at once (without the test
+results, built once per epoch), for network dashboards.
+
+Both documents are signed with the validator's hotkey, the subnet owner's: the status's fields plus `netuid`,
+`auditor` (the signing hotkey) and `issued_ms`, signed as canonical JSON (sorted keys, no whitespace) under the
+domain `verathos/status/v1` (a hotkey's status) or `verathos/network-status/v1` (the network's) into `signature`
+(`protocol/status.py`). Miners act on the test results in their status only once it verifies against the subnet
+owner hotkey; a reader that does not check ignores the four fields.
+
+These routes are public and share the auditor's process and uplink. A hotkey's status is built at most every 30 s
+(sooner once an epoch is scored or a test recorded, confirmed or voided) and may be cached as long
+(`Cache-Control: public, max-age=30`); the network's is signed once per epoch. Each client address (an IPv4 address,
+or an IPv6 /64) gets a burst of 10 status requests, then one every 5 s, and HTTP 429 with `Retry-After` beyond, so
+about 24 miner machines polling every two minutes fit behind one address; the service tracks at most 4,096 addresses
+at once. Behind a reverse proxy on the same host, the client's address comes from `X-Forwarded-For`, which the
+service takes from loopback peers only.
 
 If the validator's hotkey is the auditor, it also:
 - serves the verdicts on `port` and points its axon at `public_host:port`, where miners and validators find it;

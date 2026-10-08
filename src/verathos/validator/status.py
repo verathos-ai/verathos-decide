@@ -1,9 +1,10 @@
 """Where each endpoint stands, as a validator saw it in its last epoch.
 
-Validators that run a service (the subnet owner and the throughput auditor) serve it read-only at
-``GET /v1/status/{hotkey}``, together with the hotkey's recent throughput-test results when the validator is the
-auditor, and every hotkey's at ``GET /v1/network`` (for network dashboards). Miners poll it and log it. It is that
-validator's own view; every validator scores the same way from the same rules.
+Validators that run a service (the subnet owner and the throughput auditor) serve it read-only and signed at
+``GET /v1/status/{hotkey}``, together with the hotkey's results in the auditor's last ``STATUS_TESTS`` throughput
+tests (``protocol.status``), and every hotkey's at ``GET /v1/network`` (for network dashboards; see
+``validator.service``). Miners poll it and log it. It is that validator's own view; every validator scores the same
+way from the same rules.
 """
 
 from __future__ import annotations
@@ -65,12 +66,14 @@ def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint],
 
 
 class StatusBoard:
-    """The latest epoch's status, replaced as a whole after each epoch. The network's document is built once per
-    epoch: it is public, and every request for it would otherwise cost the validator's process a full rebuild. With a
-    ``path`` it is also kept on disk, so a restarted validator serves the last epoch's status until its next epoch."""
+    """The latest epoch's status, replaced as a whole after each epoch (``revision`` counts the replacements). The
+    network's document is built once per epoch: it is public, and every request for it would otherwise cost the
+    validator's process a full rebuild. With a ``path`` it is also kept on disk, so a restarted validator serves the
+    last epoch's status until its next epoch."""
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path
+        self.revision = 0
         self._by_hotkey: dict[str, HotkeyStatus] = {}
         if path is not None and path.exists():
             try:
@@ -85,6 +88,7 @@ class StatusBoard:
         network = _network(by_hotkey).model_dump_json().encode()
         with self._lock:
             self._by_hotkey, self._network = by_hotkey, network
+            self.revision += 1
         if self.path is not None:
             try:
                 partial = self.path.with_suffix(".partial")
@@ -101,6 +105,11 @@ class StatusBoard:
         """Every hotkey's status (``NetworkStatus``) as JSON."""
         with self._lock:
             return self._network
+
+    def versioned_network(self) -> tuple[int, bytes]:
+        """``(revision, network())``, read together."""
+        with self._lock:
+            return self.revision, self._network
 
 
 def _network(by_hotkey: dict[str, HotkeyStatus]) -> NetworkStatus:
