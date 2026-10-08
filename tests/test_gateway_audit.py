@@ -838,6 +838,7 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
     Store(tmp_path / "old.sqlite", epoch_blocks=180)  # today's, less what versions 5 on added
     db = sqlite3.connect(tmp_path / "old.sqlite")
     db.executescript("DROP TABLE demand; DROP TABLE users; DROP TABLE meta; DROP TABLE shares; DROP TABLE paid; "
+                     "DROP TABLE burns; DROP TABLE unscanned; DROP TABLE usage; "
                      "DROP INDEX results_by_endpoint; DROP INDEX samples_by_test; "
                      "ALTER TABLE samples DROP COLUMN test_id; "
                      "INSERT INTO tests VALUES ('kept', 3, 560, 'h', 565, 'confirmed', ''); "

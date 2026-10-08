@@ -89,6 +89,7 @@ from verathos.throughput.feed import (
 )
 from verathos.throughput.follow import POLL_S, ScheduleFollower
 from verathos.throughput.policy import BLOCK_TIME_S, AuditPolicy, ScheduledTest, Session, session_headers
+from verathos.throughput.usage import Burn, close, period_blocks, tao_usd
 from verathos.throughput.workload import WORDS, in_mix_form
 from verathos.validator.canaries import canary_like
 from verathos.validator.compare import RequestComparison, Tolerance
@@ -117,7 +118,11 @@ MIN_TEST_SHARE = 0.1  # a test sends at least this share of the tested rate itse
 USERS_BEFORE_S = (80.0, 20.0)  # an endpoint's usual user rate: [window start - 80 s, window start - 20 s)
 SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30  # at least STATUS_TESTS: with a test every epoch, the tests a status lists are all kept
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
+USAGE_POLL_S = 12.0  # how often the usage pool's burns are read and its periods closed
+USAGE_SCAN_S = 30.0  # the most one round reads blocks for
+SCAN_REACH_BLOCKS = 200  # blocks a node keeps the state of (a pruned node about 256): older ones are not read
+USAGE_WAIT_BLOCKS = 20  # a period's first verdicts wait this long after its start for the record of the one before
 _DEMAND_SCHEMA = """
 CREATE TABLE demand (epoch INTEGER NOT NULL, model_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
     ema REAL NOT NULL, PRIMARY KEY (epoch, model_id));
@@ -142,10 +147,19 @@ _PAID_SCHEMA = """
 CREATE TABLE paid (epoch INTEGER NOT NULL, hotkey TEXT NOT NULL, endpoint_id TEXT NOT NULL, model_id TEXT NOT NULL,
     input_tokens INTEGER NOT NULL, PRIMARY KEY (epoch, hotkey, endpoint_id, model_id));
 """
+# the usage pool: the subnet's burns as read block by block (meta burns_from: the first block read; burns_scanned: the
+# last), the block ranges that could not be read, and each period's record once closed
+_USAGE_SCHEMA = """
+CREATE TABLE burns (block INTEGER NOT NULL, event_index INTEGER NOT NULL, coldkey TEXT NOT NULL, hotkey TEXT NOT NULL,
+    amount INTEGER NOT NULL, PRIMARY KEY (block, event_index));
+CREATE TABLE unscanned (first_block INTEGER NOT NULL, end_block INTEGER NOT NULL);
+CREATE TABLE usage (first_block INTEGER NOT NULL, end_block INTEGER NOT NULL, document TEXT NOT NULL,
+    PRIMARY KEY (first_block, end_block));
+"""
 # from version -> the statements that bring it one version up
 _MIGRATIONS = {4: _DEMAND_SCHEMA, 5: _USERS_SCHEMA, 6: _RESULTS_INDEX,
                7: "ALTER TABLE samples ADD COLUMN test_id TEXT; " + _SAMPLES_BY_TEST, 8: _META_SCHEMA,
-               9: _SHARES_SCHEMA, 10: _PAID_SCHEMA}
+               9: _SHARES_SCHEMA, 10: _PAID_SCHEMA, 11: _USAGE_SCHEMA}
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
 
 
@@ -363,7 +377,8 @@ CREATE TABLE samples (
 CREATE INDEX samples_by_state ON samples (state, epoch);
 CREATE INDEX samples_by_endpoint ON samples (hotkey, endpoint_id, epoch);
 CREATE TABLE verdicts (epoch INTEGER PRIMARY KEY, document TEXT NOT NULL);
-""" + _DEMAND_SCHEMA + _USERS_SCHEMA + _RESULTS_INDEX + _SAMPLES_BY_TEST + _META_SCHEMA + _SHARES_SCHEMA + _PAID_SCHEMA
+""" + (_DEMAND_SCHEMA + _USERS_SCHEMA + _RESULTS_INDEX + _SAMPLES_BY_TEST + _META_SCHEMA + _SHARES_SCHEMA + _PAID_SCHEMA
+       + _USAGE_SCHEMA)
 # test states: running -> unconfirmed -> confirmed | void
 _SCRUB = "request = '{}', response = ''"  # a user's request and answers are kept only until their check
 # sample states: pending -> checked | skipped (its endpoint's checks for the epoch were done) | unchecked (no
@@ -393,7 +408,8 @@ class Store:
                                    "DROP TABLE IF EXISTS samples; DROP TABLE IF EXISTS verdicts; "
                                    "DROP TABLE IF EXISTS demand; DROP TABLE IF EXISTS users; "
                                    "DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS shares; "
-                                   "DROP TABLE IF EXISTS paid;" + _SCHEMA
+                                   "DROP TABLE IF EXISTS paid; DROP TABLE IF EXISTS burns; "
+                                   "DROP TABLE IF EXISTS unscanned; DROP TABLE IF EXISTS usage;" + _SCHEMA
                                    + f"PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;")
             log.info("auditor database %s started for schema %d", path, SCHEMA_VERSION)
         self._query("UPDATE tests SET state = 'void', reason = 'the auditor restarted during the test' "
@@ -743,6 +759,55 @@ class Store:
                                            {int(b): n for b, n in json.loads(latency).items()})
                 for hk, ep, model, offered, refused, answers, latency in rows}
 
+    # ---- the usage pool ----
+
+    def scan_position(self) -> tuple[int, int] | None:
+        """(the first block the burns were read from, the last block read); None before the first read."""
+        rows = dict(self._query("SELECT key, value FROM meta WHERE key IN ('burns_from', 'burns_scanned')"))
+        return (int(rows["burns_from"]), int(rows["burns_scanned"])) if len(rows) == 2 else None
+
+    def start_scan(self, first_block: int) -> None:
+        with self._lock:
+            self._db.execute("BEGIN")
+            self._db.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                                 [("burns_from", str(first_block)), ("burns_scanned", str(first_block - 1))])
+            self._db.execute("COMMIT")
+
+    def add_burns(self, last_block: int, burns: list[Burn], unscanned: tuple[int, int] | None = None) -> None:
+        """Record the burns read up to ``last_block`` (and ``unscanned``, a range not read), and the scan there."""
+        with self._lock:
+            self._db.execute("BEGIN")
+            self._db.executemany("INSERT OR REPLACE INTO burns VALUES (?, ?, ?, ?, ?)",
+                                 [(b.block, b.event_index, b.coldkey, b.hotkey, b.amount) for b in burns])
+            if unscanned is not None:
+                self._db.execute("INSERT INTO unscanned VALUES (?, ?)", unscanned)
+            self._db.execute("INSERT OR REPLACE INTO meta VALUES ('burns_scanned', ?)", (str(last_block),))
+            self._db.execute("COMMIT")
+
+    def burns(self, first_block: int, end_block: int) -> list[Burn]:
+        rows = self._query("SELECT block, event_index, coldkey, hotkey, amount FROM burns WHERE block >= ? AND "
+                           "block < ? ORDER BY block, event_index", (first_block, end_block))
+        return [Burn(block=b, event_index=i, coldkey=c, hotkey=h, amount=a) for b, i, c, h, a in rows]
+
+    def unscanned(self, first_block: int, end_block: int) -> list[tuple[int, int]]:
+        return [(a, b) for a, b in self._query("SELECT first_block, end_block FROM unscanned WHERE first_block < ? "
+                                               "AND end_block > ? ORDER BY first_block", (end_block, first_block))]
+
+    def usage_record(self, first_block: int, end_block: int) -> str | None:
+        """The record of the period of these blocks (a period is its blocks: another period length makes others)."""
+        rows = self._query("SELECT document FROM usage WHERE first_block = ? AND end_block = ?",
+                           (first_block, end_block))
+        return rows[0][0] if rows else None
+
+    def recorded_through(self) -> int:
+        """The last end block of the periods recorded: a period before it is recorded or overlaps one that is."""
+        rows = self._query("SELECT MAX(end_block) FROM usage")
+        return int(rows[0][0] or 0)
+
+    def put_usage_record(self, first_block: int, end_block: int, document: str) -> None:
+        """Keep a period's record; once kept it does not change."""
+        self._query("INSERT OR IGNORE INTO usage VALUES (?, ?, ?)", (first_block, end_block, document))
+
     # ---- served verdicts ----
 
     def served_verdicts(self, epoch: int) -> str | None:
@@ -766,8 +831,10 @@ class Store:
                 "delivered_rps", "credited_rps", "latency_p50_ms", "latency_p95_ms")
         return [ThroughputOutcome(**dict(zip(keys, row))) for row in reversed(rows)]
 
-    def prune(self, before_epoch: int) -> None:
-        """Forget epochs before ``before_epoch``."""
+    def prune(self, before_epoch: int, usage_before_epoch: int | None = None) -> None:
+        """Forget epochs before ``before_epoch``; the paid input tokens, burns and usage records before
+        ``usage_before_epoch`` (default: ``before_epoch``)."""
+        usage_before = before_epoch if usage_before_epoch is None else min(before_epoch, usage_before_epoch)
         with self._lock:
             self._db.execute("DELETE FROM results WHERE test_id IN (SELECT test_id FROM tests WHERE epoch < ?)",
                              (before_epoch,))
@@ -777,7 +844,10 @@ class Store:
             self._db.execute("DELETE FROM demand WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM users WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM shares WHERE epoch < ?", (before_epoch,))
-            self._db.execute("DELETE FROM paid WHERE epoch < ?", (before_epoch,))
+            self._db.execute("DELETE FROM paid WHERE epoch < ?", (usage_before,))
+            self._db.execute("DELETE FROM burns WHERE block < ?", (usage_before * self.epoch_blocks,))
+            self._db.execute("DELETE FROM unscanned WHERE end_block <= ?", (usage_before * self.epoch_blocks,))
+            self._db.execute("DELETE FROM usage WHERE end_block <= ?", (usage_before * self.epoch_blocks,))
             self.revision += 1
 
 
@@ -843,10 +913,14 @@ class Auditor:
     def __init__(self, *, netuid: int, keypair: Keypair, chain: SubtensorChainView,
                  policy: AuditPolicy, catalog: Callable[[], catalog_module.Catalog],
                  references: dict[str, ReferenceEngine], db_path: Path, runner: Runner = loadgen.run,
-                 screens: dict[str, ReferenceEngine] | None = None) -> None:
+                 screens: dict[str, ReferenceEngine] | None = None, usage_chain: SubtensorChainView | None = None,
+                 tao_usd: Callable[[], float] = tao_usd) -> None:
         """``references`` recompute answers in fp32; a model with an entry in ``screens`` is screened there first
-        (bf16), and the fp32 reference only confirms what the screen flags."""
+        (bf16), and the fp32 reference only confirms what the screen flags. The usage pool reads the chain through
+        ``usage_chain`` (default ``chain``) and TAO's price in USD through ``tao_usd``."""
         self.netuid, self.keypair, self.chain = netuid, keypair, chain
+        self.usage_chain, self.tao_usd = usage_chain or chain, tao_usd
+        self._usage_skipped: int | None = None  # the period last found not closable (logged once)
         self.hotkey = keypair.ss58_address
         self.policy, self.catalog, self.runner = policy, catalog, runner
         self.reference_specs, self.screen_specs = references, screens or {}
@@ -904,7 +978,8 @@ class Auditor:
         checks = Checks(
             {m: BoundedEngine(r.engine(REFERENCE_TIMEOUT_S)) for m, r in self.reference_specs.items()},
             {m: BoundedEngine(r.engine(REFERENCE_TIMEOUT_S)) for m, r in self.screen_specs.items()})
-        tasks: set[asyncio.Task] = {asyncio.create_task(self.check_samples_forever(checks))}
+        tasks: set[asyncio.Task] = {asyncio.create_task(self.check_samples_forever(checks)),
+                                    asyncio.create_task(self.usage_forever())}
         while True:
             try:
                 for test in await asyncio.to_thread(self.follower.poll):
@@ -925,6 +1000,15 @@ class Auditor:
             except Exception:
                 log.exception("checking gateway samples failed")
             await asyncio.sleep(POLL_S)
+
+    async def usage_forever(self) -> None:
+        """The usage pool's chain reads run apart from the tests' schedule, never holding it up."""
+        while True:
+            try:
+                await asyncio.to_thread(self.step_usage)
+            except Exception:
+                log.exception("usage pool step failed")
+            await asyncio.sleep(USAGE_POLL_S)
 
     async def _usable(self, checks: Checks) -> Checks:
         """``checks`` less what may not run now (``Checks.usable``)."""
@@ -1355,7 +1439,9 @@ class Auditor:
         with self._demand_lock:  # not while a new epoch length renumbers the rows
             epoch = self.follower.head // self.policy.epoch_blocks
             if epoch != self._pruned_epoch:
-                self.store.prune(epoch - KEEP_EPOCHS)
+                pool = self.catalog().scoring.usage_pool
+                self.store.prune(epoch - KEEP_EPOCHS, None if pool is None else
+                                 (pool.period(epoch) - 1) * pool.period_epochs)  # the period before's are closed now
                 self._pruned_epoch = epoch
         if self.follower.head > 0:
             self.close_epoch(epoch)
@@ -1373,6 +1459,89 @@ class Auditor:
                 self.store.set_state(test_id, "confirmed")
             else:
                 self.store.set_state(test_id, "void", "the selection block was not finalized")
+
+    # ---- the usage pool ----
+
+    def step_usage(self) -> None:
+        """With the catalog's usage pool: read the subnet's burns up to the finalized block (burned mode) and close the
+        latest period whose end is final (``throughput.usage``)."""
+        cat = self.catalog()
+        pool = cat.scoring.usage_pool
+        if pool is None or self.follower.head <= 0:
+            return
+        final, epoch_blocks = self.usage_chain.finalized_block(), self.policy.epoch_blocks
+        if pool.mode == "burned":
+            self.scan_burns(final, pool, epoch_blocks)
+        self.close_usage(final, pool, cat, epoch_blocks)
+
+    def scan_burns(self, final: int, pool: catalog_module.UsagePool, epoch_blocks: int) -> None:
+        """Read the burns on the subnet block by block up to ``final``, from the first block of the period the reading
+        starts in, for at most ``USAGE_SCAN_S``. Blocks further back than ``SCAN_REACH_BLOCKS`` are not read: they are
+        recorded as unscanned, and their burns do not count. A block that cannot be read is tried again next round."""
+        position = self.store.scan_position()
+        if position is None:
+            first = period_blocks(pool, epoch_blocks, pool.period(final // epoch_blocks))[0]
+            self.store.start_scan(first)
+            position = (first, first - 1)
+        scanned, reach = position[1], final - SCAN_REACH_BLOCKS
+        if scanned + 1 < reach:
+            log.warning("usage pool: blocks %d to %d are beyond the node's state; burns there do not count",
+                        scanned + 1, reach - 1)
+            self.store.add_burns(reach - 1, [], unscanned=(scanned + 1, reach))
+            scanned = reach - 1
+        burns: list[Burn] = []
+        deadline, last = time.monotonic() + USAGE_SCAN_S, scanned
+        for block in range(scanned + 1, final + 1):
+            if time.monotonic() > deadline:
+                break
+            try:
+                burns += self.usage_chain.burns(block, self.netuid)
+            except Exception as exc:
+                log.warning("usage pool: block %d's events not read (tried again): %s", block, exc)
+                break
+            last = block
+        if last > scanned:
+            self.store.add_burns(last, burns)
+
+    def close_usage(self, final: int, pool: catalog_module.UsagePool, cat: catalog_module.Catalog,
+                    epoch_blocks: int) -> None:
+        """Close the latest period whose end block is final into its record, once: its paid input tokens, and the
+        chain at its end block (and in burned mode its burns, once read through it; in revenue mode the prices)."""
+        period = final // (pool.period_epochs * epoch_blocks) - 1
+        first, end = period_blocks(pool, epoch_blocks, period)
+        if period < 0 or self.store.usage_record(first, end) is not None:
+            return
+        if first < self.store.recorded_through():  # periods of another length: its burns and usage are paid already
+            if self._usage_skipped != period:
+                log.info("usage pool: period %d overlaps one recorded before; it has no record", period)
+                self._usage_skipped = period
+            return
+        self.close_epoch(self.follower.head // epoch_blocks)  # the period's last epoch's paid tokens
+        paid = self.store.paid(period * pool.period_epochs, (period + 1) * pool.period_epochs - 1)
+        burns = unscanned = price = alpha = None
+        if pool.mode == "burned":
+            position = self.store.scan_position()
+            if position is None or position[1] < end - 1:
+                return  # not read through the period yet
+            if position[0] > first:
+                if self._usage_skipped != period:
+                    log.info("usage pool: period %d started before the burns were read; it has no record", period)
+                    self._usage_skipped = period
+                return
+            burns, unscanned = self.store.burns(first, end), self.store.unscanned(first, end)
+        try:
+            emission = self.usage_chain.emission(end, self.netuid, cat.mechanism)
+            coldkeys = self.usage_chain.coldkeys(sorted({hotkey for hotkey, _, _ in paid}), end)
+            if pool.mode == "revenue":
+                alpha, price = self.usage_chain.alpha_price(end, self.netuid), self.tao_usd()
+        except Exception as exc:
+            log.warning("usage pool: period %d not closed yet (tried again): %s", period, exc)
+            return
+        record = close(period, pool=pool, cat=cat, epoch_blocks=epoch_blocks, paid=paid, coldkeys=coldkeys,
+                       emission=emission, burns=burns, unscanned=unscanned, tao_usd=price, alpha_tao=alpha)
+        self.store.put_usage_record(first, end, record.model_dump_json())
+        log.info("usage pool: period %d closed (%s): basis %.6f alpha of %.6f, share %.6f, %d hotkeys served paying "
+                 "users", period, record.mode, record.basis, record.period_emission, record.share, len(record.served))
 
     # ---- outputs ----
 
@@ -1399,6 +1568,15 @@ class Auditor:
             return signed
         if self.store.pending(first, epoch - 1):
             return None
+        stated: dict[str, Any] = {}
+        pool = cat.scoring.usage_pool
+        if pool is not None and (period := pool.period(epoch) - 1) >= 0:
+            blocks = period_blocks(pool, policy.epoch_blocks, period)
+            document = self.store.usage_record(*blocks)
+            if document is not None:
+                stated["usage"] = json.loads(document)
+            elif self.follower.head < blocks[1] + USAGE_WAIT_BLOCKS:
+                return None  # the period before's record is closed within blocks of its end
         self.close_epoch(current)
 
         users = self.store.users(epoch - 1)
@@ -1421,7 +1599,8 @@ class Auditor:
         verdicts = Verdicts(netuid=self.netuid, auditor=self.hotkey, epoch=epoch,
                             credits=[with_users(c) for c in self.store.credits(first, epoch - 1, policy,
                                                                                _tolerance_in(cat))],
-                            invalid=self.store.evidence(first, epoch - 1), demand=demand, shares=shares, **told)
+                            invalid=self.store.evidence(first, epoch - 1), demand=demand, shares=shares, **told,
+                            **stated)
         signed = SignedVerdicts.create(verdicts, self.keypair)
         self.store.serve_verdicts(epoch, signed.model_dump_json())
         self._verdicts = {e: v for e, v in self._verdicts.items() if e >= current - 2} | {epoch: signed}

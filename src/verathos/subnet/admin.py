@@ -1,10 +1,11 @@
 """Subnet administration: ``verathos-subnet``. The changing commands are signed with the subnet owner's keys.
 
     status            mechanisms, emission split, UID cap, the committed catalog (its mechanism) and the shipped one,
-                      the epoch and the miner share in it
+                      the epoch and the miner share in it, the usage pool
     setup-mechanisms  mechanism count 2 and the emission split (owner coldkey)
     commit-catalog    publish a catalog file: store it where the owner's validator serves it, commit its digest; the
-                      mechanism it names must exist on chain
+                      mechanism it names must exist on chain, and a usage pool's buyback coldkey must not be the
+                      subnet owner's coldkey
 
 The owner coldkey comes from a bittensor wallet (``--wallet``, password prompt) or, for unattended test networks,
 from a mnemonic in the OS keyring (``--keyring SERVICE:USER``).
@@ -74,6 +75,19 @@ def miner_share_line(cat: catalog.Catalog, epoch: int) -> str:
                    f"{change.start_epoch + change.epochs}")
 
 
+def usage_pool_line(cat: catalog.Catalog, epoch: int) -> str:
+    """The catalog's usage pool, and the period ``epoch`` is in."""
+    pool = cat.scoring.usage_pool
+    if pool is None:
+        return "usage pool: off"
+    basis = (f"{pool.fraction:g} of the alpha {pool.buyback_coldkey} burns on the subnet" if pool.mode == "burned"
+             else f"{pool.fraction:g} of the paid usage's revenue in alpha")
+    period = pool.period(epoch)
+    return (f"usage pool ({pool.mode}): {basis} in each period of {pool.period_epochs} epochs, paid over the next "
+            f"period to the hotkeys that served paying users, {len(pool.excluded)} hotkeys or coldkeys excluded; "
+            f"epoch {epoch} is in period {period}, which pays period {period - 1}'s")
+
+
 def status(st: bt.Subtensor, netuid: int) -> None:
     q = st.substrate.query
     committed = committed_catalog(st, netuid)
@@ -96,6 +110,8 @@ def status(st: bt.Subtensor, netuid: int) -> None:
         "catalog_mechanism": cat.mechanism if cat else None,
         "epoch": epoch,
         "miner_share": cat.scoring.miner_share_at(epoch) if cat else None,
+        "usage_pool": cat.scoring.usage_pool.model_dump() if cat and cat.scoring.usage_pool else None,
+        "usage_period": cat.scoring.usage_pool.period(epoch) if cat and cat.scoring.usage_pool else None,
     }, indent=2), flush=True)
 
 
@@ -126,6 +142,11 @@ def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path 
     if unknown := cat.unknown_settings():
         raise SystemExit(f"settings this code does not know: {', '.join(unknown)}")
     cat.anchor_shares(strict=True)
+    pool = cat.scoring.usage_pool
+    if pool is not None and pool.buyback_coldkey is not None and pool.buyback_coldkey == st.substrate.query(
+            "SubtensorModule", "SubnetOwner", [netuid]).value:
+        raise SystemExit("the usage pool's buyback_coldkey is the subnet owner's coldkey: name the buyback's own "
+                         "coldkey, which signs its purchases and burns, funded with revenue only")
     if (count := st.get_mechanism_count(netuid)) <= cat.mechanism:
         raise SystemExit(f"the catalog names mechanism {cat.mechanism}, but netuid {netuid} has {count} mechanism(s) "
                          "(0 to count - 1): name an existing one, or add it first (setup-mechanisms)")
@@ -139,6 +160,7 @@ def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path 
     print(f"catalog {cat.digest()} stored at {stored}; mechanism {cat.mechanism}; active models: "
           f"{[m.model_id for m in cat.models if m.status == 'active']}", flush=True)
     print(miner_share_line(cat, st.get_current_block() // cat.epoch_blocks), flush=True)
+    print(usage_pool_line(cat, st.get_current_block() // cat.epoch_blocks), flush=True)
     value = catalog.commitment_value(cat.digest())
     result = st.set_commitment(wallet, netuid, value)
     if not getattr(result, "success", False):

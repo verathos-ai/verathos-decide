@@ -75,7 +75,8 @@ class Throughput:
             return cls(netuid=netuid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain, follower=follower)
         auditor = Auditor(netuid=netuid, keypair=wallet.hotkey, chain=chain, policy=policy,
                           catalog=current, references=references, screens=screens,
-                          db_path=state_dir / "throughput.sqlite")
+                          db_path=state_dir / "throughput.sqlite",
+                          usage_chain=SubtensorChainView(network, netuid))  # apart: the schedule waits for none of it
         auditor.start()
         log.info("throughput auditor running (%s mode)", policy.mode)
         return cls(netuid=netuid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain, auditor=auditor)

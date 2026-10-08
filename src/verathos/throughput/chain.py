@@ -1,15 +1,19 @@
 """Chain access for the throughput audit (bittensor SDK 10.x): head blocks, block hashes, finality and the
-auditor's axon."""
+auditor's axon; and for the usage pool, the subnet's burns, its miners' emission, its alpha price and hotkeys' owners
+at a block (``throughput.usage``)."""
 
 from __future__ import annotations
 
 import logging
 import threading
 import time
+from collections.abc import Callable, Iterable
+from typing import Any
 
 import bittensor as bt
 
 from verathos.protocol.manifest import axon_base
+from verathos.throughput import usage
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +72,27 @@ class SubtensorChainView:
         if number is None:
             return 0, None
         return (int(number, 0) if isinstance(number, str) else int(number)), block_hash
+
+    def _read(self, read: Callable[..., Any], *args: Any) -> Any:
+        with self._lock:
+            try:
+                return read(self._st(), *args)
+            except Exception:
+                self._reset()
+                raise
+
+    def burns(self, block: int, netuid: int) -> list[usage.Burn]:
+        """The burns on ``netuid`` in ``block``. Raises if the node no longer holds the block's state."""
+        return self._read(usage.burns_at, block, netuid)
+
+    def emission(self, block: int, netuid: int, mechanism: int) -> usage.Emission:
+        return self._read(usage.emission_at, block, netuid, mechanism)
+
+    def alpha_price(self, block: int, netuid: int) -> float:
+        return self._read(usage.alpha_price_at, block, netuid)
+
+    def coldkeys(self, hotkeys: Iterable[str], block: int) -> dict[str, str | None]:
+        return self._read(usage.coldkeys_at, list(hotkeys), block)
 
     def block_hash(self, block_number: int) -> bytes | None:
         return _hash_bytes(self._rpc("chain_getBlockHash", [int(block_number)]))

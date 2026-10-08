@@ -11,11 +11,14 @@ from verathos import catalog
 from verathos.subnet import admin
 
 OWNER = "5Owner"
+OWNER_COLDKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
 
 class Chain:
     def __init__(self, block: int = 1000 * 180, mechanisms: int = 1) -> None:
         self.block, self.mechanisms, self.commitments = block, mechanisms, []
+        self.substrate = SimpleNamespace(query=lambda module, name, params: SimpleNamespace(
+            value=OWNER_COLDKEY if name == "SubnetOwner" else None))
 
     def get_subnet_owner_hotkey(self, netuid: int, block: int | None = None) -> str:
         return OWNER
@@ -61,6 +64,27 @@ def test_commit_catalog_states_the_miner_share_now_and_how_it_changes(tmp_path, 
     assert chain.commitments[-1] == catalog.commitment_value(catalog.load(path).digest())
     commit(chain, catalog_file(tmp_path, miner_share=0.8), tmp_path)
     assert "miner share 0.800000 in epoch 1000\n" in capsys.readouterr().out
+
+
+def test_commit_catalog_states_the_usage_pool_and_refuses_the_owner_coldkey_as_its_buyback(tmp_path, capsys) -> None:
+    chain = Chain()
+    commit(chain, catalog_file(tmp_path), tmp_path)
+    assert "usage pool: off" in capsys.readouterr().out
+    buyback = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    pool = {"mode": "burned", "fraction": 1.0, "period_epochs": 40, "buyback_coldkey": buyback}
+    commit(chain, catalog_file(tmp_path, usage_pool=pool), tmp_path)
+    assert (f"usage pool (burned): 1 of the alpha {buyback} burns on the subnet in each period of 40 epochs, paid "
+            "over the next period to the hotkeys that served paying users, 0 hotkeys or coldkeys excluded; epoch "
+            "1000 is in period 25, which pays period 24's") in capsys.readouterr().out
+    with pytest.raises(SystemExit, match="buyback_coldkey is the subnet owner's coldkey"):
+        commit(chain, catalog_file(tmp_path, usage_pool={**pool, "buyback_coldkey": OWNER_COLDKEY}), tmp_path)
+    with pytest.raises(SystemExit, match="scoring.usage_pool.coldkey"):
+        commit(chain, catalog_file(tmp_path, usage_pool={**pool, "coldkey": buyback}), tmp_path)
+    with pytest.raises(ValueError, match="buyback_coldkey"):
+        commit(chain, catalog_file(tmp_path, usage_pool={"mode": "burned", "fraction": 1.0}), tmp_path)
+    assert len(chain.commitments) == 2
+    commit(chain, catalog_file(tmp_path, usage_pool={"mode": "revenue", "fraction": 0.9}), tmp_path)
+    assert "usage pool (revenue): 0.9 of the paid usage's revenue in alpha" in capsys.readouterr().out
 
 
 def test_commit_catalog_refuses_an_invalid_or_mistyped_miner_share(tmp_path) -> None:
