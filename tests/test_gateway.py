@@ -16,6 +16,7 @@ from bittensor_wallet import Keypair
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from tests.lineups import two_active_and_a_candidate
 from tests.mock_engine import MockEngine
 from tests.test_miner_app import REQUEST
 from tests.test_throughput import HostRouter, _auditor, kp
@@ -90,11 +91,12 @@ def route(keypair: Keypair, host: str, credited: float = 20.0) -> Route:
 
 
 class Setup:
-    """A gateway on SQLite in front of the given miners (host -> engine), with an in-process auditor."""
+    """A gateway on SQLite in front of the given miners (host -> engine), with an in-process auditor. The gateway
+    follows ``cat`` (the shipped catalog by default) with its own hotkey as the catalog's gateway."""
 
     def __init__(self, tmp_path, engines: dict[str, object], *, credited: float = 20.0, rate: float = 100.0,
                  burst: int = 100, monthly_quota: int | None = None, max_attempts: int = 3,
-                 attempt_timeout_s: float = 2.0) -> None:
+                 attempt_timeout_s: float = 2.0, cat: catalog.Catalog | None = None) -> None:
         tmp_path.mkdir(parents=True, exist_ok=True)
         self.gateway_kp = kp()
         self.miners = {host: miner(host, self.gateway_kp, engine) for host, engine in engines.items()}
@@ -128,7 +130,7 @@ class Setup:
         self.served = ServedCounter(self.gateway_kp, self.client, auditor_url=auditor_url,
                                     auditor_hotkey=self.auditor.hotkey)
         self.router.observer = self.served
-        cat = catalog.Catalog.parse({**catalog.load().document(), "gateways": [self.gateway_kp.ss58_address]})
+        cat = catalog.Catalog.parse({**(cat or catalog.load()).document(), "gateways": [self.gateway_kp.ss58_address]})
         self.gateway = Gateway(
             config=self.config, hotkey=self.gateway_kp.ss58_address, catalog=lambda: cat, accounts=self.accounts,
             meter=self.meter, router=self.router, sampler=self.sampler, served=self.served,
@@ -193,12 +195,13 @@ def test_monthly_quota_and_bad_requests(tmp_path) -> None:
     assert over.json()["error"]["type"] == "quota_exceeded"
     assert 1 <= int(over.headers["Retry-After"]) <= 31 * 86400  # until the next month
 
-    t = Setup(tmp_path / "other", {"10.0.0.1": MockEngine("kev-4b")})
+    t = Setup(tmp_path / "other", {"10.0.0.1": MockEngine("kev-4b")}, cat=two_active_and_a_candidate())
     invalid = asyncio.run(t.post({"model": "kev-4b"})).json()["error"]
     assert (invalid["type"], invalid["message"]) == ("invalid_request",
                                                      "not a SystemOne request: state: Field required (and 1 more)")
     assert "pydantic" not in asyncio.run(t.post({"model": "kev-4b", "questions": {"q": {"type": "nope"}}})).text
-    assert asyncio.run(t.post({**REQUEST, "model": "clef-flash"})).json()["error"]["type"] == "model_not_found"
+    candidate = asyncio.run(t.post({**REQUEST, "model": "clef-flash"}))  # checked on the network, not served to users
+    assert candidate.json()["error"]["type"] == "model_not_found"
     gone = asyncio.run(t.post({**REQUEST, "model": "kev-9b"}))  # active, but nobody serves it now: try again later
     assert gone.status_code == 503 and gone.json()["error"]["type"] == "unavailable" and "Retry-After" in gone.headers
     too_long = {**REQUEST, "state": "x" * (4 * catalog.load().get("kev-4b").max_state_tokens + 1)}
@@ -328,11 +331,12 @@ def test_the_public_status_is_computed_at_most_every_few_seconds(tmp_path) -> No
     async def calls(n: int):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=s.app), base_url="http://gw") as c:
             return [(await c.get("/v1/status")).json() for _ in range(n)]
+    active = [m.model_id for m in s.gateway.catalog().models if m.status == "active"]
     first = asyncio.run(calls(50))
-    assert len(computed) == 2 and all(doc == first[0] for doc in first)  # once per model, whoever asks
+    assert computed == active and all(doc == first[0] for doc in first)  # once per model, whoever asks
     clock.now += STATUS_TTL_S
     asyncio.run(calls(1))
-    assert len(computed) == 4
+    assert computed == active * 2
 
 
 def test_an_answer_without_a_binding_receipt_is_not_returned(tmp_path) -> None:

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.lineups import two_active_and_a_candidate
 from verathos import catalog
 from verathos.engine import code_version as engine_code_version
 from verathos.install import common, engines, plan, services
@@ -77,7 +78,7 @@ OFFERED, SCORED = ["kev-4b", "kev-9b", "clef-flash"], {"kev-4b", "kev-9b"}
 
 
 def test_the_setups_offer_active_models_then_candidates_and_never_retired_ones() -> None:
-    cat = catalog.load()
+    cat = two_active_and_a_candidate()
     statuses = {"kev-4b": "candidate", "kev-9b": "retired", "clef-flash": "active"}
     changed = cat.model_copy(update={"models": [m.model_copy(update={"status": statuses[m.model_id]})
                                                 for m in cat.models]})
@@ -613,7 +614,7 @@ def test_a_full_setup_runs_the_references_one_at_a_time_or_as_services_by_the_me
         ss58_address="5Validator")))
     monkeypatch.setattr(common, "connect", lambda network: chain)
     monkeypatch.setattr(common, "wait_engines", lambda manager, ports, timeout_s: None)
-    monkeypatch.setattr(setup, "current_catalog", lambda *args: catalog.load())
+    monkeypatch.setattr(setup, "current_catalog", lambda *args: two_active_and_a_candidate())
     monkeypatch.setattr(host, "wallets", lambda: [])
     monkeypatch.setattr(host, "gpus", lambda: [])
     monkeypatch.setattr(host, "port_free", lambda port, address="0.0.0.0": True)

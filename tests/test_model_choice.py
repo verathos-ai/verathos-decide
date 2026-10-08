@@ -182,7 +182,7 @@ class Chain:
 def test_the_setup_uses_the_network_status_only_as_the_subnet_owner_signed_it_recently(monkeypatch) -> None:
     owner, other = Keypair.create_from_uri("//owner"), Keypair.create_from_uri("//other")
     cat, now = catalog.load(), 1_800_000_000.0
-    shares = {m.model_id: 0.5 for m in cat.models if m.status == "active"}
+    shares = cat.anchor_shares()
     status = NetworkStatus(epoch=7, model_shares=shares, hotkeys=[HotkeyStatus(hotkey="5Miner", endpoints=[
         EndpointStatus(endpoint_id="gpu0", model_id="kev-4b", state="scored", credited_rps=14.0)])])
 

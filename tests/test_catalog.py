@@ -9,6 +9,8 @@ from verathos.protocol.canonical import digest
 def test_shipped_catalog_loads_and_digest_is_stable() -> None:
     c = catalog.load()
     assert c.get("kev-4b") is not None
+    # all three active, sharing the emission equally without demand; publishable: the anchors sum to 1
+    assert c.anchor_shares(strict=True) == {"kev-4b": 0.333334, "kev-9b": 0.333333, "clef-flash": 0.333333}
     assert c.digest() == catalog.load().digest()
     assert catalog.committed_digest(catalog.commitment_value(c.digest())) == c.digest()
 

@@ -90,14 +90,15 @@ What it does:
 |---|---|---|---|---|
 | `kev-4b` | active | about 15 GiB | Kev | 1.0 |
 | `kev-9b` | active | about 26 GiB | Kev | 0.85 |
-| `clef-flash` | candidate | about 21 GiB | `verathos-engine` (Clef) | 1.3 (estimate) |
+| `clef-flash` | active | about 21 GiB | `verathos-engine` (Clef) | 1.3 (estimate) |
 
 These are the shipped catalog's models; the installer reads the catalog on chain and lists its models with the
-memory each needs. Active models are scored. A candidate is checked by validators but scores zero until the subnet
-owner activates it: serving one helps measure it and earns nothing yet. The relative speed is the catalog's
-`relative_speed`: the requests/s of the model's standard mix one GPU serves, relative to the other models, as the
-subnet owner measured them on one reference GPU (`SUBNET_ADMIN.md`). How the models compare differs by GPU: kev-9b
-serves 0.85 times kev-4b's requests on an H100 and 0.55 times on an RTX 5090.
+memory each needs. All three are active from the start and share the emission equally while users pay for none of
+them (`SCORING.md`). Active models are scored. A candidate, which a catalog can list before activating it, is checked
+by validators but scores zero until the subnet owner activates it: serving one helps measure it and earns nothing
+yet. The relative speed is the catalog's `relative_speed`: the requests/s of the model's standard mix one GPU serves,
+relative to the other models, as the subnet owner measured them on one reference GPU (`SUBNET_ADMIN.md`). How the
+models compare differs by GPU: kev-9b serves 0.85 times kev-4b's requests on an H100 and 0.55 times on an RTX 5090.
 
 Each GPU serves one model: by default the active model that pays best on it now. The setup reads the auditor's
 network status (`GET /v1/network` on the subnet owner's axon, signed once per epoch) and uses it only if the subnet
@@ -115,18 +116,19 @@ emission (availability to users and latency left out). Where the hotkey already 
 other machines, or on this machine's GPUs placed before), it adds what the hotkey's part gains,
 `s ((H + x) / (C + x) - H / C)`. GPUs whose model is named by hand count first; then each GPU in order takes the
 active model that adds most, and the GPUs after it count it, so a machine with several GPUs spreads over the models
-where that pays more. For example, with kev-4b at 50% and 300 requests/s proven, and kev-9b at 50% and 120
-requests/s proven, an A100 whose measurement declares 13.9 requests/s of kev-4b adds about
-`0.5 x 13.9 / 313.9 = 2.2%` there and `0.5 x 11.8 / 131.8 = 4.5%` on kev-9b (11.8 = 13.9 x 0.85): it serves kev-9b.
+where that pays more. For example, with each model at a third of the emission and 300, 120 and 400 requests/s
+proven on kev-4b, kev-9b and clef-flash, an A100 whose measurement declares 13.9 requests/s of kev-4b adds about
+`0.333 x 13.9 / 313.9 = 1.5%` there, `0.333 x 11.8 / 131.8 = 3.0%` on kev-9b (11.8 = 13.9 x 0.85) and
+`0.333 x 18.1 / 418.1 = 1.4%` on clef-flash (18.1 = 13.9 x 1.3): it serves kev-9b.
 
 On an update, a GPU keeps the model it serves unless another pays at least 1.2 times as much: a switch downloads the
 model and measures again, and the numbers move with every epoch. When another pays at least 1.1 times as much, the
 plan says so and how to switch:
 
 ```
-the network in the auditor's epoch 45412: kev-4b 50.0% of the emission, 300.0 requests/s proven; kev-9b 50.0% of the emission, 220.0 requests/s proven; the median endpoint 14.6 requests/s at relative speed 1
+the network in the auditor's epoch 45412: kev-4b 33.3% of the emission, 300.0 requests/s proven; kev-9b 33.3% of the emission, 220.0 requests/s proven; clef-flash 33.3% of the emission, 400.0 requests/s proven; the median endpoint 14.6 requests/s at relative speed 1
 GPU 0 (NVIDIA A100 80GB PCIe, 80 GiB): kev-4b, endpoint gpu0, engine on 127.0.0.1:8008
-GPU 0: kev-4b, as set up before: about 2.21% of the emission (its share 50.0%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 2.54%, clef-flash (candidate). kev-9b would pay about 1.15x as much on GPU 0: --model kev-9b to switch
+GPU 0: kev-4b, as set up before: about 1.48% of the emission (its share 33.3%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 1.70%, clef-flash 1.44%. kev-9b would pay about 1.15x as much on GPU 0: --model kev-9b to switch
 another choice: --model <id> for every GPU, or one per GPU in order, as in --model kev-9b
 ```
 

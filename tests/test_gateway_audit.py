@@ -10,6 +10,7 @@ import httpx
 import pytest
 from bittensor_wallet import Keypair
 
+from tests.lineups import two_active_and_a_candidate
 from tests.mock_engine import MockEngine
 from tests.test_miner_app import REQUEST
 from tests.test_throughput import KEV, _auditor, block_hash, kp
@@ -721,11 +722,12 @@ def test_the_models_shares_follow_paid_demand_and_move_a_step_per_epoch(tmp_path
     from verathos.throughput.feed import published_shares
     from verathos.validator.__main__ import epoch_shares
 
-    auditor = _auditor(tmp_path)
+    cat = two_active_and_a_candidate()  # anchors 50/50
+    auditor = _auditor(tmp_path, cat)
     auditor.follower.poll()  # epoch 3
     auditor.update_slots([Slot("a", "gpu0", "http://a/e/gpu0", "kev-4b", 50.0),
                           Slot("b", "gpu0", "http://b/e/gpu0", "kev-9b", 50.0)])
-    step, epoch_s = catalog.load().scoring.max_share_step, 180 * 12.0
+    step, epoch_s = cat.scoring.max_share_step, 180 * 12.0
 
     def epoch(number: int, paid: int | None, unpaid: int) -> dict[str, float]:
         """The verdicts' shares for epoch ``number`` after users sent kev-9b ``paid`` and ``unpaid`` input tokens/s
@@ -747,7 +749,7 @@ def test_the_models_shares_follow_paid_demand_and_move_a_step_per_epoch(tmp_path
     assert third["kev-9b"] == pytest.approx(0.5 + step)  # back toward the anchors, a step at a time
     fourth = epoch(7, 1_000_000, 0)
     assert fourth["kev-9b"] == pytest.approx(0.5 + 2 * step)
-    assert epoch_shares(auditor.verdicts(7).verdicts, catalog.load()) == fourth  # what every validator scores with
+    assert epoch_shares(auditor.verdicts(7).verdicts, cat) == fourth  # what every validator scores with
 
 
 def test_shares_move_along_the_line_to_their_target() -> None:
@@ -764,7 +766,7 @@ def test_validators_score_with_the_shares_the_auditor_publishes_or_its_demand() 
     from verathos.validator.__main__ import epoch_shares
     from verathos.validator.scoring import model_shares
 
-    cat = catalog.load()
+    cat = two_active_and_a_candidate()
     demand = {"kev-4b": 30_000.0, "kev-9b": 10_000.0}
     old_auditor = Verdicts(netuid=405, auditor="aud", epoch=9, credits=[], invalid=[], demand=demand)
     assert epoch_shares(old_auditor, cat) == model_shares(demand, cat)

@@ -9,7 +9,7 @@ A validator sets weights on mechanism 1 once per epoch. It runs in one of two mo
 |---|---|---|
 | What it does | sets the weights the subnet owner's validator (the auditor) publishes each epoch, once their signature verifies | discovers miners, sends every endpoint canary requests, compares the answers with its own float32 references, applies the auditor's signed throughput verdicts, scores, sets weights |
 | Requests to miners | none | identity challenges and canaries to every endpoint |
-| Hardware | a small Linux machine, no GPU | a float32 reference engine per active model, in RAM or on GPUs: all resident (Kev-4B and Kev-9B: about 63 GiB of RAM) or one at a time (about 42 GiB, for the largest) |
+| Hardware | a small Linux machine, no GPU | a float32 reference engine per active model, in RAM or on GPUs: all resident (Kev-4B, Kev-9B and Clef-flash: about 103 GiB of RAM) or one at a time (about 42 GiB, for the largest) |
 | Stake | a validator permit | a validator permit and the catalog's `validator_min_stake` (10,000), or miners refuse it |
 | Download | the code | the code, the engines and the model weights (tens of GB) |
 
@@ -73,10 +73,10 @@ installer, which chooses by the memory it finds):
   the largest reference. Starts and stops count in the same reference time as resident references compute in (30% of
   the canaries' time, about 6.5 minutes of a 180-block epoch), so the canaries keep their time and spread.
 
-| References | RAM (or memory on one GPU) | with the candidate Clef-flash |
-|---|---|---|
-| resident: Kev-4B and Kev-9B | about 63 GiB (75 GiB) | about 103 GiB (121 GiB) |
-| one at a time | about 42 GiB (48 GiB), for Kev-9B | about 42 GiB (48 GiB) |
+| References | RAM (or memory on one GPU) |
+|---|---|
+| resident: Kev-4B, Kev-9B and Clef-flash | about 103 GiB (121 GiB) |
+| one at a time | about 42 GiB (48 GiB), for Kev-9B |
 
 These are the free memory the installer asks for; the machine also holds the system and the validator itself. The
 installer keeps the references resident while the active models' all fit in the free memory, and runs them one at a
@@ -176,14 +176,14 @@ What it does (a full validator; light, see below):
    models (checked, scored zero) in what is left, and leaves out one that does not fit. When the active models'
    references do not all fit at once, it runs them one at a time, each placed alone in the free memory
    ([References](#references-resident-or-one-at-a-time)). The plan says which, with the memory (`all references
-   resident (RAM about 63 GiB)` or `references one at a time (RAM for the largest: about 42 GiB)`), and names every
+   resident (RAM about 103 GiB)` or `references one at a time (RAM for the largest: about 42 GiB)`), and names every
    model's place and memory;
 
    | Model | Status | float32 reference in RAM | on a GPU |
    |---|---|---|---|
    | Kev-4B | active | about 21 GiB | about 27 GiB |
    | Kev-9B | active | about 42 GiB | about 48 GiB |
-   | Clef-flash | candidate | about 41 GiB | about 47 GiB |
+   | Clef-flash | active | about 41 GiB | about 47 GiB |
 
 5. installs each model's engine without the fused kernels (they change float32 results): the Kev engine at
    `engine.revision` for Kev models, `verathos-engine` from this code for Clef models, which runs the model
@@ -267,7 +267,7 @@ stops and removes the services, the code, the engines and the weights. The confi
 | `this is the subnet owner's hotkey: its validator is the auditor ... runs in full mode` | the owner's validator is never light: `install.sh validator --full` |
 | `miners refuse validators below validator_min_stake` | add stake to the hotkey until its `S` reaches the catalog's minimum; miners see it within 10 minutes |
 | `the kev-9b reference needs about 42 GiB ...; not enough is free` | free memory or add some; `--device` chooses between GPU and RAM |
-| `clef-flash (candidate ...): no reference, not enough memory left` | a candidate's reference is optional: free memory and run the command again, or leave it to other validators |
+| `<model> (candidate ...): no reference, not enough memory left` | a candidate's reference is optional: free memory and run the command again, or leave it to other validators |
 | `... of 16 canaries without a reference answer this epoch` | the reference's log: it is down, or too slow to compute the canaries within the epoch's reference time ([Requirements](#requirements)) |
 | `references one at a time: checked ...; taken from ...` | the reference time held only the models checked; every model is checked at least once every `2k` epochs ([Coverage](#references-resident-or-one-at-a-time)). Resident references (more memory) or a faster machine check more each epoch |
 | `the kev-9b reference did not start: ...` | its log, `~/.verathos/validator/references/kev-9b.log`; `another process holds its port`: a reference service of a resident setup still runs, run the installer again |
@@ -311,8 +311,7 @@ CUDA_VISIBLE_DEVICES="" KEV_DTYPE=fp32 .venv/bin/python -m kev.serve --run model
 
 Run them on CPU without `flash-linear-attention` installed.
 Clef models use `verathos-engine` in float32, which runs the model repository's own inference code one request at a
-time; install it as for miners (`MINING.md`) but without `flash-linear-attention`. `clef-flash` is a `candidate`:
-its endpoints are checked but not scored, which lets the network measure it before the owner activates it; its
+time; install it as for miners (`MINING.md`) but without `flash-linear-attention`. `clef-flash` is active: its
 reference needs about 41 GiB of RAM (47 GiB on a GPU).
 
 ```bash

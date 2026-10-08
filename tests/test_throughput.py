@@ -595,10 +595,12 @@ def _result(target_id: str, *, completed: int = 160, samples: list | None = None
                                         "errors": errors or {}, "late_sends": late_sends, "samples": samples or []})
 
 
-def _auditor(tmp_path, **policy_overrides):
+def _auditor(tmp_path, cat: catalog.Catalog | None = None, **policy_overrides):
+    """An auditor on ``cat`` (the shipped catalog by default)."""
     policy = dataclasses.replace(AuditPolicy(), **policy_overrides)
     return Auditor(netuid=405, mechid=1, keypair=kp(), chain=FakeChain(head=3 * 180 + 40), policy=policy,
-                   catalog=catalog.load, references={}, db_path=tmp_path / "t.sqlite")
+                   catalog=catalog.load if cat is None else lambda: cat, references={},
+                   db_path=tmp_path / "t.sqlite")
 
 
 def test_a_hostile_response_voids_nothing_but_its_own_endpoint(tmp_path) -> None:

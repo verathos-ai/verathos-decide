@@ -14,6 +14,7 @@ import pytest
 from bittensor_wallet import Keypair
 from fastapi import Request
 
+from tests.lineups import two_active_and_a_candidate
 from tests.mock_engine import MockEngine
 from verathos import catalog
 from verathos.miner.app import caller_request_bytes, create_app
@@ -841,7 +842,8 @@ def test_chain_trouble_fetching_verdicts_is_an_unavailable_feed() -> None:
 def test_models_share_the_emission_by_what_users_pay_with_the_anchors_as_the_fallback() -> None:
     from verathos.validator.scoring import model_shares
 
-    cat = catalog.load()  # anchors 50/50; prices kev-4b 0.04, kev-9b 0.09; full at 10,000 tokens/s; floor 0.1
+    # anchors 50/50, clef-flash a candidate; prices kev-4b 0.04, kev-9b 0.09; full at 10,000 tokens/s; floor 0.1
+    cat = two_active_and_a_candidate()
     assert model_shares({}, cat) == {"kev-4b": pytest.approx(0.5), "kev-9b": pytest.approx(0.5)}
     full = model_shares({"kev-4b": 30_000.0, "kev-9b": 10_000.0}, cat)  # revenue 1.2 against 0.9
     assert full == {"kev-4b": pytest.approx(1.2 / 2.1), "kev-9b": pytest.approx(0.9 / 2.1)}
