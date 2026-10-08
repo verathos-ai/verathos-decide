@@ -10,7 +10,8 @@ from pydantic import BaseModel
 STATUS_PATH = "/v1/status/{hotkey}"
 NETWORK_PATH = "/v1/network"
 
-State = Literal["scored", "qualifying", "candidate", "failed", "invalid", "probation", "unanswered", "not_audited"]
+State = Literal["scored", "qualifying", "candidate", "failed", "invalid", "probation", "unanswered", "not_audited",
+                "drifted"]
 
 
 class EndpointStatus(BaseModel):
@@ -19,6 +20,9 @@ class EndpointStatus(BaseModel):
     state: State
     declared_rps: float = 0.0
     credited_rps: float = 0.0  # capacity proven by the throughput audit, as scored this epoch
+    drift: bool = False  # the auditor's recomputes of its answers drifted beyond the model's tolerance: no credit
+    user_availability: float | None = None  # share of the times users found its hotkey's endpoints of the model ready
+    latency_factor: float | None = None  # what its latency did to its score (1: neutral), if scored
     sent: int = 0
     answered: int = 0
     verdict: str = ""  # this epoch's answer check, over the statistical window

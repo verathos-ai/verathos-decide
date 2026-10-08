@@ -3,9 +3,9 @@
 
 It reads one plan as JSON on stdin (targets with their URL, open-loop rate, headers and request mix), sends every
 target its traffic at once, and writes per-target counts, latencies and a random sample of completed requests as JSON
-on stdout. A request counts as delivered when it was sent inside the measured window and its response (HTTP 200, a
-JSON object of at most 1 MiB) arrives by the window's end plus ``grace_s``; ``sent`` and ``late_sends`` count the
-sends scheduled inside the window.
+on stdout. A reply counts as delivered when it arrives inside the measured window (HTTP 200, a JSON object of at most
+the plan's ``max_response_bytes``), to a request scheduled no earlier than ``grace_s`` before the window opened;
+``sent`` and ``late_sends`` count the sends scheduled inside the window.
 """
 
 from __future__ import annotations

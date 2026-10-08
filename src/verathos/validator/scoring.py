@@ -165,7 +165,8 @@ def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, flo
                  latency_ms: dict[str, float], state: ScoreState, failed_hotkeys: Collection[str] = (),
                  user_latency_ms: Mapping[str, float] | None = None,
                  user_availability: Mapping[str, float] | None = None,
-                 max_latency_s: float = AuditPolicy.max_latency_s) -> tuple[dict[str, float], set[str]]:
+                 max_latency_s: float = AuditPolicy.max_latency_s,
+                 factors: dict[str, float] | None = None) -> tuple[dict[str, float], set[str]]:
     """-> (score per endpoint key, keys that failed verification this epoch). Call after ``record_window``.
 
     ``shares`` holds each model's share of the emission (``model_shares``; missing: none); ``credited`` each
@@ -174,7 +175,8 @@ def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, flo
     auditor; ``user_latency_ms`` the median latency of its answers to users, where there were enough (it takes the
     place of the test's); ``user_availability`` the share of the times it was considered for users that it was
     ready (missing: 1); ``max_latency_s`` the latency capacity is declared at: answers to users slower than it take
-    the latency factor down linearly, to 0 at twice it.
+    the latency factor down linearly, to 0 at twice it. ``factors``, if given, receives each scored endpoint's
+    latency factor.
     """
     user_latency_ms, user_availability = user_latency_ms or {}, user_availability or {}
     scores: dict[str, float] = {}
@@ -214,6 +216,8 @@ def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, flo
                 factor *= min(max(2.0 - own / 1000 / max_latency_s, 0.0), 1.0)
         availability = (r.answered / r.sent) * min(max(user_availability.get(key, 1.0), 0.0), 1.0)
         weight[key] = credited[key] * availability * factor
+        if factors is not None:
+            factors[key] = factor
     model_total: dict[str, float] = {}
     for key, w in weight.items():
         model = eligible[key].endpoint.endpoint.model_id

@@ -30,8 +30,13 @@ def describe_endpoint(e: EndpointStatus) -> str:
     probation = f"zero score for {e.probation_epochs} more epochs"
     capacity = f"proven {e.credited_rps:.1f} of {e.declared_rps:.1f} requests/s declared"
     if e.state == "scored":
-        return (f"{name}: scored {e.score:.2%} of the epoch's emission, average {e.ema:.2%}; {capacity}; "
-                f"{_answers(e)}")
+        users = "" if e.user_availability is None else f"; ready for users {e.user_availability:.0%}"
+        latency = "" if e.latency_factor is None else f", latency factor {e.latency_factor:.2f}"
+        return (f"{name}: scored {e.score:.2%} of the epoch's emission, average {e.ema:.2%}; {capacity}{users}"
+                f"{latency}; {_answers(e)}")
+    if e.state == "drifted":
+        return (f"{name}: NO CREDIT, the auditor's recomputes of its answers (in tests or to users) drifted beyond the "
+                f"model's tolerance over recent checks; serve the catalog's weights at their precision; {_answers(e)}")
     if e.state == "qualifying":
         return f"{name}: qualifying, checked but not scored until it passes a throughput test; {_answers(e)}"
     if e.state == "candidate":
@@ -55,7 +60,7 @@ def describe_test(t: ThroughputOutcome) -> str:
     if t.state == "void" or t.outcome == "void":
         return f"{where}: not counted ({t.reason})"
     if t.outcome == "passed":
-        return f"{where}: passed, {rates}; credited {t.credited_rps:.1f}"
+        return f"{where}: passed, {rates}; credited {t.credited_rps:.1f}" + (f" ({t.reason})" if t.reason else "")
     if t.outcome == "partial":
         return f"{where}: BELOW the tested rate, {rates}; credited {t.credited_rps:.1f} ({t.reason})"
     return f"{where}: INVALID, {t.reason}"

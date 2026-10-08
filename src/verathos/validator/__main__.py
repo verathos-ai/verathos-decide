@@ -76,6 +76,7 @@ class Proven(NamedTuple):
     latency_ms: dict[str, float]  # median latency in its throughput test
     user_latency_ms: dict[str, float]  # median latency of its hotkey's answers to users of the model, if enough
     user_availability: dict[str, float]  # share of the times its hotkey's endpoints of the model were ready
+    drifted: set[str]  # credited nothing: its answers drifted beyond the model's statistical tolerance
 
 
 def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | None, cat: catalog.Catalog,
@@ -85,15 +86,17 @@ def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | 
     if mode == "observe":
         first = {m.model_id: m.first_test_rps for m in cat.models}
         return Proven({e.key: min(e.endpoint.capacity_rps, first.get(e.endpoint.model_id, 0.0)) for e in endpoints},
-                      {}, {}, {})
+                      {}, {}, {}, set())
     credits = {(c.hotkey, c.endpoint_id, c.model_id): c for c in (verdicts.credits if verdicts else []) if c.qualified}
-    sc, proven = cat.scoring, Proven({}, {}, {}, {})
+    sc, proven = cat.scoring, Proven({}, {}, {}, {}, set())
     groups: dict[tuple[str, str], list[tuple[str, Credit]]] = {}
     for e in endpoints:
         c = credits.get((e.hotkey, e.endpoint.endpoint_id, e.endpoint.model_id))
         if c is None:
             continue
         proven.credited[e.key], proven.latency_ms[e.key] = min(c.credited_rps, e.endpoint.capacity_rps), c.latency_ms
+        if c.drift:
+            proven.drifted.add(e.key)
         groups.setdefault((e.hotkey, e.endpoint.model_id), []).append((e.key, c))
     # What users got counts per hotkey and model: splitting capacity over endpoints hides none of it.
     for members in groups.values():
@@ -202,9 +205,11 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     record_window(state, results, sc.statistical_window_epochs)
     shares = epoch_shares(verdicts, cat)
     log.info("  emission shares: %s", ", ".join(f"{m} {s:.1%}" for m, s in sorted(shares.items())))
+    factors: dict[str, float] = {}
     scores, failed = epoch_scores(results, shares=shares, credited=credited, latency_ms=proven.latency_ms, state=state,
                                   failed_hotkeys=invalid_hotkeys, user_latency_ms=proven.user_latency_ms,
-                                  user_availability=proven.user_availability, max_latency_s=policy.max_latency_s)
+                                  user_availability=proven.user_availability, max_latency_s=policy.max_latency_s,
+                                  factors=factors)
     held = {e.key for e in endpoints} - set(results)
     if held:
         log.info("  %d endpoints not audited this epoch (no usable reference answers); scores held", len(held))
@@ -221,7 +226,8 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         epoch=epoch, epoch_blocks=cat.epoch_blocks, endpoints=endpoints, results=results, scores=scores, failed=failed,
         invalid_hotkeys=invalid_hotkeys, credited=credited,
         scored_models={m.model_id for m in cat.models if m.status == "active"}, state=state, model_shares=shares,
-        weights=uid_weights))
+        weights=uid_weights, drifted=proven.drifted, user_availability=proven.user_availability,
+        latency_factors=factors))
     # The epoch is scored; a failure from here on must not run it again.
     try:
         set_weights(cfg, st, wallet, uid_weights, hotkey_of_uid)

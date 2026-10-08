@@ -284,7 +284,8 @@ validator's epoch 45352:
 
 | Endpoint state | Meaning |
 |---|---|
-| `scored` | checks passed; the score, its average (EMA) and the proven capacity |
+| `scored` | checks passed; the score, its average (EMA), the proven capacity, how often users found it ready and its latency factor |
+| `NO CREDIT ... drifted` | the auditor's recomputes of its answers (in tests, or to users) drifted beyond the model's tolerance over recent checks: no credit until they are back within it |
 | `qualifying` | checked, but not scored until it passes a throughput test |
 | `candidate model` | the catalog lists the model as a candidate: checked, not scored |
 | `answers FAILED` | an answer failed verification; zero score for the probation epochs shown |

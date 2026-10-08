@@ -43,6 +43,27 @@ def test_each_endpoint_gets_one_state() -> None:
     assert (ok.declared_rps, ok.credited_rps) == (50.0, 45.0)
 
 
+def test_a_miner_is_told_why_its_credit_is_zero_and_what_users_did_to_its_score() -> None:
+    from verathos.miner.status import describe_endpoint
+
+    eps = {name: endpoint(name) for name in ("ok", "drifted")}
+    results = {e.key: result(e) for e in eps.values()}
+    state = ScoreState(window={k: [[0.06, 60.0]] for k in results})
+    board = status.build(epoch=13, epoch_blocks=180, endpoints=list(eps.values()), results=results,
+                         scores={"hkA/ok": 0.4, "hkA/drifted": 0.0}, failed=set(), invalid_hotkeys=set(),
+                         credited={"hkA/ok": 45.0, "hkA/drifted": 0.0}, scored_models={"kev-4b"}, state=state,
+                         drifted={"hkA/drifted"}, user_availability={"hkA/ok": 0.93, "hkA/drifted": 1.0},
+                         latency_factors={"hkA/ok": 1.12})
+    by_id = {e.endpoint_id: e for e in board["hkA"].endpoints}
+    assert (by_id["drifted"].state, by_id["drifted"].drift) == ("drifted", True)
+    assert (by_id["ok"].state, by_id["ok"].user_availability, by_id["ok"].latency_factor) == ("scored", 0.93, 1.12)
+    assert "NO CREDIT" in describe_endpoint(by_id["drifted"]) and "drifted" in describe_endpoint(by_id["drifted"])
+    assert "ready for users 93%, latency factor 1.12" in describe_endpoint(by_id["ok"])
+    capped = ThroughputOutcome(endpoint_id="gpu0", epoch=7, start_block=1300, state="confirmed", outcome="passed",
+                               reason="its answers to users in the test are unchecked", credited_rps=10.0)
+    assert describe_test(capped).endswith("credited 10.0 (its answers to users in the test are unchecked)")
+
+
 def test_miner_logs_each_epoch_once_and_each_final_test_once() -> None:
     doc = HotkeyStatus(hotkey="hkA", epoch=13, epoch_blocks=180, endpoints=[
         {"endpoint_id": "gpu0", "model_id": "kev-4b", "state": "qualifying", "sent": 10, "answered": 10,
