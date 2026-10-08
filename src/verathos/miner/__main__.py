@@ -15,6 +15,7 @@ import dataclasses
 import logging
 import os
 import resource
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -294,9 +295,14 @@ def adopt_first(publisher: Publisher, cat: catalog.Catalog, *, remeasure: bool,
 
 
 def main() -> None:
+    if sys.argv[1:2] in (["init"], ["uninstall"]):
+        from verathos.install import common
+
+        common.main("miner", sys.argv[1], sys.argv[2:])
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(epilog="Set up this machine as a miner: verathos-miner init. Remove it: "
+                                            "verathos-miner uninstall.")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--remeasure", action="store_true",
                         help="Measure every endpoint's capacity again (after changing its hardware)")

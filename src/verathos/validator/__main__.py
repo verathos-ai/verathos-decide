@@ -16,6 +16,7 @@ import copy
 import logging
 import os
 import secrets
+import sys
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -199,9 +200,14 @@ def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: di
 
 
 def main() -> None:
+    if sys.argv[1:2] in (["init"], ["uninstall"]):
+        from verathos.install import common
+
+        common.main("validator", sys.argv[1], sys.argv[2:])
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(epilog="Set up this machine as a validator: verathos-validator init. Remove it: "
+                                            "verathos-validator uninstall.")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--once", action="store_true", help="Run one epoch immediately and exit")
     args = parser.parse_args()
