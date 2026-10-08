@@ -170,16 +170,17 @@ Clef models use `verathos-engine` in float32 (see `MINING.md` for the install). 
 its endpoints are checked but not scored, which lets the network measure it before the owner activates it; it
 needs about 36 GB of RAM in fp32.
 
-Each epoch (and the auditor before each test and round of checks) asks every reference and screen what it serves
-(`GET /v1/models`): one that names other weights than the catalog's `hf_revision` is not used, and its model's
-endpoints are not audited. `verathos-engine` names its revision; the Kev server does not, so start it from the
-pinned revision as above. When the catalog pins other weights or another engine for a model in place, the validator
-logs it as critical: restart the reference on them within `revision_transition_epochs` (3), the epochs during which
-the model's answers are not checked.
-
 ```bash
 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8103 --device cpu --dtype float32
 ```
+
+Each epoch (and the auditor before each test and round of checks) asks every reference and screen what it serves
+(`GET /v1/models`): one that names other weights than the catalog's `hf_revision` is not used, and its model's
+endpoints are not audited. `verathos-engine` names its revision, and so does the Kev server run as
+`--run <hf_repo>@<hf_revision>` (as `verathos-validator init` sets it up); run from a local directory as above it
+names none, so download exactly the pinned revision. When the catalog pins other weights or another engine for a
+model in place, the validator logs it as critical: restart the reference on them within `revision_transition_epochs`
+(3), the epochs during which the model's answers are not checked.
 
 ### 3. Configure
 

@@ -1,26 +1,35 @@
 """Whether a reference engine may define a model's right answers now.
 
 A reference must serve what the catalog pins. An engine that names the revision of the weights it serves in its
-``GET /v1/models`` document (``verathos-engine`` does) is not used while it names another one; one that names none
-is taken at its operator's word. When the catalog pins other weights or another engine for a model in place, miners
-and references update at their own pace: for ``scoring.revision_transition_epochs`` epochs the model's answers are not
-checked, so neither side is failed for the other's lag. A new revision is best published as a new model.
+``GET /v1/models`` document (``verathos-engine`` does, and the Kev server run as ``<repo>@<revision>``) is not used
+while it names another one; one that names none is taken at its operator's word. When the catalog pins other weights
+or another engine for a model in place, miners and references update at their own pace: for
+``scoring.revision_transition_epochs`` epochs the model's answers are not checked, so neither side is failed for the
+other's lag. A new revision is best published as a new model.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from verathos.catalog import Catalog, CatalogModel
 from verathos.miner.engine import Engine
 
+_RUN = re.compile(r".+@([0-9a-f]{40})")
+
 
 def served_revisions(info: Any) -> set[str]:
-    """The revisions an engine's ``GET /v1/models`` document names for the models it serves."""
+    """The revisions an engine's ``GET /v1/models`` document names for the models it serves: a ``revision``, or a
+    ``run`` of the form ``<repo>@<revision>``."""
     models = (info.get("data") or info.get("models")) if isinstance(info, dict) else None
-    if not isinstance(models, list):
-        return set()
-    return {m["revision"] for m in models if isinstance(m, dict) and isinstance(m.get("revision"), str)}
+    out: set[str] = set()
+    for m in models if isinstance(models, list) else []:
+        if isinstance(m, dict) and isinstance(m.get("revision"), str):
+            out.add(m["revision"])
+        if isinstance(m, dict) and isinstance(m.get("run"), str) and (pinned := _RUN.fullmatch(m["run"])):
+            out.add(pinned.group(1))
+    return out
 
 
 async def wrong_revision(engine: Engine, model: CatalogModel) -> str | None:

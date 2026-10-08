@@ -169,6 +169,8 @@ def test_what_a_reference_serves_and_when_a_model_is_in_transition() -> None:
     clef_doc = {"data": [{"id": "Cloudflare/clef-flash", "revision": "a" * 40, "dtype": "float32"}]}
     kev_doc = {"models": [{"name": "kev-latest", "run": "models/kev-4b", "dtype": "float32"}]}
     assert served_revisions(clef_doc) == {"a" * 40} and served_revisions(kev_doc) == set()
+    pinned_kev = {"models": [{"name": "kev-latest", "run": f"jaredpalmer/kev-4b@{'b' * 40}"}]}  # as the setup runs it
+    assert served_revisions(pinned_kev) == {"b" * 40}
     assert served_revisions(None) == served_revisions({"data": "x"}) == set()
     assert "the catalog pins" in asyncio.run(wrong_revision(MockEngine("kev-4b", served=clef_doc), kev))
     assert asyncio.run(wrong_revision(MockEngine("kev-4b", served=kev_doc), kev)) is None  # cannot tell
