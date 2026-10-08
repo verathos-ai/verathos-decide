@@ -11,9 +11,13 @@ from verathos.protocol.api import Choice, Noul, Score, SystemOneRequest, questio
 class MockEngine:
     """Deterministic fake engine for tests: probabilities derived from a hash of the request."""
 
-    def __init__(self, model: str, salt: str = "") -> None:
+    def __init__(self, model: str, salt: str = "", served: dict[str, Any] | None = None) -> None:
         self.model = model
         self.salt = salt
+        self.served = served  # its GET /v1/models document; None: it serves none
+
+    async def info(self) -> Any:
+        return self.served
 
     async def answer(self, request: dict[str, Any]) -> dict[str, Any]:
         req = SystemOneRequest.model_validate(request)

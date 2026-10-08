@@ -32,6 +32,7 @@ from verathos.validator.audit import audit_epoch
 from verathos.validator.config import ReferenceEngine, ValidatorConfig
 from verathos.validator.discovery import DiscoveredEndpoint, discover
 from verathos.validator.follow import CatalogFollower
+from verathos.validator.references import transitioning, wrong_revision
 from verathos.validator.scoring import (
     ScoreState,
     epoch_scores,
@@ -155,8 +156,16 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     cat = current.for_epoch(st, epoch * current.catalog.epoch_blocks)
     sc, policy = cat.scoring, cat.audit_policy()
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
+    transition = transitioning(state.pins, cat, epoch)
+    if transition:
+        log.warning("  %s: the pinned weights or engine changed in place; answers are not checked for %d epochs after",
+                    ", ".join(sorted(transition)), sc.revision_transition_epochs)
     references = {m: r.engine() for m, r in cfg.references.items()
-                  if cat.get(m) is not None and cat.get(m).status != "retired"}
+                  if cat.get(m) is not None and cat.get(m).status != "retired" and m not in transition}
+    for m, engine in list(references.items()):
+        if why := await wrong_revision(engine, cat.get(m)):
+            log.error("  the %s reference engine is not used: %s; its endpoints are not audited", m, why)
+            await references.pop(m).close()
     tolerances = {m.model_id: m.tolerance for m in cat.models}
     # No pool limit: a miner's hanging connections must not delay requests to the others.
     limits = httpx.Limits(max_connections=None, max_keepalive_connections=256)
@@ -278,11 +287,20 @@ def main() -> None:
                       store=current.store if is_owner else None, auditor=throughput.auditor, board=board,
                       probation=lambda: [key for key, left in list(state.probation.items()) if left > 0],
                       gateways=lambda: current.catalog.gateways)
+    pinned = {m.model_id: (m.hf_revision, m.engine.revision) for m in current.catalog.models}
+
     def adopt(cat: catalog.Catalog) -> None:
         if missing := missing_references(cfg, cat):
             log.critical("catalog %s activates %s, which this validator has no reference engine for; stopping",
                          cat.digest()[:12], missing)
             os._exit(1)
+        for m in cat.models:
+            if m.model_id in cfg.references and pinned.get(m.model_id, (m.hf_revision, m.engine.revision)) != (
+                    m.hf_revision, m.engine.revision):
+                log.critical("catalog %s pins %s at weights %s and engine %s: restart its reference engine on them "
+                             "within %d epochs", cat.digest()[:12], m.model_id, m.hf_revision, m.engine.revision,
+                             cat.scoring.revision_transition_epochs)
+            pinned[m.model_id] = (m.hf_revision, m.engine.revision)
         throughput.set_policy(cat.audit_policy())
 
     current.on_change.append(adopt)

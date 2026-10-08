@@ -126,6 +126,65 @@ def test_sampled_gateway_answers_prove_wrong_answers(tmp_path) -> None:
     assert asyncio.run(validator.proven_invalid([evidence], reference, catalog.load())) == []
 
 
+def test_a_reference_on_other_weights_than_the_catalog_pins_checks_nothing(tmp_path) -> None:
+    """A lagging or misconfigured reference cannot prove honest miners wrong: an engine naming other weights than the
+    catalog pins is not used, and after the catalog pins other weights in place, the model's answers go unchecked for
+    ``revision_transition_epochs`` while miners and references update."""
+    gateway, wrong_kp = kp(), kp()
+    wrong = miner(wrong_kp, MockEngine("kev-4b", salt="a cheaper model"), gateway)
+
+    def samples(i: int) -> list[GatewaySample]:
+        r = asyncio.run(exchange(wrong, gateway, wrong_kp, request(i)))
+        return [GatewaySample(hotkey=wrong_kp.ss58_address, endpoint_id="gpu0", model_id="kev-4b",
+                              request=request(i), response=r.text)]
+
+    def reference(revision: str) -> Checks:
+        return Checks({"kev-4b": MockEngine("kev-4b", served={"data": [{"id": "kev-4b", "revision": revision}]})}, {})
+
+    auditor = _auditor(tmp_path, gateway_checks_per_epoch=1)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(wrong_kp.ss58_address, "gpu0", "http://x/e/gpu0", "kev-4b", 40.0)])
+    assert auditor.accept_samples(gateway.ss58_address, samples(1)) == 1
+    asyncio.run(auditor.check_samples(reference("0" * 40)))
+    assert auditor.store._query("SELECT state, reason FROM samples") == [("unchecked", "no reference for the model")]
+
+    document = catalog.load().document()
+    bumped = catalog.Catalog.parse({**document, "models": [
+        {**m, "hf_revision": "1" * 40} if m["model_id"] == "kev-4b" else m for m in document["models"]]})
+    auditor.catalog = lambda: bumped
+    assert auditor.accept_samples(gateway.ss58_address, samples(2)) == 1
+    asyncio.run(auditor.check_samples(reference("1" * 40)))  # the reference updated at once, the miner not yet
+    assert auditor.store._query("SELECT COUNT(*) FROM samples WHERE evidence IS NOT NULL") == [(0,)]
+    auditor.chain.head_block += 3 * 180  # the transition is over
+    auditor.follower.poll()
+    assert auditor.accept_samples(gateway.ss58_address, samples(3)) == 1
+    asyncio.run(auditor.check_samples(reference("1" * 40)))
+    assert auditor.store._query("SELECT COUNT(*) FROM samples WHERE evidence IS NOT NULL") == [(1,)]
+
+
+def test_what_a_reference_serves_and_when_a_model_is_in_transition() -> None:
+    from verathos.validator.references import served_revisions, transitioning, wrong_revision
+
+    kev = catalog.load().get("kev-4b")
+    clef_doc = {"data": [{"id": "Cloudflare/clef-flash", "revision": "a" * 40, "dtype": "float32"}]}
+    kev_doc = {"models": [{"name": "kev-latest", "run": "models/kev-4b", "dtype": "float32"}]}
+    assert served_revisions(clef_doc) == {"a" * 40} and served_revisions(kev_doc) == set()
+    assert served_revisions(None) == served_revisions({"data": "x"}) == set()
+    assert "the catalog pins" in asyncio.run(wrong_revision(MockEngine("kev-4b", served=clef_doc), kev))
+    assert asyncio.run(wrong_revision(MockEngine("kev-4b", served=kev_doc), kev)) is None  # cannot tell
+    on_pin = {"data": [{"revision": kev.hf_revision}]}
+    assert asyncio.run(wrong_revision(MockEngine("kev-4b", served=on_pin), kev)) is None
+
+    cat, pins = catalog.load(), {}
+    assert transitioning(pins, cat, 10) == set()  # first seen: not in transition
+    bumped = catalog.Catalog.parse({**cat.document(), "models": [
+        {**m, "engine": {**m["engine"], "revision": "2" * 40}} if m["model_id"] == "kev-9b" else m
+        for m in cat.document()["models"]]})
+    assert [transitioning(pins, bumped, e) for e in (11, 12, 13, 14)] == [{"kev-9b"}] * 3 + [set()]
+    still = bumped.model_copy(update={"scoring": bumped.scoring.model_copy(update={"revision_transition_epochs": 0})})
+    assert transitioning(dict(pins), still, 12) == set()
+
+
 def test_input_tokens_signed_beyond_the_references_count_are_evidence(tmp_path) -> None:
     """The users' input tokens set the models' emission shares; a miner signing more than the reference counts is
     caught on its sampled answers, as a wrong answer would be."""

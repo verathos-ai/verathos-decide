@@ -82,6 +82,9 @@ class Scoring(BaseModel):
                                    "its demand")
     max_share_step: float = Field(0.05, gt=0, le=1, description="Most a model's emission share moves per epoch "
                                   "toward what demand sets")
+    revision_transition_epochs: int = Field(3, ge=0, description="Epochs after a model's pinned weights or engine "
+                                            "change in place during which its answers are not checked, while miners "
+                                            "and references update")
     user_offers_prior: int = Field(20, ge=1, description="Ready offers every hotkey's endpoints of a model start an "
                                    "epoch with, so a few offers move its availability to users little")
     user_latency_min_answers: int = Field(50, ge=1, description="Answers to users an endpoint needs in an epoch for "

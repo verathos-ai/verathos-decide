@@ -49,6 +49,11 @@ Model status: `active` models are scored; `candidate` models can be served and a
 lets a new model run on the network before it is scored; `retired` models are skipped, and miners withdraw endpoints
 serving them from their manifests (a miner with no other endpoint stops).
 
+New weights or a new reference engine for a model are a new model: add it as a `candidate` under a new `model_id`,
+activate it, then retire the old one. Changing a model's `hf_revision` or `engine.revision` in place leaves its
+answers unchecked for `scoring.revision_transition_epochs` (3) epochs, while miners and references update; after
+that, answers from the old weights fail.
+
 To publish a catalog:
 
 1. Edit a copy of `src/verathos/catalog/catalog.json` (keep the repository copy in sync through a pull request;

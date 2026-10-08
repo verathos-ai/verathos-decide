@@ -90,6 +90,7 @@ from verathos.throughput.workload import WORDS, in_mix_form
 from verathos.validator.canaries import canary_like
 from verathos.validator.compare import RequestComparison, Tolerance
 from verathos.validator.config import ReferenceEngine
+from verathos.validator.references import transitioning, wrong_revision
 from verathos.validator.scoring import bounded_shares, model_shares
 
 log = logging.getLogger(__name__)
@@ -124,7 +125,8 @@ CREATE TABLE users (epoch INTEGER NOT NULL, hotkey TEXT NOT NULL, endpoint_id TE
 """
 _RESULTS_INDEX = "CREATE INDEX IF NOT EXISTS results_by_endpoint ON results (hotkey, endpoint_id);"
 _SAMPLES_BY_TEST = "CREATE INDEX IF NOT EXISTS samples_by_test ON samples (test_id, hotkey, endpoint_id);"
-# meta: epoch_blocks (the rows' numbering), paid_demand (the gateways told paid from unpaid input tokens once)
+# meta: epoch_blocks (the rows' numbering), paid_demand (the gateways told paid from unpaid input tokens once), pins
+# (per model what the catalog pins and since when, ``validator.references.transitioning``)
 _META_SCHEMA = "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
 _SHARES_SCHEMA = """
 ALTER TABLE demand ADD COLUMN paid_tokens INTEGER NOT NULL DEFAULT 0;
@@ -167,6 +169,9 @@ class BoundedEngine:
         async with self._slots:
             return await self.engine.answer(request)
 
+    async def info(self) -> Any:
+        return await self.engine.info()
+
 
 @dataclass(frozen=True)
 class Checks:
@@ -178,6 +183,24 @@ class Checks:
 
     def for_test(self, budget_s: float = RECOMPUTE_BUDGET_S) -> Recomputes:
         return Recomputes(self, time.monotonic() + budget_s)
+
+    async def usable(self, cat: catalog_module.Catalog, transitioning: Collection[str]) -> Checks:
+        """The checks that may run now: none for a model in transition (``validator.references``), and none on an
+        engine that names other weights than the catalog pins for its model."""
+
+        async def keep(engines: dict[str, Engine], role: str) -> dict[str, Engine]:
+            out = {}
+            for model_id, engine in engines.items():
+                model = cat.get(model_id)
+                if model is None or model_id in transitioning:
+                    continue
+                if why := await wrong_revision(engine, model):
+                    log.error("the %s %s engine is not used: %s", model_id, role, why)
+                    continue
+                out[model_id] = engine
+            return out
+
+        return Checks(await keep(self.references, "reference"), await keep(self.screens, "screen"))
 
 
 class RankedSlots:
@@ -377,6 +400,9 @@ class Store:
                 self._db.execute("UPDATE samples SET epoch = epoch * ? / ?, checked_epoch = checked_epoch * ? / ?",
                                  (old, new, old, new))
                 self._db.execute("DELETE FROM verdicts")
+                for (value,) in self._db.execute("SELECT value FROM meta WHERE key = 'pins'").fetchall():
+                    pins = {m: [pin, since * old // new] for m, (pin, since) in json.loads(value).items()}
+                    self._db.execute("UPDATE meta SET value = ? WHERE key = 'pins'", (json.dumps(pins),))
                 latest: dict[str, dict[tuple[int, str], tuple]] = {"demand": {}, "shares": {}}
                 for table, rows in latest.items():
                     for epoch, model, *values in self._db.execute(f"SELECT * FROM {table} ORDER BY epoch").fetchall():
@@ -400,6 +426,15 @@ class Store:
 
     def known(self, test_id: str) -> bool:
         return bool(self._query("SELECT 1 FROM tests WHERE test_id = ?", (test_id,)))
+
+    def transitioning(self, cat: catalog_module.Catalog, epoch: int) -> set[str]:
+        """The models in transition at ``epoch`` (``validator.references.transitioning``), with the pins kept here."""
+        with self._lock:
+            rows = self._db.execute("SELECT value FROM meta WHERE key = 'pins'").fetchall()
+            pins = json.loads(rows[0][0]) if rows else {}
+            out = transitioning(pins, cat, epoch)
+            self._db.execute("INSERT OR REPLACE INTO meta VALUES ('pins', ?)", (json.dumps(pins),))
+        return out
 
     def add_test(self, test: ScheduledTest) -> None:
         self._query("INSERT INTO tests (test_id, epoch, selection_block, selection_hash, start_block, state) "
@@ -848,6 +883,11 @@ class Auditor:
                 log.exception("checking gateway samples failed")
             await asyncio.sleep(POLL_S)
 
+    async def _usable(self, checks: Checks) -> Checks:
+        """``checks`` less what may not run now (``Checks.usable``)."""
+        cat, epoch = self.catalog(), self.follower.head // self.policy.epoch_blocks
+        return await checks.usable(cat, await asyncio.to_thread(self.store.transitioning, cat, epoch))
+
     def targets(self, policy: AuditPolicy) -> list[Target]:
         cat, last = self.catalog(), self.store.last_delivered(policy.regrow_after)
         by_hotkey: dict[str, list[tuple[Slot, catalog_module.CatalogModel]]] = {}
@@ -951,7 +991,7 @@ class Auditor:
             # users were answered in the window: wait for the gateways' samples of those answers (they follow the
             # start block on their own chain view)
             await asyncio.sleep(max(0.0, start_ms / 1000 + policy.session_s + TEST_SAMPLES_WAIT_S - time.time()))
-        recomputes, scales = checks.for_test(), self.user_scales(window_s)
+        recomputes, scales = (await self._usable(checks)).for_test(), self.user_scales(window_s)
         order = list(range(len(targets)))
         secrets.SystemRandom().shuffle(order)  # which endpoints' checks wait longest under pressure: unpredictable
         results = await asyncio.gather(*(self.evaluate(test, t, r, recomputes, policy, window_s,
@@ -1131,6 +1171,7 @@ class Auditor:
                                          self._rng)
         if not chosen:
             return
+        checks = await self._usable(checks)
         recomputes, cat = checks.for_test(SAMPLE_BUDGET_S), self.catalog()
 
         async def check(rank: int, row: tuple) -> None:

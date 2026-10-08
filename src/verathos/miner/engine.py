@@ -22,6 +22,8 @@ class EngineError(Exception):
 class Engine(Protocol):
     async def answer(self, request: dict[str, Any]) -> dict[str, Any]: ...
 
+    async def info(self) -> Any: ...
+
 
 class HttpEngine:
     """A local engine process speaking ``POST /v1/systemone``."""

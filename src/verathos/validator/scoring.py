@@ -52,6 +52,7 @@ class ScoreState:
     window: dict[str, list[list[float]]] = field(default_factory=dict)  # key -> [[sum_abs, count], ...] newest last
     evidence_seen: dict[str, int] = field(default_factory=dict)  # evidence id -> epoch it was applied
     held: dict[str, int] = field(default_factory=dict)  # key -> epochs in a row its average was held
+    pins: dict[str, list] = field(default_factory=dict)  # model -> [what the catalog pins, the epoch that changed it]
     last_epoch: int | None = None  # the last epoch scored, so a restart does not score it again
     scale: int = SCORE_SCALE
 
