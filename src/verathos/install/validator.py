@@ -116,7 +116,7 @@ def reference_line(reference_mode: str, placement: dict[str, str], parameters: d
 def validator_config(existing: dict, *, network: str, netuid: int, wallet_name: str, hotkey_name: str,
                      ports: dict[str, int], dry_run: bool, managed_before: set[str], home: Path,
                      mode: str = "full", reference_mode: str | None = None,
-                     launch: dict[str, dict] | None = None) -> dict:
+                     launch: dict[str, dict] | None = None, auto_update: bool | None = None) -> dict:
     """The configuration to write: ``existing`` with this setup's answers and a local reference per model (model ->
     port; none in light mode), with the command that serves it where the validator starts it (``launch``: model ->
     command, directory, environment). References configured by hand (a remote engine) and other settings are kept."""
@@ -129,6 +129,8 @@ def validator_config(existing: dict, *, network: str, netuid: int, wallet_name: 
               "hotkey_name": hotkey_name, "mode": mode, "references": references, "dry_run": dry_run}
     if reference_mode is not None:
         config["reference_mode"] = reference_mode
+    if auto_update is not None:
+        config["auto_update"] = auto_update
     config.setdefault("state_dir", str(home / "validator"))
     config.setdefault("catalog_dir", str(home / "catalog"))
     return config
@@ -168,6 +170,7 @@ def init(argv: list[str]) -> None:
         warn("this is the subnet owner's hotkey: its validator also serves the catalog and runs the throughput "
              "audit, which needs public_host, port and the load generator (docs/VALIDATING.md)")
     mode = choose_mode(ui, args.mode, existing, owner)
+    auto_update = common.auto_update(args, existing, default=not owner)  # the auditor is updated by hand
     store = catalog.CatalogStore(Path(existing.get("catalog_dir", home / "catalog")))
     try:
         cat = current_catalog(st, netuid, store, existing.get("catalog_mirrors", []))
@@ -176,7 +179,7 @@ def init(argv: list[str]) -> None:
     info(f"catalog {cat.revision} ({cat.digest()[:12]})")
     if mode == "light":
         init_light(ui, manager, record, existing, config_path, home, dry_run, cat=cat, network=network, netuid=netuid,
-                   wallet_name=wallet_name, hotkey_name=hotkey_name)
+                   wallet_name=wallet_name, hotkey_name=hotkey_name, auto_update=auto_update)
         return
 
     step("References")
@@ -244,6 +247,7 @@ def init(argv: list[str]) -> None:
             info(f"{m.model_id} ({plan.CANDIDATE}) runs on the {m.engine.name} engine, which this setup does not "
                  "install")
     info(f"validator with hotkey {wallet_name}/{hotkey_name}" + (", dry run: no weights set" if dry_run else ""))
+    info("self-update off: the auditor is updated by hand" if owner else common.update_line(auto_update))
     info(f"configuration {config_path}; engines and weights in {home}")
     if not ui.confirm("Go ahead?"):
         raise SystemExit("stopped; nothing changed")
@@ -278,7 +282,7 @@ def init(argv: list[str]) -> None:
     config = validator_config(existing, network=network, netuid=netuid, wallet_name=wallet_name,
                               hotkey_name=hotkey_name, ports=ports, dry_run=dry_run,
                               managed_before=set(record.engines), home=home, reference_mode=reference_mode,
-                              launch=launch)
+                              launch=launch, auto_update=auto_update)
     try:
         ValidatorConfig.model_validate(config)
     except ValidationError as exc:
@@ -303,7 +307,7 @@ def init(argv: list[str]) -> None:
         record.manager, record.services = None, [s.name for s in run]
         record.save(home)
         common.show_run("each reference engine and the validator, which waits for them" if reference_services else
-                        "the validator (it starts the references itself)", run)
+                        "the validator (it starts the references itself)", run, auto_update and not owner)
         if previous:
             info(f"stop the references no longer run as their own process (pm2: pm2 delete {' '.join(previous)})")
         for line in common.script_commands("validator", home, " --no-service"):
@@ -348,6 +352,7 @@ def init(argv: list[str]) -> None:
         else:
             info(f"{m}: reference on {describe(placement[m])}, service {service_name(m)}")
     info(f"validator: service {VALIDATOR}" + (" (dry run: no weights set)" if dry_run else ""))
+    info("self-update off: the auditor is updated by hand" if owner else common.update_line(auto_update))
     info(f"configuration: {config_path}; state: {config['state_dir']} (keep it: canary secret and score history)")
     info(f"status:  {manager.status_command(record.services)}")
     info(f"logs:    {manager.log_command(VALIDATOR)}")
@@ -408,7 +413,7 @@ def mode_lines(mode: str, cat: catalog.Catalog, owner: bool) -> list[str]:
 
 def init_light(ui: Prompter, manager: Manager | None, record: common.Record, existing: dict, config_path: Path,
                home: Path, dry_run: bool, *, cat: catalog.Catalog, network: str, netuid: int, wallet_name: str,
-               hotkey_name: str) -> None:
+               hotkey_name: str, auto_update: bool = True) -> None:
     """The light validator: the validator alone, as a service. References a full setup placed before stop."""
     stale = sorted(record.engines)
     step("Plan")
@@ -417,6 +422,7 @@ def init_light(ui: Prompter, manager: Manager | None, record: common.Record, exi
     if stale:
         info(f"the references of {', '.join(stale)} stop (their engines and weights stay until uninstall)")
     info(f"validator with hotkey {wallet_name}/{hotkey_name}" + (", dry run: no weights set" if dry_run else ""))
+    info(common.update_line(auto_update))
     info(f"configuration {config_path}")
     if not ui.confirm("Go ahead?"):
         raise SystemExit("stopped; nothing changed")
@@ -424,7 +430,7 @@ def init_light(ui: Prompter, manager: Manager | None, record: common.Record, exi
     step("Configuration")
     config = validator_config(existing, network=network, netuid=netuid, wallet_name=wallet_name,
                               hotkey_name=hotkey_name, ports={}, dry_run=dry_run, managed_before=set(stale),
-                              home=home, mode="light")
+                              home=home, mode="light", auto_update=auto_update)
     try:
         ValidatorConfig.model_validate(config)
     except ValidationError as exc:
@@ -440,7 +446,7 @@ def init_light(ui: Prompter, manager: Manager | None, record: common.Record, exi
         previous = [s for s in record.services if s != VALIDATOR]
         record.manager, record.services = None, [VALIDATOR]
         record.save(home)
-        common.show_run("the validator", [validator])
+        common.show_run("the validator", [validator], auto_update)
         if previous:
             info(f"stop the references it ran with (pm2: pm2 delete {' '.join(previous)})")
         for line in common.script_commands("validator", home, " --no-service"):
@@ -463,6 +469,7 @@ def init_light(ui: Prompter, manager: Manager | None, record: common.Record, exi
 
     step("Done")
     info(f"validator: service {VALIDATOR}, light mode" + (" (dry run: no weights set)" if dry_run else ""))
+    info(common.update_line(auto_update))
     info(f"configuration: {config_path}; state: {config['state_dir']}")
     info(f"status:  {manager.status_command(record.services)}")
     info(f"logs:    {manager.log_command(VALIDATOR)}")

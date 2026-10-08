@@ -61,6 +61,7 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--no-publish` | try the machine before registering: the miner serves and measures, but writes nothing on chain; once the hotkey is registered, run the command again without it |
 | `--worker`, `--name` | this machine serves its GPUs for the hotkey's primary machine; its endpoint ids start with `--name` (default: its IP address) ([One hotkey, several GPUs and machines](#one-hotkey-several-gpus-and-machines)) |
 | `--peers` | on the primary: every worker's public `ip:port`, comma-separated; replaces the list (`''` for none) |
+| `--no-auto-update` | the miner does not update its code by itself to each new release; `--auto-update` turns that on again ([Update](#update)) |
 | `--no-service` | no root, no system packages and no services: set everything up in the user's home and print the commands to run under pm2 or another process manager you run; `git`, `curl` and a C compiler (`build-essential`) must be there ([Without root](VALIDATING.md#without-root-pm2-or-another-process-manager)) |
 | `--source`, `--ref`, `--dir` | the code from another git URL, git bundle or tarball; a branch, tag or commit; another directory than `~/verathos-decide`, which must be missing, empty or a checkout of this code (another checkout is never changed) |
 
@@ -183,6 +184,17 @@ A GPU whose model the setup chose moves to another model only if that pays at le
 ([Models](#models)). The miner restarts and reuses its capacity measurement while nothing it depends on changed; an
 engine restarts only when its revision or settings changed, or for `verathos-engine` (Clef models) its code, which
 the miner then measures again.
+
+A miner set up by the installer also updates its code by itself (`auto_update` in `miner.json`; `--no-auto-update`
+turns it off, `--auto-update` on again). About every hour it reads the release tags (`v<version>`) of the repository
+its code came from. A newer release is installed at a random time within the next hour, so miners do not all
+restart at once, and never while a throughput test is selected or its traffic runs, nor while a measurement runs or
+waits for a test: the miner checks out the tagged commit, installs it into its Python environment and exits, and its
+process manager starts the new release (systemd, supervisord and pm2 restart a process that exits). The restarted
+miner reuses its capacity measurement; its engines keep running. It does not update a checkout with local changes
+(`self-update: local changes in ...`) or to a tag whose code names another version; a failed install puts the
+previous code back. Engines and services stay as they are: a release that changes them, such as `verathos-engine`'s
+code, says so, and running the installer again updates them.
 
 ### Uninstall
 
@@ -359,6 +371,7 @@ reference.
 | `catalog_mirrors` | extra catalog sources, URL templates with `{digest}`, tried after the owner's axon |
 | `catalog_dir` | local catalog store (default `~/.verathos/catalog`) |
 | `state_dir` | capacity measurements and the caps tests set on them, and the last published manifest (default `~/.verathos/miner`) |
+| `auto_update` | install each new release by itself outside throughput tests, then exit for the process manager to start it (default false; the installer sets true) ([Update](#update)) |
 
 ### 5. Run
 
@@ -533,7 +546,9 @@ An endpoint makes the miner measure again at most once every 3 epochs, and never
 
 ## Updating
 
-A miner set up with the one-command install updates by running it again ([Update](#update)). A manual installation:
+A miner set up with the one-command install updates itself to each release, and by running it again
+([Update](#update)). A manual installation (`auto_update` in `miner.json` makes a git checkout run under a process
+manager update itself too):
 
 ```bash
 git pull && VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"

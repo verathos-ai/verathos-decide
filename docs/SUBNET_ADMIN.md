@@ -170,6 +170,13 @@ Raise it from the subnet owner coldkey (AdminUtils `sudo_set_weights_version_key
 `btcli sudo set --netuid 96 --param weights_version --value 1000000`), and only once the validators that should keep
 setting weights run a release at or above it.
 
+To publish a release: set `__version__` to the new version in a commit, tag that commit `v<version>` (an annotated
+tag) and push the tag to the repository installs come from. Miners and validators set up by the installer
+(`auto_update`) find it within an hour and install it within the hour after, each at a random time and a quiet moment
+of its own (`MINING.md`, `VALIDATING.md`), then restart; a tag whose code names another version is never installed.
+The auditor is updated by hand. A release that changes engines or services needs the installer run again: say so
+when announcing it. Run every release on testnet first.
+
 ## Test network first
 
 Every release and policy change runs on testnet (netuid 405) before mainnet: the same commands with

@@ -31,7 +31,8 @@ Light validators follow the auditor's results; full validators check answers ind
 
 The command installs what the machine needs, asks a few questions (each has a default), and runs everything as
 system services; with `--no-service` it needs no root and prints the commands for pm2 or another process manager.
-Run it again to update. What it asks, what it installs, how to check, update and uninstall, and
+Miners and validators then install each new release by themselves (`--no-auto-update` turns that off); running the
+command again updates them too. What it asks, what it installs, how to check, update and uninstall, and
 the manual installation: [Mining](docs/MINING.md#quick-start-one-command),
 [Validating](docs/VALIDATING.md#quick-start-one-command).
 
@@ -64,7 +65,7 @@ memory for the largest only; `--candidates` adds the candidates' references wher
 | [Throughput audit](docs/THROUGHPUT_AUDIT.md) | declared capacity, the network-wide tests, verdicts, policy |
 | [Gateway](docs/GATEWAY.md) | user traffic: keys, limits, routing, answer checks, running it |
 | [Discovery](docs/DISCOVERY.md) | manifests, commitments and the catalog on chain |
-| [Subnet administration](docs/SUBNET_ADMIN.md) | mechanisms, catalog releases, audit rollout |
+| [Subnet administration](docs/SUBNET_ADMIN.md) | mechanisms, catalog releases, audit rollout, code releases and the weights version key |
 
 ## Layout
 
@@ -79,6 +80,8 @@ src/verathos/
   engine/      verathos-engine for model families served from their repository code (Clef)
   subnet/      chain helpers miners and validators share, and the verathos-subnet admin CLI
   install/     guided setup: verathos-miner init, verathos-validator init, uninstall
+  release.py   the release version and the weights version key
+  update.py    self-update to each release tag
 native/loadgen/  Rust load generator the auditor drives the tests with
 scripts/       installer, miner probe
 docs/

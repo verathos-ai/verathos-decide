@@ -87,6 +87,9 @@ class ValidatorConfig(BaseModel):
     catalog_dir: Path = Path("~/.verathos/catalog")
     state_dir: Path = Path("~/.verathos/validator")
     dry_run: bool = False
+    auto_update: bool = Field(False, description="Update the code to each new release of the repository it was "
+                              "installed from (release tags), at a quiet moment, and exit for the process manager to "
+                              "start it (the installer turns it on; verathos.update)")
 
     @field_validator("public_host")
     @classmethod

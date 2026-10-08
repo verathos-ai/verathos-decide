@@ -28,7 +28,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI
 
-from verathos import catalog
+from verathos import catalog, update
 from verathos.miner.admission import Admission, RequestBudget
 from verathos.miner.app import caller_request_bytes, create_app
 from verathos.miner.chain import PermitAuthorizer, build_host_endpoints, build_manifest, own_endpoints, publish
@@ -144,6 +144,7 @@ class Publisher:
         self._announced: set[object] = set()  # why the waiting measurement is wanted, as logged
         self._published = False
         self._left_out: list[str] = []
+        self.updater: update.Updater | None = None
 
     @property
     def mechid(self) -> int:
@@ -381,8 +382,26 @@ class Publisher:
             while True:
                 time.sleep(interval_s)
                 st = self.follow(st, store)
+                if self.updater is not None and self.updater.due():
+                    try:
+                        if self.update_held() is None:
+                            self.updater.at_safe_point()
+                    except Exception:
+                        log.exception("self-update failed; trying again in a minute")
 
         threading.Thread(target=run, name="catalog-watch", daemon=True).start()
+
+    def update_held(self) -> str | None:
+        """Why the miner does not restart for a self-update now: a throughput test's traffic arrives, or a test is
+        selected and not over, or a measurement waits for one; None if it may (between rounds of ``follow``, so no
+        measurement runs)."""
+        if self.testing():
+            return "a throughput test is running"
+        if self.interrupted:
+            return "a measurement waits for a throughput test"
+        if self.window is not None and (deferral := self.window.deferral()) is not None:
+            return deferral.line
+        return None
 
     def follow(self, st: bt.Subtensor | None, store: catalog.CatalogStore) -> bt.Subtensor | None:
         """One round of ``watch``. A new catalog is adopted at once (measuring again if it changed what a measurement
@@ -532,6 +551,7 @@ def main() -> None:
         publisher.poll_peers()
     publisher.publish(subtensor)
     if not args.no_publish:
+        publisher.updater = update.start(config.auto_update, "miner")
         publisher.watch()
         StatusWatcher(hotkey=wallet.hotkey.ss58_address, netuid=config.netuid, auditor_url=chain.auditor_url,
                       auditor_hotkey=lambda: publisher.auditor, listed=publisher.own_ids,

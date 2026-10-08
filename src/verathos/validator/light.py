@@ -217,8 +217,10 @@ class LightValidator:
 
 
 def run(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, current: Any, *,
-        set_weights: Callable[[dict[int, float], int], bool], once: bool = False) -> None:
-    """Run a light validator; with ``once``, try to set the source's latest results once and return."""
+        set_weights: Callable[[dict[int, float], int], bool], once: bool = False,
+        between: Callable[[], None] | None = None) -> None:
+    """Run a light validator; with ``once``, try to set the source's latest results once and return. ``between`` is
+    called between steps, where no weights are being set (the self-update)."""
     hotkey = wallet.hotkey.ss58_address
     if hotkey == st.get_subnet_owner_hotkey(cfg.netuid):
         raise SystemExit(OWNER_IS_FULL)
@@ -245,4 +247,6 @@ def run(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, current: Any,
         except Exception:
             log.exception("light mode step failed; retrying in one block")
             wait = BLOCK_TIME_S
+        if between is not None:
+            between()
         time.sleep(wait)

@@ -472,6 +472,7 @@ def test_install_script_parses_and_documents_its_options() -> None:
     assert usage.returncode == 0 and "--source" in usage.stdout and "uninstall" in usage.stdout
     assert "--worker" in usage.stdout and "--peers" in usage.stdout
     assert "--light" in usage.stdout and "--full" in usage.stdout and "--references" in usage.stdout
+    assert "--no-service" in usage.stdout and "--no-auto-update" in usage.stdout
 
 
 def installer(home: Path, *args: str) -> subprocess.CompletedProcess:

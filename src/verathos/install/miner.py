@@ -196,7 +196,7 @@ def choose_models(ui: Prompter, gpus: list[host.Gpu], offered: list[str], need: 
 
 def miner_config(existing: dict, *, network: str, netuid: int, wallet_name: str, hotkey_name: str, public_ip: str,
                  port: int, endpoints: dict[str, tuple[str, int]], managed_before: set[str], home: Path,
-                 role: str = "primary", peers: list[str] | None = None) -> dict:
+                 role: str = "primary", peers: list[str] | None = None, auto_update: bool | None = None) -> dict:
     """The configuration to write: ``existing`` with this setup's answers and its endpoints (endpoint id -> model,
     engine port). Endpoints added by hand and settings the setup does not ask about are kept; endpoints it set up
     before and no longer serves are dropped. ``peers`` (a primary's) replace the configured ones; None keeps them."""
@@ -209,6 +209,8 @@ def miner_config(existing: dict, *, network: str, netuid: int, wallet_name: str,
     config["peers"] = (existing.get("peers", []) if peers is None else peers) if role == "primary" else []
     if not config["peers"]:
         del config["peers"]
+    if auto_update is not None:
+        config["auto_update"] = auto_update
     config.setdefault("state_dir", str(home / "miner"))
     config.setdefault("catalog_dir", str(home / "catalog"))
     return config
@@ -321,6 +323,8 @@ def init(argv: list[str]) -> None:
          + (" (testing: nothing written on chain)" if args.no_publish else ""))
     if workers:
         info(f"workers whose endpoints the manifest lists: {', '.join(workers)}")
+    auto_update = common.auto_update(args, existing)
+    info(common.update_line(auto_update))
     info(f"configuration {config_path}; engines and weights in {home}")
     if not ui.confirm("Go ahead?"):
         raise SystemExit("stopped; nothing changed")
@@ -343,7 +347,8 @@ def init(argv: list[str]) -> None:
     config = miner_config(existing, network=network, netuid=netuid, wallet_name=wallet_name,
                           hotkey_name=hotkey_name, public_ip=public_ip, port=port,
                           endpoints={eid: (chosen[gpu], engine_ports[eid]) for gpu, eid in endpoint_ids.items()},
-                          managed_before=set(record.engines), home=home, role=role, peers=peers)
+                          managed_before=set(record.engines), home=home, role=role, peers=peers,
+                          auto_update=auto_update)
     try:
         MinerConfig.model_validate(config)
     except ValidationError as exc:
@@ -380,7 +385,7 @@ def init(argv: list[str]) -> None:
         previous = [s for s in record.services if s not in names and s != MINER]
         record.manager, record.services = None, [*names, MINER]
         record.save(home)
-        common.show_run("each engine and the miner", [*engine_services.values(), miner])
+        common.show_run("each engine and the miner", [*engine_services.values(), miner], auto_update)
         if previous:
             info(f"stop the engines no longer served (pm2: pm2 delete {' '.join(previous)})")
         info("the miner waits for its engines, measures its capacity (a few minutes), then "
@@ -417,6 +422,7 @@ def init(argv: list[str]) -> None:
         info(f"endpoint {eid}: {chosen[g.index]} on GPU {g.index}, service {engine_services[eid].name}")
     info(f"miner: http://{public_ip}:{port}, service {MINER}"
          + (" (testing: nothing published on chain)" if args.no_publish else ""))
+    info(common.update_line(auto_update))
     info(f"configuration: {config_path}; state: {config['state_dir']}")
     info(f"status:  {manager.status_command(record.services)}")
     info(f"logs:    {manager.log_command(MINER)}")

@@ -28,6 +28,7 @@ import bittensor as bt
 import httpx
 
 from verathos import __version__, catalog, release
+from verathos import update as self_update
 from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator import chain, light, status
@@ -432,8 +433,9 @@ def main() -> None:
                               state_path=cfg.state_dir.expanduser() / "catalog_followed.json")
     if cfg.mode == "light":  # no references, no miners: the source's verified weights
         current.start()
+        updater = None if args.once else self_update.start(cfg.auto_update, "validator")
         light.run(cfg, st, wallet, current, set_weights=lambda w, mechid: set_weights(cfg, st, wallet, w, mechid),
-                  once=args.once)
+                  once=args.once, between=updater.at_safe_point if updater else None)
         st.close()
         return
     try:
@@ -474,6 +476,10 @@ def main() -> None:
                       store=current.store if is_owner else None, auditor=throughput.auditor, board=board,
                       probation=lambda: [key for key, left in list(state.probation.items()) if left > 0],
                       gateways=lambda: current.catalog.gateways)
+    if is_owner and cfg.auto_update:
+        log.info("self-update: the auditor does not update itself (its restart would stop the throughput tests); "
+                 "update it by hand")
+    updater = None if args.once else self_update.start(cfg.auto_update and not is_owner, "validator")
     pinned = {m.model_id: (m.hf_revision, m.engine.revision) for m in current.catalog.models}
     mechanism = [catalog.mechanism_of(current.catalog, cfg.mechid)]
     log.info("setting weights on mechanism %d (%s)", mechanism[0],
@@ -525,6 +531,8 @@ def main() -> None:
                 state.save(state_path)
                 if args.once:
                     break
+            if updater is not None:  # between epochs: scored, weights set, state saved
+                updater.at_safe_point()
             time.sleep(max((next_start - st.get_current_block()) * BLOCK_TIME_S, 0) + BLOCK_TIME_S)
         except Exception:
             if args.once:

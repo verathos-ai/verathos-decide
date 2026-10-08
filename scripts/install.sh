@@ -23,6 +23,8 @@
 #   --no-service    no system packages, services or sudo; print the commands to run instead
 # Every other option goes to `verathos-<role> init`, for example:
 #   --yes --wallet <name> --hotkey <name> --network finney|test|<ws url> --netuid <n>
+#   --no-auto-update  the miner or validator does not install new releases by itself (on by default, except for the
+#                     subnet owner's validator; --auto-update turns it on again)
 #   validator mode: --light (the default, except for the subnet owner's hotkey: sets the auditor's published weights;
 #                   no GPU, no reference engines, no requests to miners) or --full (checks miners on references)
 #   miner: --public-ip <ip> --port <port> --model <id>[,<id>...] --gpus <i,j> --no-publish

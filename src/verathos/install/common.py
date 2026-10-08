@@ -94,6 +94,21 @@ def common_arguments(parser: argparse.ArgumentParser) -> None:
                         "set up, then print the commands to run under a process manager you run (pm2 or another)")
     parser.add_argument("--home", type=Path, default=DEFAULT_HOME, help="Configuration, state, engines and weights "
                         "(default ~/.verathos)")
+    parser.add_argument("--auto-update", action=argparse.BooleanOptionalAction, default=None, help="Update the code "
+                        "to each new release of the repository it came from, by itself (default: on, except for the "
+                        "subnet owner's validator; a later run keeps the choice)")
+
+
+def auto_update(args: argparse.Namespace, existing: dict, default: bool = True) -> bool:
+    """Whether the process updates itself (``auto_update``): as asked, else as configured before, else ``default``."""
+    return args.auto_update if args.auto_update is not None else bool(existing.get("auto_update", default))
+
+
+def update_line(on: bool) -> str:
+    if on:
+        return ("self-update on: the code follows the releases (v<version> tags) of the repository it came from, "
+                "restarting at a quiet moment (--no-auto-update turns it off)")
+    return "self-update off: update the code with the installer (--auto-update turns it on)"
 
 
 # ---- the record of what was set up ----
@@ -240,10 +255,11 @@ def uninstall_command(role: str) -> str:
     return f"bash {INSTALLER} uninstall" if INSTALLER.exists() else f"verathos-{role} uninstall"
 
 
-def show_run(what: str, run: list[services.Service]) -> None:
+def show_run(what: str, run: list[services.Service], auto_update: bool = False) -> None:
     """How to run ``run`` under a process manager the operator runs, which restarts each when it exits."""
     step("Run (no services installed)")
-    info(f"start {what} under your process manager, which restarts each when it exits; with pm2:")
+    info(f"start {what} under your process manager, which restarts each when it exits"
+         + (" (a self-update exits to start the new release)" if auto_update else "") + "; with pm2:")
     for s in run:
         print(f"      {services.pm2_command(s)}", flush=True)
     print("      pm2 save", flush=True)

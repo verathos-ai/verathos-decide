@@ -168,6 +168,7 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--candidates` | also run references for the catalog's candidate models, in the memory the active ones leave; a later run keeps them, `--no-candidates` removes them |
 | `--dry-run` | compute weights without setting them; `--no-dry-run` sets them again |
 | `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
+| `--no-auto-update` | the validator does not update its code by itself to each new release; `--auto-update` turns that on again (off for the subnet owner's validator) ([Update](#update)) |
 | `--no-service` | no root, no system packages and no services: print the commands to run under a process manager you run ([Without root](#without-root-pm2-or-another-process-manager)) |
 | `--source`, `--ref`, `--dir` | as for miners (`MINING.md`) |
 
@@ -221,8 +222,9 @@ pm2 start ~/verathos-decide/.venv/bin/verathos-validator --name verathos-validat
 pm2 save
 ```
 
-`--interpreter none` runs the program itself, which pm2 would otherwise run under node. To update by hand, run the
-installer again with `--no-service`, then `pm2 restart verathos-validator`. System services set up before are
+`--interpreter none` runs the program itself, which pm2 would otherwise run under node. pm2 restarts it when it
+exits, as after a self-update ([Update](#update)). To update by hand, run the installer again with `--no-service`,
+then `pm2 restart verathos-validator`. System services set up before are
 refused (uninstall them first, the configuration and state stay), so one copy runs; `uninstall` names the processes
 to stop. Light validator, unattended:
 
@@ -279,6 +281,17 @@ catalog activates a model. References keep running unless their revision or sett
 It keeps the mode, and references one at a time stay so (`--references resident` makes them resident again). Resident
 references that no longer fit in the memory, as when the catalog activates another model, run one at a time from then
 on. A light validator has only its code to update.
+
+A validator set up by the installer also updates its code by itself (`auto_update` in `validator.json`;
+`--no-auto-update` turns it off, `--auto-update` on again; the subnet owner's validator, the auditor, is updated by
+hand). About every hour it reads the release tags (`v<version>`) of the repository its code came from. A newer
+release is installed at a random time within the next hour, so validators do not all restart at once, and between
+epochs, once the weights are set (light: between two attempts to set them): the validator checks out the tagged
+commit, installs it into its Python environment and exits, and its process manager starts the new release (systemd,
+supervisord and pm2 restart a process that exits). It does not update a checkout with local changes
+(`self-update: local changes in ...`) or to a tag whose code names another version; a failed install puts the
+previous code back. The logs say each step (`self-update: ...`). Engines, references and services stay as they
+are: a release that changes them says so, and the installer updates them.
 
 ### Uninstall
 
@@ -407,6 +420,7 @@ of a full validator:
 | `audit_screens` | {} | auditor only: model id -> a bf16 engine (same forms) that screens the sampled test answers; an answer it flags counts as wrong only once the fp32 reference confirms it |
 | `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database; references one at a time: their times (`references.json`) and logs (`references/`); light: the last epoch whose weights it set |
 | `dry_run` | false | compute weights without setting them (light: log the weights it would set) |
+| `auto_update` | false (the installer sets true, except for the subnet owner's validator) | install each new release by itself between epochs, then exit for the process manager to start it ([Update](#update)) |
 | `public_host`, `port` | -, 8091 | public IP and port of the validator's service; needed by the subnet owner and the auditor. A full validator that sets them serves its status and the weights it sets there, for light validators that name it in `source_hotkey` |
 | `catalog_mirrors` | [] | extra catalog sources, URL templates with `{digest}`, tried after the owner's axon |
 | `catalog_dir` | `~/.verathos/catalog` | local catalog store; the owner's validator serves catalogs from it |
