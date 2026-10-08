@@ -14,6 +14,7 @@ import logging
 
 import uvicorn
 
+from verathos.engine import code_version
 from verathos.engine.server import create_app
 
 FAMILIES = ("clef",)
@@ -38,7 +39,8 @@ def main() -> None:
 
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     engine = clef.load(args.repo, args.revision, device=args.device, dtype=args.dtype)
-    served = {"id": args.repo, "revision": args.revision, "device": args.device, "dtype": args.dtype}
+    served = {"id": args.repo, "revision": args.revision, "device": args.device, "dtype": args.dtype,
+              "code": code_version()}
     uvicorn.run(create_app(engine, [served]), host=args.host, port=args.port, log_level="info")
 
 

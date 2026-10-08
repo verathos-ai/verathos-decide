@@ -124,8 +124,8 @@ bash ~/verathos/scripts/install.sh validator --yes
 ```
 
 updates the code, and the engines and weights when the catalog pins new revisions; it adds a reference when the
-catalog activates a model. References keep running unless their revision or settings changed; the validator
-restarts.
+catalog activates a model. References keep running unless their revision or settings changed (or, for
+`verathos-engine`, its code); the validator restarts.
 
 ### Uninstall
 

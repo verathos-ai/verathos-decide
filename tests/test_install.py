@@ -4,12 +4,14 @@ and the service definitions."""
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from verathos import catalog
+from verathos.engine import code_version as engine_code_version
 from verathos.install import common, engines, plan, services
 from verathos.install.host import GiB, Gpu, parse_gpus
 from verathos.install.miner import miner_config
@@ -347,6 +349,11 @@ def test_clef_models_install_verathos_engine_and_others_are_refused(tmp_path) ->
     assert miner[-4:] == ["--device", "cuda", "--dtype", "bfloat16"]
     assert engine.command("reference", clef, 8103)[-4:] == ["--device", "auto", "--dtype", "float32"]
     assert engines.FLA_VERSION.search(engines.QWEN35.read_text())  # the miner environment's kernel pin
+    env = engine.environment_variables("miner", "cuda:1", tmp_path / "hf")
+    assert env["CUDA_VISIBLE_DEVICES"] == "1" and env["HF_HUB_OFFLINE"] == "1"
+    # new engine code changes the service, so the engine restarts on an update
+    assert re.fullmatch(r"[0-9a-f]{12}", env["VERATHOS_ENGINE_CODE"])
+    assert env["VERATHOS_ENGINE_CODE"] == engine_code_version()
     other = clef.model_copy(update={"engine": clef.engine.model_copy(update={"name": "other"})})
     assert not plan.installable(other)
     with pytest.raises(plan.PlanError, match="does not install"):

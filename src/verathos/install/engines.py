@@ -26,6 +26,7 @@ from pathlib import Path
 import httpx
 
 from verathos import catalog
+from verathos.engine import code_version
 from verathos.install.plan import PlanError
 
 HF_API = "https://huggingface.co/api/models/{repo}/revision/{revision}"
@@ -167,9 +168,11 @@ class ClefEngine:
 
     @staticmethod
     def environment_variables(purpose: str, device: str, hf_home: Path) -> dict[str, str]:
-        """``device``: "cpu" or "cuda:<index>" (nvidia-smi's numbering)."""
+        """``device``: "cpu" or "cuda:<index>" (nvidia-smi's numbering). ``VERATHOS_ENGINE_CODE`` changes the service
+        when an update changes the engine's code, so the engine restarts on it."""
         return {"HF_HOME": str(hf_home), "HF_HUB_OFFLINE": "1", "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-                "CUDA_VISIBLE_DEVICES": "" if device == "cpu" else device.split(":", 1)[1]}
+                "CUDA_VISIBLE_DEVICES": "" if device == "cpu" else device.split(":", 1)[1],
+                "VERATHOS_ENGINE_CODE": code_version()}
 
 
 ENGINES = {"kev": KevEngine, "clef": ClefEngine}

@@ -142,7 +142,8 @@ bash ~/verathos/scripts/install.sh miner --yes
 
 It updates the code from where it was installed, and the engines and weights when the catalog pins new revisions.
 The miner restarts and reuses its capacity measurement while nothing it depends on changed; an engine restarts only
-when its revision or settings changed.
+when its revision or settings changed, or for `verathos-engine` (Clef models) its code, which the miner then measures
+again.
 
 ### Uninstall
 
