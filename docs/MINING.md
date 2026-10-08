@@ -245,8 +245,17 @@ VIRTUAL_ENV=/opt/clef uv pip install "flash-linear-attention==$(sed -n 's/^FLA_V
 CUDA_VISIBLE_DEVICES=2 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8010
 ```
 
-Clef-flash on one GPU, 525-token requests with five questions: about 69 requests per second on an H100 and 25 on
-an A100 (20 ms and 58 ms for a single request).
+Clef-flash on one GPU, requests of about 525 tokens with one or two questions, several requests at once:
+
+| GPU | Requests per second | One request alone |
+|---|---|---|
+| H100 80 GB | 69 | 20 ms |
+| A100 80 GB | 25 | 58 ms |
+| RTX 5090 | 18 | 96 ms |
+
+The backbone's matrix multiplications are most of the work, so a GPU's bfloat16 throughput sets these figures; GeForce
+cards accumulate bfloat16 in fp32 at half their fp16 rate. Answers from all of them stay within 0.014 of the float32
+reference.
 
 ### 4. Configure
 
