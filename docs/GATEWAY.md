@@ -159,6 +159,7 @@ keeps using its own; older than 3 epochs, the routes are stale: the log says so 
    | `request_timeout_s`, `attempt_timeout_s`, `max_attempts` | 10, 4, 3 | the miners' deadline per request, per attempt, attempts |
    | `max_in_flight` | 4096 | requests in flight per process; more get 503 |
    | `max_body_bytes` | 1 MiB | |
+   | `max_in_flight_bytes` | 256 MiB | request bodies held in this process at once; more get 503 |
    | `sample_window_s` | 600 | one exchange per endpoint and window goes to the auditor |
    | `admin_host`, `admin_port`, `admin_token_file` | 127.0.0.1, -, - | the admin API (see below); off without a port |
    | `state_dir`, `catalog_dir` | `~/.verathos/gateway`, `~/.verathos/catalog` | last routes, catalogs |
@@ -293,8 +294,8 @@ Every response to `POST /v1/systemone` carries `X-Request-Id` (the client's, if 
 | 429 | `rate_limited` | over the key's rate, or too many invalid keys from the address; `Retry-After` |
 | 429 | `quota_exceeded` | the month's quota is used up; `Retry-After` until the next month |
 | 500 | `internal` | a fault of the gateway |
-| 503 | `busy` | no capacity free for the model now; `Retry-After` |
-| 503 | `unavailable` | no miner serves the model right now, none answered in time or the miners refused the request, every miner of the model is failing (`Retry-After: 30`), or accounts cannot be checked; `Retry-After` |
+| 503 | `busy` | no capacity free for the model now, or the gateway is at capacity (`max_in_flight`, `max_in_flight_bytes`); `Retry-After` |
+| 503 | `unavailable` | no miner serves the model right now, none answered in time or the miners refused the request, every miner of the model is failing (`Retry-After: 30`), accounts cannot be checked, or the gateway has no catalog yet (starting); `Retry-After` |
 
 ## Accounts and keys
 

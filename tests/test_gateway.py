@@ -773,6 +773,30 @@ def test_requests_no_miner_could_answer_are_refused_before_any_miner(tmp_path) -
     assert Counting.calls == 0
 
 
+def test_request_bodies_held_at_once_are_bounded(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": Slow("kev-4b", 0.3)}, credited=100.0)
+    s.config.max_in_flight_bytes = 1 << 20
+    padded = json.dumps(REQUEST).encode() + b" " * 600_000  # within the body limit; spaces are no prompt
+
+    async def run(n: int):
+        return [r.status_code for r in await asyncio.gather(*(s.post(content_override=padded) for _ in range(n)))]
+    assert sorted(asyncio.run(run(2))) == [200, 503]  # the second would hold more than the budget
+    assert asyncio.run(run(1)) == [200]  # released when the first ended
+
+
+def test_no_model_is_found_before_the_catalog_is(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    s.gateway.catalog = lambda: None  # starting: the routes' catalog is not resolved yet
+    r = asyncio.run(s.post())
+    assert r.status_code == 503 and r.json()["error"]["type"] == "unavailable" and r.headers["Retry-After"]
+
+
+def test_the_auditor_overwrites_what_it_scrubs(tmp_path) -> None:
+    from verathos.throughput.auditor import Store
+
+    assert Store(tmp_path / "a.sqlite", epoch_blocks=180)._query("PRAGMA secure_delete") == [(1,)]
+
+
 def test_a_request_that_breaks_every_miner_opens_no_breaker(tmp_path) -> None:
     s = Setup(tmp_path, {f"10.0.0.{i}": Counting("kev-4b") for i in (1, 2, 3)})
     poison = {**REQUEST, "state": "POISON"}

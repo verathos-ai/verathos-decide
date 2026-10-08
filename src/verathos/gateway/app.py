@@ -19,9 +19,10 @@ month).
     429 rate_limited        over the key's rate (or too many invalid keys from one address)
     429 quota_exceeded      over the account's monthly quota
     500 internal            a fault of the gateway
-    503 busy                no capacity free for the model right now
+    503 busy                no capacity free for the model right now, or the gateway is at capacity
     503 unavailable         no miner serves the model right now, the miners failed or refused the request within its
-                            deadline, every miner of the model is failing, or accounts cannot be checked
+                            deadline, every miner of the model is failing, accounts cannot be checked, or the gateway
+                            has no catalog yet
 """
 
 from __future__ import annotations
@@ -224,7 +225,9 @@ def check_request(g: Gateway, body: bytes) -> Checked:
     except (ValueError, TypeError, RecursionError) as exc:
         raise Rejected(400, "invalid_request", f"not a SystemOne request: {exc}"[:500]) from None
     cat = g.catalog()
-    model = cat.get(parsed.model) if cat is not None else None
+    if cat is None:
+        raise Rejected(503, "unavailable", "the gateway has no catalog yet", 5)
+    model = cat.get(parsed.model)
     if model is None or model.status != "active":
         raise Rejected(404, "model_not_found", f"{parsed.model} is not served")
     if parsed.model not in g.router.models():
@@ -370,7 +373,7 @@ async def mark_states_forever(g: Gateway, every_s: float = 60.0) -> None:
 def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
     app = FastAPI(title="Verathos gateway", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     trusted = [ipaddress.ip_network(n, strict=False) for n in g.config.trusted_proxies]
-    in_flight = 0
+    in_flight = in_flight_bytes = 0
     computed: dict[str, tuple[float, Any]] = {}
 
     def recent(name: str, compute: Callable[[], Any]) -> Any:
@@ -443,10 +446,10 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
 
     @app.post("/v1/systemone")
     async def systemone(request: Request):
-        nonlocal in_flight
+        nonlocal in_flight, in_flight_bytes
         given = request.headers.get("x-request-id", "")
         request_id = given if _REQUEST_ID.fullmatch(given) else secrets.token_hex(12)
-        request.state.request_id = request_id
+        request.state.request_id, request.state.held_bytes = request_id, 0
         if in_flight >= g.config.max_in_flight:
             return reject(503, "busy", "the gateway is at capacity", request_id, 1)
         in_flight += 1
@@ -455,7 +458,17 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
             return await serve(request, request_id)
         finally:
             in_flight -= 1
+            in_flight_bytes -= request.state.held_bytes
             metrics.IN_FLIGHT.set(in_flight)
+
+    def hold(request: Request, size: int) -> bool:
+        """Count ``size`` more bytes of the request's body as held until it ends; False if over the budget."""
+        nonlocal in_flight_bytes
+        if in_flight_bytes + size > g.config.max_in_flight_bytes:
+            return False
+        in_flight_bytes += size
+        request.state.held_bytes += size
+        return True
 
     async def serve(request: Request, request_id: str):
         started = g.clock()
@@ -490,6 +503,8 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
             body += chunk
             if len(body) > g.config.max_body_bytes:
                 return reject(413, "too_large", f"the body exceeds {g.config.max_body_bytes} bytes", request_id)
+            if not hold(request, len(chunk)):
+                return reject(503, "busy", "the gateway is at capacity", request_id, 1)
         try:
             checked = check_request(g, bytes(body))
         except Rejected as r:

@@ -34,6 +34,8 @@ class GatewayConfig(BaseModel):
     max_attempts: int = Field(3, ge=1, le=5)
     max_in_flight: int = Field(4096, ge=1, description="User requests in flight in this process; more get 503")
     max_body_bytes: int = Field(1 << 20, ge=1024, le=1 << 20)
+    max_in_flight_bytes: int = Field(256 << 20, ge=1 << 20, description="Request bodies held in this process at "
+                                     "once (they are parsed into several copies); more get 503")
     sample_window_s: float = Field(600.0, ge=10, description="One exchange per endpoint and window goes to the "
                                    "auditor")
     catalog_dir: Path = Path("~/.verathos/catalog")

@@ -371,6 +371,7 @@ class Store:
 
     def __init__(self, path: Path, *, epoch_blocks: int) -> None:
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._db.execute("PRAGMA secure_delete = ON")  # a scrubbed request leaves nothing in the file
         self._lock = threading.Lock()
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         while version in _MIGRATIONS:
