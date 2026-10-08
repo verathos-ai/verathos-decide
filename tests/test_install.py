@@ -157,11 +157,11 @@ def test_a_worker_and_its_primary_are_configured_for_one_hotkey(tmp_path) -> Non
     for bad in ("10.0.0.1:8091", "9.9.9.9", "localhost:8091", "[::ffff:8.8.8.8]:80"):
         with pytest.raises(SystemExit, match="--peers"):
             parse_peers(bad)
-    primary = configure({}, "primary", "40.119.45.15", ["gpu0"], peers)
+    primary = configure({}, "primary", "1.0.0.1", ["gpu0"], peers)
     assert primary["role"] == "primary" and primary["peers"] == peers
-    assert configure(primary, "primary", "40.119.45.15", ["gpu0"], None)["peers"] == peers  # --yes keeps them
-    assert "peers" not in configure(primary, "primary", "40.119.45.15", ["gpu0"], [])  # --peers ''
-    assert "peers" not in configure(primary, "worker", "40.119.45.15", ["x-gpu0"], None)
+    assert configure(primary, "primary", "1.0.0.1", ["gpu0"], None)["peers"] == peers  # --yes keeps them
+    assert "peers" not in configure(primary, "primary", "1.0.0.1", ["gpu0"], [])  # --peers ''
+    assert "peers" not in configure(primary, "worker", "1.0.0.1", ["x-gpu0"], None)
 
 
 def test_the_validator_configuration_keeps_remote_references_and_settings(tmp_path) -> None:
