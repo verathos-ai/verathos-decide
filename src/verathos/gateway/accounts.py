@@ -14,10 +14,11 @@ from many addresses never reaches the database. While the budget is spent, such 
 Credit is a ledger (``credits``): each entry names the payment or grant it records (``reference``), so recording one
 twice adds it once. The account's balance is kept with it: the entries minus the cost of the usage written.
 
-Usage is paid (``Principal.paid``) when the account is prepaid and has topped up at least once: its answers are then
-paid from credit someone bought. The ledger does not tell which entry a request spends, so an account that only ever
-had free credit (a grant: a sign-up, the demo) is unpaid, and one that topped up is paid from then on, grants
-included. Only paid usage moves the models' emission shares (``ServedCount.paid_input_tokens``).
+Usage is paid when the account is prepaid, has topped up (``Principal.paid``), and its free credit is spent: its
+balance is no more than its top-ups (``UsageMeter.paid``). Free credit (a grant: a sign-up, the demo) is counted as
+spent first, as ``paid_cost`` counts it, so an account that only ever had free credit is unpaid, and one that topped
+up is paid once its grants are used. Only paid usage moves the models' emission shares
+(``ServedCount.paid_input_tokens``).
 
 The network's totals (``totals``) and their series per day or week (``series``) count every account's answered
 requests. Their paid usage is stricter, money that came in: each account's usage cost beyond its free credit (counted
@@ -73,7 +74,7 @@ class Principal:
     burst: int
     monthly_quota: int | None
     prepaid: bool = False
-    paid: bool = False  # prepaid, and topped up at least once (see the module docstring)
+    paid: bool = False  # prepaid, and topped up at least once; paid usage once its grants are spent (see the module)
 
 
 def new_key() -> str:

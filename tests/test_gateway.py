@@ -1169,7 +1169,8 @@ def test_one_answer_to_users_per_endpoint_and_test_reaches_the_auditor_once_the_
 
 
 def test_only_answers_paid_from_bought_credit_count_as_paid_demand(tmp_path) -> None:
-    """Free credit (a sign-up grant, the demo) moves no emission: an account counts as paid once it topped up."""
+    """Free credit (a sign-up grant, the demo) moves no emission: an account's answers count as paid once it topped up
+    and its grants are spent, as the totals count paid usage."""
     import time as time_module
 
     s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
@@ -1181,11 +1182,19 @@ def test_only_answers_paid_from_bought_credit_count_as_paid_demand(tmp_path) -> 
     assert asyncio.run(s.post()).status_code == 200  # not prepaid (invoiced, internal): unpaid
     assert paid_and_all()[0] == 0
     asyncio.run(s.accounts.set_account("acme", prepaid=True))
-    asyncio.run(s.accounts.add_credit("acme", 1_000_000, kind="grant", reference="signup"))
-    assert asyncio.run(s.post()).status_code == 200  # spends a free grant
-    assert paid_and_all()[0] == 0
+    asyncio.run(s.accounts.add_credit("acme", 1, kind="grant", reference="signup"))
+    while (answered := asyncio.run(s.post())).status_code == 200:  # spends a free grant of one micro-USD
+        pass
+    assert answered.status_code == 402 and paid_and_all()[0] == 0
     asyncio.run(s.accounts.add_credit("acme", 1_000_000, kind="topup", reference="pay-1"))
     tokens = asyncio.run(s.post()).json()["usage"]["input_tokens"]  # the key cache is 0 s here, a minute in production
+    assert paid_and_all() == (tokens, tokens)
+    asyncio.run(s.accounts.add_credit("acme", 10, kind="grant", reference="promo"))  # free credit is spent first
+    spent = 0.0
+    while not paid_and_all()[0]:
+        spent += asyncio.run(s.post()).json()["usage"]["input_tokens"] * 0.04
+    assert 10 <= spent <= 10 + 2 * tokens * 0.04
+    asyncio.run(s.post())
     s.served.clock = lambda: time_module.time() + 2  # those seconds are over
     asyncio.run(s.served.report())
     assert s.auditor._paid[s.auditor.follower.head // 180]["kev-4b"] == tokens > 0

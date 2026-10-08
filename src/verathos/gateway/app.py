@@ -557,9 +557,10 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
                                      "usage": {"input_tokens": outcome.input_tokens}, "receipt": outcome.receipt},
                                     headers={"X-Request-Id": request_id})
             g.stats.record(model, "answered", g.clock() - started)
+            paid = g.meter.paid(principal)  # before its cost is charged
             g.meter.record(principal, model, answered=True, input_tokens=outcome.input_tokens, price=checked.price)
             g.sampler.offer(outcome)
-            g.served.record(outcome.route, outcome.input_tokens, outcome.seconds, paid=principal.paid)
+            g.served.record(outcome.route, outcome.input_tokens, outcome.seconds, paid=paid)
             metrics.REQUESTS.labels(model, "answered").inc()
             return response
         g.stats.record(model, "busy" if outcome == "busy" else "failed")
