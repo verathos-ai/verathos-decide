@@ -4,7 +4,7 @@
     verathos-engine clef --repo Cloudflare/clef-flash --revision <sha> --port 8110 --device cpu --dtype float32
 
 Take ``--repo`` and ``--revision`` from the model's catalog entry (``hf_repo``, ``hf_revision``). Miners run their
-GPU in bfloat16; validators run the reference in float32.
+GPU in bfloat16 (the batched fast path); validators run the release's reference code in float32.
 """
 
 from __future__ import annotations
@@ -33,9 +33,9 @@ def main() -> None:
 
     from verathos.engine import clef
 
-    runner = clef.load(args.repo, args.revision, device=args.device, dtype=args.dtype)
+    engine = clef.load(args.repo, args.revision, device=args.device, dtype=args.dtype)
     served = {"id": args.repo, "revision": args.revision, "device": args.device, "dtype": args.dtype}
-    uvicorn.run(create_app(runner, [served]), host=args.host, port=args.port, log_level="info")
+    uvicorn.run(create_app(engine, [served]), host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":
