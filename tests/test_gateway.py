@@ -1330,6 +1330,7 @@ def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
     listed = {m["id"]: m for m in asyncio.run(models())}
     assert listed["kev-4b"]["price"] == {"usd_per_million_input_tokens": price, "usd_per_million_output_tokens": 0}
     assert listed["kev-4b"]["available"] and listed["kev-4b"]["weights"]["repo"]
+    assert all(m["input_modalities"] == ["text"] for m in listed.values())
     assert not listed["kev-9b"]["available"]  # active in the catalog, listed, but no miner routed
 
     asyncio.run(s.accounts.set_account("acme", prepaid=True))

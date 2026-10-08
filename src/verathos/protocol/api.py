@@ -27,6 +27,9 @@ JSONContent = str | dict | list | int | float | bool | None
 MAX_OPTIONS = 255
 MAX_RESPONSE_BYTES = 64 << 10  # a response (answers and receipt) larger than this is not a valid answer
 STATE_CHARS_PER_TOKEN = 4  # a generous bound: tokens of these models average fewer characters
+# What a state carries, for every model: text, plain or JSON. Images and video are not in the protocol; one that
+# carries them would list them per model.
+INPUT_MODALITIES = ("text",)
 ANSWER_FIELDS = {"noul": {"type", "noul", "probabilities", "confidence"},
                  "choice": {"type", "choice", "probabilities", "confidence"},
                  "score": {"type", "score", "probabilities", "confidence", "legend"}}
