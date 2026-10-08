@@ -225,7 +225,9 @@ For scoring epoch `E` the auditor publishes, signed by its hotkey, at `GET /v1/t
 
 They also state each model's user demand: the input tokens per second the gateways reported answered, averaged over
 epochs (`demand`), and of them those users paid for once the gateways tell them apart (`paid_demand`); and the
-models' emission shares that follow (`shares`, `SCORING.md`), moved by at most `max_share_step` per epoch.
+models' emission shares that follow (`shares`, `SCORING.md`), moved by at most `max_share_step` per epoch. Once the
+gateways tell paid from unpaid, they list per endpoint the input tokens of the answers it gave paying users in epoch
+`E - 1`, summed over every catalog gateway's reports (`paid_served`: hotkey, endpoint, model, input tokens).
 
 The verdicts for the current epoch and the two before are served once their tests are settled (404 otherwise);
 once served, an epoch's verdicts do not change.

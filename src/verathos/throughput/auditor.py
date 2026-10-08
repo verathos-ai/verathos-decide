@@ -77,6 +77,7 @@ from verathos.throughput.feed import (
     MALFORMED,
     Credit,
     Evidence,
+    PaidServed,
     ReferenceUnavailable,
     SignedVerdicts,
     Verdicts,
@@ -116,7 +117,7 @@ MIN_TEST_SHARE = 0.1  # a test sends at least this share of the tested rate itse
 USERS_BEFORE_S = (80.0, 20.0)  # an endpoint's usual user rate: [window start - 80 s, window start - 20 s)
 SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30  # at least STATUS_TESTS: with a test every epoch, the tests a status lists are all kept
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 _DEMAND_SCHEMA = """
 CREATE TABLE demand (epoch INTEGER NOT NULL, model_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
     ema REAL NOT NULL, PRIMARY KEY (epoch, model_id));
@@ -137,27 +138,34 @@ ALTER TABLE demand ADD COLUMN paid_ema REAL NOT NULL DEFAULT 0;
 CREATE TABLE shares (epoch INTEGER NOT NULL, model_id TEXT NOT NULL, share REAL NOT NULL,
     PRIMARY KEY (epoch, model_id));
 """
+_PAID_SCHEMA = """
+CREATE TABLE paid (epoch INTEGER NOT NULL, hotkey TEXT NOT NULL, endpoint_id TEXT NOT NULL, model_id TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL, PRIMARY KEY (epoch, hotkey, endpoint_id, model_id));
+"""
 # from version -> the statements that bring it one version up
 _MIGRATIONS = {4: _DEMAND_SCHEMA, 5: _USERS_SCHEMA, 6: _RESULTS_INDEX,
                7: "ALTER TABLE samples ADD COLUMN test_id TEXT; " + _SAMPLES_BY_TEST, 8: _META_SCHEMA,
-               9: _SHARES_SCHEMA}
+               9: _SHARES_SCHEMA, 10: _PAID_SCHEMA}
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
 
 
 @dataclass
 class UserTally:
     """What one endpoint did for the gateways' users in one epoch: times it was considered for a request, refusals
-    (see ``gateway.router``), answers with a known duration, and those durations (``protocol.gateway`` buckets)."""
+    (see ``gateway.router``), answers with a known duration, those durations (``protocol.gateway`` buckets), and the
+    input tokens of its answers users paid for."""
 
     offered: int = 0
     refused: int = 0
     answers: int = 0
     latency: dict[int, int] = field(default_factory=dict)
+    paid_tokens: int = 0
 
     def add(self, other: UserTally) -> None:
         self.offered += other.offered
         self.refused += other.refused
         self.answers += other.answers
+        self.paid_tokens += other.paid_tokens
         for bucket, n in other.latency.items():
             self.latency[bucket] = self.latency.get(bucket, 0) + n
 
@@ -355,7 +363,7 @@ CREATE TABLE samples (
 CREATE INDEX samples_by_state ON samples (state, epoch);
 CREATE INDEX samples_by_endpoint ON samples (hotkey, endpoint_id, epoch);
 CREATE TABLE verdicts (epoch INTEGER PRIMARY KEY, document TEXT NOT NULL);
-""" + _DEMAND_SCHEMA + _USERS_SCHEMA + _RESULTS_INDEX + _SAMPLES_BY_TEST + _META_SCHEMA + _SHARES_SCHEMA
+""" + _DEMAND_SCHEMA + _USERS_SCHEMA + _RESULTS_INDEX + _SAMPLES_BY_TEST + _META_SCHEMA + _SHARES_SCHEMA + _PAID_SCHEMA
 # test states: running -> unconfirmed -> confirmed | void
 _SCRUB = "request = '{}', response = ''"  # a user's request and answers are kept only until their check
 # sample states: pending -> checked | skipped (its endpoint's checks for the epoch were done) | unchecked (no
@@ -384,7 +392,8 @@ class Store:
             self._db.executescript("BEGIN; DROP TABLE IF EXISTS results; DROP TABLE IF EXISTS tests; "
                                    "DROP TABLE IF EXISTS samples; DROP TABLE IF EXISTS verdicts; "
                                    "DROP TABLE IF EXISTS demand; DROP TABLE IF EXISTS users; "
-                                   "DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS shares;" + _SCHEMA
+                                   "DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS shares; "
+                                   "DROP TABLE IF EXISTS paid;" + _SCHEMA
                                    + f"PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;")
             log.info("auditor database %s started for schema %d", path, SCHEMA_VERSION)
         self._query("UPDATE tests SET state = 'void', reason = 'the auditor restarted during the test' "
@@ -422,6 +431,9 @@ class Store:
                         "SELECT * FROM users").fetchall():
                     users.setdefault((epoch * old // new, hk, ep, model), UserTally()).add(UserTally(
                         offered, refused, answers, {int(b): n for b, n in json.loads(latency).items()}))
+                paid: dict[tuple, int] = {}
+                for epoch, hk, ep, model, tokens in self._db.execute("SELECT * FROM paid").fetchall():
+                    paid[epoch * old // new, hk, ep, model] = paid.get((epoch * old // new, hk, ep, model), 0) + tokens
                 for table, rows in latest.items():
                     self._db.execute(f"DELETE FROM {table}")
                     for row in rows.values():
@@ -430,6 +442,9 @@ class Store:
                 self._db.executemany("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                                      [(*key, t.offered, t.refused, t.answers, json.dumps(t.latency, sort_keys=True))
                                       for key, t in users.items()])
+                self._db.execute("DELETE FROM paid")
+                self._db.executemany("INSERT INTO paid VALUES (?, ?, ?, ?, ?)",
+                                     [(*key, tokens) for key, tokens in paid.items()])
                 log.info("auditor database renumbered from epochs of %d blocks to epochs of %d", old, new)
             self._db.execute("COMMIT")
             self.revision += 1
@@ -703,13 +718,22 @@ class Store:
     def close_users(self, epoch: int, tallies: dict[tuple[str, str, str], UserTally]) -> None:
         rows = [(epoch, hk, ep, model, t.offered, t.refused, t.answers, json.dumps(t.latency, sort_keys=True))
                 for (hk, ep, model), t in tallies.items()]
+        paid = [(epoch, *key, t.paid_tokens) for key, t in tallies.items() if t.paid_tokens > 0]
         with self._lock:
             self._db.execute("BEGIN")
             self._db.executemany("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            self._db.executemany("INSERT OR REPLACE INTO paid VALUES (?, ?, ?, ?, ?)", paid)
             self._db.execute("COMMIT")
 
     def users_closed(self, epoch: int) -> bool:
         return bool(self._query("SELECT 1 FROM users WHERE epoch = ? LIMIT 1", (epoch,)))
+
+    def paid(self, first_epoch: int, last_epoch: int) -> dict[tuple[str, str, str], int]:
+        """The input tokens users paid for that each endpoint answered, per (hotkey, endpoint, model), in epochs
+        ``first_epoch .. last_epoch``."""
+        rows = self._query("SELECT hotkey, endpoint_id, model_id, SUM(input_tokens) FROM paid WHERE epoch BETWEEN ? "
+                           "AND ? GROUP BY hotkey, endpoint_id, model_id", (first_epoch, last_epoch))
+        return {(hk, ep, model): int(tokens) for hk, ep, model, tokens in rows}
 
     def users(self, epoch: int) -> dict[tuple[str, str, str], UserTally]:
         """What each endpoint did for the gateways' users of each model in ``epoch``."""
@@ -753,6 +777,7 @@ class Store:
             self._db.execute("DELETE FROM demand WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM users WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM shares WHERE epoch < ?", (before_epoch,))
+            self._db.execute("DELETE FROM paid WHERE epoch < ?", (before_epoch,))
             self.revision += 1
 
 
@@ -1265,6 +1290,7 @@ class Auditor:
                 tally = users.setdefault((*key, model_of[key]), UserTally())
                 tally.offered += c.offered
                 tally.refused += c.refused
+                tally.paid_tokens += c.paid_input_tokens or 0
                 for bucket, n in c.latency.items():
                     tally.answers += n
                     tally.latency[bucket] = tally.latency.get(bucket, 0) + n
@@ -1389,11 +1415,13 @@ class Auditor:
         # only paid usage moves the shares, once the gateways tell it apart; by at most max_share_step per epoch
         shares = self.store.close_shares(epoch, model_shares(demand if paid is None else paid, cat),
                                          cat.scoring.max_share_step, start=model_shares({}, cat))
+        told = {} if paid is None else {"paid_demand": paid, "paid_served": [
+            PaidServed(hotkey=hk, endpoint_id=ep, model_id=model, input_tokens=tokens).model_dump()
+            for (hk, ep, model), tokens in sorted(self.store.paid(epoch - 1, epoch - 1).items())]}
         verdicts = Verdicts(netuid=self.netuid, auditor=self.hotkey, epoch=epoch,
                             credits=[with_users(c) for c in self.store.credits(first, epoch - 1, policy,
                                                                                _tolerance_in(cat))],
-                            invalid=self.store.evidence(first, epoch - 1), demand=demand, shares=shares,
-                            **({} if paid is None else {"paid_demand": paid}))
+                            invalid=self.store.evidence(first, epoch - 1), demand=demand, shares=shares, **told)
         signed = SignedVerdicts.create(verdicts, self.keypair)
         self.store.serve_verdicts(epoch, signed.model_dump_json())
         self._verdicts = {e: v for e, v in self._verdicts.items() if e >= current - 2} | {epoch: signed}

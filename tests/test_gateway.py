@@ -1200,6 +1200,33 @@ def test_only_answers_paid_from_bought_credit_count_as_paid_demand(tmp_path) -> 
     assert s.auditor._paid[s.auditor.follower.head // 180]["kev-4b"] == tokens > 0
 
 
+def test_each_endpoint_is_credited_the_paid_input_tokens_it_answered(tmp_path) -> None:
+    """Per endpoint, the auditor learns the input tokens of the answers it gave paying users: not those of free
+    credit, of accounts that are not prepaid, or of admin requests."""
+    import time as time_module
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": MockEngine("kev-4b")})
+
+    async def account(name: str, credit: list[tuple[str, int]]) -> str:
+        await s.accounts.create_account(name, rate_rps=100.0, burst=100, prepaid=True)
+        for kind, amount in credit:
+            await s.accounts.add_credit(name, amount, kind=kind, reference=f"{name}-{kind}")
+        return await s.accounts.create_key(name, "k")
+    paying = asyncio.run(account("paying", [("topup", 1_000_000)]))
+    free = asyncio.run(account("free", [("grant", 1_000_000)]))
+    expected: dict[str, int] = {}
+    for key in [paying, free, "default"] * 6:
+        answer = asyncio.run(s.post(key=key)).json()
+        if key == paying:
+            hotkey = answer["receipt"]["receipt"]["miner_hotkey"]
+            expected[hotkey] = expected.get(hotkey, 0) + answer["usage"]["input_tokens"]
+    s.served.clock = lambda: time_module.time() + 2  # those seconds are over
+    asyncio.run(s.served.report())
+    epoch = s.auditor.follower.head // 180
+    paid = {hk: t.paid_tokens for (hk, _, _), t in s.auditor._users[epoch].items() if t.paid_tokens}
+    assert paid == expected and len(expected) == 2
+
+
 def test_served_counts_are_kept_while_the_auditor_cannot_be_found() -> None:
     async def unknown():
         raise RuntimeError("chain unreachable")

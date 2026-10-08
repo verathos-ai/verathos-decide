@@ -66,10 +66,21 @@ class Evidence(BaseModel):
         return self.test_id.startswith(GATEWAY_EVIDENCE + "-")
 
 
+class PaidServed(BaseModel):
+    """The input tokens of the answers one endpoint gave users who paid for them, in one epoch, summed over the
+    gateways' reports (``protocol.gateway.ServedCount.paid_input_tokens``)."""
+
+    hotkey: str
+    endpoint_id: str
+    model_id: str
+    input_tokens: int = Field(ge=0)
+
+
 class Verdicts(BaseModel):
     """Fields added since are extra fields, so the documents of auditors without them verify unchanged: ``shares``,
-    each active model's emission share (``published_shares``), and ``paid_demand``, the users' input tokens/s they
-    paid for per model (EMA over epochs), once the gateways tell paid from unpaid."""
+    each active model's emission share (``published_shares``); and, once the gateways tell paid from unpaid,
+    ``paid_demand``, the users' input tokens/s they paid for per model (EMA over epochs), and ``paid_served``, the
+    paid input tokens each endpoint answered in the epoch before (``paid_served``)."""
 
     model_config = ConfigDict(extra="allow")  # a newer auditor's fields stay signed
     netuid: int
@@ -87,6 +98,16 @@ def published_shares(verdicts: Verdicts) -> dict[str, float] | None:
         return None
     shares = {m: s for m, s in raw.items() if isinstance(s, float | int) and not isinstance(s, bool) and 0 <= s <= 1}
     return shares if len(shares) == len(raw) and abs(sum(shares.values()) - 1.0) < 1e-6 else None
+
+
+def paid_served(verdicts: Verdicts) -> list[PaidServed]:
+    """The paid input tokens each endpoint answered in the epoch before the verdicts', as they state them (none from
+    an auditor that does not tell, or entries that are not well formed)."""
+    raw = (verdicts.model_extra or {}).get("paid_served")
+    try:
+        return [PaidServed.model_validate(entry) for entry in raw] if isinstance(raw, list) else []
+    except ValueError:
+        return []
 
 
 class SignedVerdicts(BaseModel):
