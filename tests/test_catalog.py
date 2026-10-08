@@ -138,8 +138,8 @@ def test_a_models_relative_speed_is_positive_and_one_when_absent() -> None:
     from pydantic import ValidationError
 
     document = catalog.load().document()
-    assert {m.model_id: m.relative_speed for m in catalog.load().models} == {"kev-4b": 1.0, "kev-9b": 0.85,
-                                                                            "clef-flash": 0.64}
+    assert {m.model_id: m.relative_speed for m in catalog.load().models} == {"kev-4b": 1.0, "kev-9b": 0.92,
+                                                                            "clef-flash": 0.92}
     without = [{k: v for k, v in m.items() if k != "relative_speed"} for m in document["models"]]
     assert {m.relative_speed for m in catalog.Catalog.parse({**document, "models": without}).models} == {1.0}
     for speed in (0, -1.0):

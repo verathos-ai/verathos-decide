@@ -47,9 +47,9 @@ values, on an H100 80GB, relative to kev-4b:
 
 | Model | `relative_speed` | Measured |
 |---|---|---|
-| `kev-4b` | 1.0 | 28-30 requests/s of the standard mix within 2 s |
-| `kev-9b` | 0.85 | 24.5-27 requests/s in the same runs (0.55 on an RTX 5090: 11.7 against 21.5) |
-| `clef-flash` | 0.64 | on an A100 80GB SXM4, not yet on the H100: 9.5 requests/s of the standard mix within 2 s against kev-4b's 14.2-15.1 on the same machine's other GPUs (its standard mix, about 700 tokens and six questions, costs it far more than the 525-token requests with one or two questions behind the engine's figures in `MINING.md`) |
+| `kev-4b` | 1.0 | 28.1 requests/s of the standard mix within 2 s (28-30 in earlier runs) |
+| `kev-9b` | 0.92 | 25.8 requests/s in the same session (24.5-27 before); 0.82 on an A100 80GB SXM4, 0.68 on an A100 80GB PCIe, 0.55 on an RTX 5090 |
+| `clef-flash` | 0.92 | 25.8 requests/s in the same session; 0.65 on an A100 80GB SXM4 (9.5 against kev-4b's 14.2-15.1) |
 
 The ratio differs by GPU: a larger model costs relatively less on a larger GPU. Re-measure on the reference GPU when
 an engine gets faster, and replace an estimate once the model's standard mix is measured.
