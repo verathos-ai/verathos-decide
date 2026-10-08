@@ -91,9 +91,11 @@ have none. The pools follow what users pay for each model through the subnet's g
   `max_share_step` (0.05) for any model, so a burst of demand shifts the emission over hours, not at once.
   Validators score with the shares published for the models they score, else from the published demand.
 
-Without demand the pools are the anchor shares, each at least `min_model_share`. Miners choose which models to serve: a model with few endpoints
-splits its pool among few, and a crowded one among many, so capacity moves to where users pay. No conversion between
-models is needed: what a request costs on a given GPU is the miner's to weigh.
+Without demand the pools are the anchor shares, each at least `min_model_share`. Miners choose which models to
+serve: a model with few endpoints splits its pool among few, and a crowded one among many, so capacity moves to where
+users pay. The miner setup chooses so by default: per GPU, the model that pays best by the published shares and the
+capacity proven on each model (`MINING.md`). No conversion between models is needed: what a request costs on a given
+GPU is the miner's to weigh.
 
 Probation lasts `probation_epochs` (6) epochs, the failing one included, whatever the later results; a new failure
 restarts the count, and the hotkey's statistical windows start over. An endpoint a hotkey adds while one of its

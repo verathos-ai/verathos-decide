@@ -37,10 +37,11 @@ Models of the shipped catalog (the installers read the catalog the subnet owner 
 | `clef-flash` | candidate | about 21 GiB | about 41 GiB or 47 GiB |
 
 `active` models are scored; `candidate` models are checked by validators but score zero. A miner serves one model per
-GPU: by default the first active model that fits, and its plan lists the others that fit; `--model` names one model
-for every GPU, or one per GPU in order (`--model kev-4b,clef-flash`). A validator runs each active model's reference
-on a GPU while one has room, smallest first, and in RAM otherwise; `--candidates` adds the candidates' references
-where memory is left.
+GPU: by default the active model that pays best on it now, from each model's share of the emission and the capacity
+serving it on the network ([Models](docs/MINING.md#models)), and its plan lists the others that fit; `--model` names
+one model for every GPU, or one per GPU in order (`--model kev-4b,clef-flash`). A validator runs each active model's
+reference on a GPU while one has room, smallest first, and in RAM otherwise; `--candidates` adds the candidates'
+references where memory is left.
 
 ## Documentation
 

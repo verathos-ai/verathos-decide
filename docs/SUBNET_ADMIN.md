@@ -26,8 +26,8 @@ the emission split between mechanisms 0 and 1. Calls wait out the admin freeze w
 ## Catalog: models and policy
 
 The catalog lists the served models (pinned weights, engine and engine revision, verification tolerances, the
-standard request mix `workload`, `price`, `anchor_share`, `first_test_rps`, status), the epoch length, the scoring
-settings
+standard request mix `workload`, `price`, `anchor_share`, `first_test_rps`, `relative_speed`, status), the epoch
+length, the scoring settings
 (`scoring`) and the throughput-audit policy (`throughput_audit`). Miners and validators use whichever catalog the
 owner hotkey commits; publishing a new one needs no code release.
 
@@ -37,6 +37,22 @@ there is no user demand; the active models' anchors must sum to 1 (`commit-catal
 Activating a model means giving it an anchor and lowering the others'; every active model keeps at least
 `min_model_share`, whatever its anchor. `commit-catalog` also refuses settings this code does not know. `first_test_rps` caps the rate of an endpoint's first test, and of all a new hotkey's
 endpoints together; later tests grow from what was delivered.
+
+`relative_speed` is the model's speed relative to the other models: the requests/s of its standard mix one GPU
+serves within `max_latency_s`, measured for every model on the same reference GPU and divided by one model's (1.0;
+positive, 1.0 when absent). Miners' setups choose each GPU's model by what it would pay there (`MINING.md`), and
+estimate a GPU's rate on a model it has not served from its rate on the one it served and this ratio. Measure a new
+model on the reference GPU through the miner's own measurement, as miners do, before activating it. The shipped
+values, on an H100 80GB, relative to kev-4b:
+
+| Model | `relative_speed` | Measured |
+|---|---|---|
+| `kev-4b` | 1.0 | 28-30 requests/s of the standard mix within 2 s |
+| `kev-9b` | 0.85 | 24.5-27 requests/s in the same runs (0.55 on an RTX 5090: 11.7 against 21.5) |
+| `clef-flash` | 1.3, an estimate | not with the standard mix: 58-62 requests/s over HTTP with requests of 525 tokens and five questions; the standard mix's states average about 700 tokens, with six questions, which scales that to about 38. The same estimate gives about 0.95 on an A100 (21-23 requests/s of those requests, scaled the same way, against kev-4b's 14.6 of the standard mix) |
+
+The ratio differs by GPU: a larger model costs relatively less on a larger GPU. Re-measure on the reference GPU when
+an engine gets faster, and replace an estimate once the model's standard mix is measured.
 
 `gateways` lists the hotkeys of the subnet's gateways (`GATEWAY.md`): miners serve them like validators, without
 the per-caller limit, and the auditor checks a sample of their answers. Rotating a gateway hotkey is a catalog

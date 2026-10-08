@@ -251,6 +251,7 @@ def test_measurement_finds_capacity_and_shares_of_one_engine(tmp_path) -> None:
         store = MeasurementStore(tmp_path / "capacity.json")
         measured, failures = await measure_and_store(targets, store, max_latency_s=1.0, run_s=0.25)
         assert failures == {} and stored(targets, store) == measured
+        assert {m.model_id for m in store.load().values()} == {"kev-4b"}  # the miner setup reads it
         changed = [dataclasses.replace(targets[0], fingerprint="new")] + targets[1:]
         assert stored(changed, store) is None
         return measured

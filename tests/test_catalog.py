@@ -129,3 +129,17 @@ def test_settings_this_code_does_not_know_are_found_before_publishing() -> None:
     assert catalog.load().unknown_settings() == []
     unknown = catalog.Catalog.parse(mistyped).unknown_settings()
     assert unknown == ["scoring.min_model_shares", f"models.{document['models'][0]['model_id']}.prise"]
+
+
+def test_a_models_relative_speed_is_positive_and_one_when_absent() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    document = catalog.load().document()
+    assert {m.model_id: m.relative_speed for m in catalog.load().models} == {"kev-4b": 1.0, "kev-9b": 0.85,
+                                                                            "clef-flash": 1.3}
+    without = [{k: v for k, v in m.items() if k != "relative_speed"} for m in document["models"]]
+    assert {m.relative_speed for m in catalog.Catalog.parse({**document, "models": without}).models} == {1.0}
+    for speed in (0, -1.0):
+        with pytest.raises(ValidationError, match="relative_speed"):
+            catalog.Catalog.parse({**document, "models": [{**document["models"][0], "relative_speed": speed}]})

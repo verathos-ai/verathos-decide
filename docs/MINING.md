@@ -39,7 +39,7 @@ engines and services:
 | Wallet/hotkey | the hotkey on the machine, or the one set up before |
 | Public IP address of this machine | detected |
 | Public TCP port of the miner | 8091 |
-| Model for each kind of GPU | the model it served before, else the first active catalog model that fits ([Models](#models)) |
+| Model for each kind of GPU | the one that pays best now, measured from the network; or the one named before with `--model` ([Models](#models)) |
 
 To answer on the command line instead, add `--yes` and the options:
 
@@ -52,7 +52,7 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 |---|---|
 | `--wallet`, `--hotkey` | the wallet and hotkey |
 | `--public-ip`, `--port` | the address validators reach the miner at |
-| `--model` | one model for every GPU, or one per GPU in order (`kev-4b,clef-flash`) ([Models](#models)) |
+| `--model` | one model for every GPU, or one per GPU in order (`kev-4b,clef-flash`); `auto` leaves a GPU to the setup ([Models](#models)) |
 | `--gpus` | the GPUs to serve on (`0,1`; default all) |
 | `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
 | `--no-publish` | try the machine before registering: the miner serves and measures, but writes nothing on chain; once the hotkey is registered, run the command again without it |
@@ -86,29 +86,59 @@ What it does:
 
 ### Models
 
-| Model | Status | GPU memory (bfloat16) | Engine |
-|---|---|---|---|
-| `kev-4b` | active | about 15 GiB | Kev |
-| `kev-9b` | active | about 26 GiB | Kev |
-| `clef-flash` | candidate | about 21 GiB | `verathos-engine` (Clef) |
+| Model | Status | GPU memory (bfloat16) | Engine | Relative speed |
+|---|---|---|---|---|
+| `kev-4b` | active | about 15 GiB | Kev | 1.0 |
+| `kev-9b` | active | about 26 GiB | Kev | 0.85 |
+| `clef-flash` | candidate | about 21 GiB | `verathos-engine` (Clef) | 1.3 (estimate) |
 
 These are the shipped catalog's models; the installer reads the catalog on chain and lists its models with the
 memory each needs. Active models are scored. A candidate is checked by validators but scores zero until the subnet
-owner activates it: serving one helps measure it and earns nothing yet.
+owner activates it: serving one helps measure it and earns nothing yet. The relative speed is the catalog's
+`relative_speed`: the requests/s of the model's standard mix one GPU serves, relative to the other models, as the
+subnet owner measured them on one reference GPU (`SUBNET_ADMIN.md`). How the models compare differs by GPU: kev-9b
+serves 0.85 times kev-4b's requests on an H100 and 0.55 times on an RTX 5090.
 
-Each GPU serves one model: the one it served before, else the first active model that fits its memory. The plan
-says why and what else fits, for example on one A100:
+Each GPU serves one model: by default the active model that pays best on it now. The setup reads the auditor's
+network status (`GET /v1/network` on the subnet owner's axon, signed once per epoch) and uses it only if the subnet
+owner hotkey signed it for this subnet within two epochs of the machine's clock. From it, per active model:
+
+- its share of the emission, as the auditor published it for its last epoch (`SCORING.md`);
+- the capacity proven by the endpoints serving it: the requests/s credited to its scored endpoints, this machine's
+  own left out.
+
+A GPU's rate on a model is its speed times the model's relative speed. Its speed comes from the capacity the miner
+measured on it before (what it declares, `~/.verathos/miner/capacity.json`), else from a GPU of the same kind on the
+machine, else from the network's median scored endpoint. A model's share splits among its endpoints by proven
+capacity, so a GPU of rate `x` on a model of share `s` with proven capacity `C` adds about `s x / (C + x)` of the
+emission (availability to users and latency left out). Where the hotkey already holds `H` of that capacity (on its
+other machines, or on this machine's GPUs placed before), it adds what the hotkey's part gains,
+`s ((H + x) / (C + x) - H / C)`. GPUs whose model is named by hand count first; then each GPU in order takes the
+active model that adds most, and the GPUs after it count it, so a machine with several GPUs spreads over the models
+where that pays more. For example, with kev-4b at 50% and 300 requests/s proven, and kev-9b at 50% and 120
+requests/s proven, an A100 whose measurement declares 13.9 requests/s of kev-4b adds about
+`0.5 x 13.9 / 313.9 = 2.2%` there and `0.5 x 11.8 / 131.8 = 4.5%` on kev-9b (11.8 = 13.9 x 0.85): it serves kev-9b.
+
+On an update, a GPU keeps the model it serves unless another pays at least 1.2 times as much: a switch downloads the
+model and measures again, and the numbers move with every epoch. When another pays at least 1.1 times as much, the
+plan says so and how to switch:
 
 ```
+the network in the auditor's epoch 45412: kev-4b 50.0% of the emission, 300.0 requests/s proven; kev-9b 50.0% of the emission, 220.0 requests/s proven; the median endpoint 14.6 requests/s at relative speed 1
 GPU 0 (NVIDIA A100 80GB PCIe, 80 GiB): kev-4b, endpoint gpu0, engine on 127.0.0.1:8008
-kev-4b, the first active model that fits. Also fit: kev-9b, clef-flash (candidate)
+GPU 0: kev-4b, as set up before: about 2.21% of the emission (its share 50.0%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 2.54%, clef-flash (candidate). kev-9b would pay about 1.15x as much on GPU 0: --model kev-9b to switch
 another choice: --model <id> for every GPU, or one per GPU in order, as in --model kev-9b
 ```
 
-`--model` names one model for every GPU (`--model kev-9b`), or one per GPU in the order of their numbers, which mixes
-models on one machine (`--model kev-4b,clef-flash` on two GPUs); a candidate is served only when chosen. On a
-terminal the installer also asks once per kind of GPU. Which active model earns more depends on the GPU and on how
-many others serve it ([3. Start one engine per GPU](#3-start-one-engine-per-gpu)).
+Without the network's numbers (the auditor's validator unreachable or of an older release, a status not signed as
+above, or no endpoint scored yet, as on a new subnet), each GPU keeps the model it served before, else takes the
+first active model that fits, and the setup says why in one line.
+
+The setup never chooses a candidate. `--model` names one model for every GPU (`--model kev-9b`), or one per GPU in
+the order of their numbers, which mixes models on one machine (`--model kev-4b,clef-flash` on two GPUs); `auto`
+leaves a GPU to the setup (`--model kev-9b,auto`). On a terminal the installer also asks once per kind of GPU, with
+the setup's choice as the default. A model named by hand stays on later runs, whatever pays more, until
+`--model auto`.
 
 ### Check that it works
 
@@ -141,9 +171,10 @@ bash ~/verathos/scripts/install.sh miner --yes
 ```
 
 It updates the code from where it was installed, and the engines and weights when the catalog pins new revisions.
-The miner restarts and reuses its capacity measurement while nothing it depends on changed; an engine restarts only
-when its revision or settings changed, or for `verathos-engine` (Clef models) its code, which the miner then measures
-again.
+A GPU whose model the setup chose moves to another model only if that pays at least 1.2 times as much
+([Models](#models)). The miner restarts and reuses its capacity measurement while nothing it depends on changed; an
+engine restarts only when its revision or settings changed, or for `verathos-engine` (Clef models) its code, which
+the miner then measures again.
 
 ### Uninstall
 
@@ -235,11 +266,11 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"
 
 ### 3. Start one engine per GPU
 
-Which model to serve is yours to choose. Each active model has its own share of the emission, split among the
-endpoints serving it by proven capacity (`SCORING.md`); the shares follow what users pay for each model through the
-subnet's gateway, and the miner logs them every epoch. What a request costs differs by GPU (the larger Kev model
-costs 1.1x the smaller on an H100 and 1.8x on an RTX 5090, for the same requests), so compare what your hardware
-proves on each model with how many others serve it.
+Which model to serve is yours to choose (the one-command setup chooses as in [Models](#models)). Each active model
+has its own share of the emission, split among the endpoints serving it by proven capacity (`SCORING.md`); the shares
+follow what users pay for each model through the subnet's gateway, and the miner logs them every epoch. What a
+request costs differs by GPU (the larger Kev model costs 1.1x the smaller on an H100 and 1.8x on an RTX 5090, for
+the same requests), so compare what your hardware proves on each model with how many others serve it.
 
 Validators check answers, not engines: any engine that serves `POST /v1/systemone` and returns the reference
 probabilities within the model's tolerances passes, and a faster engine proves more capacity. Each catalog model

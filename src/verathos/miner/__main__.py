@@ -52,6 +52,7 @@ from verathos.subnet.chain import CHAIN_ERRORS, committed_catalog, current_catal
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.follow import ScheduleFollower
 from verathos.throughput.measure import (
+    STORE_FILE,
     Measurement,
     MeasurementFailed,
     MeasurementInterrupted,
@@ -112,7 +113,7 @@ class Publisher:
                  subtensor: bt.Subtensor) -> None:
         self.config, self.wallet = config, wallet
         self.publish_on_chain = publish_on_chain and config.role == "primary"
-        self.store = MeasurementStore(config.state_dir / "capacity.json")
+        self.store = MeasurementStore(config.state_dir / STORE_FILE)
         self.shortfalls = Shortfalls(config.state_dir / "shortfalls.json")
         self.tests: list[ThroughputOutcome] = []  # the hotkey's latest test results, from a verified status
         state = config.state_dir.expanduser()

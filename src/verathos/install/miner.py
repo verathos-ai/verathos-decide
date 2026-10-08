@@ -1,9 +1,11 @@
 """``verathos-miner init``: set up this machine as a miner.
 
 One engine per GPU serving a catalog model, the miner service in front of them on one public port, both as system
-services. The miner measures its endpoints' capacity when it starts (or reuses the stored measurement) and then
-publishes its manifest; the setup shows that, and how to follow it afterwards. With GPUs on several machines, each
-is set up the same way: the workers (``--worker``) first, then the primary with the workers' addresses (``--peers``).
+services. Each GPU serves the model that pays best on it by the auditor's signed network status
+(``plan.choose_models``), unless ``--model`` names one. The miner measures its endpoints' capacity when it starts (or
+reuses the stored measurement) and then publishes its manifest; the setup shows that, and how to follow it afterwards.
+With GPUs on several machines, each is set up the same way: the workers (``--worker``) first, then the primary with
+the workers' addresses (``--peers``).
 """
 
 from __future__ import annotations
@@ -14,6 +16,8 @@ import ipaddress
 import re
 import shlex
 import sys
+import time
+from collections.abc import Callable, Collection
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -24,8 +28,12 @@ from verathos.install import common, engines, host, plan
 from verathos.install.common import Prompter, info, step, warn
 from verathos.install.services import Service
 from verathos.miner.config import MinerConfig, peer_url
+from verathos.protocol.http import get_json
 from verathos.protocol.manifest import ENDPOINTS_PATH, axon_base, is_public
-from verathos.subnet.chain import current_catalog
+from verathos.protocol.status import MAX_NETWORK_BYTES, NETWORK_DOMAIN, NETWORK_PATH, NetworkStatus, unverified
+from verathos.subnet.chain import axon_url, current_catalog, one_line
+from verathos.throughput.measure import STORE_FILE, MeasurementStore
+from verathos.throughput.policy import BLOCK_TIME_S
 
 DEFAULT_PORT = 8091
 ENGINE_PORT = 8008
@@ -33,6 +41,7 @@ MINER = "verathos-miner"
 ENGINE_READY_S = 1800.0
 MEASURE_S = 2400.0
 MIN_DRIVER_CUDA = (12, 8)
+NETWORK_MAX_AGE_EPOCHS = 2  # the auditor signs its network status once per epoch
 
 
 def parser() -> argparse.ArgumentParser:
@@ -43,8 +52,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--public-ip", help="Public IP address validators reach the miner at (default: detected)")
     p.add_argument("--port", type=int, help=f"Public TCP port of the miner (default {DEFAULT_PORT})")
     p.add_argument("--gpus", help="GPUs to serve on, comma-separated nvidia-smi indices (default: all)")
-    p.add_argument("--model", help="Model for every GPU, or one per GPU in order, comma-separated (default: the first "
-                   "active catalog model that fits; candidate models are served only when named here)")
+    p.add_argument("--model", help=f"Model for every GPU, or one per GPU in order, comma-separated; {plan.AUTO}: the "
+                   "setup chooses (default: the active model that pays best on each GPU by the network's numbers, "
+                   "or one named before; candidate models are served only when named here)")
     p.add_argument("--no-publish", action="store_true", help="Test the machine: the miner uses the shipped catalog "
                    "and writes nothing on chain, so the hotkey need not be registered")
     p.add_argument("--worker", action="store_true", help="This machine serves its GPUs for the hotkey's primary "
@@ -119,25 +129,70 @@ def select_gpus(gpus: list[host.Gpu], value: str | None) -> list[host.Gpu]:
     return [g for g in gpus if g.index in wanted]
 
 
-def choose_models(ui: Prompter, gpus: list[host.Gpu], offered: list[str], need: dict[str, int], requested: list[str],
-                  previous: dict[int, str], scored: set[str]) -> dict[int, str]:
-    """The model per GPU: the defaults (or ``requested``), asked once per kind of GPU on a terminal."""
+def read_market(st, netuid: int, hotkey: str, own: Collection[str], cat: catalog.Catalog,
+                clock: Callable[[], float] = time.time) -> tuple[plan.Market | None, str]:
+    """The market in the auditor's network status (``GET /v1/network`` on the subnet owner's axon) once it verifies:
+    signed by the subnet owner hotkey for ``netuid`` within ``NETWORK_MAX_AGE_EPOCHS`` epochs of this machine's clock.
+    Otherwise None and why. ``own``: the endpoint ids this machine served, left out of the capacity it competes
+    with."""
     try:
-        chosen = plan.choose_models(gpus, offered, need, requested, previous, scored)
+        auditor = st.get_subnet_owner_hotkey(netuid)
+        base = axon_url(st, netuid, auditor) if auditor else None
+        if base is None:
+            return None, "the subnet owner's validator serves no axon"
+        document = get_json(base + NETWORK_PATH, limit=MAX_NETWORK_BYTES, timeout=15)
+    except Exception as exc:  # whatever stops the reading, the setup chooses without the network
+        return None, f"the auditor's network status is not available ({one_line(exc)})"
+    why = unverified(document, domain=NETWORK_DOMAIN, auditor=auditor, netuid=netuid, now_ms=int(clock() * 1000),
+                     max_age_s=NETWORK_MAX_AGE_EPOCHS * cat.epoch_blocks * BLOCK_TIME_S)
+    if why is None:
+        try:
+            return plan.network_market(NetworkStatus.model_validate(document), hotkey=hotkey, own=own,
+                                       active=[m.model_id for m in cat.models if m.status == "active"],
+                                       relative={m.model_id: m.relative_speed for m in cat.models}), ""
+        except ValueError as exc:
+            why = str(exc).splitlines()[0]
+    return None, f"the auditor's network status is not used: {why}"
+
+
+def measured_capacity(state_dir: Path, engines: dict[str, dict], margin: float) -> dict[int, tuple[str, float]]:
+    """Per GPU index, the model this machine's miner measured on it and the requests/s it declares from that (its
+    stored measurements, ``margin`` of them), for the endpoints the setup installed (``engines``)."""
+    try:
+        stored = MeasurementStore(state_dir / STORE_FILE).load()
+    except (OSError, ValueError, TypeError):
+        return {}
+    return {engines[eid]["gpu"]: (m.model_id or engines[eid]["model"], m.measured_rps * margin)
+            for eid, m in stored.items() if eid in engines}
+
+
+def choose_models(ui: Prompter, gpus: list[host.Gpu], offered: list[str], need: dict[str, int], requested: list[str],
+                  previous: dict[int, str], scored: set[str], **rule) -> dict[int, plan.Choice]:
+    """The model per GPU (``plan.choose_models``, with ``rule``'s inputs): the setup's choice or ``requested``, asked
+    once per kind of GPU on a terminal."""
+    try:
+        chosen = plan.choose_models(gpus, offered, need, requested, previous, scored, **rule)
+        if requested or not ui.interactive:
+            return chosen
+        kinds: dict[tuple[str, int], list[host.Gpu]] = {}
+        for g in gpus:
+            kinds.setdefault((g.name, g.memory_total), []).append(g)
+        answered = {}
+        for group in kinds.values():
+            label = group[0].describe() if len(group) == 1 else \
+                f"the {len(group)} {group[0].name} GPUs ({', '.join(str(g.index) for g in group)})"
+            setup = {chosen[g.index].model for g in group}
+            default = setup.pop() if len(setup) == 1 else plan.AUTO
+            if default == plan.AUTO:
+                label += f" ({plan.AUTO}: {', '.join(f'{chosen[g.index].model} on GPU {g.index}' for g in group)})"
+            options = plan.fitting(offered, need, group[0]) + ([plan.AUTO] if default == plan.AUTO else [])
+            model = ui.choose(f"Model for {label}", options, default)
+            if model != default:
+                answered.update((g.index, model) for g in group)
+        return plan.choose_models(gpus, offered, need, requested, previous, scored, answered=answered,
+                                  **rule) if answered else chosen
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
-    if requested or not ui.interactive:
-        return chosen
-    kinds: dict[tuple[str, int], list[host.Gpu]] = {}
-    for g in gpus:
-        kinds.setdefault((g.name, g.memory_total), []).append(g)
-    for group in kinds.values():
-        label = group[0].describe() if len(group) == 1 else \
-            f"the {len(group)} {group[0].name} GPUs ({', '.join(str(g.index) for g in group)})"
-        model = ui.choose(f"Model for {label}", plan.fitting(offered, need, group[0]), chosen[group[0].index])
-        for g in group:
-            chosen[g.index] = model
-    return chosen
 
 
 def miner_config(existing: dict, *, network: str, netuid: int, wallet_name: str, hotkey_name: str, public_ip: str,
@@ -218,8 +273,17 @@ def init(argv: list[str]) -> None:
         raise SystemExit(str(exc)) from None
     info(plan.offer_line(list(models), need, scored))
     previous = {e["gpu"]: e["model"] for e in record.engines.values()}
+    # records of earlier releases do not say; there only a candidate was ever chosen by hand
+    manual = {e["gpu"] for e in record.engines.values() if e.get("manual", e["model"] not in scored)}
+    market, why = read_market(st, netuid, wallet.hotkey.ss58_address, set(record.engines), cat)
+    info(plan.market_line(market) if market else f"choosing models without the network's numbers: {why}; each GPU "
+         "keeps the model it served before, else takes the first active model that fits")
+    measured = measured_capacity(Path(existing.get("state_dir", home / "miner")).expanduser(), record.engines,
+                                 cat.audit_policy().capacity_margin)
     requested = plan.parse_models(args.model)
-    chosen = choose_models(ui, gpus, list(models), need, requested, previous, scored)
+    choices = choose_models(ui, gpus, list(models), need, requested, previous, scored, manual=manual, market=market,
+                            measured=measured, relative={m: models[m].relative_speed for m in models})
+    chosen = {g: c.model for g, c in choices.items()}
 
     step("Network")
     role = choose_role(ui, args, existing)
@@ -251,7 +315,7 @@ def init(argv: list[str]) -> None:
     for g in gpus:
         info(f"{g.describe()}: {chosen[g.index]}, endpoint {endpoint_ids[g.index]}, engine on "
              f"127.0.0.1:{engine_ports[endpoint_ids[g.index]]}")
-    for line in plan.choice_lines(gpus, chosen, list(models), need, scored, requested, previous):
+    for line in plan.choice_lines(gpus, choices, list(models), need, scored, market.shares if market else None):
         info(line)
     info(f"miner at {public_ip}:{port} with hotkey {wallet_name}/{hotkey_name}, "
          + ("a worker: its primary lists its endpoints" if role == "worker" else "the primary")
@@ -309,8 +373,8 @@ def init(argv: list[str]) -> None:
     stale = [s for s in record.services if s.startswith("verathos-engine-") and s not in names]
 
     record.config = str(config_path)
-    record.engines = {eid: {"gpu": g, "model": chosen[g], "port": engine_ports[eid]}
-                      for g, eid in endpoint_ids.items()}
+    record.engines = {eid: {"gpu": g, "model": chosen[g], "port": engine_ports[eid],
+                            "manual": choices[g].reason in plan.BY_HAND} for g, eid in endpoint_ids.items()}
     record.paths = sorted(str(d) for d in installs)
 
     if manager is None:

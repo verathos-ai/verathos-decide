@@ -61,6 +61,9 @@ class CatalogModel(BaseModel):
                                 "is no user demand; the active models' anchors sum to 1")
     first_test_rps: float = Field(gt=0, description="Highest rate an endpoint is tested at before its first test; "
                                   "later tests grow from what it delivered")
+    relative_speed: float = Field(1.0, gt=0, description="Requests/s of its standard mix a GPU serves of this model "
+                                  "relative to the other models, measured on one reference GPU; miners' setups "
+                                  "estimate what each model pays on a GPU from it")
     tolerance: Tolerance = Tolerance()
 
 

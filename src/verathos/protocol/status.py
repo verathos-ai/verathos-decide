@@ -5,7 +5,8 @@ The validator that serves them, the subnet owner's (the throughput auditor), sig
 to the status's own fields it adds ``netuid``, ``auditor`` (its hotkey) and ``issued_ms`` (when it signed), and signs
 the canonical JSON of all of them (``protocol.signing``) into ``signature``. A reader that knows only the status's own
 fields ignores the four. A miner acts on the test results in its status only once the document verifies
-(``unverified``).
+(``unverified``), and its setup chooses models from the network's only once that verifies (signed once per epoch, so
+it may be older).
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ NETWORK_DOMAIN = "verathos/network-status/v1"
 STATUS_TESTS = 10  # a hotkey's status lists its results in the auditor's last this many tests (one per epoch at most)
 MAX_STATUS_BYTES = 1 << 20  # a status: up to 64 endpoints, and their results in STATUS_TESTS tests
 STATUS_MAX_AGE_S = 300.0  # a miner acts on a status signed at most this long before or after its own clock
+MAX_NETWORK_BYTES = 32 << 20  # every hotkey's status: up to 256 UIDs of 64 endpoints, without their tests
 
 State = Literal["scored", "qualifying", "candidate", "failed", "invalid", "probation", "unanswered", "not_audited",
                 "drifted"]
@@ -93,9 +95,10 @@ def sign_document(document: dict[str, Any], keypair: Keypair, *, netuid: int, do
     return {**body, "signature": signing.sign(keypair, domain, body)}
 
 
-def unverified(document: Any, *, domain: str, auditor: str | None, netuid: int, now_ms: int) -> str | None:
+def unverified(document: Any, *, domain: str, auditor: str | None, netuid: int, now_ms: int,
+               max_age_s: float = STATUS_MAX_AGE_S) -> str | None:
     """Why ``document`` (as received) is not a document ``auditor`` signed under ``domain`` for ``netuid`` within
-    ``STATUS_MAX_AGE_S`` of ``now_ms``; None if it is."""
+    ``max_age_s`` of ``now_ms``; None if it is."""
     if not isinstance(document, dict) or "signature" not in document:
         return "it is not signed (the auditor runs an older release)"
     if not auditor:
@@ -106,6 +109,6 @@ def unverified(document: Any, *, domain: str, auditor: str | None, netuid: int, 
                           document["signature"]):
         return "its signature does not verify against the subnet owner hotkey"
     issued = document.get("issued_ms")
-    if not isinstance(issued, int) or isinstance(issued, bool) or abs(now_ms - issued) > STATUS_MAX_AGE_S * 1000:
-        return f"it was not signed within {STATUS_MAX_AGE_S:.0f} s of this machine's clock"
+    if not isinstance(issued, int) or isinstance(issued, bool) or abs(now_ms - issued) > max_age_s * 1000:
+        return f"it was not signed within {max_age_s:.0f} s of this machine's clock"
     return None

@@ -45,14 +45,22 @@ def test_the_kev_models_fit_the_gpus_they_are_known_to_run_on() -> None:
     assert 33 * GiB < plan.reference_memory(KEV["kev-9b"], "cpu") < 44 * GiB
 
 
-def test_each_gpu_gets_the_requested_model_or_keeps_its_model_or_the_first_that_fits() -> None:
+def models(choices: dict[int, plan.Choice]) -> dict[int, str]:
+    return {i: c.model for i, c in choices.items()}
+
+
+def test_without_the_networks_numbers_each_gpu_gets_the_requested_model_or_keeps_its_model_or_the_first_that_fits(
+) -> None:
     offered = ["kev-4b", "kev-9b"]
     gpus = [gpu(0, 80), gpu(1, 24)]
-    assert plan.choose_models(gpus, offered, MINER_NEED, [], {}) == {0: "kev-4b", 1: "kev-4b"}
-    assert plan.choose_models(gpus, offered, MINER_NEED, [], {0: "kev-9b", 1: "kev-9b"}) == {0: "kev-9b",
-                                                                                            1: "kev-4b"}
-    assert plan.choose_models(gpus[:1], offered, MINER_NEED, ["kev-9b"], {}) == {0: "kev-9b"}
-    assert plan.choose_models(gpus, offered, MINER_NEED, ["kev-9b", "kev-4b"], {}) == {0: "kev-9b", 1: "kev-4b"}
+    assert models(plan.choose_models(gpus, offered, MINER_NEED, [], {})) == {0: "kev-4b", 1: "kev-4b"}
+    kept = plan.choose_models(gpus, offered, MINER_NEED, [], {0: "kev-9b", 1: "kev-9b"})
+    assert models(kept) == {0: "kev-9b", 1: "kev-4b"} and [c.reason for c in kept.values()] == [plan.BEFORE, plan.FIRST]
+    assert models(plan.choose_models(gpus[:1], offered, MINER_NEED, ["kev-9b"], {})) == {0: "kev-9b"}
+    assert models(plan.choose_models(gpus, offered, MINER_NEED, ["kev-9b", "kev-4b"], {})) == {0: "kev-9b",
+                                                                                              1: "kev-4b"}
+    assert models(plan.choose_models(gpus, offered, MINER_NEED, ["kev-9b", plan.AUTO], {})) == {0: "kev-9b",
+                                                                                               1: "kev-4b"}
     with pytest.raises(plan.PlanError, match="needs about"):
         plan.choose_models(gpus, offered, MINER_NEED, ["kev-9b"], {})
     with pytest.raises(plan.PlanError, match="not a catalog model this setup can install"):
@@ -77,14 +85,19 @@ def test_the_setups_offer_active_models_then_candidates_and_never_retired_ones()
     assert [m.model_id for m in plan.servable_models(cat)] == ["kev-4b", "kev-9b", "clef-flash"]
 
 
-def test_a_candidate_is_served_only_when_requested_or_kept_from_before() -> None:
+def test_a_candidate_is_served_only_when_requested_or_chosen_by_hand_before() -> None:
     a100, rtx_4090 = gpu(0, 80), gpu(1, 23.99, "NVIDIA GeForce RTX 4090")
-    assert plan.choose_models([a100, rtx_4090], OFFERED, NEED, [], {}, SCORED) == {0: "kev-4b", 1: "kev-4b"}
-    assert plan.choose_models([a100, rtx_4090], OFFERED, NEED, ["kev-4b", "clef-flash"], {}, SCORED) == {
+    assert models(plan.choose_models([a100, rtx_4090], OFFERED, NEED, [], {}, SCORED)) == {0: "kev-4b", 1: "kev-4b"}
+    assert models(plan.choose_models([a100, rtx_4090], OFFERED, NEED, ["kev-4b", "clef-flash"], {}, SCORED)) == {
         0: "kev-4b", 1: "clef-flash"}
-    assert plan.choose_models([a100], OFFERED, NEED, [], {0: "clef-flash"}, SCORED) == {0: "clef-flash"}
-    # a candidate that is no longer offered (retired) gives way to the default
-    assert plan.choose_models([a100], ["kev-4b", "kev-9b"], NEED, [], {0: "clef-flash"}, SCORED) == {0: "kev-4b"}
+    kept = plan.choose_models([a100], OFFERED, NEED, [], {0: "clef-flash"}, SCORED, manual={0})
+    assert models(kept) == {0: "clef-flash"} and kept[0].reason == plan.MANUAL
+    assert models(plan.choose_models([a100], OFFERED, NEED, [plan.AUTO], {0: "clef-flash"}, SCORED,
+                                     manual={0})) == {0: "kev-4b"}
+    # the setup never keeps a candidate it did not get by hand, and one no longer offered (retired) gives way
+    assert models(plan.choose_models([a100], OFFERED, NEED, [], {0: "clef-flash"}, SCORED)) == {0: "kev-4b"}
+    assert models(plan.choose_models([a100], ["kev-4b", "kev-9b"], NEED, [], {0: "clef-flash"}, SCORED,
+                                     manual={0})) == {0: "kev-4b"}
     with pytest.raises(plan.PlanError, match=r"with --model it can serve clef-flash \(candidate"):
         plan.choose_models([gpu(0, 23.99)], ["kev-9b", "clef-flash"], NEED, [], {}, {"kev-9b"})
 
@@ -93,18 +106,19 @@ def test_the_plan_says_why_each_gpu_serves_its_model_what_else_fits_and_how_to_c
     a100, rtx_4090 = gpu(0, 80), gpu(1, 23.99, "NVIDIA GeForce RTX 4090")
     offer = plan.offer_line(OFFERED, NEED, SCORED)
     assert offer.startswith("models: kev-4b (about 15 GiB), kev-9b (about 26 GiB), clef-flash (about 21 GiB; candidate")
-    first, how = plan.choice_lines([a100], {0: "kev-4b"}, OFFERED, NEED, SCORED, [], {})
-    assert first == "kev-4b, the first active model that fits. Also fit: kev-9b, clef-flash (candidate)"
+    first, how = plan.choice_lines([a100], {0: plan.Choice("kev-4b", plan.FIRST)}, OFFERED, NEED, SCORED)
+    assert first == "GPU 0: kev-4b, the first active model that fits. Also fit: kev-9b, clef-flash (candidate)"
     assert how.endswith("one per GPU in order, as in --model kev-9b")
-    chosen = {0: "kev-4b", 1: "clef-flash"}
-    first, how = plan.choice_lines([a100, rtx_4090], chosen, OFFERED, NEED, SCORED, ["kev-4b", "clef-flash"], {})
-    assert first.startswith("kev-4b on GPU 0, as --model asks; clef-flash (candidate) on GPU 1, as --model asks. ")
-    assert "kev-9b (GPU 0)" in first and "kev-4b (GPU 1)" in first
+    chosen = {0: plan.Choice("kev-4b", plan.REQUESTED), 1: plan.Choice("clef-flash", plan.REQUESTED)}
+    first, second, how = plan.choice_lines([a100, rtx_4090], chosen, OFFERED, NEED, SCORED)
+    assert first == "GPU 0: kev-4b, as --model asks. Also fit: kev-9b, clef-flash (candidate)"
+    assert second == "GPU 1: clef-flash (candidate), as --model asks. Also fit: kev-4b"
     assert how.endswith("--model kev-9b,clef-flash")
-    first, = plan.choice_lines([gpu(0, 20)], {0: "kev-4b"}, OFFERED, NEED, SCORED, [], {})
-    assert first == "kev-4b, the first active model that fits. No other catalog model fits"
-    first, _ = plan.choice_lines([a100], {0: "clef-flash"}, OFFERED, NEED, SCORED, [], {0: "clef-flash"})
-    assert first.startswith("clef-flash (candidate), as set up before")
+    first, = plan.choice_lines([gpu(0, 20)], {0: plan.Choice("kev-4b", plan.FIRST)}, OFFERED, NEED, SCORED)
+    assert first == "GPU 0: kev-4b, the first active model that fits. No other catalog model fits"
+    first, _ = plan.choice_lines([a100], {0: plan.Choice("clef-flash", plan.MANUAL)}, OFFERED, NEED, SCORED)
+    assert first.startswith("GPU 0: clef-flash (candidate), as chosen by hand before (--model auto lets the setup "
+                            "choose)")
 
 
 def test_candidate_references_take_the_memory_the_active_ones_leave_or_are_left_out() -> None:

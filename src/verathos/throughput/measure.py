@@ -60,6 +60,7 @@ class Measurement:
     concurrency: int  # the knee: lowest concurrency within KNEE_SHARE of the best throughput
     runs: tuple[float, ...]
     measured_at: float
+    model_id: str = ""  # the model measured (stores of older releases leave it out)
 
     def declared(self, margin: float) -> float:
         return round(self.measured_rps * margin, 2)
@@ -235,8 +236,11 @@ async def measure_all(targets: Sequence[Target], max_latency_s: float, run_s: fl
             failures[t.endpoint_id] = "completed no requests under load"
         else:
             measurements[t.endpoint_id] = Measurement(t.endpoint_id, t.fingerprint, statistics.median(runs),
-                                                      best[i][0], runs, time.time())
+                                                      best[i][0], runs, time.time(), t.model_id)
     return measurements, failures
+
+
+STORE_FILE = "capacity.json"  # in the miner's state_dir
 
 
 class MeasurementStore:

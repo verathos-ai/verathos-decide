@@ -18,7 +18,8 @@
 # Every other option goes to `verathos-<role> init`, for example:
 #   --yes --wallet <name> --hotkey <name> --network finney|test|<ws url> --netuid <n>
 #   miner: --public-ip <ip> --port <port> --model <id>[,<id>...] --gpus <i,j> --no-publish
-#          --model: one model for every GPU or one per GPU in order (default: the first active model that fits)
+#          --model: one model for every GPU or one per GPU in order, auto: the setup chooses (default: the
+#                   active model that pays best on each GPU, measured from the network)
 #          --worker [--name <name>]  (a worker machine of the hotkey; set up the workers first)
 #          --peers <ip:port>[,...]   (on the primary: every worker; replaces the list)
 #   validator: --device auto|cpu|gpu --dry-run --candidates (also references for candidate models)
