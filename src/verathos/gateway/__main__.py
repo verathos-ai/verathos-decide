@@ -164,7 +164,11 @@ async def serve(config: GatewayConfig) -> None:
     app: Any = create_app(gateway, lifespan=lifespan)
     sockets = [listen(config.listen_host, config.port)]
     if config.admin_port is not None:
-        app = ByPort(app, config.admin_port, admin_app(gateway, token=read_token(config.admin_token_file)))
+        token = read_token(config.admin_token_file)
+        accounts_token = read_token(config.accounts_token_file) if config.accounts_token_file else None
+        if accounts_token == token:
+            raise SystemExit("the account service's token must differ from the admin token")
+        app = ByPort(app, config.admin_port, admin_app(gateway, token=token, accounts_token=accounts_token))
         sockets.append(listen(config.admin_host, config.admin_port))
         log.info("admin API on %s:%d", config.admin_host, config.admin_port)
     # On SIGTERM: stop accepting (the reverse proxy turns to the standby), finish what is in flight (its account

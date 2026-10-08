@@ -176,6 +176,8 @@ view of the miners does not take a model off the gateway. Once the current table
    | `max_in_flight_bytes` | 256 MiB | request bodies held in this process at once; more get 503 |
    | `sample_window_s` | 600 | one exchange per endpoint and window goes to the auditor |
    | `admin_host`, `admin_port`, `admin_token_file` | 127.0.0.1, -, - | the admin API (see below); off without a port |
+   | `accounts_token_file`, `accounts_prefix` | -, `u_` | the account service's token and the accounts it reaches (see below) |
+   | `accounts_max_credit`, `accounts_max_credit_per_hour` | 100 USD, 1,000 USD | the account service's credit caps, in micro-USD (per process) |
    | `state_dir`, `catalog_dir` | `~/.verathos/gateway`, `~/.verathos/catalog` | last routes, catalogs |
 
 6. Schema: `verathos-gateway --config gateway.json db upgrade` (after every update; the gateway does not start on
@@ -356,7 +358,15 @@ umask 077; openssl rand -hex 32 > ~/.verathos/gateway/admin.token   # at least 3
 ```
 
 The gateway refuses to start with a shorter token or a file others can read. Every call is logged, wrong tokens
-with the caller's address.
+with the caller's address, and every credit with the token and address that recorded it.
+
+The service that signs users up (the web app) gets a token of its own, `accounts_token_file` (made the same way, and
+not the admin token), whose scope is narrower: only the accounts named with `accounts_prefix` (`u_`), which it
+creates prepaid; their keys, usage and ledger; changes other than `prepaid`; and credit of kind `grant` or `topup`,
+at most `accounts_max_credit` per entry and `accounts_max_credit_per_hour` within an hour (per process; recording an
+entry again under its reference takes no more). Anything else, including requests, state and routes, answers 403, and
+reaching a cap is logged as an error. A leaked web app token can then neither give an account unlimited service nor
+mint more than the hourly cap.
 
 | Call | Returns |
 |---|---|

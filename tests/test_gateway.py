@@ -1197,13 +1197,14 @@ def test_what_users_get_from_each_endpoint_reaches_the_auditor(tmp_path) -> None
 # ---- the admin API ----
 
 ADMIN_TOKEN = "a" * 40
+ACCOUNTS_TOKEN = "c" * 40
 
 
 def admin_setup(tmp_path):
     from verathos.gateway.admin import ByPort, admin_app
 
     s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": Slow("kev-4b", 0.05)})
-    s.app = ByPort(s.app, 9999, admin_app(s.gateway, token=ADMIN_TOKEN))
+    s.app = ByPort(s.app, 9999, admin_app(s.gateway, token=ADMIN_TOKEN, accounts_token=ACCOUNTS_TOKEN))
     return s
 
 
@@ -1265,6 +1266,8 @@ def test_the_admin_api_is_never_public_and_needs_a_private_token(tmp_path) -> No
             GatewayConfig(**base, admin_host=public, admin_port=9100, admin_token_file="t")
     with pytest.raises(ValueError):
         GatewayConfig(**base, admin_port=9100)
+    with pytest.raises(ValueError):
+        GatewayConfig(**base, accounts_token_file="c")  # a scoped token needs the admin API
     GatewayConfig(**base, admin_host="10.1.2.3", admin_port=9100, admin_token_file="t")
     token = tmp_path / "admin.token"
     token.write_text(ADMIN_TOKEN)
@@ -1620,6 +1623,46 @@ def test_the_admin_api_signs_users_up_with_keys_and_credit(tmp_path) -> None:
         assert call(method, path, body).status_code == 404, (method, path)
     assert call("GET", "/admin/v1/accounts/u_42", None).status_code == 200
     assert asyncio.run(admin_call(s, "GET", "/admin/v1/accounts/u_42", port=80)).status_code == 404
+
+
+def test_the_account_services_token_reaches_only_its_prepaid_accounts_within_the_credit_caps(tmp_path,
+                                                                                             caplog) -> None:
+    import logging
+
+    caplog.set_level(logging.INFO, logger="verathos.gateway.admin")
+    s = admin_setup(tmp_path)
+    s.config.accounts_max_credit, s.config.accounts_max_credit_per_hour = 1_000_000, 1_500_000
+
+    def call(method: str, path: str, body=None, token: str = ACCOUNTS_TOKEN) -> httpx.Response:
+        return asyncio.run(admin_call(s, method, path, json_=body, token=token))
+
+    new = {"name": "u_7", "rate_rps": 5, "burst": 10, "prepaid": True}
+    assert call("POST", "/admin/v1/accounts", new).status_code == 201
+    for refused in ({**new, "name": "acme2"}, {**new, "name": "u_8", "prepaid": False}):
+        assert call("POST", "/admin/v1/accounts", refused).status_code == 403
+    for method, path, body in (("GET", "/admin/v1/state", None), ("GET", "/admin/v1/routes", None),
+                               ("POST", "/admin/v1/systemone", {"request": REQUEST}),
+                               ("GET", "/admin/v1/accounts/acme", None),
+                               ("POST", "/admin/v1/accounts/acme/credits",
+                                {"amount": 5, "kind": "grant", "reference": "x"}),
+                               ("PATCH", "/admin/v1/accounts/u_7", {"prepaid": False})):
+        assert call(method, path, body).status_code == 403, path
+    assert call("PATCH", "/admin/v1/accounts/u_7", {"rate_rps": 9}).json()["rate_rps"] == 9
+    assert call("POST", "/admin/v1/accounts/u_7/keys", {"name": "web"}).status_code == 201
+    grant = {"amount": 1_000_000, "kind": "grant", "reference": "signup:u_7"}
+    assert call("POST", "/admin/v1/accounts/u_7/credits", grant).status_code == 201
+    assert call("POST", "/admin/v1/accounts/u_7/credits", grant).status_code == 200  # a repeat takes no cap
+    adjust = {"amount": 5, "kind": "adjust", "reference": "fix"}
+    assert call("POST", "/admin/v1/accounts/u_7/credits", adjust).status_code == 403
+    too_much = {"amount": 1_000_001, "kind": "topup", "reference": "pay-big"}
+    assert call("POST", "/admin/v1/accounts/u_7/credits", too_much).status_code == 403  # over the entry cap
+    topup = {"amount": 600_000, "kind": "topup", "reference": "pay-1"}
+    assert call("POST", "/admin/v1/accounts/u_7/credits", topup).status_code == 403  # over the hour's cap
+    assert sum(r.levelname == "ERROR" and "over the account service's cap" in r.message for r in caplog.records) == 2
+    assert any("credit 'signup:u_7' of 1000000 micro-USD (grant) to u_7 by the accounts token" in r.message
+               for r in caplog.records)
+    assert call("POST", "/admin/v1/accounts/u_7/credits", topup, token=ADMIN_TOKEN).status_code == 201
+    assert call("GET", "/admin/v1/accounts/u_7/credits").json()["balance"] == 1_600_000
 
 
 def test_a_database_from_before_credit_is_upgraded_in_place(tmp_path) -> None:

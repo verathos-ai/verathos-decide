@@ -256,18 +256,22 @@ class Accounts:
             created = True
         except IntegrityError:
             created = False
-        async with self.engine.connect() as conn:
-            row = (await conn.execute(select(credits, accounts.c.name.label("account"))
-                                      .join(accounts, credits.c.account_id == accounts.c.id)
-                                      .where(credits.c.reference == reference))).first()
-        if row is None:  # the insert failed for another reason than the reference
+        entry = await self.credit(reference)
+        if entry is None:  # the insert failed for another reason than the reference
             raise Conflict(f"credit {reference!r} could not be recorded")
-        entry = dict(row._mapping)
         if not created and (entry["account"], entry["amount"], entry["kind"]) != (account, amount, kind):
             raise Conflict(f"reference {reference!r} records another credit")
         if self.meter is not None:
             self.meter.forget_balance(entry["account_id"])
         return entry, created
+
+    async def credit(self, reference: str) -> dict[str, Any] | None:
+        """The credit entry recorded under ``reference``, with its account's name, if any."""
+        async with self.engine.connect() as conn:
+            row = (await conn.execute(select(credits, accounts.c.name.label("account"))
+                                      .join(accounts, credits.c.account_id == accounts.c.id)
+                                      .where(credits.c.reference == reference))).first()
+        return None if row is None else dict(row._mapping)
 
     async def credits(self, account: str, limit: int = 100) -> list[dict[str, Any]]:
         """The account's credit entries, newest first."""

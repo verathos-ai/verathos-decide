@@ -1,8 +1,14 @@
 """The gateway's admin API: inspection and debugging, for the operators only.
 
 An app of its own (``admin_app``), served on a socket of its own (``admin_host:admin_port``: loopback or a private
-network; ``ByPort`` hands it the requests that arrive there) and only with the admin token (``admin_token_file``). On
-the public port none of its routes exist. Every call is logged.
+network; ``ByPort`` hands it the requests that arrive there) and only with a token. On the public port none of its
+routes exist. Every call is logged, and every credit with its caller.
+
+Two tokens, two scopes. The admin token (``admin_token_file``) reaches everything. The account service's token
+(``accounts_token_file``), for the web app that signs users up, reaches only the accounts named with
+``accounts_prefix``, which it creates prepaid: their keys, usage and ledger, changes other than ``prepaid``, and
+credit of kind grant or top-up within ``accounts_max_credit`` per entry and ``accounts_max_credit_per_hour`` (per
+process; reaching a cap is logged as an error). Requests, state and routes are the admin token's only.
 
     GET  /admin/v1/state       routes, catalog, and what is waiting to be written (usage) or sent (samples, counts)
     GET  /admin/v1/routes      every routable endpoint as the router sees it: capacity, cap, in flight, breaker
@@ -30,6 +36,7 @@ Accounts, for the service that signs users up (amounts in micro-USD; ``name``: `
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import datetime as dt
 import hmac
@@ -154,20 +161,60 @@ class ByPort:
             await self.default(scope, receive, send)
 
 
-def admin_app(g: Gateway, *, token: str) -> FastAPI:
+def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> FastAPI:
+    """``accounts_token``: the account service's (see the module docstring)."""
     app = FastAPI(title="Verathos gateway admin", docs_url=None, redoc_url=None, openapi_url=None)
-    expected = f"Bearer {token}".encode()
+    scopes = [(f"Bearer {token}".encode(), "admin")]
+    if accounts_token is not None:
+        scopes.append((f"Bearer {accounts_token}".encode(), "accounts"))
+    credited: collections.deque[tuple[float, int]] = collections.deque()  # the account service's credit, last hour
+
+    def reaches(request: Request) -> bool:
+        """Whether the caller's scope reaches this call: the account service only its own accounts' routes."""
+        if request.state.scope == "admin":
+            return True
+        parts = request.url.path.split("/")  # "", "admin", "v1", "accounts", name, ...
+        return parts[1:4] == ["admin", "v1", "accounts"] and (
+            len(parts) == 4 or parts[4].startswith(g.config.accounts_prefix))
 
     @app.middleware("http")
     async def authorized(request: Request, call_next):
         client = request.client.host if request.client else "?"
-        if not hmac.compare_digest(request.headers.get("authorization", "").encode(), expected):
+        given = request.headers.get("authorization", "").encode()
+        scope = next((name for expected, name in scopes if hmac.compare_digest(given, expected)), None)
+        if scope is None:
             log.warning("admin call %s %s with a wrong token from %s", request.method, request.url.path, client)
             return JSONResponse({"error": {"type": "unauthorized", "message": "admin token required"}},
                                 status_code=401)
+        request.state.scope, request.state.caller = scope, f"{scope} token from {client}"
+        if not reaches(request):
+            log.warning("admin call %s %s by the %s: out of its scope", request.method, request.url.path,
+                        request.state.caller)
+            return error(403, "forbidden", "out of this token's scope")
         response = await call_next(request)
-        log.info("admin call %s %s from %s -> %d", request.method, request.url.path, client, response.status_code)
+        log.info("admin call %s %s by the %s -> %d", request.method, request.url.path, request.state.caller,
+                 response.status_code)
         return response
+
+    def over_cap(request: Request, name: str, new: NewCredit) -> JSONResponse | tuple[float, int] | None:
+        """The account service's credit limits (kinds, per entry, per hour): the refusal, or the share of the hour's
+        cap the entry holds until it is known to be new; None for the admin token."""
+        if request.state.scope == "admin":
+            return None
+        if new.kind not in ("grant", "topup"):
+            return error(403, "forbidden", "the account service records grants and top-ups only")
+        now = time.monotonic()
+        while credited and credited[0][0] < now - 3600:
+            credited.popleft()
+        hour = sum(amount for _, amount in credited)
+        if new.amount > g.config.accounts_max_credit or hour + new.amount > g.config.accounts_max_credit_per_hour:
+            log.error("credit of %d micro-USD to %s refused, over the account service's cap (%d per entry, %d an "
+                      "hour, %d recorded this hour): %s", new.amount, name, g.config.accounts_max_credit,
+                      g.config.accounts_max_credit_per_hour, hour, request.state.caller)
+            return error(403, "forbidden", "over the account service's credit cap")
+        held = (now, new.amount)
+        credited.append(held)
+        return held
 
     @app.get("/admin/v1/state")
     async def state():
@@ -222,6 +269,9 @@ def admin_app(g: Gateway, *, token: str) -> FastAPI:
         new = await parse(request, NewAccount)
         if isinstance(new, JSONResponse):
             return new
+        if request.state.scope != "admin" and not (new.name.startswith(g.config.accounts_prefix) and new.prepaid):
+            return error(403, "forbidden", f"the account service creates prepaid accounts named "
+                                           f"{g.config.accounts_prefix}... only")
         try:
             await accounts.create_account(new.name, rate_rps=new.rate_rps, burst=new.burst,
                                           monthly_quota=new.monthly_quota, prepaid=new.prepaid)
@@ -241,6 +291,8 @@ def admin_app(g: Gateway, *, token: str) -> FastAPI:
         values = change.model_dump(exclude_unset=True)
         if any(v is None for k, v in values.items() if k != "monthly_quota"):
             return error(400, "invalid_request", "only monthly_quota may be null")
+        if request.state.scope != "admin" and "prepaid" in values:
+            return error(403, "forbidden", "the account service does not change prepaid")
         if values and not await accounts.set_account(name, **values):
             return error(404, "not_found", f"no account {name!r}")
         return await lookup(name)
@@ -284,6 +336,13 @@ def admin_app(g: Gateway, *, token: str) -> FastAPI:
         new = await parse(request, NewCredit)
         if isinstance(new, JSONResponse):
             return new
+        recorded = request.state.scope != "admin" and await accounts.credit(new.reference) is not None
+        held = None if recorded else over_cap(request, name, new)  # a repeat records nothing more
+        if isinstance(held, JSONResponse):
+            return held
+        log.info("credit %r of %d micro-USD (%s) to %s by the %s", new.reference, new.amount, new.kind, name,
+                 request.state.caller)
+        created = False
         try:
             entry, created = await accounts.add_credit(name, new.amount, kind=new.kind, reference=new.reference,
                                                        note=new.note)
@@ -293,6 +352,9 @@ def admin_app(g: Gateway, *, token: str) -> FastAPI:
             return error(400, "invalid_request", str(exc))
         except Conflict as exc:
             return error(409, "conflict", str(exc))
+        finally:
+            if held is not None and not created:  # a repeat or a failure records nothing: it takes none of the cap
+                credited.remove(held)
         account = await accounts.account(name)
         return JSONResponse(jsonable_encoder({"credit": entry, "created": created, "balance": account["balance"]}),
                             status_code=201 if created else 200)

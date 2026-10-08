@@ -24,6 +24,14 @@ class GatewayConfig(BaseModel):
     admin_port: int | None = Field(None, ge=1, le=65535, description="The admin API's port; none: no admin API")
     admin_token_file: Path | None = Field(None, description="File holding the admin token (at least 32 characters, "
                                           "readable by the gateway's user only)")
+    accounts_token_file: Path | None = Field(None, description="File holding the account service's token, of the "
+                                             "admin API's accounts scope (see admin.py); none: no such token")
+    accounts_prefix: str = Field("u_", pattern=r"^[A-Za-z0-9_.:@-]{1,32}$",
+                                 description="The accounts the account service's token reaches: names starting so")
+    accounts_max_credit: int = Field(100_000_000, ge=1, description="micro-USD the account service may record in one "
+                                     "credit entry")
+    accounts_max_credit_per_hour: int = Field(1_000_000_000, ge=1, description="micro-USD the account service may "
+                                              "record per hour, per process")
     auditor_url: str | None = Field(None, description="The auditor's service; default: the subnet owner's axon")
     instances: int = Field(1, ge=1, description="Gateway processes sharing the miners' capacity (each uses 1 / "
                            "instances of it); route each API key to one process, so its limits hold exactly")
@@ -60,6 +68,8 @@ class GatewayConfig(BaseModel):
     def _admin_needs_token(self) -> GatewayConfig:
         if self.admin_port is not None and self.admin_token_file is None:
             raise ValueError("admin_port needs admin_token_file")
+        if self.accounts_token_file is not None and self.admin_port is None:
+            raise ValueError("accounts_token_file needs admin_port")
         if self.admin_port is not None and self.admin_port == self.port:
             raise ValueError("admin_port must differ from port")
         return self
