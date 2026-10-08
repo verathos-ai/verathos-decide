@@ -136,9 +136,9 @@ Gateway answers); test requests beyond its spare capacity otherwise go undeliver
 
 A caller other than a gateway (the catalog's `gateways`, or one in the miner's own `gateway_hotkeys`) needs only its
 canaries, so it gets one request at once per endpoint, each no larger (as canonical JSON) than the largest request
-of the model's request mix (HTTP 413 beyond), and while the auditor's test traffic arrives at the miner (and for a
-minute after) its requests wait behind the test's. Validators hold their canaries during a test, so honest ones never
-wait; a validator cannot crowd a competitor's test out with priority traffic. The miner signs only well-formed
+of the model's request mix (HTTP 413 beyond), and while the auditor's test traffic arrives at the miner (its last
+request came within 5 s) its requests wait behind the test's. Validators hold their canaries during a test, so honest
+ones never wait; a validator cannot crowd a competitor's test out with priority traffic. The miner signs only well-formed
 answers: an engine fault returns an error, never a signed wrong answer.
 
 A test also leaves room for users: it sends each endpoint its tested rate less the rate of user requests the

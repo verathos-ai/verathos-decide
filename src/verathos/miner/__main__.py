@@ -52,6 +52,7 @@ from verathos.throughput.policy import POLICY_WATCH_S
 log = logging.getLogger("verathos.miner")
 LOCAL_HOSTS = {"0.0.0.0": "127.0.0.1", "": "127.0.0.1", "::": "::1"}
 TEST_QUIET_S = 60.0  # a measurement starts only this long after the last test request
+TEST_ARRIVING_S = 5.0  # test traffic arrives while its last request came this recently (it sends one a second or more)
 
 
 def servable(config: MinerConfig, cat: catalog.Catalog) -> list[EndpointConfig]:
@@ -128,6 +129,11 @@ class Publisher:
     def testing(self) -> bool:
         """Whether the auditor's test traffic arrived within the last ``TEST_QUIET_S``."""
         return time.monotonic() - self.test_seen < TEST_QUIET_S
+
+    def test_arriving(self) -> bool:
+        """Whether the auditor's test traffic arrives now (validators' requests wait behind it): its last request came
+        within ``TEST_ARRIVING_S``."""
+        return time.monotonic() - self.test_seen < TEST_ARRIVING_S
 
     # ---- measuring ----
 
@@ -335,7 +341,7 @@ def main() -> None:
                      authorized=authorizer, auditors=publisher.auditors, admissions=publisher.admissions,
                      serving=lambda: publisher.serving, max_state_tokens=max_state_tokens,
                      max_caller_request=max_caller_request, on_test_traffic=publisher.note_test_traffic,
-                     testing=publisher.testing, gateways=gateways)
+                     testing=publisher.test_arriving, gateways=gateways)
     # Connections beyond the descriptors left are refused, so a flood of idle connections cannot starve the rest.
     limit = max(256, raise_open_file_limit() - 256)
     server = uvicorn.Server(uvicorn.Config(app, host=config.listen_host, port=config.port, log_level="warning",

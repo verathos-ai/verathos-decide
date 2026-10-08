@@ -106,6 +106,8 @@ def test_a_test_arriving_at_the_start_delays_the_first_manifest_instead_of_stopp
     with pytest.raises(SystemExit):
         miner_main.adopt_first(publisher, catalog.load(), remeasure=False, sleep=waits.append)
 
-    assert not publisher.testing()
+    assert not publisher.testing() and not publisher.test_arriving()
     publisher.note_test_traffic()
-    assert publisher.testing()  # no measurement starts now
+    assert publisher.testing() and publisher.test_arriving()  # no measurement starts now; validators wait
+    publisher.test_seen -= miner_main.TEST_ARRIVING_S
+    assert publisher.testing() and not publisher.test_arriving()  # the traffic is over: users and validators alike
