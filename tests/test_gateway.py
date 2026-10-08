@@ -307,6 +307,27 @@ def test_the_status_says_per_model_what_users_get(tmp_path) -> None:
     assert models["kev-4b"]["state"] == "unavailable" and models["kev-4b"]["availability_24h"] == 0.0
 
 
+def test_the_latency_covers_the_fewest_hours_that_hold_enough_answers_when_the_last_minutes_are_quiet() -> None:
+    from verathos.gateway.stats import MIN_LATENCIES, ModelStats
+
+    clock = Clock()
+    stats = ModelStats(clock=clock)
+    assert stats.latency("kev-4b") is None
+    for _ in range(MIN_LATENCIES - 5):
+        stats.record("kev-4b", "answered", 0.2)
+    clock.now += 2.5 * 3600
+    for _ in range(5):
+        stats.record("kev-4b", "answered", 0.4)
+    assert stats.latency("kev-4b") == {"p50": 200, "p95": 400, "window_s": 3 * 3600}  # the last 3 hours hold 20
+    for _ in range(MIN_LATENCIES):
+        stats.record("kev-4b", "answered", 0.3)
+    assert stats.latency("kev-4b") == {"p50": 300, "p95": 400, "window_s": 900}  # enough in the last 15 minutes
+    clock.now += 20 * 3600 + 1
+    assert stats.latency("kev-4b") == {"p50": 300, "p95": 400, "window_s": 21 * 3600}
+    clock.now += 4 * 3600  # every answer is over a day old
+    assert stats.latency("kev-4b") is None and stats.summary("kev-4b")["latency_ms"] is None
+
+
 def test_one_user_bursting_beyond_capacity_does_not_degrade_the_model(tmp_path) -> None:
     from verathos.gateway.app import model_state
 

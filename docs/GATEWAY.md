@@ -292,7 +292,9 @@ this gateway process:
 - `state`: `unavailable` without a routable endpoint or with every endpoint failing; `degraded` when under 98% of the
   last 15 minutes' user requests were answered (of those not refused for want of capacity) or more than half the
   endpoints are failing; else `operational`.
-- `latency_ms`: of the answers to users in the last 15 minutes, retries included (null without answers).
+- `latency_ms`: p50 and p95 of the answers to users, retries included, over `window_s`: the last 15 minutes, or,
+  with fewer than 20 answers there, the fewest whole hours that hold 20 (the last 24 hours when they hold fewer);
+  null without answers in the last 24 hours.
 - `success_rate_1h`: answered among answered and failed user requests of the last hour (null under 20 of them);
   `busy_rate_1h`: the share of the hour's user requests refused for want of free capacity (503 `busy`; null under 20
   requests); `requests_1h`: answered, failed and busy.

@@ -1,21 +1,25 @@
 """What users get from each model, as this gateway process sees it, for the public status (``GET /v1/status``).
 
 Per model and minute: the user requests answered, failed and refused for want of free capacity (busy), and whether
-the model was unavailable; the answers' latencies of the last ``LATENCY_WINDOW_S``. Kept for a day, in memory: a
+the model was unavailable; the answers' latencies (at most ``MAX_LATENCIES``). Kept for a day, in memory: a
 restarted process starts afresh, so the figures cover ``since`` until now. The success rate is of the requests the
-model had capacity for: one user bursting beyond it says nothing about what the others get.
+model had capacity for: one user bursting beyond it says nothing about what the others get. The latency is of the
+last ``LATENCY_WINDOW_S``, or, with fewer than ``MIN_LATENCIES`` answers there, of the fewest whole hours that hold
+them (all of the day's answers when fewer), so a quiet quarter of an hour does not hide it.
 """
 
 from __future__ import annotations
 
 import collections
+import math
 import time
 from collections.abc import Callable
 from typing import Any
 
 DAY_MINUTES = 24 * 60
 LATENCY_WINDOW_S = 900
-MAX_LATENCIES = 50_000  # per model, within the window
+MIN_LATENCIES = 20  # fewer answers than this in LATENCY_WINDOW_S: the latency is of a longer window
+MAX_LATENCIES = 50_000  # per model
 DEGRADED_SUCCESS = 0.98  # below this share of answered requests in the last 15 minutes (busy left out): degraded
 OUTCOMES = ("answered", "failed", "busy")
 MIN_REQUESTS = 20  # fewer requests than this in the window say nothing about the success rate
@@ -70,17 +74,24 @@ class ModelStats:
         total = answered + failed + busy
         return None if total < MIN_REQUESTS else round(busy / total, 4)
 
-    def summary(self, model: str) -> dict[str, Any]:
-        cutoff = self.clock() - LATENCY_WINDOW_S
+    def latency(self, model: str) -> dict[str, int] | None:
+        """p50 and p95 in milliseconds over ``window_s`` (see the module docstring); None without answers today."""
+        now = self.clock()
         latencies = self._latencies.get(model, collections.deque())
-        while latencies and latencies[0][0] < cutoff:
+        while latencies and latencies[0][0] < now - 60 * DAY_MINUTES:
             latencies.popleft()
-        recent = sorted(s for _, s in latencies)
+        if not latencies:
+            return None
+        age = now - latencies[-min(MIN_LATENCIES, len(latencies))][0]  # of the MIN_LATENCIES-th latest answer
+        window = LATENCY_WINDOW_S if age <= LATENCY_WINDOW_S else min(60 * DAY_MINUTES, 3600 * math.ceil(age / 3600))
+        recent = sorted(s for t, s in latencies if t >= now - window)
+        return {"p50": round(1000 * recent[len(recent) // 2]), "p95": round(1000 * recent[int(len(recent) * 0.95)]),
+                "window_s": window}
+
+    def summary(self, model: str) -> dict[str, Any]:
         minutes = self._minutes.get(model, {})
         return {
-            "latency_ms": None if not recent else {
-                "p50": round(1000 * recent[len(recent) // 2]), "p95": round(1000 * recent[int(len(recent) * 0.95)]),
-                "window_s": LATENCY_WINDOW_S},
+            "latency_ms": self.latency(model),
             "success_rate_1h": self.success_rate(model, 60),
             "busy_rate_1h": self.busy_rate(model, 60),
             "requests_1h": sum(self.requests(model, 60)),
