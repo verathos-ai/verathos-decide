@@ -554,7 +554,7 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
             g.stats.record(model, "answered", g.clock() - started)
             g.meter.record(principal, model, answered=True, input_tokens=outcome.input_tokens, price=checked.price)
             g.sampler.offer(outcome)
-            g.served.record(outcome.route, outcome.input_tokens, outcome.seconds)
+            g.served.record(outcome.route, outcome.input_tokens, outcome.seconds, paid=principal.paid)
             metrics.REQUESTS.labels(model, "answered").inc()
             return response
         g.stats.record(model, "busy" if outcome == "busy" else "failed")

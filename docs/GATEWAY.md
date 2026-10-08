@@ -98,8 +98,11 @@ it posts each pick marked with the test's id, and again on failure for 5 minutes
 The gateway also reports, every 5 s, how many requests each endpoint answered it per second, and their input tokens.
 Miners serve the gateway before the auditor's test traffic; what an endpoint answers the gateway inside a test's
 measured window counts as delivered, so serving users never costs a miner credit (`THROUGHPUT_AUDIT.md`). The input
-tokens per model are the users' demand, which, at each model's catalog `price`, sets the models' emission shares
-(`SCORING.md`).
+tokens per model are the users' demand; of them, the paid ones (`paid_input_tokens`) set, at each model's catalog
+`price`, the models' emission shares (`SCORING.md`). Usage is paid when its account is prepaid and has topped up at
+least once: the ledger does not tell which entry a request spends, so an account that only ever had free credit (a
+sign-up grant, the demo) is unpaid, one that bought credit is paid from then on (grants included), and accounts that
+are not prepaid (invoiced, internal) are unpaid.
 
 ## Privacy of user requests
 

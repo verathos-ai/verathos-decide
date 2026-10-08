@@ -1132,6 +1132,29 @@ def test_one_answer_to_users_per_endpoint_and_test_reaches_the_auditor_once_the_
     assert "during the test" in json.loads(row[0])["state"]
 
 
+def test_only_answers_paid_from_bought_credit_count_as_paid_demand(tmp_path) -> None:
+    """Free credit (a sign-up grant, the demo) moves no emission: an account counts as paid once it topped up."""
+    import time as time_module
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+
+    def paid_and_all() -> tuple[int, int]:
+        counts = list(s.served._counts.values())
+        s.served._counts.clear()
+        return sum(n.paid_input_tokens for n in counts), sum(n.input_tokens for n in counts)
+    assert asyncio.run(s.post()).status_code == 200  # not prepaid (invoiced, internal): unpaid
+    assert paid_and_all()[0] == 0
+    asyncio.run(s.accounts.set_account("acme", prepaid=True))
+    asyncio.run(s.accounts.add_credit("acme", 1_000_000, kind="grant", reference="signup"))
+    assert asyncio.run(s.post()).status_code == 200  # spends a free grant
+    assert paid_and_all()[0] == 0
+    asyncio.run(s.accounts.add_credit("acme", 1_000_000, kind="topup", reference="pay-1"))
+    tokens = asyncio.run(s.post()).json()["usage"]["input_tokens"]  # the key cache is 0 s here, a minute in production
+    s.served.clock = lambda: time_module.time() + 2  # those seconds are over
+    asyncio.run(s.served.report())
+    assert s.auditor._paid[s.auditor.follower.head // 180]["kev-4b"] == tokens > 0
+
+
 def test_served_counts_are_kept_while_the_auditor_cannot_be_found() -> None:
     async def unknown():
         raise RuntimeError("chain unreachable")

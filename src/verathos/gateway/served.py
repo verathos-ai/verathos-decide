@@ -4,7 +4,8 @@ considered them for a request, and how often they were not ready then or refused
 
 Miners serve the gateway before the auditor's test traffic; the auditor counts what an endpoint answered the gateway
 inside a test's measured window as delivered too, so serving users never costs a miner credit, and refusing users
-during a test costs it. The input tokens are the users' demand per model, which sets the models' emission shares.
+during a test costs it. The input tokens are the users' demand per model; those of paid usage (``Principal.paid``)
+set the models' emission shares.
 Refusals and durations are scored: what users get between tests. Every ``REPORT_S`` the counts of finished seconds
 are posted (signed by the gateway) under a report id the auditor takes once; a failed post is sent again as it is,
 same id, with the next report, while its counts are up to ``KEEP_S`` old, so a post the auditor took but whose answer
@@ -44,6 +45,7 @@ class _Second:
     attempts: int = 0
     answered: int = 0
     input_tokens: int = 0
+    paid_input_tokens: int = 0
     offered: int = 0
     refused: int = 0
     latency: dict[int, int] = field(default_factory=dict)
@@ -63,12 +65,14 @@ class ServedCounter:
     def _second(self, route: Route) -> _Second:
         return self._counts.setdefault((route.hotkey, route.endpoint_id, int(self.clock())), _Second())
 
-    def record(self, route: Route, input_tokens: int, seconds: float = 0.0) -> None:
-        """A user request the endpoint answered after ``seconds`` (the attempt's duration). It counts in the second
-        its request was sent, so an answer held back cannot be moved into a test's window."""
+    def record(self, route: Route, input_tokens: int, seconds: float = 0.0, *, paid: bool = False) -> None:
+        """A user request the endpoint answered after ``seconds`` (the attempt's duration), ``paid`` from credit
+        bought (``Principal.paid``). It counts in the second its request was sent, so an answer held back cannot be
+        moved into a test's window."""
         counts = self._counts.setdefault((route.hotkey, route.endpoint_id, int(self.clock() - seconds)), _Second())
         counts.answered += 1
         counts.input_tokens += input_tokens
+        counts.paid_input_tokens += input_tokens if paid else 0
         bucket = latency_bucket(seconds)
         counts.latency[bucket] = counts.latency.get(bucket, 0) + 1
 
@@ -137,8 +141,8 @@ def _parts(counts: dict[tuple[str, str, int], _Second]):
     size = 0
     for (hk, ep, second), n in counts.items():
         entry = ServedCount(hotkey=hk, endpoint_id=ep, second=second, attempts=n.attempts, answered=n.answered,
-                            input_tokens=n.input_tokens, offered=n.offered, refused=n.refused,
-                            latency=n.latency).model_dump_json()
+                            input_tokens=n.input_tokens, paid_input_tokens=n.paid_input_tokens, offered=n.offered,
+                            refused=n.refused, latency=n.latency).model_dump_json()
         if part and (len(part) >= MAX_SERVED_COUNTS or size + len(entry) + 1 > MAX_SERVED_BYTES - 1024):
             yield part
             part, size = [], 0

@@ -13,6 +13,11 @@ from many addresses never reaches the database. While the budget is spent, such 
 
 Credit is a ledger (``credits``): each entry names the payment or grant it records (``reference``), so recording one
 twice adds it once. The account's balance is kept with it: the entries minus the cost of the usage written.
+
+Usage is paid (``Principal.paid``) when the account is prepaid and has topped up at least once: its answers are then
+paid from credit someone bought. The ledger does not tell which entry a request spends, so an account that only ever
+had free credit (a grant: a sign-up, the demo) is unpaid, and one that topped up is paid from then on, grants
+included. Only paid usage moves the models' emission shares (``ServedCount.paid_input_tokens``).
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import exists, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -62,6 +67,7 @@ class Principal:
     burst: int
     monthly_quota: int | None
     prepaid: bool = False
+    paid: bool = False  # prepaid, and topped up at least once (see the module docstring)
 
 
 def new_key() -> str:
@@ -127,20 +133,21 @@ class Accounts:
 
     async def _load(self, h: str) -> Principal | None:
         now = dt.datetime.now(dt.UTC)
+        topped_up = exists().where(credits.c.account_id == accounts.c.id, credits.c.kind == "topup")
         query = (select(api_keys.c.id, api_keys.c.expires_at, api_keys.c.revoked_at, accounts.c.id, accounts.c.name,
                         accounts.c.status, accounts.c.rate_rps, accounts.c.burst, accounts.c.monthly_quota,
-                        accounts.c.prepaid)
+                        accounts.c.prepaid, topped_up)
                  .join(accounts, api_keys.c.account_id == accounts.c.id).where(api_keys.c.key_hash == h))
         async with self.engine.connect() as conn:
             row = (await conn.execute(query)).first()
             if row is None:
                 return None
-            key_id, expires_at, revoked_at, account_id, name, status, rate, burst, quota, prepaid = row
+            key_id, expires_at, revoked_at, account_id, name, status, rate, burst, quota, prepaid, topped = row
             if revoked_at is not None or status != "active" or (expires_at is not None and _utc(expires_at) <= now):
                 return None
         if quota is not None and self.meter is not None:
             await self.meter.read_month(account_id)
-        return Principal(account_id, key_id, name, rate, burst, quota, bool(prepaid))
+        return Principal(account_id, key_id, name, rate, burst, quota, bool(prepaid), bool(prepaid) and bool(topped))
 
     async def load_keys(self) -> None:
         """Load the hashes of the keys not revoked."""
