@@ -83,8 +83,9 @@ Per endpoint and epoch:
 
 ## Models
 
-Each `active` model has a pool: a share of the epoch's emission. Its endpoints split it as above; `candidate` models
-have none. The pools follow what users pay for each model through the subnet's gateway:
+Each `active` model has a pool: a share of the epoch's emission, of the part the scores pay (the miner share,
+[Weights](#weights)). Its endpoints split it as above; `candidate` models have none. The pools follow what users pay
+for each model through the subnet's gateway:
 - demand: the input tokens of the users' requests per model (as the miners signed them), once the gateways tell
   paid from unpaid only those users paid for, averaged over epochs (`demand_ema_alpha`, 0.1: about six hours);
 - revenue: demand x the model's `price` (USD per million input tokens, what users pay);
@@ -108,9 +109,14 @@ endpoints is on probation inherits the remaining probation, so renaming an endpo
 
 ## Weights
 
-A UID's value is the sum of its endpoints' EMAs, normalised over all UIDs and set on mechanism 1 once per epoch.
-Endpoints whose UID now belongs to another hotkey are ignored. If no endpoint has a positive score, the weight goes
-to the subnet owner's UID.
+A UID's value is the sum of its endpoints' EMAs, normalised over all UIDs. Endpoints whose UID now belongs to another
+hotkey are ignored. The miners' values are then scaled to sum to the epoch's miner share, the catalog's
+`scoring.miner_share` (0.59 in the shipped catalog), and the subnet owner's UID gets the rest; the weights are set on
+mechanism 1 once per epoch. The chain pays the subnet owner hotkey no incentive: it burns it, or recycles it under the
+subnet's `RecycleOrBurn` setting (`SUBNET_ADMIN.md`). The share is a constant or moves linearly from one value to
+another over a number of epochs; each epoch's comes from the catalog and the epoch number alone, rounded to 6
+decimals, so every validator sets the same split. If no endpoint has a positive score, all weight goes to the subnet
+owner's UID. If the owner hotkey holds no UID, the miners' values are set as they are.
 
 Everything above is what a full validator does. A full validator running its references one at a time scores the
 endpoints of the models it does not check in an epoch with the source's published results for them: the score the

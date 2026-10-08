@@ -319,6 +319,8 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     credited = proven.credited
     shares = epoch_shares(verdicts, cat)
     log.info("  emission shares: %s", ", ".join(f"{m} {s:.1%}" for m, s in sorted(shares.items())))
+    miner_share = sc.miner_share_at(epoch)
+    log.info("  miner share %.6f: the miners' weights sum to it, the subnet owner's UID gets the rest", miner_share)
     scores, failed, held, factors = score_epoch(state, endpoints, results, taken=taken, shares=shares, proven=proven,
                                                 invalid_hotkeys=invalid_hotkeys, sc=sc,
                                                 max_latency_s=policy.max_latency_s)
@@ -331,14 +333,14 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                  credited.get(key, 0.0), proven.user_availability.get(key, 1.0), scores.get(key, 0.0),
                  f" errors={sorted(set(r.errors))}" if r.errors else "")
     # What the board publishes is exactly what is set: light validators set the same.
-    uid_weights = weights_to_set(weights(state, hotkey_of_uid), hotkey_of_uid, throughput.auditor_hotkey)
+    uid_weights = weights_to_set(weights(state, hotkey_of_uid), hotkey_of_uid, throughput.auditor_hotkey, miner_share)
     board.publish(status.build(
         epoch=epoch, epoch_blocks=cat.epoch_blocks, endpoints=endpoints, results=results, scores=scores, failed=failed,
         invalid_hotkeys=invalid_hotkeys, credited=credited,
         scored_models={m.model_id for m in cat.models if m.status == "active"}, state=state, model_shares=shares,
         weights=uid_weights, drifted=proven.drifted, user_availability=proven.user_availability,
-        latency_factors=factors, taken=taken.status if taken else None), epoch=epoch, epoch_blocks=cat.epoch_blocks,
-        model_shares=shares, weights=uid_weights)
+        latency_factors=factors, taken=taken.status if taken else None, miner_share=miner_share), epoch=epoch,
+        epoch_blocks=cat.epoch_blocks, model_shares=shares, weights=uid_weights, miner_share=miner_share)
     # The epoch is scored; a failure from here on must not run it again.
     try:
         set_weights(cfg, st, wallet, uid_weights)
@@ -346,15 +348,26 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         log.exception("setting weights failed this epoch")
 
 
-def weights_to_set(w: dict[int, float], hotkey_of_uid: dict[int, str], owner_hotkey: str) -> dict[int, float]:
-    """``w``, or, if no miner has a positive score, all weight on the subnet owner's UID (none if it holds no UID)."""
-    if w:
-        return w
+def weights_to_set(w: dict[int, float], hotkey_of_uid: dict[int, str], owner_hotkey: str,
+                   miner_share: float = 1.0) -> dict[int, float]:
+    """The miners' weights ``w`` (summing to 1) scaled to sum to ``miner_share``, and the rest on the subnet owner's
+    UID, whose incentive the chain does not pay out; all on the owner's UID if no miner has a positive score. If the
+    owner hotkey holds no UID there is nothing to put the rest on: the miners get it all (nothing if none scores)."""
     owner = next((uid for uid, hotkey in hotkey_of_uid.items() if hotkey == owner_hotkey), None)
     if owner is None:
-        log.warning("no miner has a positive score and the subnet owner hotkey holds no UID; no weights set")
-        return {}
-    return {owner: 1.0}
+        if not w:
+            log.warning("no miner has a positive score and the subnet owner hotkey holds no UID; no weights set")
+        elif miner_share < 1:
+            log.warning("the subnet owner hotkey holds no UID: the miners get all of the weights, not miner_share "
+                        "%.6f", miner_share)
+        return w
+    if not w:
+        return {owner: 1.0}
+    if miner_share >= 1:
+        return w
+    out = {uid: value * miner_share for uid, value in w.items()}
+    out[owner] = out.get(owner, 0.0) + 1.0 - miner_share
+    return out
 
 
 def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: dict[int, float]) -> bool:

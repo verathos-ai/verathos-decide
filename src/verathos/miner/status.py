@@ -145,6 +145,9 @@ class StatusWatcher:
             if status.model_shares:
                 out.append("  emission shares: " + ", ".join(f"{m} {s:.1%}" for m, s in
                                                               sorted(status.model_shares.items())))
+            if status.miner_share is not None and status.miner_share < 1:
+                out.append(f"  miner share {status.miner_share:.2%}: the scores below are shares of it; the subnet "
+                           "owner's UID gets the rest of the miners' emission")
             seen = set()
             for e in status.endpoints:
                 if e.endpoint_id in listed:

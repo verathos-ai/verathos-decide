@@ -9,8 +9,8 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[chain,ops]"
 .venv/bin/verathos-subnet --network finney --netuid 96 status
 ```
 
-`status` shows the UID cap, the mechanisms and their emission split, the owner hotkey, the committed catalog digest
-and the digest of the catalog shipped with this code.
+`status` shows the UID cap, the mechanisms and their emission split, the owner hotkey, the committed catalog digest,
+the digest of the catalog shipped with this code, the current epoch and the committed catalog's miner share in it.
 
 ## Mechanisms
 
@@ -27,9 +27,9 @@ the emission split between mechanisms 0 and 1. Calls wait out the admin freeze w
 
 The catalog lists the served models (pinned weights, engine and engine revision, verification tolerances, the
 standard request mix `workload`, `price`, `anchor_share`, `first_test_rps`, `relative_speed`, status), the epoch
-length, the scoring settings
-(`scoring`) and the throughput-audit policy (`throughput_audit`). Miners and validators use whichever catalog the
-owner hotkey commits; publishing a new one needs no code release.
+length, the scoring settings (`scoring`, including the [miner share](#miner-share)) and the throughput-audit policy
+(`throughput_audit`). Miners and validators use whichever catalog the owner hotkey commits; publishing a new one needs
+no code release.
 
 `price` is what users pay for the model, in USD per million input tokens, and the model's share of the emission
 follows what its users pay (`SCORING.md`). `anchor_share` is the model's share while
@@ -106,6 +106,30 @@ epoch. A changed request mix lowers declared capacities while miners measure aga
 announce it. Announce model changes before committing so validators can start a reference engine for a new model
 and miners can deploy it: a validator without a reference engine for an `active` model stops. A model family
 whose engine needs new code, or a protocol change, still goes out as a code release.
+
+## Miner share
+
+`scoring.miner_share` is the share of the mechanism's miner emission the scores pay the miners. Validators scale the
+miners' weights to sum to it and set the rest as weight on the subnet owner's UID (`SCORING.md`). The chain pays the
+subnet owner hotkey no incentive: it burns it, or recycles it if the subnet's `RecycleOrBurn` is set to recycle
+(AdminUtils `sudo_set_recycle_or_burn`). Without the setting the miners get all of it (1). It is a number in (0, 1],
+or a linear change, as in the shipped catalog:
+
+```json
+"miner_share": {"from": 0.59, "to": 0.15, "start_epoch": null, "epochs": 2400}
+```
+
+The share is `from` until `start_epoch`, then moves linearly to `to` over `epochs` epochs and stays there; while
+`start_epoch` is null it stays at `from`. `from` and `to` are in (0, 1] (either may be the larger), `epochs` at least
+1. 2400 epochs of 180 blocks are about 60 days. Every validator computes an epoch's share from the catalog and the
+epoch number (block // `epoch_blocks`) alone, rounded to 6 decimals, logs it each epoch, and the auditor publishes it
+in `GET /v1/network` (`miner_share`); light validators set the auditor's weights as published.
+
+To start the step-down, set `start_epoch` to the epoch it starts at, no earlier than the epoch after the one the
+commit falls in (each epoch is scored under the catalog committed at its first block; an earlier one makes the share
+jump), and commit the catalog. `status` shows the current epoch and its share, and `commit-catalog` prints the share
+in the current epoch and when the change ends. Keep `start_epoch` and `epochs` in later catalogs, or the share jumps
+to what the new values give; changing `epoch_blocks` renumbers the epochs, so it moves the change too.
 
 ## Throughput audit
 

@@ -7,7 +7,9 @@ measures each endpoint's capacity, publishes a signed manifest and answers signe
 
 Validators check every endpoint's answers against a reference computation (see `SCORING.md`), and the throughput
 audit (see `THROUGHPUT_AUDIT.md`) checks the capacity each endpoint declares. An endpoint's score is the capacity it
-proves, so hardware pays by its throughput per cost.
+proves, so hardware pays by its throughput per cost. The scores split the catalog's miner share of the mechanism's
+miner emission (0.59 in the shipped catalog); validators set the rest as weight on the subnet owner's UID, which the
+chain does not pay out (`SCORING.md`).
 
 ## Requirements
 
@@ -92,20 +94,21 @@ What it does:
 | `kev-9b` | active | about 26 GiB | Kev | 0.92 |
 | `clef-flash` | active | about 21 GiB | `verathos-engine` (Clef) | 0.92 |
 
-These are the shipped catalog's models; the installer reads the catalog on chain and lists its models with the
-memory each needs. All three are active from the start and share the emission equally while users pay for none of
-them (`SCORING.md`). Active models are scored. A candidate, which a catalog can list before activating it, is checked
-by validators but scores zero until the subnet owner activates it: serving one helps measure it and earns nothing
-yet. The relative speed is the catalog's `relative_speed`: the requests/s of the model's standard mix one GPU serves,
-relative to the other models, as the subnet owner measured them on one reference GPU (`SUBNET_ADMIN.md`). How the
-models compare differs by GPU: kev-9b and clef-flash serve 0.92 times kev-4b's requests on an H100; on an A100 kev-9b
-serves 0.68-0.82 times and clef-flash 0.65 times, on an RTX 5090 kev-9b 0.55 times.
+These are the shipped catalog's models; the installer reads the catalog on chain and lists its models with the memory
+each needs. All three are active from the start and share the miners' emission equally while users pay for none of them
+(`SCORING.md`). Active models are scored. A candidate, which a catalog can list before activating it, is checked by
+validators but scores zero until the subnet owner activates it: serving one helps measure it and earns nothing yet. The
+relative speed is the catalog's `relative_speed`: the requests/s of the model's standard mix one GPU serves, relative to
+the other models, as the subnet owner measured them on one reference GPU (`SUBNET_ADMIN.md`). How the models compare
+differs by GPU: kev-9b and clef-flash serve 0.92 times kev-4b's requests on an H100; on an A100 kev-9b serves 0.68-0.82
+times and clef-flash 0.65 times, on an RTX 5090 kev-9b 0.55 times.
 
 Each GPU serves one model: by default the active model that pays best on it now. The setup reads the auditor's
 network status (`GET /v1/network` on the subnet owner's axon, signed once per epoch) and uses it only if the subnet
 owner hotkey signed it for this subnet within two epochs of the machine's clock. From it, per active model:
 
-- its share of the emission, as the auditor published it for its last epoch (`SCORING.md`);
+- its share of the emission: its share of the scores, as the auditor published it for its last epoch
+  (`SCORING.md`), times the miner share the auditor published with it;
 - the capacity proven by the endpoints serving it: the requests/s credited to its scored endpoints, this machine's
   own left out.
 
@@ -417,6 +420,7 @@ validator's epoch 45351:
 throughput test of epoch 45351 (block 8163045), gpu0: passed, delivered 18.9 of 18.9 requests/s, p95 latency 1630 ms; credited 18.9
 validator's epoch 45352:
   emission shares: kev-4b 50.0%, kev-9b 50.0%
+  miner share 59.00%: the scores below are shares of it; the subnet owner's UID gets the rest of the miners' emission
   gpu0 (kev-4b): scored 12.40% of the epoch's emission, average 2.48%; proven 18.9 of 18.9 requests/s declared; answers pass 10/10, mean diff 0.0014
 ```
 

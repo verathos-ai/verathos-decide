@@ -871,7 +871,8 @@ def test_an_epoch_checks_what_fits_takes_the_rest_from_the_source_and_sets_one_w
     assert state.waited == {"kev-4b": 0, "kev-9b": 1}
     assert state.ema[kev9] == pytest.approx(CAT.scoring.ema_alpha * 0.4) and state.ema[kev4] > 0
     (w,) = weights_set
-    assert set(w) == {2, 3} and sum(w.values()) == pytest.approx(1.0)
+    assert set(w) == {0, 2, 3} and sum(w.values()) == pytest.approx(1.0)  # the owner's UID beyond the miner share
+    assert w[0] == pytest.approx(1 - cat.scoring.miner_share_at(7))
     assert transport.counts.get(("10.0.7.2", "systemone"), 0) == transport.counts.get(("10.0.7.2", "identity"), 0) == 0
     assert transport.counts[("10.0.7.1", "systemone")] == 2
     published = {h.hotkey: h for h in NetworkStatus.model_validate_json(board.network()).hotkeys}

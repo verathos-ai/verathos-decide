@@ -76,6 +76,7 @@ class HotkeyStatus(BaseModel):
     endpoints: list[EndpointStatus] = []
     tests: list[ThroughputOutcome] = []
     model_shares: dict[str, float] = {}  # each active model's share of the epoch's emission
+    miner_share: float | None = None  # the share of the miners' emission the scores paid (None: an older release)
 
 
 class NetworkStatus(BaseModel):
@@ -84,6 +85,9 @@ class NetworkStatus(BaseModel):
     epoch: int | None = None
     epoch_blocks: int | None = None
     model_shares: dict[str, float] = {}
+    # the share of the mechanism's miner emission the miners' weights sum to; the subnet owner's UID has the rest.
+    # None from a validator of an older release.
+    miner_share: float | None = None
     # per UID, exactly the weights the validator set after the epoch (in a dry run, would have set); a UID absent gets
     # none. None from a validator of an older release.
     weights: dict[int, float] | None = None

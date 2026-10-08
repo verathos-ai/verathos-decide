@@ -432,6 +432,24 @@ def test_weights_ignore_reassigned_uids() -> None:
     assert weights(state, {1: "hkA", 2: "someone-else"}) == {1: pytest.approx(1.0)}
 
 
+def test_the_miner_share_scales_the_miners_weights_and_the_owners_uid_gets_the_rest(caplog) -> None:
+    """The miners' weights sum to the epoch's miner share and the subnet owner's UID, whose incentive the chain does
+    not pay out, gets the rest; with no miner scored it gets everything. An owner hotkey without a UID leaves
+    nothing to put the rest on: the miners get it all."""
+    from verathos.validator.__main__ import weights_to_set
+
+    miners, hotkeys = {1: 0.75, 2: 0.25}, {0: "owner", 1: "hkA", 2: "hkB"}
+    assert weights_to_set(miners, hotkeys, "owner") == miners  # the default share: everything to the miners
+    assert weights_to_set(miners, hotkeys, "owner", 0.59) == pytest.approx({0: 0.41, 1: 0.4425, 2: 0.1475})
+    assert sum(weights_to_set(miners, hotkeys, "owner", 0.150183).values()) == pytest.approx(1.0)
+    assert weights_to_set({}, hotkeys, "owner", 0.59) == {0: 1.0}
+    assert weights_to_set({0: 0.5, 1: 0.5}, hotkeys, "owner", 0.5) == pytest.approx({0: 0.75, 1: 0.25})
+    unowned = {1: "hkA", 2: "hkB"}
+    assert weights_to_set(miners, unowned, "owner", 0.59) == miners
+    assert "the subnet owner hotkey holds no UID: the miners get all of the weights" in caplog.text
+    assert weights_to_set({}, unowned, "owner", 0.59) == {}
+
+
 def test_window_catches_subtle_drift_no_single_epoch_shows() -> None:
     """Each epoch alone has too few probabilities for the statistical bound; three epochs together fail it."""
     from verathos.validator.audit import EndpointResult

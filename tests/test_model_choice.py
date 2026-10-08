@@ -140,6 +140,10 @@ def test_the_market_counts_the_scored_capacity_others_serve() -> None:
     assert m.capacity == pytest.approx({"kev-4b": 30.0, "kev-9b": 25.5})  # this machine's gpu0 left out
     assert m.held == pytest.approx({"kev-4b": 0.0, "kev-9b": 8.5})  # the hotkey's worker
     assert m.median_speed == pytest.approx(20.0) and m.epoch == 7  # of 30, 20, 20 and 10 at relative speed 1
+    assert m.shares == {"kev-4b": 0.5, "kev-9b": 0.5}  # an auditor of an older release: no miner share stated
+    burning = plan.network_market(status.model_copy(update={"miner_share": 0.59}), hotkey=mine, own={"gpu0"},
+                                  active=KEV, relative=SPEED)
+    assert burning.shares == pytest.approx({"kev-4b": 0.295, "kev-9b": 0.295})  # of the miners' emission
     with pytest.raises(ValueError, match="not for the catalog's active models"):
         plan.network_market(status, hotkey=mine, own=(), active=["kev-4b", "kev-9b", "clef-flash"], relative=SPEED)
     with pytest.raises(ValueError, match="no endpoint is scored yet"):

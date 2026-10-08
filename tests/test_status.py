@@ -123,6 +123,10 @@ def test_miner_logs_each_epoch_once_and_each_final_test_once() -> None:
     shared = doc.model_copy(update={"model_shares": {"kev-4b": 0.6, "kev-9b": 0.4}})
     fresh = watching([])
     assert fresh.lines(shared)[1] == "  emission shares: kev-4b 60.0%, kev-9b 40.0%"
+    assert watching([]).lines(shared.model_copy(update={"miner_share": 0.59}))[2] == (
+        "  miner share 59.00%: the scores below are shares of it; the subnet owner's UID gets the rest of the miners' "
+        "emission")
+    assert not any("miner share" in line for line in watching([]).lines(shared.model_copy(update={"miner_share": 1})))
     assert lines[4] == ("throughput test of epoch 12 (block 2200), gpu1: passed, delivered 46.2 of 45.0 requests/s, "
                         "p95 latency 830 ms; credited 45.0")
     assert watcher.lines(doc) == []  # nothing new; the unconfirmed test is not final yet

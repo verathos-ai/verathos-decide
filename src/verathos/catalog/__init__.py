@@ -16,7 +16,7 @@ import logging
 import re
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from bittensor_wallet import Keypair
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
@@ -33,6 +33,7 @@ COMMITMENT_PREFIX = "verathos/catalog/v1 sha256:"
 CATALOG_PATH = "/v1/catalog/{digest}"
 DEFAULT_CACHE_DIR = Path("~/.verathos/catalog")
 MAX_CATALOG_BYTES = 1 << 20
+SHARE_DIGITS = 6  # decimals of the miners' share an epoch's weights are formed with
 
 
 class Engine(BaseModel):
@@ -67,6 +68,22 @@ class CatalogModel(BaseModel):
     tolerance: Tolerance = Tolerance()
 
 
+class MinerShareChange(BaseModel):
+    """The miners' share moving linearly from ``from`` to ``to`` over ``epochs`` epochs from ``start_epoch`` on:
+    ``from`` until then, and throughout while ``start_epoch`` is null."""
+
+    from_: float = Field(alias="from", gt=0, le=1)
+    to: float = Field(gt=0, le=1)
+    start_epoch: int | None = Field(None, ge=0, description="The epoch (block // epoch_blocks) the change starts at; "
+                                    "null: not started")
+    epochs: int = Field(ge=1, description="Epochs the change takes")
+
+    def at(self, epoch: int) -> float:
+        if self.start_epoch is None or epoch <= self.start_epoch:
+            return self.from_
+        return self.from_ + (self.to - self.from_) * min(epoch - self.start_epoch, self.epochs) / self.epochs
+
+
 class Scoring(BaseModel):
     """Scoring settings every validator applies."""
 
@@ -85,6 +102,10 @@ class Scoring(BaseModel):
                                    "its demand")
     max_share_step: float = Field(0.05, gt=0, le=1, description="Most a model's emission share moves per epoch "
                                   "toward what demand sets")
+    miner_share: Annotated[float, Field(gt=0, le=1)] | MinerShareChange = Field(
+        1.0, description="Share of the mechanism's miner emission the scores pay the miners; the rest is weight on "
+        "the subnet owner's UID, whose incentive the chain does not pay out. A number, or a linear change "
+        "{from, to, start_epoch, epochs}")
     revision_transition_epochs: int = Field(3, ge=0, description="Epochs after a model's pinned weights or engine "
                                             "change in place during which its answers are not checked, while miners "
                                             "and references update")
@@ -99,6 +120,11 @@ class Scoring(BaseModel):
                                                      "endpoint per epoch (canaries and identity challenges); beyond "
                                                      "them miners answer 429 until the next epoch. Default: "
                                                      "``request_budget``")
+
+    def miner_share_at(self, epoch: int) -> float:
+        """``miner_share`` in ``epoch``, rounded to ``SHARE_DIGITS`` decimals, so every validator sets the same."""
+        share = self.miner_share.at(epoch) if isinstance(self.miner_share, MinerShareChange) else self.miner_share
+        return round(share, SHARE_DIGITS)
 
     def request_budget(self) -> int:
         """``validator_requests_per_epoch``, by default 4 x ``canary_pool_size``. In one pass of an epoch a validator
@@ -140,7 +166,7 @@ class Catalog(BaseModel):
 
     def document(self) -> Any:
         """The JSON document this catalog was parsed from (or its own fields if built in code)."""
-        return self._document if self._document is not None else self.model_dump(mode="json")
+        return self._document if self._document is not None else self.model_dump(mode="json", by_alias=True)
 
     @model_validator(mode="after")
     def _check(self) -> Catalog:
@@ -169,7 +195,11 @@ class Catalog(BaseModel):
         them, so a publisher must not mistype one."""
         doc = self._document or {}
         unknown = [k for k in doc if k not in type(self).model_fields]
-        unknown += [f"scoring.{k}" for k in doc.get("scoring") or {} if k not in Scoring.model_fields]
+        scoring = doc.get("scoring") or {}
+        unknown += [f"scoring.{k}" for k in scoring if k not in Scoring.model_fields]
+        if isinstance(scoring.get("miner_share"), dict):
+            known = {f.alias or name for name, f in MinerShareChange.model_fields.items()}
+            unknown += [f"scoring.miner_share.{k}" for k in scoring["miner_share"] if k not in known]
         for m in doc.get("models") or []:
             unknown += [f"models.{m.get('model_id', '?')}.{k}" for k in m if k not in CatalogModel.model_fields]
         return unknown

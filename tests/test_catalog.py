@@ -145,3 +145,35 @@ def test_a_models_relative_speed_is_positive_and_one_when_absent() -> None:
     for speed in (0, -1.0):
         with pytest.raises(ValidationError, match="relative_speed"):
             catalog.Catalog.parse({**document, "models": [{**document["models"][0], "relative_speed": speed}]})
+
+
+def test_the_miner_share_is_a_number_or_a_linear_change_and_the_same_for_every_validator() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    document = catalog.load().document()
+
+    def with_share(share) -> catalog.Catalog:
+        return catalog.Catalog.parse({**document, "scoring": {**document["scoring"], "miner_share": share}})
+
+    shipped = catalog.load().scoring
+    assert shipped.miner_share_at(0) == shipped.miner_share_at(10**7) == 0.59  # not started: the owner starts it
+    without = {**document, "scoring": {k: v for k, v in document["scoring"].items() if k != "miner_share"}}
+    assert catalog.Catalog.parse(without).scoring.miner_share_at(5) == 1.0  # older catalogs: everything to miners
+    assert with_share(0.7).scoring.miner_share_at(5) == 0.7
+    change = with_share({"from": 0.59, "to": 0.15, "start_epoch": 1000, "epochs": 2400}).scoring
+    assert [change.miner_share_at(e) for e in (0, 1000, 1001, 2200, 3399, 3400, 10**7)] == [
+        0.59, 0.59, 0.589817, 0.37, 0.150183, 0.15, 0.15]
+    rising = with_share({"from": 0.2, "to": 0.8, "start_epoch": 10, "epochs": 3}).scoring
+    assert [rising.miner_share_at(e) for e in (10, 11, 12, 13)] == [0.2, 0.4, 0.6, 0.8]
+    assert with_share({"from": 0.59, "to": 0.15, "start_epoch": 7, "epochs": 2}).unknown_settings() == []
+    assert with_share({"from": 0.59, "to": 0.15, "epochs": 2, "start": 7}).unknown_settings() == [
+        "scoring.miner_share.start"]
+    for invalid in (0, 1.01, -0.5, {"from": 0.59, "to": 0, "epochs": 1}, {"from": 1.2, "to": 0.5, "epochs": 1},
+                    {"from": 0.59, "to": 0.15, "epochs": 0}, {"from": 0.59, "to": 0.15},
+                    {"from": 0.59, "to": 0.15, "epochs": 5, "start_epoch": -1}, [0.59, 0.15]):
+        with pytest.raises(ValidationError, match="miner_share"):
+            with_share(invalid)
+    built = catalog.load().model_copy(update={"revision": "built"})  # a catalog built in code keeps the JSON names
+    assert built.document()["scoring"]["miner_share"] == document["scoring"]["miner_share"]
+    assert catalog.Catalog.parse(built.document()).digest() == built.digest()

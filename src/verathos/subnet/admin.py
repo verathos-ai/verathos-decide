@@ -1,6 +1,7 @@
 """Subnet administration: ``verathos-subnet``. The changing commands are signed with the subnet owner's keys.
 
-    status            mechanisms, emission split, UID cap, the committed catalog and the shipped one
+    status            mechanisms, emission split, UID cap, the committed catalog and the shipped one, the epoch
+                      and the miner share in it
     setup-mechanisms  mechanism count 2 and the emission split (owner coldkey)
     commit-catalog    publish a catalog file: store it where the owner's validator serves it, commit its digest
 
@@ -21,7 +22,7 @@ import bittensor as bt
 from bittensor_wallet import Keypair
 
 from verathos import catalog
-from verathos.subnet.chain import committed_catalog
+from verathos.subnet.chain import committed_catalog, current_catalog
 
 MAX_UIDS_TWO_MECHANISMS = 128  # chain rule: max UIDs x mechanism count <= 256
 SPLIT_SCALE = 65535
@@ -60,10 +61,28 @@ def admin_call(st: bt.Subtensor, kp: Keypair, netuid: int, function: str, params
     print(f"{function} {params}: ok", flush=True)
 
 
+def miner_share_line(cat: catalog.Catalog, epoch: int) -> str:
+    """The catalog's miner share in ``epoch`` and how it changes."""
+    change = cat.scoring.miner_share
+    line = f"miner share {cat.scoring.miner_share_at(epoch):.6f} in epoch {epoch}"
+    if not isinstance(change, catalog.MinerShareChange):
+        return line
+    if change.start_epoch is None:
+        return line + f"; the change to {change.to:g} over {change.epochs} epochs has no start_epoch yet"
+    return line + (f"; {change.from_:g} until epoch {change.start_epoch}, then linearly to {change.to:g} at epoch "
+                   f"{change.start_epoch + change.epochs}")
+
+
 def status(st: bt.Subtensor, netuid: int) -> None:
     q = st.substrate.query
     committed = committed_catalog(st, netuid)
-    local = catalog.load().digest()
+    shipped = catalog.load()
+    try:
+        cat = current_catalog(st, netuid, catalog.CatalogStore(), [])
+    except catalog.CatalogUnavailable as exc:
+        print(f"the committed catalog is not available: {exc}", file=sys.stderr, flush=True)
+        cat = None
+    epoch = st.get_current_block() // (cat or shipped).epoch_blocks
     print(json.dumps({
         "max_allowed_uids": q("SubtensorModule", "MaxAllowedUids", [netuid]).value,
         "registered_uids": q("SubtensorModule", "SubnetworkN", [netuid]).value,
@@ -71,8 +90,10 @@ def status(st: bt.Subtensor, netuid: int) -> None:
         "mechanism_emission_split": q("SubtensorModule", "MechanismEmissionSplit", [netuid]).value,
         "owner_hotkey": st.get_subnet_owner_hotkey(netuid),
         "committed_catalog": committed,
-        "shipped_catalog": local,
-        "shipped_catalog_is_committed": committed == local,
+        "shipped_catalog": shipped.digest(),
+        "shipped_catalog_is_committed": committed == shipped.digest(),
+        "epoch": epoch,
+        "miner_share": cat.scoring.miner_share_at(epoch) if cat else None,
     }, indent=2), flush=True)
 
 
@@ -106,6 +127,7 @@ def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path 
     stored = catalog.CatalogStore(store_dir).put(cat)
     print(f"catalog {cat.digest()} stored at {stored}; active models: "
           f"{[m.model_id for m in cat.models if m.status == 'active']}", flush=True)
+    print(miner_share_line(cat, st.get_current_block() // cat.epoch_blocks), flush=True)
     value = catalog.commitment_value(cat.digest())
     result = st.set_commitment(wallet, netuid, value)
     if not getattr(result, "success", False):

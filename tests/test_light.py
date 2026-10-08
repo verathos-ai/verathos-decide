@@ -318,9 +318,9 @@ def test_a_light_validator_never_contacts_miners_or_loads_references(tmp_path, m
     assert [s["uids"] for s in chain.set] == [[3, 7, 12]]
 
 
-def test_the_auditor_publishes_exactly_the_weights_it_sets_and_light_validators_set_the_same(tmp_path) -> None:
-    """Weights of UIDs whose endpoints are gone this epoch (their averages decay) and the fallback to the owner's UID
-    are part of what is set, so they are part of what is published."""
+def auditor_and_light(tmp_path, cat: catalog.Catalog):
+    """The auditor's epochs (run_epoch with no endpoints, publishing on its board), and a light validator following
+    it: -> (chain, light validator, a function running the auditor's epoch and returning the weights it set)."""
     from verathos.validator import __main__ as validator_main
     from verathos.validator.discovery import Identities, ManifestCache
 
@@ -337,13 +337,14 @@ def test_the_auditor_publishes_exactly_the_weights_it_sets_and_light_validators_
     throughput = SimpleNamespace(auditor_hotkey=owner.ss58_address, manifests=ManifestCache(60.0),
                                  identities=Identities(), holding=lambda: False, verdicts=no_verdicts,
                                  update_slots=lambda miners, neurons, epoch: None)
-    current = SimpleNamespace(catalog=CAT, for_epoch=lambda st, block: CAT, accepted=lambda: {CAT.digest()})
+    current = SimpleNamespace(catalog=cat, for_epoch=lambda st, block: cat, accepted=lambda: {cat.digest()})
     auditor_cfg = SimpleNamespace(netuid=405, mechid=1, references={}, dry_run=False)
     board = StatusBoard()
     app = FastAPI()
     add_network_route(app, board, owner, 405)
     client = TestClient(app)
     follower = validator(tmp_path, chain, own, [None])
+    follower.current = SimpleNamespace(catalog=cat)
     follower.fetch = lambda url, **kwargs: client.get(NETWORK_PATH).json()
 
     def auditor_epoch(state: ScoreState, epoch: int) -> dict:
@@ -351,12 +352,21 @@ def test_the_auditor_publishes_exactly_the_weights_it_sets_and_light_validators_
                                              epoch, 1, throughput, current, board))
         return chain.set[-1]
 
+    return chain, follower, board, auditor_epoch
+
+
+def test_the_auditor_publishes_exactly_the_weights_it_sets_and_light_validators_set_the_same(tmp_path) -> None:
+    """Weights of UIDs whose endpoints are gone this epoch (their averages decay), the owner's UID's part beyond the
+    miner share and the fallback to the owner's UID are part of what is set, so they are part of what is
+    published."""
+    chain, follower, board, auditor_epoch = auditor_and_light(tmp_path, CAT)
     state = ScoreState(ema={"hkA/gpu0": 0.6, "hkB/gpu0": 0.2}, uid_of={"hkA/gpu0": 1, "hkB/gpu0": 2})
     published = auditor_epoch(state, 100)
     network = NetworkStatus.model_validate_json(board.network())
     assert network.hotkeys == [] and network.epoch == 100  # no endpoint this epoch, yet weights are set
     assert network.weights == dict(zip(published["uids"], published["weights"]))
-    assert network.weights == pytest.approx({1: 0.75, 2: 0.25})
+    assert network.miner_share == CAT.scoring.miner_share_at(100) == 0.59  # the shipped share, not stepping down yet
+    assert network.weights == pytest.approx({0: 0.41, 1: 0.75 * 0.59, 2: 0.25 * 0.59})
     follower.step()
     assert chain.set[-1] == published
 
@@ -366,6 +376,26 @@ def test_the_auditor_publishes_exactly_the_weights_it_sets_and_light_validators_
     chain.block = 101 * BLOCKS + OFFSET + 5
     follower.step()
     assert chain.set[-1] == published and len(chain.set) == 4
+
+
+def test_the_miner_share_steps_down_by_epoch_and_light_validators_set_the_auditors_weights(tmp_path) -> None:
+    """Once the owner sets start_epoch, each epoch's share follows from the epoch alone: the auditor sets the miners'
+    weights summing to it and the rest on the owner's UID, publishes the share, and a light validator sets exactly
+    those weights."""
+    document = CAT.document()
+    stepping = catalog.Catalog.parse({**document, "scoring": {**document["scoring"], "miner_share": {
+        "from": 0.59, "to": 0.15, "start_epoch": 100, "epochs": 4}}})
+    chain, follower, board, auditor_epoch = auditor_and_light(tmp_path, stepping)
+    state = ScoreState(ema={"hkA/gpu0": 0.6, "hkB/gpu0": 0.2}, uid_of={"hkA/gpu0": 1, "hkB/gpu0": 2})
+    for epoch, share in ((100, 0.59), (101, 0.48), (102, 0.37)):
+        chain.block = epoch * BLOCKS + OFFSET + 5
+        published = auditor_epoch(state, epoch)
+        network = NetworkStatus.model_validate_json(board.network())
+        assert network.miner_share == share and network.weights == dict(zip(published["uids"], published["weights"]))
+        assert network.weights[0] == pytest.approx(1 - share) and sum(network.weights.values()) == pytest.approx(1)
+        follower.step()
+        assert chain.set[-1] == published
+    assert [stepping.scoring.miner_share_at(e) for e in (103, 104, 10**6)] == [0.26, 0.15, 0.15]
 
 
 def test_a_light_configuration_needs_no_references(tmp_path) -> None:

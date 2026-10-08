@@ -221,11 +221,13 @@ throughput tests are run by 5D...; applying its verdicts
 epoch 45406: 3 miners, 3 open endpoints
 ```
 
-At the end of each epoch it logs the emission shares, a line per endpoint checked and the weights:
+At the end of each epoch it logs the emission shares, the miner share, a line per endpoint checked and the weights:
 
 ```
+  emission shares: clef-flash 33.3%, kev-4b 33.3%, kev-9b 33.3%
+  miner share 0.590000: the miners' weights sum to it, the subnet owner's UID gets the rest
   5CzN.../gpu0 epoch_verdict=insufficient answered=7/7 identity=True mean_abs=0.0013 proven_rps=7.6 users=1.00 score=0.191
-dry run (mechanism 1 configured dry): weights {1: 0.57, 12: 0.43}
+dry run (mechanism 1 configured dry): weights {0: 0.41, 1: 0.3363, 12: 0.2537}
 ```
 
 A validator restarted in an epoch it already scored (or, light, whose weights it set) starts with the next one.
@@ -400,9 +402,9 @@ A light validator, each epoch (`epoch_blocks` from the catalog, default 180 bloc
    sets the weights in it only if the document is signed by the source hotkey under `verathos/network-status/v1` for
    this netuid, was signed within 5 minutes of the validator's clock (the source signs it again every 30 s), is for
    the current or the previous epoch and for a later epoch than the weights it set last;
-3. sets exactly those weights (UIDs it does not list get none) on `mechid`, as a full validator sets its own: the
-   subnet's weights version key, commit-reveal where the subnet has it, retried once per block up to 10 times; and
-   logs the epoch, the source, the number of UIDs and the highest weights;
+3. sets exactly those weights (the subnet owner's UID's included; UIDs it does not list get none) on `mechid`, as a
+   full validator sets its own: the subnet's weights version key, commit-reveal where the subnet has it, retried
+   once per block up to 10 times; and logs the epoch, the source, the number of UIDs and the highest weights;
 4. without a document that verifies by the same point of the next epoch, when the next results can come, sets
    nothing for the epoch and logs why, once; the weights it set before stay on chain.
 
@@ -430,7 +432,8 @@ Per epoch a full validator:
    and latency), each model's user demand, and any proven wrong answers;
 6. one at a time: takes the source's results for the models it did not check;
 7. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
-   probation, and sets weights on `mechid` (retried once per block, up to 10 times).
+   probation, scales the miners' weights to the catalog's miner share for the epoch and gives the subnet owner's UID
+   the rest (`SCORING.md`), and sets weights on `mechid` (retried once per block, up to 10 times).
 
 Nothing a miner returns can stop the epoch: replies are size- and time-bounded and every malformed reply is
 recorded against that endpoint. Chain errors are retried every block, and an epoch that fails part way leaves no
@@ -451,14 +454,15 @@ issued to a catalog gateway and takes the auditor's word for the wrongness, as i
 recent test; without any, no endpoint has proven capacity that epoch. In `observe` mode it counts declared
 capacities, up to the model's `first_test_rps`, and fetches nothing.
 
-Validators that run a service (the subnet owner's, which is the auditor, and full validators with `public_host`)
-also serve each hotkey's status for its miners at `GET /v1/status/<hotkey>`: the UID and its share of the weights
-set, per endpoint the state in the last epoch (scored, qualifying, candidate, drifted, failed, invalid, probation),
-its checks, declared and proven capacity, how ready users found it, its latency factor and scores, and the hotkey's
+Validators that run a service (the subnet owner's, which is the auditor, and full validators with `public_host`) also
+serve each hotkey's status for its miners at `GET /v1/status/<hotkey>`: the UID and its share of the weights set, per
+endpoint the state in the last epoch (scored, qualifying, candidate, drifted, failed, invalid, probation), its
+checks, declared and proven capacity, how ready users found it, its latency factor and scores, and the hotkey's
 results in the auditor's last 10 tests (at most 64 endpoints each). `GET /v1/network` serves every hotkey's status of
-the last epoch at once (without the test results, built once per epoch) and `weights`, per UID exactly the weights
-the validator set after the epoch, for network dashboards and light validators. The validator publishes it before it
-sets those weights, and a restarted one serves the last epoch's until its next.
+the last epoch at once (without the test results, built once per epoch), `weights`, per UID exactly the weights the
+validator set after the epoch (the subnet owner's UID's included), and `miner_share`, the epoch's miner share, for
+network dashboards and light validators. The validator publishes it before it sets those weights, and a restarted one
+serves the last epoch's until its next.
 
 Both documents are signed with the validator's hotkey: the status's fields plus `netuid`, `auditor` (the signing
 hotkey) and `issued_ms`, signed as canonical JSON (sorted keys, no whitespace) under the domain `verathos/status/v1`

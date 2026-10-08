@@ -74,9 +74,10 @@ WHY = {REQUESTED: "as --model asks", ANSWERED: "as chosen",
 @dataclass
 class Market:
     """What the network pays for each active model, from the auditor's network status: the model's share of the
-    emission, the capacity proven by the endpoints serving it (requests/s of its standard mix, as credited to scored
-    endpoints; this machine's own left out, so a GPU does not compete with itself) and how much of that the hotkey
-    holds, and the median scored endpoint's speed in requests/s of a model of relative speed 1."""
+    miners' emission (its share of the scores times the miner share), the capacity proven by the endpoints serving it
+    (requests/s of its standard mix, as credited to scored endpoints; this machine's own left out, so a GPU does not
+    compete with itself) and how much of that the hotkey holds, and the median scored endpoint's speed in requests/s
+    of a model of relative speed 1."""
 
     shares: dict[str, float]
     capacity: dict[str, float]
@@ -119,7 +120,8 @@ def network_market(status: NetworkStatus, *, hotkey: str, own: Collection[str], 
                 held[e.model_id] += e.credited_rps
     if not speeds:
         raise ValueError("no endpoint is scored yet")
-    return Market(dict(status.model_shares), capacity, held, median(speeds), status.epoch)
+    paid = 1.0 if status.miner_share is None else status.miner_share
+    return Market({m: s * paid for m, s in status.model_shares.items()}, capacity, held, median(speeds), status.epoch)
 
 
 def gpu_speeds(gpus: list[Gpu], measured: Mapping[int, tuple[str, float]], relative: Mapping[str, float],
