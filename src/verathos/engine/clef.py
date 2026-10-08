@@ -85,9 +85,9 @@ class FastEngine:
         *,
         max_length: int = 16384,
         max_batch_tokens: int = 8192,
-        batch_sizes: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8),
+        max_rows: int = 64,
         length_step: int = 32,
-        graph_max_length: int = 2048,
+        graph_tokens: int = 2048,
     ) -> None:
         import torch
 
@@ -110,18 +110,17 @@ class FastEngine:
         self.device = torch.device(device)
         self.max_length = max_length
         self.max_batch_tokens = max_batch_tokens
-        self.batch_sizes = batch_sizes
+        self.max_rows = max_rows
         self.length_step = length_step
         self.forward = GraphedForward(
             lambda ids: self.backbone.forward(ids),
             self.backbone.hidden_size,
             torch.bfloat16,
             self.device,
-            batch_sizes=batch_sizes,
             length_step=length_step,
-            max_length=graph_max_length,
-            max_tokens=max_batch_tokens,
+            max_tokens=graph_tokens,
         )
+        self.forward.capture_all()
 
     def prepare(self, body: dict[str, Any]) -> Prepared:
         _validate(body)
@@ -137,7 +136,7 @@ class FastEngine:
         for i in order:
             length = bucket_length(len(items[i].encoded.input_ids), self.length_step)
             group = groups[-1] if groups else None
-            if group and len(group) < self.batch_sizes[-1] and (len(group) + 1) * length <= self.max_batch_tokens:
+            if group and len(group) < self.max_rows and (len(group) + 1) * length <= self.max_batch_tokens:
                 group.append(i)
             else:
                 groups.append([i])
@@ -145,11 +144,11 @@ class FastEngine:
 
     def _pass(self, records: list[Any]) -> list[list[Any]]:
         from verathos.engine.clef_head import batched_head
-        from verathos.engine.graphs import bucket_batch, bucket_length
+        from verathos.engine.graphs import bucket_length
 
         torch = self.torch
         length = bucket_length(max(len(r.input_ids) for r in records), self.length_step)
-        batch = bucket_batch(len(records), self.batch_sizes) or len(records)
+        batch = self.forward.graphed_batch(len(records), length) or len(records)
         ids = torch.full((batch, length), self.pad_id, dtype=torch.long)
         mask = torch.zeros((len(records), length), dtype=torch.long)
         for row, record in enumerate(records):

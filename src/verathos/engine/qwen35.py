@@ -6,12 +6,11 @@ causal convolution in the linear layers, causal attention in the full layers) pa
 the hidden states of its real tokens. That keeps every pass a fixed-shape computation that CUDA graphs can replay.
 
 Per decoder layer the math is transformers' Qwen3.5 reference, computed with flash-linear-attention's Triton kernels:
-- the zero-centred RMSNorms as one fused kernel with weight 1 + w in fp32, the post-mixer norm also adding the
-  residual;
+- the zero-centred RMSNorms as one fused kernel with weight 1 + w in fp32, each norm also adding the preceding
+  block's output to the residual;
 - linear attention: the causal convolution with SiLU, the chunked
-  gated delta rule with the q/k L2 norm in the kernel and the key heads shared by their value heads, and the gated
-  RMSNorm; the decay gate -exp(A_log) * softplus(a + dt_bias) and the beta sigmoid are computed in fp32 as in the
-  reference;
+  gated delta rule with the q/k L2 norm, the decay gate -exp(A_log) * softplus(a + dt_bias) and the beta sigmoid in
+  the kernel and the key heads shared by their value heads, and the gated RMSNorm;
 - full attention: fused q/k RMSNorms, rotary embeddings on the first
   ``rotary_dim`` channels, scaled-dot-product attention with grouped key/value heads, and the sigmoid output gate;
 - MLP: the fused SwiGLU.
@@ -34,6 +33,31 @@ from fla.modules.layernorm import rms_norm
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 FLA_VERSION = "0.5.2"  # the flash-linear-attention release these kernels were validated against
+
+
+class _OneTokenClass:
+    """A Triton kernel launched with NB=1. fla passes these kernels NB, a class of the token count (rows / 1024 or
+    2048, rounded up), as a constexpr and an autotuning key, but their bodies never read it: every pass with a new
+    class compiled and autotuned them again, stalling serving for seconds. With NB fixed they tune once per width."""
+
+    def __init__(self, kernel) -> None:
+        self.kernel = kernel
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+        return lambda *args, **kwargs: launch(*args, **{**kwargs, "NB": 1})
+
+
+def _fix_token_classes() -> None:
+    import fla.modules.conv.triton.ops as conv
+    import fla.modules.fused_norm_gate as gated
+    import fla.modules.l2norm as l2
+    import fla.modules.layernorm as norm
+
+    for module, name in ((conv, "causal_conv1d_fwd_kernel"), (gated, "layer_norm_gated_fwd_kernel"),
+                         (l2, "l2norm_fwd_kernel"), (norm, "layer_norm_fwd_kernel")):
+        if not isinstance(getattr(module, name), _OneTokenClass):
+            setattr(module, name, _OneTokenClass(getattr(module, name)))
 
 
 @dataclass
@@ -82,6 +106,7 @@ class Backbone:
             raise RuntimeError(
                 f"the Qwen3.5 kernels need flash-linear-attention=={FLA_VERSION}, found {fla.__version__}"
             )
+        _fix_token_classes()
         config = text_model.config
         self.hidden_size = config.hidden_size
         self.eps = config.rms_norm_eps
@@ -163,14 +188,17 @@ class Backbone:
         mixed, z, b, a = F.linear(h, m.qkv), F.linear(h, m.z), F.linear(h, m.b), F.linear(h, m.a)
         mixed, _ = causal_conv1d(mixed, m.conv_weight, None, activation="silu")
         q, k, v = mixed.split((self.key_dim, self.key_dim, self.value_dim), -1)
-        g = -m.a_log.exp() * F.softplus(a.float() + m.dt_bias)
         out, _ = chunk_gated_delta_rule(
             q.reshape(B, T, -1, self.k_head_dim),
             k.reshape(B, T, -1, self.k_head_dim),
             v.reshape(B, T, -1, self.v_head_dim),
-            g=g,
-            beta=b.sigmoid(),
+            g=a,
+            beta=b,
             use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            A_log=m.a_log,
+            dt_bias=m.dt_bias,
+            use_beta_sigmoid_in_kernel=True,
         )
         z = z.reshape(B, T, -1, self.v_head_dim)
         out = rms_norm_gated(out, z, m.norm_weight, None, activation="swish", eps=self.eps)
@@ -201,12 +229,16 @@ class Backbone:
         if position_ids is None:
             position_ids = torch.arange(T, device=x.device).expand(B, T)
         cos, sin = self.rotary(position_ids)
+        mlp = None  # the previous layer's MLP output, added to the residual inside the next norm
         for layer in self.layers:
-            h = rms_norm(x, layer.input_norm, None, eps=self.eps)
+            if mlp is None:
+                h = rms_norm(x, layer.input_norm, None, eps=self.eps)
+            else:
+                h, x = rms_norm(mlp, layer.input_norm, None, residual=x, eps=self.eps, prenorm=True)
             if isinstance(layer.mixer, LinearLayer):
                 h = self._linear(layer.mixer, h)
             else:
                 h = self._attention(layer.mixer, h, cos, sin)
             h, x = rms_norm(h, layer.post_norm, None, residual=x, eps=self.eps, prenorm=True)
-            x = x + F.linear(swiglu(F.linear(h, layer.gate), F.linear(h, layer.up)), layer.down)
-        return rms_norm(x, self.final_norm, None, eps=self.eps)
+            mlp = F.linear(swiglu(F.linear(h, layer.gate), F.linear(h, layer.up)), layer.down)
+        return rms_norm(mlp, self.final_norm, None, residual=x, eps=self.eps)

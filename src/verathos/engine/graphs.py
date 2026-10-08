@@ -1,14 +1,19 @@
-"""CUDA graphs for a fixed-shape forward pass, one graph per (batch, length) bucket.
+"""CUDA graphs for the small passes of a fixed-shape forward, one graph per (batch, length) bucket.
 
-A pass is replayed from a graph when its padded shape fits the captured buckets, otherwise it runs eagerly. Every graph
-reads its inputs from one shared input buffer and writes its output into one shared output buffer (views of the
-bucket's shape at the start of each), so the memory held across graphs is the largest bucket's input and output plus
-the graphs' shared pool, not one output per bucket. Graphs are captured on first use.
+A pass costs the CPU about the same to launch at any size, so only small passes are limited by the launches: there a
+graph replay is several times faster, while a pass of a few thousand tokens keeps the GPU busier than the CPU and runs
+as fast eagerly. Graphs therefore cover every bucket of at most ``max_tokens`` tokens, and all of them are captured at
+start-up, so serving never stalls on a capture; larger passes run eagerly.
+
+Every graph reads its inputs from one shared input buffer and writes its output into one shared output buffer (views
+of the bucket's shape at the start of each), and the graphs share one memory pool, so the memory held across graphs
+is one small pass's, not one per bucket.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 
 import torch
@@ -20,13 +25,9 @@ def bucket_length(n: int, step: int) -> int:
     return -(-n // step) * step
 
 
-def bucket_batch(n: int, sizes: tuple[int, ...]) -> int | None:
-    return next((size for size in sizes if size >= n), None)
-
-
 class GraphedForward:
-    """``forward(ids [B, T]) -> hidden [B, T, H]`` replayed from CUDA graphs for B in ``batch_sizes`` and T a
-    multiple of ``length_step`` up to ``max_length``."""
+    """``forward(ids [B, T]) -> hidden [B, T, H]``, replayed from a CUDA graph when B is in ``batch_sizes``, T is a
+    multiple of ``length_step`` and B x T is at most ``max_tokens``; eager otherwise."""
 
     def __init__(
         self,
@@ -37,28 +38,30 @@ class GraphedForward:
         *,
         batch_sizes: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8),
         length_step: int = 32,
-        max_length: int = 2048,
-        max_tokens: int = 8192,
+        max_tokens: int = 2048,
     ) -> None:
         self.forward = forward
         self.batch_sizes = batch_sizes
         self.length_step = length_step
-        self.max_length = max_length
         self.max_tokens = max_tokens
+        self.hidden_size = hidden_size
         self.ids = torch.zeros(max_tokens, dtype=torch.long, device=device)
         self.out = torch.empty(max_tokens * hidden_size, dtype=dtype, device=device)
-        self.hidden_size = hidden_size
         self.pool = torch.cuda.graph_pool_handle()
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
 
-    def fits(self, batch: int, length: int) -> bool:
-        return length <= self.max_length and batch <= self.batch_sizes[-1] and batch * length <= self.max_tokens
+    def graphed_batch(self, rows: int, length: int) -> int | None:
+        """The graph batch size a pass of ``rows`` rows of ``length`` tokens is padded to, or None to run it eagerly."""
+        batch = next((size for size in self.batch_sizes if size >= rows), None)
+        if batch is None or length % self.length_step or batch * length > self.max_tokens:
+            return None
+        return batch
 
     def _views(self, batch: int, length: int) -> tuple[torch.Tensor, torch.Tensor]:
         n = batch * length
         return self.ids[:n].view(batch, length), self.out[: n * self.hidden_size].view(batch, length, self.hidden_size)
 
-    def _capture(self, batch: int, length: int) -> torch.cuda.CUDAGraph:
+    def _capture(self, batch: int, length: int) -> None:
         ids, out = self._views(batch, length)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -69,19 +72,24 @@ class GraphedForward:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self.pool):
             out.copy_(self.forward(ids))
-        log.info("captured a CUDA graph for batch %d x %d tokens", batch, length)
-        return graph
+        self.graphs[(batch, length)] = graph
+
+    @torch.inference_mode()
+    def capture_all(self) -> None:
+        start = time.perf_counter()
+        for batch in self.batch_sizes:
+            for length in range(self.length_step, self.max_tokens // batch + 1, self.length_step):
+                self._capture(batch, length)
+        log.info("captured %d CUDA graphs (passes up to %d tokens) in %.0f s", len(self.graphs), self.max_tokens,
+                 time.perf_counter() - start)
 
     def __call__(self, ids: torch.Tensor) -> torch.Tensor:
-        """Hidden states for right-padded ids [B, T] (B and T already bucketed). Graph outputs are views into the shared
-        output buffer: read them before the next call."""
-        batch, length = ids.shape
-        if not self.fits(batch, length):
+        """Hidden states for right-padded ids [B, T]. A graph's output is a view into the shared output buffer: read it
+        before the next call."""
+        graph = self.graphs.get(tuple(ids.shape))
+        if graph is None:
             return self.forward(ids)
-        key = (batch, length)
-        if key not in self.graphs:
-            self.graphs[key] = self._capture(batch, length)
-        static_ids, out = self._views(batch, length)
+        static_ids, out = self._views(*ids.shape)
         static_ids.copy_(ids)
-        self.graphs[key].replay()
+        graph.replay()
         return out
