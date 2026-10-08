@@ -7,8 +7,9 @@
     GET  /health         the process is up
     GET  /ready          routes are loaded and the gateway is in the catalog (503 otherwise)
 
-Every response carries ``X-Request-Id`` (the client's, if it sent a valid one). Errors are
-``{"error": {"type": ..., "message": ...}}``; 429 and 503 carry ``Retry-After``.
+Every response to ``POST /v1/systemone`` carries ``X-Request-Id`` (the client's, if it sent a valid one). Errors are
+``{"error": {"type": ..., "message": ...}}``; 429 and 503 carry ``Retry-After`` (for a used-up quota: until the next
+month).
 
     400 invalid_request     not JSON (NaN and infinities included), or not a SystemOne request
     401 unauthorized        missing, unknown, revoked or expired key, or a suspended account
@@ -54,7 +55,7 @@ from verathos.gateway.sampler import Sampler
 from verathos.gateway.served import ServedCounter
 from verathos.gateway.stats import DEGRADED_SUCCESS, ModelStats
 from verathos.gateway.upstream import Exchange, Upstream, UpstreamFailure
-from verathos.gateway.usage import UsageMeter
+from verathos.gateway.usage import UsageMeter, month_start
 from verathos.protocol.api import MAX_RESPONSE_BYTES, Choice, SystemOneRequest, question_keys
 from verathos.protocol.canonical import canonical_json, digest
 from verathos.protocol.gateway import Routes
@@ -449,7 +450,11 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         if wait:
             return reject(429, "rate_limited", "over the key's request rate", request_id, wait)
         if not g.meter.within_quota(principal):
-            return reject(429, "quota_exceeded", "the account's monthly quota is used up", request_id)
+            now = dt.datetime.now(dt.UTC)
+            next_month = dt.datetime.combine(month_start(month_start(now.date()) + dt.timedelta(days=32)), dt.time(),
+                                             dt.UTC)
+            return reject(429, "quota_exceeded", "the account's monthly quota is used up", request_id,
+                          (next_month - now).total_seconds())
         try:
             funded = await bounded("balance lookup", g.meter.has_credit(principal))
         except Unchecked:

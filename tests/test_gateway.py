@@ -187,7 +187,9 @@ def test_keys_and_rate_limits(tmp_path) -> None:
 def test_monthly_quota_and_bad_requests(tmp_path) -> None:
     s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")}, monthly_quota=2)
     assert [asyncio.run(s.post()).status_code for _ in range(2)] == [200, 200]
-    assert asyncio.run(s.post()).json()["error"]["type"] == "quota_exceeded"
+    over = asyncio.run(s.post())
+    assert over.json()["error"]["type"] == "quota_exceeded"
+    assert 1 <= int(over.headers["Retry-After"]) <= 31 * 86400  # until the next month
 
     t = Setup(tmp_path / "other", {"10.0.0.1": MockEngine("kev-4b")})
     invalid = asyncio.run(t.post({"model": "kev-4b"})).json()["error"]

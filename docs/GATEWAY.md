@@ -100,6 +100,13 @@ answer to a user carries only the receipt. Validators check that the miner answe
 auditor's word for the wrongness, as they take it for capacity; test evidence, whose requests are synthetic, stays
 fully checkable by every validator.
 
+Between the gateway and the miners, requests and answers travel over plain HTTP: a route's URL is the miner's axon
+(`http://ip:port/e/<id>`), as the protocol has it. So do the sampled exchanges to the auditor, unless `auditor_url`
+points elsewhere. The signatures keep anyone from altering them, not from reading them: whoever is on the path
+between the gateway and a miner, or the auditor, can read the users' requests and answers. When the gateway runs next
+to the auditor, set `auditor_url` to its loopback or private address (for example `http://127.0.0.1:8091`), so the
+samples never leave the host or the private network.
+
 ## Routes
 
 `GET /v1/routes` on the owner's validator: the endpoints listed in an accepted manifest now, credited in the current
@@ -142,7 +149,7 @@ credited.
    |---|---|---|
    | `listen_host`, `port` | 127.0.0.1, 8080 | where the gateway listens, behind the TLS reverse proxy |
    | `metrics_port` | - | Prometheus metrics on 127.0.0.1 |
-   | `auditor_url` | owner's axon | the owner validator's service |
+   | `auditor_url` | owner's axon | the owner validator's service; its loopback or private address when it runs next to the gateway (see privacy) |
    | `instances` | 1 | gateway processes sharing the miners' capacity |
    | `trusted_proxies` | localhost | networks whose `X-Forwarded-For` is believed |
    | `request_timeout_s`, `attempt_timeout_s`, `max_attempts` | 10, 4, 3 | the miners' deadline per request, per attempt, attempts |
@@ -219,8 +226,9 @@ upstream gateway { hash $http_authorization consistent; server 127.0.0.1:8080; s
 
 Each process then uses `1 / instances` of every endpoint's capacity, and each key's rate holds exactly (an account's
 keys may land on different processes). Restart them one at a time; with `proxy_next_upstream` as above, the proxy
-moves a stopped process's keys to the others meanwhile. A monthly quota is enforced from the database's usage plus each process's own
-counts, so it can be exceeded by what other processes served in the last few seconds.
+moves a stopped process's keys to the others meanwhile. A monthly quota is enforced from the database's usage plus
+each process's own counts; a process reads the account's month with its key, at most a minute before using it, so a
+quota can be exceeded by what other processes served in that time.
 
 ## API
 
@@ -266,7 +274,7 @@ this gateway process:
 - `availability_24h`: the share of minutes the model was not unavailable, of the minutes recorded.
 - In memory: the figures cover `since` (the process start) until now.
 
-Every response carries `X-Request-Id` (the client's, if it sent a valid one). Errors are
+Every response to `POST /v1/systemone` carries `X-Request-Id` (the client's, if it sent a valid one). Errors are
 `{"error": {"type": ..., "message": ...}}`:
 
 | Status | Type | When |
@@ -277,7 +285,7 @@ Every response carries `X-Request-Id` (the client's, if it sent a valid one). Er
 | 404 | `model_not_found` | not an active model of the catalog |
 | 413 | `too_large` | body, state, or the answers the questions would need, over the limits |
 | 429 | `rate_limited` | over the key's rate, or too many invalid keys from the address; `Retry-After` |
-| 429 | `quota_exceeded` | the month's quota is used up |
+| 429 | `quota_exceeded` | the month's quota is used up; `Retry-After` until the next month |
 | 500 | `internal` | a fault of the gateway |
 | 503 | `busy` | no capacity free for the model now; `Retry-After` |
 | 503 | `unavailable` | no miner serves the model right now, none answered in time or the miners refused the request, every miner of the model is failing (`Retry-After: 30`), or accounts cannot be checked; `Retry-After` |
