@@ -212,7 +212,7 @@ def init(argv: list[str]) -> None:
     if not models:
         raise SystemExit("no active catalog model this setup can install")
     try:
-        need = {m: plan.miner_memory(engines.parameters(models[m])) for m in models}
+        need = {m: plan.miner_memory(engines.parameters(models[m]), models[m].engine.name) for m in models}
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
     previous = {e["gpu"]: e["model"] for e in record.engines.values()}
@@ -258,11 +258,11 @@ def init(argv: list[str]) -> None:
         raise SystemExit("stopped; nothing changed")
 
     step("Engines")
-    kev = {}
+    installs = {}
     for model_id in sorted(set(chosen.values())):
         engine = engines.engine_for(home, models[model_id])
-        kev.setdefault(engine.directory, engine)
-    for engine in kev.values():
+        installs.setdefault(engine.directory, engine)
+    for engine in installs.values():
         info(f"{engine.engine.name} at {engine.engine.revision[:12]} in {engine.directory}")
         engine.install("miner")
 
@@ -306,7 +306,7 @@ def init(argv: list[str]) -> None:
     record.config = str(config_path)
     record.engines = {eid: {"gpu": g, "model": chosen[g], "port": engine_ports[eid]}
                       for g, eid in endpoint_ids.items()}
-    record.paths = sorted(str(d) for d in kev)
+    record.paths = sorted(str(d) for d in installs)
 
     if manager is None:
         record.save(home)

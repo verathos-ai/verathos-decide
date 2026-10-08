@@ -146,11 +146,11 @@ def init(argv: list[str]) -> None:
         raise SystemExit("stopped; nothing changed")
 
     step("Engines")
-    kev = {}
+    installs = {}
     for m in sorted(models):
         engine = engines.engine_for(home, models[m])
-        kev.setdefault(engine.directory, engine)
-    for engine in kev.values():
+        installs.setdefault(engine.directory, engine)
+    for engine in installs.values():
         info(f"{engine.engine.name} at {engine.engine.revision[:12]} in {engine.directory}")
         engine.install("reference")
 
@@ -187,7 +187,7 @@ def init(argv: list[str]) -> None:
 
     record.config = str(config_path)
     record.engines = {m: {"model": m, "device": placement[m], "port": ports[m]} for m in models}
-    record.paths = sorted(str(d) for d in kev)
+    record.paths = sorted(str(d) for d in installs)
 
     if manager is None:
         record.save(home)

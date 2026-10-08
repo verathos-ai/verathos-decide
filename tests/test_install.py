@@ -278,11 +278,27 @@ def test_engine_commands_pin_the_revisions_and_the_precision(tmp_path) -> None:
     assert engines.FLA_VERSION.search('x = 1\nFLA_VERSION = "0.5.2"   # pinned\n')[1] == "0.5.2"
 
 
-def test_models_on_other_engines_are_not_installed(tmp_path) -> None:
+def test_clef_models_install_verathos_engine_and_others_are_refused(tmp_path) -> None:
     clef = catalog.load().get("clef-flash")
-    assert not plan.installable(clef)
+    assert plan.installable(clef)
+    engine = engines.engine_for(tmp_path, clef)
+    assert isinstance(engine, engines.ClefEngine) and engine.directory == tmp_path / "engines" / "verathos-clef"
+    miner = engine.command("miner", clef, 8010)
+    assert miner[1:4] == ["-m", "verathos.engine", "clef"]
+    assert miner[miner.index("--revision") + 1] == clef.hf_revision
+    assert miner[-4:] == ["--device", "cuda", "--dtype", "bfloat16"]
+    assert engine.command("reference", clef, 8103)[-4:] == ["--device", "auto", "--dtype", "float32"]
+    assert engines.FLA_VERSION.search(engines.QWEN35.read_text())  # the miner environment's kernel pin
+    other = clef.model_copy(update={"engine": clef.engine.model_copy(update={"name": "other"})})
+    assert not plan.installable(other)
     with pytest.raises(plan.PlanError, match="does not install"):
-        engines.engine_for(tmp_path, clef)
+        engines.engine_for(tmp_path, other)
+
+
+def test_a_9b_clef_model_fits_a_24_gb_gpu_but_not_a_20_gb_one() -> None:
+    need = plan.miner_memory(9_400_000_000, "clef")
+    assert 20 * GiB < need < 24 * GiB
+    assert plan.miner_memory(9_400_000_000, "kev") > need
 
 
 def test_the_record_round_trips_and_defaults_to_nothing_installed(tmp_path) -> None:

@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("family", choices=FAMILIES)
     parser.add_argument("--repo", required=True, help="Hugging Face repository (catalog hf_repo)")
     parser.add_argument("--revision", required=True, help="exact commit (catalog hf_revision)")
-    parser.add_argument("--device", default="cuda", help="cuda, cuda:N or cpu")
+    parser.add_argument("--device", default="cuda", help="cuda, cuda:N, cpu, or auto (cuda when a GPU is visible)")
     parser.add_argument("--dtype", default="bfloat16", choices=("bfloat16", "float32"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8010)
@@ -33,6 +33,10 @@ def main() -> None:
 
     from verathos.engine import clef
 
+    if args.device == "auto":
+        import torch
+
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
     engine = clef.load(args.repo, args.revision, device=args.device, dtype=args.dtype)
     served = {"id": args.repo, "revision": args.revision, "device": args.device, "dtype": args.dtype}
     uvicorn.run(create_app(engine, [served]), host=args.host, port=args.port, log_level="info")

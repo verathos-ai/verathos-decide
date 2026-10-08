@@ -12,17 +12,22 @@ from verathos.install.host import GiB, Gpu
 # float32 weights plus the activations of a request, and on a GPU its CUDA graphs and state cache too.
 MINER_WEIGHTS_FACTOR = 1.25
 MINER_FIXED = 4 * GiB
+# The Clef engine references the bfloat16 weights without copies and its CUDA graphs share one pool: 9.4B parameters
+# peaked at 19.5 GB on an A100.
+CLEF_MINER_FIXED = 3 * GiB
 REFERENCE_WEIGHTS_FACTOR = 1.1
 REFERENCE_FIXED = {"cpu": 2 * GiB, "gpu": 8 * GiB}
-INSTALLABLE_ENGINES = ("kev",)
+INSTALLABLE_ENGINES = ("kev", "clef")
 
 
 class PlanError(ValueError):
     pass
 
 
-def miner_memory(parameters: int) -> int:
-    """GPU memory an engine needs to serve a model of ``parameters`` in bfloat16."""
+def miner_memory(parameters: int, engine: str = "kev") -> int:
+    """GPU memory the ``engine`` family needs to serve a model of ``parameters`` in bfloat16."""
+    if engine == "clef":
+        return parameters * 2 + CLEF_MINER_FIXED
     return int(parameters * 2 * MINER_WEIGHTS_FACTOR) + MINER_FIXED
 
 

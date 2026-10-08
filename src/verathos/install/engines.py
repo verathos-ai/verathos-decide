@@ -1,11 +1,17 @@
 """Engines and weights: the engine a catalog model names, at its pinned revision, the pinned weights, and the
 command that serves the model.
 
-The Kev engine is installed from its source repository at ``engine.revision`` with ``uv sync``, in one environment
-per purpose: miners serve bfloat16 with the fused kernels (``flash-linear-attention`` at the version the engine
-pins), references compute float32 without them. Weights are the catalog's ``hf_repo`` at ``hf_revision`` and, for
-an adapter, ``base_repo`` at ``base_revision``, kept in the setup's Hugging Face cache; the engine then runs offline,
-so it serves exactly the pinned revisions.
+Each engine family is a class with the same interface (``install``, ``python``, ``command``,
+``environment_variables``), chosen by the catalog's ``engine.name`` in ``engine_for``; a new family is one more class
+there and in ``plan.INSTALLABLE_ENGINES``. Each installs one environment per purpose: miners serve bfloat16 on the
+GPU, references compute float32.
+- ``kev``: the Kev engine from its source repository at ``engine.revision`` (``uv sync``); miners add the fused
+  kernels (``flash-linear-attention`` at the version the engine pins), references run without them.
+- ``clef``: ``verathos-engine`` from this release's code with the ``clef`` extra, which runs the inference code the
+  model repository ships at ``hf_revision``; miners add ``flash-linear-attention`` at the version the fast path pins
+  (``verathos.engine.qwen35.FLA_VERSION``), references run the release's own code without it.
+Weights are the catalog's ``hf_repo`` at ``hf_revision`` and, for an adapter, ``base_repo`` at ``base_revision``, kept
+in the setup's Hugging Face cache; the engine then runs offline, so it serves exactly the pinned revisions.
 """
 
 from __future__ import annotations
@@ -119,11 +125,62 @@ class KevEngine:
         return env
 
 
-def engine_for(home: Path, model: catalog.CatalogModel) -> KevEngine:
-    if model.engine.name != "kev":
+CODE = Path(__file__).resolve().parents[3]  # the checkout this release runs from (holds pyproject.toml)
+QWEN35 = CODE / "src" / "verathos" / "engine" / "qwen35.py"
+
+
+class ClefEngine:
+    """``verathos-engine clef`` from this release's code, under ``<home>/engines/verathos-clef``. Its source is this
+    release, so the directory is shared by every Clef model and follows the code when it is updated."""
+
+    def __init__(self, home: Path, engine: catalog.Engine) -> None:
+        self.engine = engine
+        self.directory = home / "engines" / "verathos-clef"
+
+    def environment(self, purpose: str) -> Path:
+        return self.directory / (".venv" if purpose == "miner" else ".venv-reference")
+
+    def python(self, purpose: str) -> Path:
+        return self.environment(purpose) / "bin" / "python"
+
+    def install(self, purpose: str) -> None:
+        """An environment for ``purpose`` ("miner" or "reference") with this release installed with the clef extra."""
+        if not (CODE / "pyproject.toml").exists():
+            raise SystemExit(f"the release's code is not at {CODE}; reinstall it with scripts/install.sh")
+        self.directory.mkdir(parents=True, exist_ok=True)
+        if not self.python(purpose).exists():
+            run([uv(), "venv", "--quiet", "-p", PYTHON, str(self.environment(purpose))])
+        run([uv(), "pip", "install", "--quiet", "--python", str(self.python(purpose)), "-e", f"{CODE}[clef]"])
+        if purpose == "miner":
+            pin = FLA_VERSION.search(QWEN35.read_text(errors="replace"))
+            if pin is None:
+                raise SystemExit(f"{QWEN35} names no FLA_VERSION")
+            run([uv(), "pip", "install", "--quiet", "--python", str(self.python(purpose)),
+                 f"flash-linear-attention=={pin[1]}"])
+
+    def command(self, purpose: str, model: catalog.CatalogModel, port: int) -> list[str]:
+        # the reference's device is its CUDA_VISIBLE_DEVICES (environment_variables): a GPU when one is visible
+        device = ["--device", "cuda", "--dtype", "bfloat16"] if purpose == "miner" else \
+            ["--device", "auto", "--dtype", "float32"]
+        return [str(self.python(purpose)), "-m", "verathos.engine", "clef", "--repo", model.hf_repo,
+                "--revision", model.hf_revision, "--host", "127.0.0.1", "--port", str(port), *device]
+
+    @staticmethod
+    def environment_variables(purpose: str, device: str, hf_home: Path) -> dict[str, str]:
+        """``device``: "cpu" or "cuda:<index>" (nvidia-smi's numbering)."""
+        return {"HF_HOME": str(hf_home), "HF_HUB_OFFLINE": "1", "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+                "CUDA_VISIBLE_DEVICES": "" if device == "cpu" else device.split(":", 1)[1]}
+
+
+ENGINES = {"kev": KevEngine, "clef": ClefEngine}
+
+
+def engine_for(home: Path, model: catalog.CatalogModel) -> KevEngine | ClefEngine:
+    family = ENGINES.get(model.engine.name)
+    if family is None:
         raise PlanError(f"{model.model_id} runs on the {model.engine.name} engine, which this release does not "
                         "install; set it up by hand (docs/MINING.md, docs/VALIDATING.md)")
-    return KevEngine(home, model.engine)
+    return family(home, model.engine)
 
 
 def download(python: Path, model: catalog.CatalogModel, hf_home: Path) -> None:

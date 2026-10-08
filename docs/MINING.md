@@ -67,9 +67,9 @@ What it does:
 2. puts the code in `~/verathos` with its Python environment, and `verathos-miner` and `verathos-validator` on the
    `PATH`;
 3. checks the hotkey, its registration, the subnet's catalog and the GPUs;
-4. installs the Kev engine at the catalog's `engine.revision` and downloads the weights at `hf_revision` (and the
-   base model at `base_revision`). The engines run offline from that copy, so they serve exactly the pinned
-   revisions;
+4. installs each chosen model's engine (the Kev engine at the catalog's `engine.revision` for Kev models,
+   `verathos-engine` from this code for Clef models) and downloads the weights at `hf_revision` (and the base model
+   at `base_revision`). The engines run offline from that copy, so they serve exactly the pinned revisions;
 5. writes the configuration, `~/.verathos/miner.json` ([4. Configure](#4-configure));
 6. starts one engine per GPU (`verathos-engine-gpu0`, ...) on `127.0.0.1` and the miner (`verathos-miner`) as
    services, waits for the engines to load, and shows the capacity measurement (a few minutes) until the miner
@@ -80,7 +80,7 @@ What it does:
 | `~/verathos` | code and its Python environment |
 | `~/.verathos/miner.json` | configuration |
 | `~/.verathos/miner/` | capacity measurements and the caps tests set on them, the last published manifest and the endpoints this machine serves |
-| `~/.verathos/engines/`, `~/.verathos/hf/` | engines (one per pinned revision) and model weights |
+| `~/.verathos/engines/`, `~/.verathos/hf/` | engines (one per pinned Kev revision, one for Clef) and model weights |
 | `/etc/systemd/system/verathos-*.service` | services; in a container `/etc/supervisor/conf.d/verathos-*.conf`, with logs in `/var/log/verathos/` |
 
 ### Check that it works
@@ -233,13 +233,20 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m kev.serve --run models/kev-4b --port 
 
 Keep each engine on its own GPU and bind it to localhost.
 
-Clef models run on `verathos-engine`, which loads the inference code shipped in the model repository at the pinned
-revision. Install it in its own environment:
+Clef models run on `verathos-engine`, which loads the encoding and the head from the inference code shipped in the
+model repository at the pinned revision. On a GPU in bfloat16 it batches the requests that arrive together and runs
+the Qwen3.5 backbone on fused kernels, with CUDA graphs for small passes; it needs a GPU with at least 24 GB (about
+20 GB in use for Clef-flash) and takes about half a minute after loading to capture its graphs. Install it in its
+own environment with the kernels at the version the engine pins:
 
 ```bash
 uv venv -p 3.12 /opt/clef && VIRTUAL_ENV=/opt/clef uv pip install -e ".[clef]"
+VIRTUAL_ENV=/opt/clef uv pip install "flash-linear-attention==$(sed -n 's/^FLA_VERSION = "\(.*\)".*/\1/p' src/verathos/engine/qwen35.py)"
 CUDA_VISIBLE_DEVICES=2 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8010
 ```
+
+Clef-flash on one GPU, 525-token requests with five questions: about 69 requests per second on an H100 and 25 on
+an A100 (20 ms and 58 ms for a single request).
 
 ### 4. Configure
 

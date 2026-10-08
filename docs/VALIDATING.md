@@ -75,10 +75,12 @@ What it does:
    |---|---|---|
    | Kev-4B | about 21 GiB | about 27 GiB |
    | Kev-9B | about 42 GiB | about 48 GiB |
+   | Clef-flash | about 41 GiB | about 47 GiB |
 
-5. installs the Kev engine at `engine.revision`, without the fused kernels (they change float32 results), and
-   downloads the weights at `hf_revision` and the base model at `base_revision`; the references run offline from
-   that copy;
+5. installs each model's engine without the fused kernels (they change float32 results): the Kev engine at
+   `engine.revision` for Kev models, `verathos-engine` from this code for Clef models, which runs the model
+   repository's own inference code; then downloads the weights at `hf_revision` and the base model at
+   `base_revision`; the references run offline from that copy;
 6. writes `~/.verathos/validator.json` ([3. Configure](#3-configure)) with the `references` and `state_dir`
    (`~/.verathos/validator`: the canary secret, the score history and the last status; keep it);
 7. starts the references (`verathos-reference-kev-4b`, ...) on `127.0.0.1` and the validator
@@ -174,7 +176,8 @@ CUDA_VISIBLE_DEVICES="" KEV_DTYPE=fp32 .venv/bin/python -m kev.serve --run model
 ```
 
 Run them on CPU without `flash-linear-attention` installed.
-Clef models use `verathos-engine` in float32 (see `MINING.md` for the install). `clef-flash` is a `candidate`:
+Clef models use `verathos-engine` in float32, which runs the model repository's own inference code one request at a
+time; install it as for miners (`MINING.md`) but without `flash-linear-attention`. `clef-flash` is a `candidate`:
 its endpoints are checked but not scored, which lets the network measure it before the owner activates it; it
 needs about 36 GB of RAM in fp32.
 
