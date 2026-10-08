@@ -183,7 +183,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                                     mechid=cfg.mechid, pool_size=sc.canary_pool_size,
                                     per_endpoint=sc.canaries_per_endpoint,
                                     budget_s=blocks_left * BLOCK_TIME_S * sc.canary_spread_fraction,
-                                    holding=throughput.holding)
+                                    holding=throughput.holding, request_timeout_s=policy.request_timeout_s)
         verdicts = None if policy.mode == "observe" else await throughput.verdicts(client, epoch)
         evidence = []
         if verdicts is not None:

@@ -147,6 +147,48 @@ def test_epoch_scores_honest_and_zeroes_cheater() -> None:
     assert state.probation[f"{cheat_kp.ss58_address}/gpu0"] == 4
 
 
+def test_a_bound_canary_receipt_proves_control_and_a_canary_counts_only_within_the_request_timeout() -> None:
+    """A lost identity challenge does not zero an endpoint whose canary receipts bind it to its hotkey; a miner
+    holding canaries cannot stretch the epoch: one unanswered within request_timeout_s counts as unanswered."""
+
+    class Slow(MockEngine):
+        async def answer(self, request):
+            await asyncio.sleep(0.5)
+            return await super().answer(request)
+
+    validator = kp()
+    keys = {"lost": kp(), "slow": kp()}
+    apps, neurons = {}, []
+    for uid, (host, name, engine) in enumerate((("10.0.2.1", "lost", MockEngine("kev-4b")),
+                                                ("10.0.2.2", "slow", Slow("kev-4b")))):
+        apps[host], commit = miner(host, keys[name], validator, engine)
+        neurons.append(Neuron(uid, keys[name].ss58_address, host, 80, commit))
+
+    class IdentityLost(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.inner = HostRouter(apps)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/v1/identity"):
+                return httpx.Response(504)
+            return await self.inner.handle_async_request(request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=IdentityLost()) as client:
+            endpoints = [e for m in await discover(neurons, 405, 1, client, {catalog.load().digest()})
+                         for e in m.endpoints()]
+            return await audit_epoch(endpoints, epoch=1, secret=b"k" * 32, keypair=validator,
+                                     references={"kev-4b": MockEngine("kev-4b")},
+                                     tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client,
+                                     netuid=405, mechid=1, pool_size=4, per_endpoint=2, request_timeout_s=0.2)
+
+    results = asyncio.run(run())
+    lost, slow = (results[f"{keys[n].ss58_address}/gpu0"] for n in ("lost", "slow"))
+    assert lost.identity_ok and lost.answered == lost.sent == 2
+    assert not slow.identity_ok and (slow.sent, slow.answered) == (2, 0)
+    assert slow.errors == ["request failed: TimeoutError"] * 2
+
+
 def test_weights_ignore_reassigned_uids() -> None:
     state = ScoreState(ema={"hkA/gpu0": 0.5, "hkB/gpu0": 0.5}, uid_of={"hkA/gpu0": 1, "hkB/gpu0": 2})
     assert weights(state, {1: "hkA", 2: "someone-else"}) == {1: pytest.approx(1.0)}

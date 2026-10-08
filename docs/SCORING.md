@@ -29,9 +29,9 @@ endpoints are not audited that epoch and keep their score, for at most 3 epochs 
 
 Every request is signed by the validator and bound to the miner and a nonce. Every answer comes with a receipt
 signed by the miner hotkey that binds the request, the answers, the endpoint, the model, the caller, the nonce, the
-netuid and the mechanism. A request the endpoint declines (error status or timeout) counts as unanswered. A reply
-without a valid receipt, or whose answers are malformed (a probability that is not a number in [0, 1]), fails the
-request as a hard failure.
+netuid and the mechanism. A request the endpoint declines (an error status, or no answer within the audit policy's
+`request_timeout_s`, 10 s) counts as unanswered. A reply without a valid receipt, or whose answers are malformed (a
+probability that is not a number in [0, 1]), fails the request as a hard failure.
 
 ## Comparison
 
@@ -54,8 +54,8 @@ Per endpoint and epoch:
 - zero, with probation for every endpoint of the hotkey and their averages reset to zero, if a request failed the
   hard check, the statistical check failed, or the throughput auditor proved a wrong answer the hotkey signed in a
   test or to the subnet's gateway (see `THROUGHPUT_AUDIT.md`);
-- zero if the endpoint failed the identity challenge, answered nothing, or has not yet proven capacity in a
-  throughput test;
+- zero if the endpoint proved control neither by the identity challenge nor by a canary receipt that binds it,
+  answered nothing, or has not yet proven capacity in a throughput test;
 - otherwise its share of its model's pool (see Models): the model's emission share, split among the model's scored
   endpoints in proportion to `proven capacity x answered / sent x availability to users x latency factor`. The
   proven capacity is the auditor's credit in requests/s of the model's standard mix, at most what the endpoint
