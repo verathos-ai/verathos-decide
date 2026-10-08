@@ -15,10 +15,11 @@ proves, so hardware pays by its throughput per cost.
   drivers for GPU engines).
 - One GPU per endpoint. Any GPU that runs the model's engine works; a GPU shared by several endpoints is credited
   once, split between them.
-- A public IP address and one open TCP port for the miner service. Validators and the auditor reach endpoints only
-  at the axon's IP and port, so the miner service must be reachable there directly (plain HTTP; requests and
-  receipts are signed). A test sends every endpoint its declared rate for about 20 s: the connection must carry it.
-- A hotkey registered on the subnet; the miner machine needs the hotkey and `coldkeypub.txt`, never the coldkey.
+- A public IP address and one open TCP port for the miner service, on every machine. Validators, the auditor and
+  the gateways reach each endpoint directly at its machine's IP and port, so the miner service must be reachable
+  there (plain HTTP; requests and receipts are signed). A test sends every endpoint its declared rate for about
+  20 s: each machine's connection must carry its own endpoints' rates.
+- A hotkey registered on the subnet; every miner machine needs the hotkey and `coldkeypub.txt`, never the coldkey.
 
 ## Quick start (one command)
 
@@ -76,7 +77,7 @@ What it does:
 |---|---|
 | `~/verathos` | code and its Python environment |
 | `~/.verathos/miner.json` | configuration |
-| `~/.verathos/miner/` | capacity measurements and the last published manifest |
+| `~/.verathos/miner/` | capacity measurements, the last published manifest and the endpoints this machine serves |
 | `~/.verathos/engines/`, `~/.verathos/hf/` | engines (one per pinned revision) and model weights |
 | `/etc/systemd/system/verathos-*.service` | services; in a container `/etc/supervisor/conf.d/verathos-*.conf`, with logs in `/var/log/verathos/` |
 
@@ -217,7 +218,9 @@ CUDA_VISIBLE_DEVICES=2 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --rev
 | Field | Meaning |
 |---|---|
 | `network` | `finney`, `test`, or a subtensor websocket URL |
-| `public_host`, `port` | the public IP address and port validators reach the miner at (the axon); the miner listens on `listen_host` (default `0.0.0.0`) at `port` |
+| `public_host`, `port` | the public IP address and port validators reach this machine's endpoints at (on the primary also the axon); the miner listens on `listen_host` (default `0.0.0.0`) at `port` |
+| `role` | `primary` (default): publishes the hotkey's manifest; `worker`: serves its endpoints for a primary and writes nothing on chain ([One hotkey, several GPUs and machines](#one-hotkey-several-gpus-and-machines)) |
+| `peers` | primary only: the workers' `ip:port`, whose endpoints the manifest lists |
 | `endpoint_id` | 1-32 characters of `a-z`, `0-9`, `-`; unique per miner |
 | `model_id` | a catalog model |
 | `engine_url`, `engine_api_key` | the endpoint's engine and its bearer token, if it needs one |
@@ -242,9 +245,10 @@ On start the miner:
    few minutes; see `THROUGHPUT_AUDIT.md`), or reuses the stored measurements if nothing they depend on changed.
    Meanwhile it serves the manifest it last published. An endpoint that cannot be measured is withdrawn, and the
    miner stops only if none is left;
-4. signs a manifest listing its endpoints and their declared capacity, points its axon at `public_host:port`
-   (`serve_axon`) and commits the manifest digest (`set_commitment`); both are free and only sent when they change,
-   so a restart with the same configuration and measurements writes nothing;
+4. signs a manifest listing its endpoints and their declared capacity (on a primary with `peers`, the workers' too),
+   points its axon at `public_host:port` (`serve_axon`) and commits the manifest digest (`set_commitment`); both are
+   free and only sent when they change, so a restart with the same configuration and measurements writes nothing. A
+   worker signs only its own endpoints and serves them to its primary at `GET /v1/endpoints`;
 5. checks the owner's commitment and its engines every minute; when the owner commits a new catalog it re-signs
    and re-publishes the manifest by itself, withdrawing endpoints whose model was retired and measuring again if the
    catalog changed what a measurement depends on (a model's request mix or `max_latency_s`); when an engine changed

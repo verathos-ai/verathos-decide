@@ -1,12 +1,14 @@
-"""Miner HTTP service: one public port (the axon) for the manifest and every endpoint.
+"""Miner HTTP service: one public port per machine for its endpoints, and on the primary (the axon) the manifest.
 
-    GET  /v1/manifest                      signed manifest (public)
+    GET  /v1/manifest                      the hotkey's signed manifest (public; the primary only)
+    GET  /v1/endpoints                     this machine's endpoints as the manifest lists them, signed (public)
     POST /e/{endpoint_id}/v1/systemone     signed caller request, or auditor test traffic -> answers + signed receipt
     POST /e/{endpoint_id}/v1/identity      signed caller challenge -> hotkey signature proving endpoint control
     GET  /health
 
-Test traffic carries the auditor's session for this endpoint and test instead of a per-request signature (see
-``throughput.policy``); its receipts name the auditor as caller and the request id as nonce.
+Every machine of a hotkey runs this service with the same callers: validators with a permit, gateways, the auditor's
+test sessions. Test traffic carries the auditor's session for this endpoint and test instead of a per-request
+signature (see ``throughput.policy``); its receipts name the auditor as caller and the request id as nonce.
 
 Callers other than gateways (validators) need only their canaries: one request at once per endpoint, at most the size
 of the model's largest standard request (``caller_request_bytes``), and while test traffic arrives their requests wait
@@ -34,7 +36,7 @@ from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
 from verathos.protocol.api import STATE_CHARS_PER_TOKEN, SystemOneRequest, known_fields, prompt_chars, well_formed
 from verathos.protocol.canonical import canonical_json, digest
-from verathos.protocol.manifest import SignedManifest
+from verathos.protocol.manifest import ENDPOINTS_PATH, SignedHostEndpoints, SignedManifest
 from verathos.protocol.receipts import Receipt, SignedReceipt
 from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, verify_request
 from verathos.throughput.policy import HDR_SESSION, SessionGate
@@ -73,10 +75,11 @@ def create_app(
     *,
     config: MinerConfig,
     keypair: Keypair,
-    manifest: Callable[[], SignedManifest],
+    manifest: Callable[[], SignedManifest | None],
     engines: dict[str, Engine],
     authorized: Callable[[str], bool],
     auditors: Callable[[], Collection[str]],
+    host_endpoints: Callable[[], SignedHostEndpoints | None] = lambda: None,
     admissions: dict[str, Admission] | None = None,
     serving: Callable[[], Collection[str]] | None = None,
     max_state_tokens: Callable[[str], int | None] = lambda model_id: None,
@@ -84,14 +87,17 @@ def create_app(
     on_test_traffic: Callable[[], None] = lambda: None,
     testing: Callable[[], bool] = lambda: False,
     gateways: Callable[[], Collection[str]] | None = None,
+    catalog_digest: Callable[[], str] | None = None,
 ) -> FastAPI:
-    """``auditors`` gives the hotkeys whose test sessions are accepted (besides the miner's own, for its
-    measurement), and ``on_test_traffic`` is called for each of their requests; ``testing`` whether their traffic
-    arrives now; ``admissions`` the engine admission per endpoint (default: ``max_concurrency`` slots); ``serving``
-    the endpoints answered (default: those the manifest lists); ``max_state_tokens`` a model's limit
-    (``api.prompt_chars``); ``max_caller_request`` the largest request of a model callers other than gateways may send
-    (``caller_request_bytes``); ``gateways`` the callers exempt from the per-caller limits (default: the configured
-    ``gateway_hotkeys``)."""
+    """``manifest`` gives the hotkey's manifest this machine serves (None on a worker), ``host_endpoints`` this
+    machine's own endpoints document (None until there is one). ``auditors`` gives the hotkeys whose test sessions are
+    accepted (besides the miner's own, for its measurement), and ``on_test_traffic`` is called for each of their
+    requests; ``testing`` whether their traffic arrives now; ``admissions`` the engine admission per endpoint
+    (default: ``max_concurrency`` slots); ``serving`` the endpoints answered (default: those the manifest lists);
+    ``max_state_tokens`` a model's limit (``api.prompt_chars``); ``max_caller_request`` the largest request of a model
+    callers other than gateways may send (``caller_request_bytes``); ``gateways`` the callers exempt from the
+    per-caller limits (default: the configured ``gateway_hotkeys``); ``catalog_digest`` the catalog receipts name
+    (default: the manifest's)."""
     app = FastAPI(title="Verathos miner")
     nonces = NonceCache()
     endpoints = {e.endpoint_id: e for e in config.endpoints}
@@ -99,6 +105,7 @@ def create_app(
     hotkey = keypair.ss58_address
     sessions = SessionGate(config.netuid, hotkey)
     gateways = gateways or (lambda: config.gateway_hotkeys)
+    catalog_digest = catalog_digest or (lambda: manifest().manifest.catalog_digest)
     in_flight: dict[tuple[str, str], int] = {}  # (caller, endpoint) -> requests, for callers other than gateways
 
     def error(status: int, message: str) -> JSONResponse:
@@ -160,8 +167,18 @@ def create_app(
         return {"hotkey": hotkey, "endpoints": list(endpoints)}
 
     @app.get("/v1/manifest")
-    async def get_manifest() -> dict[str, Any]:
-        return manifest().model_dump(mode="json")
+    async def get_manifest():
+        signed = manifest()
+        if signed is None:
+            return error(404, f"this machine serves its endpoints for the hotkey's primary: {ENDPOINTS_PATH}")
+        return signed.model_dump(mode="json")
+
+    @app.get(ENDPOINTS_PATH)
+    async def get_endpoints():
+        signed = host_endpoints()
+        if signed is None:
+            return error(404, "no endpoint measured yet")
+        return signed.model_dump(mode="json")
 
     @app.post("/e/{endpoint_id}/v1/identity")
     async def identity(endpoint_id: str, request: Request):
@@ -236,7 +253,7 @@ def create_app(
             return error(502, "engine returned malformed answers")
         receipt = Receipt(
             netuid=config.netuid, mechid=config.mechid, miner_hotkey=hotkey, endpoint_id=endpoint_id,
-            model_id=endpoint.model_id, catalog_digest=manifest().manifest.catalog_digest, caller_hotkey=caller.hotkey,
+            model_id=endpoint.model_id, catalog_digest=catalog_digest(), caller_hotkey=caller.hotkey,
             request_nonce=caller.nonce, request_sha256=digest(raw), answers_sha256=digest(answers),
             received_ms=received_ms, responded_ms=int(time.time() * 1000),
             input_tokens=int((response.get("usage") or {}).get("input_tokens", 0)),

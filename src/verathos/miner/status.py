@@ -1,7 +1,8 @@
 """The miner's own standing, read from the throughput auditor's status page and written to the log.
 
-Once per epoch the log gets one line per endpoint (scored, qualifying, failed, ...), and one line for every
-throughput test of this hotkey once its outcome is final.
+Once per epoch the log gets one line per endpoint this machine serves (scored, qualifying, failed, ...), and one line
+for every throughput test of those endpoints once its outcome is final. The status page itself lists every endpoint
+of the hotkey, on all its machines.
 """
 
 from __future__ import annotations
@@ -95,7 +96,7 @@ class StatusWatcher:
             log.info(line)
 
     def lines(self, status: HotkeyStatus) -> list[str]:
-        out = []
+        out, listed = [], self.listed()
         if status.epoch is not None and status.epoch != self._epoch:
             self._epoch = status.epoch
             out.append(f"validator's epoch {status.epoch}:")
@@ -104,15 +105,16 @@ class StatusWatcher:
                                                               sorted(status.model_shares.items())))
             seen = set()
             for e in status.endpoints:
-                seen.add(e.endpoint_id)
-                out.append("  " + describe_endpoint(e))
-            for endpoint_id in self.listed():
+                if e.endpoint_id in listed:
+                    seen.add(e.endpoint_id)
+                    out.append("  " + describe_endpoint(e))
+            for endpoint_id in listed:
                 if endpoint_id not in seen:
                     out.append(f"  {endpoint_id}: not in that epoch (manifest not accepted yet, or published after "
                                "the epoch started)")
         for t in sorted(status.tests, key=lambda t: (t.epoch, t.endpoint_id)):
             key = (t.epoch, t.endpoint_id)
-            if key not in self._tests_logged and t.state in FINAL_STATES:
+            if t.endpoint_id in listed and key not in self._tests_logged and t.state in FINAL_STATES:
                 self._tests_logged.add(key)
                 out.append(describe_test(t))
         return out

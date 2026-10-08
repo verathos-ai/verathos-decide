@@ -6,24 +6,29 @@ Miners and the model catalog are discovered from native chain state only. No EVM
                          SUBSTRATE (SN96)
   ┌──────────────────────────────────────────────────────────────────┐
   │  owner hotkey (UID 0)                                            │
-  │    commitment: "verathos/catalog/v1 sha256:<catalog digest>"       │
+  │    commitment: "verathos/catalog/v1 sha256:<catalog digest>"     │
   │                                                                  │
   │  miner hotkey (any UID)                                          │
-  │    axon:       ip:port of the miner's manifest server            │
-  │    commitment: "verathos/manifest/v1 sha256:<manifest digest>"     │
+  │    axon:       ip:port of the miner's primary machine            │
+  │    commitment: "verathos/manifest/v1 sha256:<manifest digest>"   │
   └──────────────────────────────────────────────────────────────────┘
           ▲ serve_axon / set_commitment              │ read axons + commitments
-          │ (free, hotkey-signed)                    ▼
+          │ (free, hotkey-signed, primary only)      ▼
   ┌──────────────────────────┐   GET /v1/manifest   ┌───────────────────────────┐
-  │ MINER                    │ ◄────────────────────│ VALIDATOR / GATEWAY       │
-  │  manifest server (axon)  │                      │  1. hotkeys with manifest │
-  │  signed manifest:        │                      │     commitment            │
-  │   endpoint gpu0 kev-4b   │                      │  2. fetch manifest        │
-  │   endpoint gpu1 kev-9b   │                      │  3. signature == hotkey   │
-  │   ...                    │   requests, audits   │  4. digest == commitment  │
-  │  decision engines        │ ◄────────────────────│  5. catalog digest ==     │
-  └──────────────────────────┘                      │     owner commitment      │
-                                                    └───────────────────────────┘
+  │ MINER primary (axon)     │ ◄────────────────────│ VALIDATOR / GATEWAY       │
+  │  signed manifest:        │                      │  1. hotkeys with manifest │
+  │   gpu0 kev-4b, here      │                      │     commitment            │
+  │   w1-gpu0 kev-9b, worker │                      │  2. fetch manifest        │
+  │  decision engines        │  identity, canaries, │  3. signature == hotkey   │
+  │                          │ ◄────────────────────│  4. digest == commitment  │
+  └────────────┬─────────────┘  tests, requests     │  5. catalog digest ==     │
+               │ GET /v1/endpoints, every minute    │     owner commitment      │
+               ▼                                    │  6. each endpoint signs a │
+  ┌──────────────────────────┐  identity, canaries, │     challenge at its URL  │
+  │ MINER worker, same hotkey│ ◄────────────────────│     before any traffic    │
+  │  no chain writes         │  tests, requests     └───────────────────────────┘
+  │  decision engines        │
+  └──────────────────────────┘
 ```
 
 Rules:

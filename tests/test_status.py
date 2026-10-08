@@ -90,6 +90,16 @@ def test_miner_logs_each_epoch_once_and_each_final_test_once() -> None:
     assert watcher.lines(doc) == []  # nothing new; the unconfirmed test is not final yet
 
 
+def test_each_machine_logs_the_endpoints_it_serves() -> None:
+    """The hotkey's status lists the endpoints of all its machines; each machine logs its own."""
+    doc = HotkeyStatus(hotkey="hkA", epoch=13, epoch_blocks=180, endpoints=[
+        {"endpoint_id": e, "model_id": "kev-4b", "state": "qualifying"} for e in ("gpu0", "w1-gpu0")],
+        tests=[{"endpoint_id": e, "epoch": 12, "start_block": 2200, "state": "confirmed", "outcome": "passed"}
+               for e in ("gpu0", "w1-gpu0")])
+    lines = StatusWatcher(hotkey="hkA", auditor_url=lambda: None, listed=lambda: ["w1-gpu0"]).lines(doc)
+    assert len(lines) == 3 and lines[1].startswith("  w1-gpu0 (kev-4b): qualifying") and "w1-gpu0: passed" in lines[2]
+
+
 def test_test_lines_name_the_reason() -> None:
     partial = ThroughputOutcome(endpoint_id="gpu1", epoch=7, start_block=1300, state="confirmed", outcome="partial",
                           reason="delivered 21.0 of 40.0 requests/s", tested_rps=40.0, delivered_rps=21.0,

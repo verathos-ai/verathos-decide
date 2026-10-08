@@ -1,10 +1,12 @@
-"""Run a miner: ``verathos-miner --config miner.json``.
+"""Run a miner: ``verathos-miner --config miner.json``, on every machine of a hotkey.
 
 The miner starts its service, measures the capacity of its endpoints through it with each model's standard request
-mix (all endpoints at once), declares it in its manifest, and publishes. Measurements are stored and reused until an
-endpoint's engine, configuration, model revision or request mix changes, or ``--remeasure`` is given. An endpoint that
-cannot be measured is withdrawn; the others are served. Until the first measurement is done, the service serves the
-manifest the miner last published.
+mix (all endpoints at once), and declares it. Measurements are stored and reused until an endpoint's engine,
+configuration, model revision or request mix changes, or ``--remeasure`` is given. An endpoint that cannot be measured
+is withdrawn; the others are served. The primary (``role``) signs the hotkey's manifest, its own endpoints and its
+peers' (``miner.peers``), and publishes it; a worker serves its endpoints and what it declares
+(``GET /v1/endpoints``) and publishes nothing. Until the first measurement is done, a machine serves what it last
+served.
 """
 
 from __future__ import annotations
@@ -23,16 +25,25 @@ from pathlib import Path
 import bittensor as bt
 import httpx
 import uvicorn
+from fastapi import FastAPI
 
 from verathos import catalog
 from verathos.miner.admission import Admission
 from verathos.miner.app import caller_request_bytes, create_app
-from verathos.miner.chain import PermitAuthorizer, build_manifest, publish
+from verathos.miner.chain import PermitAuthorizer, build_host_endpoints, build_manifest, own_endpoints, publish
 from verathos.miner.config import EndpointConfig, MinerConfig
-from verathos.miner.engine import HttpEngine
+from verathos.miner.engine import Engine, HttpEngine
+from verathos.miner.peers import Peers, merged
 from verathos.miner.status import StatusWatcher
 from verathos.protocol.http import raise_open_file_limit
-from verathos.protocol.manifest import SignedManifest, axon_base, is_public
+from verathos.protocol.manifest import (
+    ENDPOINTS_PATH,
+    SignedHostEndpoints,
+    SignedManifest,
+    axon_base,
+    endpoint_host,
+    is_public,
+)
 from verathos.subnet.chain import committed_catalog, current_catalog
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.measure import (
@@ -47,7 +58,7 @@ from verathos.throughput.measure import (
     stored,
     wait_ready,
 )
-from verathos.throughput.policy import POLICY_WATCH_S
+from verathos.throughput.policy import BLOCK_TIME_S, POLICY_WATCH_S
 
 log = logging.getLogger("verathos.miner")
 LOCAL_HOSTS = {"0.0.0.0": "127.0.0.1", "": "127.0.0.1", "::": "::1"}
@@ -87,33 +98,49 @@ async def engine_fingerprint(e: EndpointConfig, cat: catalog.Catalog) -> str:
 
 
 class Publisher:
-    """The current signed manifest: the endpoints whose capacity is measured, rebuilt when the subnet owner commits a
-    new catalog or an engine changes, and published on chain."""
+    """What this machine serves: its endpoints whose capacity is measured, and on the primary the hotkey's manifest,
+    which lists them and the peers' (``miner.peers``). Rebuilt when the subnet owner commits a new catalog, an engine
+    changes or a peer's endpoints change; the manifest is published on chain."""
 
     def __init__(self, config: MinerConfig, wallet: bt.Wallet, cat: catalog.Catalog, *, publish_on_chain: bool,
                  subtensor: bt.Subtensor) -> None:
-        self.config, self.wallet, self.publish_on_chain = config, wallet, publish_on_chain
+        self.config, self.wallet = config, wallet
+        self.publish_on_chain = publish_on_chain and config.role == "primary"
         self.store = MeasurementStore(config.state_dir / "capacity.json")
-        self.manifest_path = config.state_dir.expanduser() / "manifest.json"
+        state = config.state_dir.expanduser()
+        self.manifest_path, self.endpoints_path = state / "manifest.json", state / "endpoints.json"
         self.admissions = {e.endpoint_id: Admission(e.max_concurrency) for e in config.endpoints}
         endpoints = servable(config, cat)
         if not endpoints:
             raise SystemExit(f"no configured endpoint serves a model of catalog {cat.digest()[:12]}")
         self.catalog = cat
-        # Until the first measurement: the manifest last published (so validators find the miner as committed), or
-        # an unpublished one, so the service can be measured through.
-        self.signed = self._last_published() or build_manifest(
-            config, endpoints, dict.fromkeys((e.endpoint_id for e in endpoints), 0.0), wallet.hotkey, cat.digest())
+        # Until the first measurement: what this machine last served (so validators find the miner as committed and a
+        # primary keeps a worker's endpoints), or an unpublished manifest, so the service can be measured through.
+        self.local = self._last_served()
+        self.peers: Peers | None = None
+        self.signed: SignedManifest | None = None
+        if config.role == "primary":
+            self.peers = Peers(config.peers, hotkey=wallet.hotkey.ss58_address, netuid=config.netuid,
+                               mechid=config.mechid)
+            self.signed = self._last_published() or build_manifest(
+                config, own_endpoints(config, endpoints, dict.fromkeys((e.endpoint_id for e in endpoints), 0.0)),
+                wallet.hotkey, cat.digest())
+            self.peers.seed(self.signed.manifest)
         self.serving = {e.endpoint_id for e in endpoints}
         self.auditor = subtensor.get_subnet_owner_hotkey(config.netuid)  # the subnet owner's validator runs tests
         self.test_seen = float("-inf")  # monotonic time the auditor's test traffic last arrived
         self.interrupted = False  # the last adopt stepped aside for a test
         self._published = False
+        self._left_out: list[str] = []
 
-    # ---- the auditor ----
+    # ---- callers ----
 
     def auditors(self) -> set[str]:
         return {self.auditor}
+
+    def gateways(self) -> set[str]:
+        """Callers served without the per-caller limits: the catalog's gateways and the configured ones."""
+        return {*self.config.gateway_hotkeys, *self.catalog.gateways}
 
     def note_test_traffic(self) -> None:
         self.test_seen = time.monotonic()
@@ -127,6 +154,10 @@ class Publisher:
         within ``TEST_ARRIVING_S``."""
         return time.monotonic() - self.test_seen < TEST_ARRIVING_S
 
+    def own_ids(self) -> list[str]:
+        """The endpoints this machine serves, as it lists them."""
+        return [e.endpoint_id for e in self.local.host.endpoints] if self.local is not None else []
+
     # ---- measuring ----
 
     def _last_published(self) -> SignedManifest | None:
@@ -137,6 +168,16 @@ class Publisher:
         m = signed.manifest
         same = (m.hotkey, m.netuid, m.mechid) == (self.wallet.hotkey.ss58_address, self.config.netuid,
                                                   self.config.mechid)
+        return signed if same else None
+
+    def _last_served(self) -> SignedHostEndpoints | None:
+        try:
+            signed = SignedHostEndpoints.model_validate_json(self.endpoints_path.read_text())
+        except (OSError, ValueError):
+            return None
+        h = signed.host
+        same = (h.hotkey, h.netuid, h.mechid, h.url) == (self.wallet.hotkey.ss58_address, self.config.netuid,
+                                                         self.config.mechid, self.config.base_url)
         return signed if same else None
 
     def _local_url(self, endpoint_id: str) -> str:
@@ -174,9 +215,9 @@ class Publisher:
 
     def adopt(self, cat: catalog.Catalog, *, remeasure: bool = False) -> bool:
         """Measure the endpoints ``cat`` serves (or reuse their stored measurements) through the running service and
-        sign a manifest of those measured. A measurement neither starts nor continues while the auditor's test traffic
-        arrives. False if none could be measured or the measurement stepped aside (``interrupted``); the current
-        manifest stays."""
+        sign what this machine serves, and on the primary the manifest. A measurement neither starts nor continues
+        while the auditor's test traffic arrives. False if none could be measured or the measurement stepped aside
+        (``interrupted``); what is served stays."""
         endpoints = servable(self.config, cat)
         if not endpoints:
             log.error("no configured endpoint serves a model of catalog %s", cat.digest()[:12])
@@ -209,15 +250,19 @@ class Publisher:
                      e.model_id, m.measured_rps, m.concurrency, ", ".join(f"{r:.1f}" for r in m.runs),
                      m.declared(margin))
         self.catalog = cat
-        self.signed = build_manifest(self.config, listed, {e.endpoint_id: measured[e.endpoint_id].declared(margin)
-                                                           for e in listed}, self.wallet.hotkey, cat.digest())
+        own = own_endpoints(self.config, listed, {e.endpoint_id: measured[e.endpoint_id].declared(margin)
+                                                  for e in listed})
+        self.local = build_host_endpoints(self.config, own, self.wallet.hotkey, cat.digest())
+        self.endpoints_path.parent.mkdir(parents=True, exist_ok=True)
+        self.endpoints_path.write_text(self.local.model_dump_json())
         self.serving = {e.endpoint_id for e in listed}
-        self._published = False
+        if self.peers is not None:
+            self.merge()
         return True
 
     def engines_changed(self) -> bool:
         """Whether a listed endpoint's engine or configuration no longer matches its stored measurement."""
-        listed = {e.endpoint_id for e in self.signed.manifest.endpoints}
+        listed = set(self.own_ids())
         endpoints = [e for e in servable(self.config, self.catalog) if e.endpoint_id in listed]
         stored_now = self.store.load()
 
@@ -230,7 +275,29 @@ class Publisher:
 
         return asyncio.run(check())
 
-    # ---- publishing ----
+    # ---- the primary: peers and publishing ----
+
+    def poll_peers(self) -> None:
+        """Fetch the peers' endpoints and rebuild the manifest (``miner.peers``); a peer out for an epoch is
+        withdrawn."""
+
+        async def run() -> None:
+            async with httpx.AsyncClient() as client:
+                await self.peers.poll(client, self.catalog.digest(), self.catalog.epoch_blocks * BLOCK_TIME_S)
+
+        asyncio.run(run())
+        self.merge()
+
+    def merge(self) -> None:
+        """Sign the manifest of this machine's measured endpoints and the peers'; it is published once it changed."""
+        endpoints, left_out = merged(self.local.host.endpoints, self.peers.peers, self.catalog)
+        if left_out != self._left_out:
+            for line in left_out:
+                log.error(line)
+            self._left_out = left_out
+        signed = build_manifest(self.config, endpoints, self.wallet.hotkey, self.catalog.digest())
+        if signed.manifest.digest() != self.signed.manifest.digest():
+            self.signed, self._published = signed, False
 
     def publish(self, st: bt.Subtensor) -> None:
         if self.publish_on_chain and not self._published:
@@ -240,9 +307,9 @@ class Publisher:
         self._published = True
 
     def watch(self, interval_s: float = POLICY_WATCH_S) -> None:
-        """Follow the owner's catalog commitment and the engines. A new catalog is adopted at once (measuring again
-        if it changed what a measurement depends on), so is a changed engine; on-chain publication is retried until
-        it succeeds."""
+        """Follow the owner's catalog commitment, the engines and, on the primary, the peers. A new catalog is adopted
+        at once (measuring again if it changed what a measurement depends on), so is a changed engine; on-chain
+        publication is retried until it succeeds."""
 
         def run() -> None:
             store = catalog.CatalogStore(self.config.catalog_dir)
@@ -254,15 +321,17 @@ class Publisher:
                     if committed_catalog(st, self.config.netuid) != self.catalog.digest():
                         cat = current_catalog(st, self.config.netuid, store, self.config.catalog_mirrors)
                         if self.adopt(cat):
-                            log.info("catalog %s committed; manifest rebuilt", cat.digest()[:12])
+                            log.info("catalog %s committed; endpoints rebuilt", cat.digest()[:12])
                         else:
-                            log.error("catalog %s committed but not adopted yet; keeping the current manifest",
+                            log.error("catalog %s committed but not adopted yet; keeping the current endpoints",
                                       cat.digest()[:12])
                     elif self.engines_changed():
                         log.info("an engine changed; measuring again")
                         self.adopt(self.catalog)
+                    if self.peers is not None and self.peers.peers:
+                        self.poll_peers()
                     self.auditor = st.get_subnet_owner_hotkey(self.config.netuid)
-                    if not self._published:
+                    if self.publish_on_chain and not self._published:
                         self.publish(st)
                         log.info("manifest published")
                 except Exception:
@@ -270,6 +339,27 @@ class Publisher:
                     st = None
 
         threading.Thread(target=run, name="catalog-watch", daemon=True).start()
+
+
+def build_app(config: MinerConfig, keypair, publisher: Publisher, authorized: Callable[[str], bool],
+              engines: dict[str, Engine]) -> FastAPI:
+    """This machine's miner service, primary or worker alike: callers are permitted validators (``authorized``),
+    gateways and the auditor's test sessions, each within its limits."""
+
+    def max_state_tokens(model_id: str) -> int | None:
+        model = publisher.catalog.get(model_id)
+        return model.max_state_tokens if model is not None else None
+
+    def max_caller_request(model_id: str) -> int | None:
+        model = publisher.catalog.get(model_id)
+        return caller_request_bytes(model_id, model.workload) if model is not None else None
+
+    return create_app(config=config, keypair=keypair, manifest=lambda: publisher.signed,
+                      host_endpoints=lambda: publisher.local, engines=engines, authorized=authorized,
+                      auditors=publisher.auditors, admissions=publisher.admissions, serving=lambda: publisher.serving,
+                      max_state_tokens=max_state_tokens, max_caller_request=max_caller_request,
+                      on_test_traffic=publisher.note_test_traffic, testing=publisher.test_arriving,
+                      gateways=publisher.gateways, catalog_digest=lambda: publisher.catalog.digest())
 
 
 def resolve_catalog(subtensor: bt.Subtensor, config: MinerConfig) -> catalog.Catalog:
@@ -284,12 +374,25 @@ def resolve_catalog(subtensor: bt.Subtensor, config: MinerConfig) -> catalog.Cat
 
 def adopt_first(publisher: Publisher, cat: catalog.Catalog, *, remeasure: bool,
                 sleep: Callable[[float], None] = time.sleep) -> None:
-    """The first manifest: measure (or reuse the stored measurements), after any running test. Exits if no endpoint
-    can be measured."""
+    """The first measurement (or the stored one reused), after any running test. Exits if no endpoint can be
+    measured."""
     while not publisher.adopt(cat, remeasure=remeasure):
         if not publisher.interrupted:
             raise SystemExit("no endpoint could be measured")
         sleep(TEST_QUIET_S)
+
+
+def serving_line(config: MinerConfig, publisher: Publisher) -> str:
+    """What the miner logs once it serves."""
+    line = f"serving {len(publisher.own_ids())} endpoints on port {config.port}"
+    if config.role == "worker":
+        line += f" for the hotkey's primary, which lists them from {config.base_url}{ENDPOINTS_PATH}"
+    elif config.peers:
+        machines = {endpoint_host(e.url, e.endpoint_id) for e in publisher.signed.manifest.endpoints}
+        line += (f"; the manifest lists {len(publisher.signed.manifest.endpoints)} endpoints on {len(machines)} "
+                 "machines")
+    return (f"{line}; throughput tests are accepted from {', '.join(sorted(publisher.auditors()))}; status is logged "
+            "once per epoch")
 
 
 def main() -> None:
@@ -316,27 +419,10 @@ def main() -> None:
     subtensor = bt.Subtensor(network=config.network)
     cat = catalog.load() if args.no_publish else resolve_catalog(subtensor, config)
     publisher = Publisher(config, wallet, cat, publish_on_chain=not args.no_publish, subtensor=subtensor)
-
-    def gateways() -> set[str]:
-        return {*config.gateway_hotkeys, *publisher.catalog.gateways}
-
-    authorizer = PermitAuthorizer(config.network, config.netuid, gateways)
+    authorizer = PermitAuthorizer(config.network, config.netuid, publisher.gateways)
     engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key, max_connections=e.max_concurrency)
                for e in config.endpoints}
-
-    def max_state_tokens(model_id: str) -> int | None:
-        model = publisher.catalog.get(model_id)
-        return model.max_state_tokens if model is not None else None
-
-    def max_caller_request(model_id: str) -> int | None:
-        model = publisher.catalog.get(model_id)
-        return caller_request_bytes(model_id, model.workload) if model is not None else None
-
-    app = create_app(config=config, keypair=wallet.hotkey, manifest=lambda: publisher.signed, engines=engines,
-                     authorized=authorizer, auditors=publisher.auditors, admissions=publisher.admissions,
-                     serving=lambda: publisher.serving, max_state_tokens=max_state_tokens,
-                     max_caller_request=max_caller_request, on_test_traffic=publisher.note_test_traffic,
-                     testing=publisher.test_arriving, gateways=gateways)
+    app = build_app(config, wallet.hotkey, publisher, authorizer, engines)
     # Connections beyond the descriptors left are refused, so a flood of idle connections cannot starve the rest.
     limit = max(256, raise_open_file_limit() - 256)
     server = uvicorn.Server(uvicorn.Config(app, host=config.listen_host, port=config.port, log_level="warning",
@@ -349,14 +435,15 @@ def main() -> None:
         time.sleep(0.1)
 
     adopt_first(publisher, cat, remeasure=args.remeasure)
+    if publisher.peers is not None and publisher.peers.peers:
+        publisher.poll_peers()
     publisher.publish(subtensor)
     if not args.no_publish:
         publisher.watch()
         chain = SubtensorChainView(config.network, config.netuid)
         StatusWatcher(hotkey=wallet.hotkey.ss58_address, auditor_url=chain.auditor_url,
-                      listed=lambda: [e.endpoint_id for e in publisher.signed.manifest.endpoints]).start()
-    log.info("serving %d endpoints on port %d; throughput tests are accepted from %s; status is logged once per "
-             "epoch", len(publisher.signed.manifest.endpoints), config.port, ", ".join(sorted(publisher.auditors())))
+                      listed=publisher.own_ids).start()
+    log.info(serving_line(config, publisher))
     service.join()
     os._exit(1)  # the service stopped
 

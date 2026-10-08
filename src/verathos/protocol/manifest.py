@@ -11,6 +11,10 @@ current commitment, and every endpoint URL is ``http://<ip>:<port>/e/<endpoint_i
 axon, or another machine of the miner. Signature and digest cover the JSON exactly as received, so nodes running
 different code versions agree on them. A listed host gets traffic only once the endpoint proved control at its URL
 (``validator.discovery.Identities``).
+
+A hotkey with GPUs on several machines publishes from one of them, the primary. Each other machine serves the
+endpoints it measured as a ``HostEndpoints`` document signed by the hotkey (``GET /v1/endpoints``), which the primary
+checks (``accept_host``) and lists.
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ from verathos.protocol.canonical import digest
 
 MANIFEST_DOMAIN = "verathos/manifest/v1"
 COMMITMENT_PREFIX = "verathos/manifest/v1 sha256:"
+ENDPOINTS_DOMAIN = "verathos/endpoints/v1"
+ENDPOINTS_PATH = "/v1/endpoints"
 MAX_ENDPOINTS = 64
 MAX_HOSTS = 64  # distinct hosts (ip:port) per manifest
 _ENDPOINT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
@@ -88,6 +94,38 @@ class SignedManifest(BaseModel):
             raise ValueError("keypair does not match manifest.hotkey")
         return cls(manifest=manifest,
                    signature=signing.sign(keypair, MANIFEST_DOMAIN, manifest.model_dump(mode="json")))
+
+
+class HostEndpoints(BaseModel):
+    """The endpoints one machine of a hotkey serves (``GET /v1/endpoints`` on it), as the hotkey's manifest lists
+    them, and the machine's base URL (``http://ip:port``): the machine that publishes the manifest gathers them. It
+    holds nothing the manifest does not publish."""
+
+    version: Literal[1] = 1
+    netuid: int = Field(ge=0)
+    mechid: int = Field(ge=0)
+    hotkey: str
+    catalog_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    url: str = Field(max_length=64)
+    endpoints: list[Endpoint] = Field(max_length=MAX_ENDPOINTS)
+
+    @model_validator(mode="after")
+    def _unique(self) -> HostEndpoints:
+        ids = [e.endpoint_id for e in self.endpoints]
+        if len(ids) != len(set(ids)):
+            raise ValueError("endpoint ids must be unique")
+        return self
+
+
+class SignedHostEndpoints(BaseModel):
+    host: HostEndpoints
+    signature: str
+
+    @classmethod
+    def create(cls, host: HostEndpoints, keypair: Keypair) -> SignedHostEndpoints:
+        if keypair.ss58_address != host.hotkey:
+            raise ValueError("keypair does not match host.hotkey")
+        return cls(host=host, signature=signing.sign(keypair, ENDPOINTS_DOMAIN, host.model_dump(mode="json")))
 
 
 def commitment_value(manifest_digest: str) -> str:
@@ -189,3 +227,27 @@ def accept(document: Any, *, hotkey: str, netuid: int, mechid: int, commitment: 
     if len(hosts) > MAX_HOSTS:
         raise ManifestRejected(f"more than {MAX_HOSTS} hosts")
     return manifest
+
+
+def accept_host(document: Any, *, hotkey: str, netuid: int, mechid: int, url: str) -> HostEndpoints:
+    """The publishing machine's check of what another machine of its hotkey serves at ``url`` (``GET
+    /v1/endpoints``, the parsed JSON body): signed by the hotkey, for this netuid and mechanism, and every endpoint at
+    a URL a manifest may list on that very machine. Raises ManifestRejected."""
+    if not isinstance(document, dict) or not isinstance(document.get("host"), dict):
+        raise ManifestRejected("not a signed endpoints document")
+    raw = document["host"]
+    if not signing.verify(hotkey, ENDPOINTS_DOMAIN, raw, document.get("signature")):
+        raise ManifestRejected("not signed by this hotkey")
+    try:
+        host = HostEndpoints.model_validate(raw)
+    except ValueError as exc:
+        raise ManifestRejected(f"malformed endpoints document: {exc}") from None
+    if host.hotkey != hotkey or host.netuid != netuid or host.mechid != mechid:
+        raise ManifestRejected("for another hotkey, netuid or mechanism")
+    if host.url != url:
+        raise ManifestRejected(f"it says it is {host.url}")
+    for e in host.endpoints:
+        if endpoint_host(e.url, e.endpoint_id) != url:
+            raise ManifestRejected(f"endpoint {e.endpoint_id} is not listed at {url}/e/{e.endpoint_id} on a public "
+                                   "address")
+    return host

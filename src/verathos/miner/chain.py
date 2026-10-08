@@ -11,24 +11,40 @@ from collections.abc import Callable, Collection
 import bittensor as bt
 
 from verathos.miner.config import EndpointConfig, MinerConfig
-from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
+from verathos.protocol.manifest import (
+    Endpoint,
+    HostEndpoints,
+    Manifest,
+    SignedHostEndpoints,
+    SignedManifest,
+    commitment_value,
+)
 from verathos.subnet.chain import serve_axon
 
 log = logging.getLogger(__name__)
 
 
-def build_manifest(config: MinerConfig, endpoints: list[EndpointConfig], capacity_rps: dict[str, float], keypair,
-                   catalog_digest: str) -> SignedManifest:
-    """Sign a manifest for ``endpoints`` with their declared capacities. The same configuration, measurements and
-    catalog always give the same manifest, so a restart does not change the on-chain commitment."""
-    listed = [
-        Endpoint(endpoint_id=e.endpoint_id, url=config.endpoint_url(e.endpoint_id), model_id=e.model_id, tier=e.tier,
-                 capacity_rps=capacity_rps[e.endpoint_id])
-        for e in endpoints
-    ]
+def own_endpoints(config: MinerConfig, endpoints: list[EndpointConfig],
+                  capacity_rps: dict[str, float]) -> list[Endpoint]:
+    """This machine's ``endpoints`` as a manifest lists them, with their declared capacities."""
+    return [Endpoint(endpoint_id=e.endpoint_id, url=config.endpoint_url(e.endpoint_id), model_id=e.model_id,
+                     tier=e.tier, capacity_rps=capacity_rps[e.endpoint_id]) for e in endpoints]
+
+
+def build_manifest(config: MinerConfig, endpoints: list[Endpoint], keypair, catalog_digest: str) -> SignedManifest:
+    """Sign the hotkey's manifest. The same endpoints and catalog always give the same manifest, so a restart does not
+    change the on-chain commitment."""
     manifest = Manifest(netuid=config.netuid, mechid=config.mechid, hotkey=keypair.ss58_address,
-                        catalog_digest=catalog_digest, endpoints=listed)
+                        catalog_digest=catalog_digest, endpoints=endpoints)
     return SignedManifest.create(manifest, keypair)
+
+
+def build_host_endpoints(config: MinerConfig, endpoints: list[Endpoint], keypair,
+                         catalog_digest: str) -> SignedHostEndpoints:
+    """Sign what this machine serves, for the primary (``GET /v1/endpoints``)."""
+    host = HostEndpoints(netuid=config.netuid, mechid=config.mechid, hotkey=keypair.ss58_address,
+                         catalog_digest=catalog_digest, url=config.base_url, endpoints=endpoints)
+    return SignedHostEndpoints.create(host, keypair)
 
 
 def publish(subtensor: bt.Subtensor, wallet: bt.Wallet, config: MinerConfig, signed: SignedManifest) -> None:
