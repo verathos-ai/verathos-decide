@@ -30,7 +30,8 @@ The installer never creates, imports or reads a coldkey. Then, on the miner mach
 curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
 ```
 
-It shows its plan before it changes anything, and asks:
+After installing the code it asks a few questions, then shows its plan and asks to go ahead before it sets up
+engines and services:
 
 | Question | Default |
 |---|---|

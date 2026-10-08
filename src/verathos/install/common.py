@@ -347,7 +347,8 @@ def uninstall(role: str, argv: list[str]) -> None:
     Record.path(home, role).unlink(missing_ok=True)
     if args.purge:
         config = Path(record.config) if record.config else home / f"{role}.json"
-        for path in (config, home / role):
+        state = Path(read_json(config).get("state_dir", home / role)).expanduser()
+        for path in (config, state):
             if path.is_dir():
                 shutil.rmtree(path, ignore_errors=True)
             else:
