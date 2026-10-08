@@ -730,6 +730,9 @@ def test_requests_no_miner_could_answer_are_refused_before_any_miner(tmp_path) -
         f"q{i}": {"type": "choice", "criteria": {f"option {j:03d} with a long name": "" for j in range(255)}}
         for i in range(20)}}
     assert asyncio.run(s.post(huge)).json()["error"]["type"] == "too_large"
+    limit = 4 * catalog.load().get("kev-4b").max_state_tokens  # characters of state, instructions and criteria
+    wordy = {"model": "kev-4b", "state": "x", "questions": {"q": {"type": "noul", "instructions": "x" * limit}}}
+    assert asyncio.run(s.post(wordy)).json()["error"]["type"] == "too_large"
     assert Counting.calls == 0
 
 

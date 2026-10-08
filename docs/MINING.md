@@ -254,13 +254,14 @@ On start the miner:
 Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted from
 hotkeys holding a validator permit, from the subnet's gateways (the catalog's `gateways`) and the miner's own
 `gateway_hotkeys`, and as test traffic under a session the auditor signed. Other callers are refused before their
-request body is read; bodies are capped at 1 MiB and must arrive within 10 s, and a state may hold at most 4
-characters per token of the model's `max_state_tokens`. A validator gets one request at once per endpoint (HTTP
-429 beyond that), each no larger than the largest request of the model's request mix (HTTP 413), and while the
-auditor's test traffic arrives its requests wait behind the test's; gateways are not limited. The miner signs only
-well-formed answers (one distribution per question over its options, with the `noul`, `choice` and `score` derived
-from it; fields other than an answer type's own are dropped before signing): an engine that returns anything else
-gets an error back to the caller, never a signed receipt. The auditor recomputes a sample of the
+request body is read; bodies are capped at 1 MiB and must arrive within 10 s, and a request's state, question ids,
+instructions and criteria together may hold at most 4 characters per token of the model's `max_state_tokens`. A
+validator gets one request at once per endpoint (HTTP 429 beyond that), each no larger than the largest request of
+the model's request mix (HTTP 413), and while the auditor's test traffic arrives its requests wait behind the test's;
+gateways are not limited. The miner signs only well-formed answers (one distribution per question over its options,
+with the `noul`, `choice` and `score` derived from it; fields other than an answer type's own are dropped before
+signing): an engine that returns anything else gets an error back to the caller, never a signed receipt. The auditor
+recomputes a sample of the
 answers given to the subnet's gateway, as it does test answers: serve users the same model, at the same precision.
 The input tokens a receipt signs are checked against the reference's count too: users are billed for them and they
 set each model's share of the emission, so signing more or fewer than the reference counts is a wrong answer.

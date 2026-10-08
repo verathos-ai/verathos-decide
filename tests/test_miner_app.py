@@ -161,7 +161,10 @@ def test_sessions_cannot_outlast_the_replay_protection(setup) -> None:
 def test_states_longer_than_the_model_accepts_are_refused(setup) -> None:
     client, miner, validator, *_ = setup
     r = post(client, validator, miner, "/e/gpu0/v1/systemone", {**REQUEST, "state": "word " * 200})
-    assert (r.status_code, r.json()["error"]) == (413, "state longer than the model accepts")
+    assert (r.status_code, r.json()["error"]) == (413, "state, instructions and criteria longer than the model accepts")
+    long_question = {"type": "noul", "instructions": "word " * 200}  # a short state: the questions count too
+    r = post(client, validator, miner, "/e/gpu0/v1/systemone", {**REQUEST, "questions": {"q": long_question}})
+    assert r.status_code == 413
 
 
 def test_the_miner_signs_only_well_formed_answers() -> None:

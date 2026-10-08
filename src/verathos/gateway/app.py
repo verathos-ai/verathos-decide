@@ -56,12 +56,19 @@ from verathos.gateway.served import ServedCounter
 from verathos.gateway.stats import DEGRADED_SUCCESS, ModelStats
 from verathos.gateway.upstream import Exchange, Upstream, UpstreamFailure
 from verathos.gateway.usage import UsageMeter, month_start
-from verathos.protocol.api import MAX_RESPONSE_BYTES, Choice, SystemOneRequest, question_keys
-from verathos.protocol.canonical import canonical_json, digest
+from verathos.protocol.api import (
+    MAX_RESPONSE_BYTES,
+    STATE_CHARS_PER_TOKEN,
+    Choice,
+    SystemOneRequest,
+    prompt_chars,
+    question_keys,
+    text,
+)
+from verathos.protocol.canonical import digest
 from verathos.protocol.gateway import Routes
 
 log = logging.getLogger(__name__)
-STATE_CHARS_PER_TOKEN = 4  # as the miners count it
 # An answer is billed at least one token per this many characters of the state, whatever the miner signs; these
 # models' tokens average far fewer characters, so an honest count is never raised.
 STATE_CHARS_PER_BILLED_TOKEN = 8
@@ -201,12 +208,12 @@ def validation_message(exc: ValidationError) -> str:
 
 def check_request(g: Gateway, body: bytes) -> Checked:
     """A body the gateway can forward: strict JSON, a SystemOne request for an active model miners serve now, within
-    the model's state limit and with answers that fit a response. Raises Rejected."""
+    the model's limit (``prompt_chars``) and with answers that fit a response. Raises Rejected."""
     try:
         raw = json.loads(body, parse_constant=_no_constants)
         parsed = SystemOneRequest.model_validate(raw)
         request_sha256 = digest(raw)
-        state = parsed.state if isinstance(parsed.state, str) else canonical_json(parsed.state).decode()
+        state, prompt = text(parsed.state), prompt_chars(parsed)
     except ValidationError as exc:
         raise Rejected(400, "invalid_request", f"not a SystemOne request: {validation_message(exc)}") from None
     except (ValueError, TypeError, RecursionError) as exc:
@@ -217,8 +224,9 @@ def check_request(g: Gateway, body: bytes) -> Checked:
         raise Rejected(404, "model_not_found", f"{parsed.model} is not served")
     if parsed.model not in g.router.models():
         raise Rejected(503, "unavailable", f"no miner serves {parsed.model} right now", 30, parsed.model)
-    if len(state) > STATE_CHARS_PER_TOKEN * model.max_state_tokens:
-        raise Rejected(413, "too_large", f"the state exceeds what {model.model_id} accepts", model=parsed.model)
+    if prompt > STATE_CHARS_PER_TOKEN * model.max_state_tokens:
+        raise Rejected(413, "too_large", f"the state, instructions and criteria exceed what {model.model_id} accepts",
+                       model=parsed.model)
     if answer_bytes(parsed) > MAX_RESPONSE_BYTES:
         raise Rejected(413, "too_large", "the answers to these questions would exceed a response's size limit",
                        model=parsed.model)

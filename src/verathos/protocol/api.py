@@ -21,9 +21,12 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from verathos.protocol.canonical import canonical_json
+
 JSONContent = str | dict | list | int | float | bool | None
 MAX_OPTIONS = 255
 MAX_RESPONSE_BYTES = 64 << 10  # a response (answers and receipt) larger than this is not a valid answer
+STATE_CHARS_PER_TOKEN = 4  # a generous bound: tokens of these models average fewer characters
 ANSWER_FIELDS = {"noul": {"type", "noul", "probabilities", "confidence"},
                  "choice": {"type", "choice", "probabilities", "confidence"},
                  "score": {"type", "score", "probabilities", "confidence", "legend"}}
@@ -62,6 +65,18 @@ class SystemOneRequest(BaseModel):
     model: str
     state: JSONContent
     questions: dict[str, Question] = Field(min_length=1)
+
+
+def text(value: JSONContent) -> str:
+    """A request's content as the characters it counts: text as it is, anything else as canonical JSON."""
+    return value if isinstance(value, str) else "" if value is None else canonical_json(value).decode()
+
+
+def prompt_chars(request: SystemOneRequest) -> int:
+    """The characters of what a model reads of a request: its state, and each question's id, instructions and
+    criteria. A model's ``max_state_tokens`` bounds them all, at ``STATE_CHARS_PER_TOKEN``."""
+    return len(text(request.state)) + sum(len(qid) + len(text(q.instructions)) + len(text(q.criteria))
+                                          for qid, q in request.questions.items())
 
 
 def question_keys(question: Noul | Choice | Score) -> list[str]:

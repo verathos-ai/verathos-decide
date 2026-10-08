@@ -33,9 +33,10 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    (then 503), and every database statement is bounded (10 s, 5 s waiting for a lock), so a stalled database
    refuses requests instead of holding them; the miners' deadline (`request_timeout_s`) starts after these checks.
 3. **Request.** Strict JSON (no NaN or infinities): a SystemOne request (`protocol/api.py`) for a model the catalog
-   lists as `active` and the routes serve, with a state within the model's `max_state_tokens` (4 characters per
-   token, as miners count), and questions whose answers fit a response (64 KiB). Requests no miner could answer are
-   refused here, so they cannot count against miners.
+   lists as `active` and the routes serve, whose state, question ids, instructions and criteria together are within
+   the model's `max_state_tokens` (4 characters per token, as miners count; JSON as canonical JSON), and questions
+   whose answers fit a response (64 KiB). Requests no miner could answer are refused here, so they cannot count
+   against miners.
 4. **Endpoint.** Two endpoints of the model are drawn in proportion to their proven capacity; the one with fewer
    requests in flight per unit of capacity takes the request. In this process an endpoint takes at most
    `credited rps x max_latency_s / instances` requests at once, what it serves within the latency bound.

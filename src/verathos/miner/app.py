@@ -32,7 +32,7 @@ from verathos.miner.admission import BEHIND_TESTS, REGULAR, TEST, Admission
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
-from verathos.protocol.api import SystemOneRequest, known_fields, well_formed
+from verathos.protocol.api import STATE_CHARS_PER_TOKEN, SystemOneRequest, known_fields, prompt_chars, well_formed
 from verathos.protocol.canonical import canonical_json, digest
 from verathos.protocol.manifest import SignedManifest
 from verathos.protocol.receipts import Receipt, SignedReceipt
@@ -46,7 +46,6 @@ IDENTITY_DOMAIN = "verathos/identity/v1"
 MAX_REQUEST_BYTES = 1 << 20
 BODY_TIMEOUT_S = 10.0
 CALLER_CONCURRENCY = 1
-STATE_CHARS_PER_TOKEN = 4  # a generous bound: tokens of these models average fewer characters
 
 
 @dataclass(frozen=True)
@@ -89,8 +88,8 @@ def create_app(
     """``auditors`` gives the hotkeys whose test sessions are accepted (besides the miner's own, for its
     measurement), and ``on_test_traffic`` is called for each of their requests; ``testing`` whether their traffic
     arrives now; ``admissions`` the engine admission per endpoint (default: ``max_concurrency`` slots); ``serving``
-    the endpoints answered (default: those the manifest lists); ``max_state_tokens`` a model's state limit;
-    ``max_caller_request`` the largest request of a model callers other than gateways may send
+    the endpoints answered (default: those the manifest lists); ``max_state_tokens`` a model's limit
+    (``api.prompt_chars``); ``max_caller_request`` the largest request of a model callers other than gateways may send
     (``caller_request_bytes``); ``gateways`` the callers exempt from the per-caller limits (default: the configured
     ``gateway_hotkeys``)."""
     app = FastAPI(title="Verathos miner")
@@ -196,9 +195,8 @@ def create_app(
         if parsed.model != endpoint.model_id:
             return error(422, f"endpoint serves {endpoint.model_id}, not {parsed.model}")
         limit = max_state_tokens(endpoint.model_id)
-        state = parsed.state if isinstance(parsed.state, str) else canonical_json(parsed.state).decode()
-        if limit is not None and len(state) > STATE_CHARS_PER_TOKEN * limit:
-            return error(413, "state longer than the model accepts")
+        if limit is not None and prompt_chars(parsed) > STATE_CHARS_PER_TOKEN * limit:
+            return error(413, "state, instructions and criteria longer than the model accepts")
         capped = (caller.hotkey, endpoint_id) if not test and caller.hotkey not in gateways() else None
         if capped is not None:
             largest = max_caller_request(endpoint.model_id)
