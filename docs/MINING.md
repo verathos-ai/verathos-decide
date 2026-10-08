@@ -56,6 +56,8 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--gpus` | the GPUs to serve on (`0,1`; default all) |
 | `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
 | `--no-publish` | try the machine before registering: the miner serves and measures, but writes nothing on chain; once the hotkey is registered, run the command again without it |
+| `--worker`, `--name` | this machine serves its GPUs for the hotkey's primary machine; its endpoint ids start with `--name` (default: its IP address) ([One hotkey, several GPUs and machines](#one-hotkey-several-gpus-and-machines)) |
+| `--peers` | on the primary: every worker's public `ip:port`, comma-separated; replaces the list (`''` for none) |
 | `--no-service` | set everything up, and print the commands to run instead of installing services |
 | `--source`, `--ref`, `--dir` | the code from another git URL, git bundle or tarball; a branch, tag or commit; another directory than `~/verathos` |
 
@@ -134,12 +136,53 @@ stay for a later install; `--purge` deletes them too. Wallets are never touched.
 | `no NVIDIA GPU found` | install the NVIDIA driver; in a container, start it with the GPUs passed through |
 | `the NVIDIA driver supports CUDA 12.x` | the engines need a driver for CUDA 12.8 or newer |
 | `port ... is in use` | choose another port with `--port` |
-| validators cannot reach the miner | `curl http://<public ip>:<port>/v1/manifest` from another machine must answer: open the port for inbound TCP (`ufw allow <port>/tcp`, the provider's firewall). Behind port forwarding, as in most rented containers, the outside port must be the same as the port inside: the axon has one port |
+| validators cannot reach the miner | `curl http://<public ip>:<port>/v1/manifest` (on a worker `/v1/endpoints`) from another machine must answer: open the port for inbound TCP (`ufw allow <port>/tcp`, the provider's firewall). Behind port forwarding, as in most rented containers, the outside port must be the same as the port inside: each machine is listed at one port |
+| `peer ...: endpoint ... left out` | endpoint ids must be unique across the hotkey's machines: give the worker another `--name` |
 | an engine keeps stopping | its log says why; out of GPU memory: another model, or a GPU free of other work |
 | `no endpoint could be measured` | the engine logs: the measurement needs the engines answering |
 | no services after a container restart | containers start no services by themselves: run the command again, or `supervisord -c /etc/supervisor/supervisord.conf` |
 | `local changes in ... stop the update` | the installer manages `~/verathos`: see `git -C ~/verathos status` and discard the changes |
 | downloads slow or rate limited | use a Hugging Face token: `export HF_TOKEN=<token>` before the command |
+
+## One hotkey, several GPUs and machines
+
+A hotkey serves up to 64 endpoints, one per GPU. On one machine nothing needs doing: the installer sets up an
+endpoint per GPU (`gpu0`, `gpu1`, ...).
+
+On several machines, one is the primary and the others are its workers. Every machine runs the engines for its own
+GPUs and `verathos-miner`, which measures its endpoints and serves them at its own public IP and port: each machine
+needs that port open for inbound TCP, and the hotkey and `coldkeypub.txt` (never the coldkey). The primary publishes
+the hotkey's manifest, listing every endpoint at its own machine's address; a worker writes nothing on chain and
+serves what it measured, signed by the hotkey, at `GET /v1/endpoints`, which the primary reads every minute.
+Validators, the auditor and the gateways send each endpoint's traffic, the throughput test included, straight to its
+machine: each machine needs the bandwidth of its own endpoints only, and a machine that is down costs only its own.
+
+A worker is protected exactly like a single miner: it runs the same miner service, which answers only validators
+holding a permit in the metagraph (read again every 10 minutes), the catalog's gateways and the auditor's signed test
+sessions, refuses anyone else with 403 before reading the request, and applies the same per-caller limits. Engines
+listen on 127.0.0.1 only. `GET /v1/endpoints` is read-only and holds nothing the manifest does not publish.
+
+Set up the workers first, then the primary with every worker's address:
+
+```bash
+# on each worker
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner --worker \
+    --yes --wallet miner --hotkey default --port 8091
+# on the primary
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner --yes \
+    --wallet miner --hotkey default --port 8091 --peers 154.54.100.137:8091,198.51.100.7:8091
+```
+
+A worker's endpoint ids start with its name (`--name`, default its IP address, as in `154-54-100-137-gpu0`): ids
+must be unique across the hotkey's machines. At its end the worker's setup prints the line for the primary. Running
+`install.sh miner --yes --peers ...` again on the primary replaces its list; `peers` in its `miner.json` and a
+restart of its miner do the same.
+
+The primary takes a worker's endpoints only as the hotkey signed them, for its catalog, at that worker's address,
+and leaves out an endpoint whose id another machine already lists (its log says which). It keeps a worker that does
+not answer in the manifest for an epoch, then withdraws its endpoints until it is back. While the primary itself is
+down, validators keep using the manifest it last served for up to 3 epochs, so the workers' endpoints keep their
+checks. Each machine logs the status of its own endpoints; `GET /v1/status/<hotkey>` on the auditor lists all.
 
 ## Manual installation
 
@@ -240,7 +283,8 @@ On start the miner:
 1. finds the catalog the subnet owner commits on chain (the shipped copy, its local store, the owner's axon or a
    configured mirror; any copy is checked against the committed digest); endpoints whose model the catalog does not
    serve (unknown or `retired`) are left out, and it exits if none remain;
-2. starts its service: the manifest (`GET /v1/manifest`) and the endpoints (`/e/<endpoint_id>/v1/...`) on one port;
+2. starts its service: the manifest (`GET /v1/manifest`, on a worker its endpoints, `GET /v1/endpoints`) and the
+   endpoints (`/e/<endpoint_id>/v1/...`) on one port;
 3. waits until every engine answers, then measures the endpoints' capacity through its own service, all at once (a
    few minutes; see `THROUGHPUT_AUDIT.md`), or reuses the stored measurements if nothing they depend on changed.
    Meanwhile it serves the manifest it last published. An endpoint that cannot be measured is withdrawn, and the

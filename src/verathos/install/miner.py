@@ -2,15 +2,20 @@
 
 One engine per GPU serving a catalog model, the miner service in front of them on one public port, both as system
 services. The miner measures its endpoints' capacity when it starts (or reuses the stored measurement) and then
-publishes its manifest; the setup shows that, and how to follow it afterwards.
+publishes its manifest; the setup shows that, and how to follow it afterwards. With GPUs on several machines, each
+is set up the same way: the workers (``--worker``) first, then the primary with the workers' addresses (``--peers``).
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import ipaddress
+import re
 import shlex
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -18,7 +23,8 @@ from verathos import catalog
 from verathos.install import common, engines, host, plan
 from verathos.install.common import Prompter, info, step, warn
 from verathos.install.services import Service
-from verathos.miner.config import MinerConfig
+from verathos.miner.config import MinerConfig, peer_url
+from verathos.protocol.manifest import ENDPOINTS_PATH, axon_base, is_public
 from verathos.subnet.chain import current_catalog
 
 DEFAULT_PORT = 8091
@@ -41,8 +47,62 @@ def parser() -> argparse.ArgumentParser:
                    "catalog model that fits)")
     p.add_argument("--no-publish", action="store_true", help="Test the machine: the miner uses the shipped catalog "
                    "and writes nothing on chain, so the hotkey need not be registered")
+    p.add_argument("--worker", action="store_true", help="This machine serves its GPUs for the hotkey's primary "
+                   "machine, which lists them (its --peers); it writes nothing on chain")
+    p.add_argument("--name", help="Worker only: the start of its endpoint ids, unique among the hotkey's machines "
+                   "(default: from its public IP address)")
+    p.add_argument("--peers", help="Primary only: the workers' public ip:port, comma-separated; replaces the list "
+                   "('' for none)")
     p.add_argument("--config", type=Path, help="Miner configuration (default <home>/miner.json)")
     return p
+
+
+def choose_role(ui: Prompter, args: argparse.Namespace, existing: dict) -> str:
+    """primary or worker: as given (``--worker``; ``--peers`` names a primary), as configured before, or asked."""
+    if args.worker and args.peers is not None:
+        raise SystemExit("--peers is set on the primary, --worker on a worker: not both")
+    if args.worker:
+        return "worker"
+    if args.peers is not None:
+        return "primary"
+    if existing.get("role"):
+        return existing["role"]
+    return ui.choose("Role of this machine (primary: publishes the hotkey's manifest; worker: serves its GPUs for a "
+                     "primary)", ["primary", "worker"], "primary")
+
+
+def parse_peers(value: str) -> list[str]:
+    """``--peers``: public ip:port, comma-separated, as the miner's configuration writes them."""
+    peers = []
+    for item in (v for v in value.split(",") if v.strip()):
+        try:
+            peer = peer_url(item)
+        except ValueError as exc:
+            raise SystemExit(f"--peers: {exc}") from None
+        if not is_public(urlsplit(peer).hostname or ""):
+            raise SystemExit(f"--peers: {item.strip()} is not a public address; validators reach every machine of "
+                             "the hotkey at its public address")
+        peers.append(peer)
+    return peers
+
+
+def endpoint_prefix(role: str, name: str | None, public_ip: str, previous: list[str]) -> str:
+    """What this machine's endpoint ids start with: nothing on the primary (``gpu0``, ...); on a worker its name, the
+    one it had (``previous``: its endpoint ids before), or one from its public IP address, so ids stay unique among the
+    hotkey's machines and the same across runs."""
+    if role == "primary":
+        return ""
+    if name:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,23}", name):
+            raise SystemExit("--name: 1-24 characters of a-z, 0-9 and '-'")
+        return name + "-"
+    before = {m[1] for e in previous if (m := re.fullmatch(r"(.+-)gpu\d+", e))}
+    if len(before) == 1:
+        return before.pop()
+    address = ipaddress.ip_address(public_ip)
+    if address.version == 4:
+        return str(address).replace(".", "-") + "-"
+    return "v6-" + hashlib.sha256(str(address).encode()).hexdigest()[:8] + "-"
 
 
 def select_gpus(gpus: list[host.Gpu], value: str | None) -> list[host.Gpu]:
@@ -81,16 +141,20 @@ def choose_models(ui: Prompter, gpus: list[host.Gpu], offered: list[str], need: 
 
 
 def miner_config(existing: dict, *, network: str, netuid: int, wallet_name: str, hotkey_name: str, public_ip: str,
-                 port: int, endpoints: dict[str, tuple[str, int]], managed_before: set[str], home: Path) -> dict:
+                 port: int, endpoints: dict[str, tuple[str, int]], managed_before: set[str], home: Path,
+                 role: str = "primary", peers: list[str] | None = None) -> dict:
     """The configuration to write: ``existing`` with this setup's answers and its endpoints (endpoint id -> model,
     engine port). Endpoints added by hand and settings the setup does not ask about are kept; endpoints it set up
-    before and no longer serves are dropped."""
+    before and no longer serves are dropped. ``peers`` (a primary's) replace the configured ones; None keeps them."""
     old = {e["endpoint_id"]: e for e in existing.get("endpoints", [])}
     listed = [{**old.get(eid, {}), "endpoint_id": eid, "model_id": model, "engine_url": f"http://127.0.0.1:{p}"}
               for eid, (model, p) in endpoints.items()]
     listed += [e for eid, e in old.items() if eid not in endpoints and eid not in managed_before]
     config = {**existing, "network": network, "netuid": netuid, "wallet_name": wallet_name,
-              "hotkey_name": hotkey_name, "public_host": public_ip, "port": port, "endpoints": listed}
+              "hotkey_name": hotkey_name, "public_host": public_ip, "port": port, "role": role, "endpoints": listed}
+    config["peers"] = (existing.get("peers", []) if peers is None else peers) if role == "primary" else []
+    if not config["peers"]:
+        del config["peers"]
     config.setdefault("state_dir", str(home / "miner"))
     config.setdefault("catalog_dir", str(home / "catalog"))
     return config
@@ -155,9 +219,13 @@ def init(argv: list[str]) -> None:
     chosen = choose_models(ui, gpus, list(models), need, plan.parse_models(args.model), previous)
 
     step("Network")
+    role = choose_role(ui, args, existing)
+    if args.name and role != "worker":
+        raise SystemExit("--name names a worker's endpoints")
+    peers = parse_peers(args.peers) if args.peers is not None else None
     detected = args.public_ip or existing.get("public_host") or host.detect_public_ip() or ""
     public_ip = ui.ask("Public IP address of this machine", detected,
-                       lambda v: None if host.is_public(v) else "not a public IP address (pass --public-ip)")
+                       lambda v: None if is_public(v) else "not a public IP address (pass --public-ip)")
     miner_running = manager is not None and MINER in record.services and manager.active(MINER)
 
     def port_problem(value: str) -> str | None:
@@ -169,16 +237,22 @@ def init(argv: list[str]) -> None:
 
     port = int(ui.ask("Public TCP port of the miner (open it for inbound TCP)",
                       str(args.port or existing.get("port") or DEFAULT_PORT), port_problem))
-    endpoint_ids = {g.index: f"gpu{g.index}" for g in gpus}
+    prefix = endpoint_prefix(role, args.name, public_ip, list(record.engines))
+    endpoint_ids = {g.index: f"{prefix}gpu{g.index}" for g in gpus}
     engine_ports = plan.pick_ports(list(endpoint_ids.values()),
                                    {k: v["port"] for k, v in record.engines.items()}, ENGINE_PORT,
                                    lambda p: p != port and host.port_free(p, "127.0.0.1"))
+    workers = (existing.get("peers", []) if peers is None else peers) if role == "primary" else []
 
     step("Plan")
     for g in gpus:
-        info(f"{g.describe()}: {chosen[g.index]}, engine on 127.0.0.1:{engine_ports[endpoint_ids[g.index]]}")
-    info(f"miner at {public_ip}:{port} with hotkey {wallet_name}/{hotkey_name}"
+        info(f"{g.describe()}: {chosen[g.index]}, endpoint {endpoint_ids[g.index]}, engine on "
+             f"127.0.0.1:{engine_ports[endpoint_ids[g.index]]}")
+    info(f"miner at {public_ip}:{port} with hotkey {wallet_name}/{hotkey_name}, "
+         + ("a worker: its primary lists its endpoints" if role == "worker" else "the primary")
          + (" (testing: nothing written on chain)" if args.no_publish else ""))
+    if workers:
+        info(f"workers whose endpoints the manifest lists: {', '.join(workers)}")
     info(f"configuration {config_path}; engines and weights in {home}")
     if not ui.confirm("Go ahead?"):
         raise SystemExit("stopped; nothing changed")
@@ -201,7 +275,7 @@ def init(argv: list[str]) -> None:
     config = miner_config(existing, network=network, netuid=netuid, wallet_name=wallet_name,
                           hotkey_name=hotkey_name, public_ip=public_ip, port=port,
                           endpoints={eid: (chosen[gpu], engine_ports[eid]) for gpu, eid in endpoint_ids.items()},
-                          managed_before=set(record.engines), home=home)
+                          managed_before=set(record.engines), home=home, role=role, peers=peers)
     try:
         MinerConfig.model_validate(config)
     except ValidationError as exc:
@@ -215,7 +289,8 @@ def init(argv: list[str]) -> None:
         model = models[chosen[g.index]]
         engine = engines.engine_for(home, model)
         engine_services[eid] = Service(
-            name=f"verathos-engine-{eid}", description=f"Verathos engine {eid}: {model.model_id} on GPU {g.index}",
+            name=f"verathos-engine-gpu{g.index}",
+            description=f"Verathos engine of endpoint {eid}: {model.model_id} on GPU {g.index}",
             command=engine.command("miner", model, engine_ports[eid]), directory=engine.directory,
             user=common.operator(),
             environment={"HOME": str(Path.home()),
@@ -225,7 +300,8 @@ def init(argv: list[str]) -> None:
                     + (["--no-publish"] if args.no_publish else []), directory=home, user=common.operator(),
                     environment={"HOME": str(Path.home())},
                     after=tuple(s.name for s in engine_services.values()))
-    stale = [f"verathos-engine-{eid}" for eid in record.engines if eid not in engine_ports]
+    names = [s.name for s in engine_services.values()]
+    stale = [s for s in record.services if s.startswith("verathos-engine-") and s not in names]
 
     record.config = str(config_path)
     record.engines = {eid: {"gpu": g, "model": chosen[g], "port": engine_ports[eid]}
@@ -239,11 +315,11 @@ def init(argv: list[str]) -> None:
         for s in [*engine_services.values(), miner]:
             env = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(s.environment.items()) if k != "HOME")
             print(f"      cd {shlex.quote(str(s.directory))} && {env + ' ' if env else ''}{shlex.join(s.command)}")
-        info("the miner measures its capacity when it starts (a few minutes), then publishes its manifest")
+        info("the miner measures its capacity when it starts (a few minutes), then "
+             + ("serves its endpoints to its primary" if role == "worker" else "publishes its manifest"))
         return
 
     step("Services")
-    names = [s.name for s in engine_services.values()]
     for name in [*names, MINER]:
         manager.mark(name)
     if stale:
@@ -254,7 +330,7 @@ def init(argv: list[str]) -> None:
     info(f"{manager.name}: {', '.join(names + [MINER])}" + (f" (new or changed: {', '.join(sorted(changed))})"
                                                              if changed else ""))
     info("waiting for the engines to load their models")
-    common.wait_engines(manager, {f"verathos-engine-{eid}": p for eid, p in engine_ports.items()}, ENGINE_READY_S)
+    common.wait_engines(manager, {engine_services[eid].name: p for eid, p in engine_ports.items()}, ENGINE_READY_S)
 
     step("Capacity")
     info("the miner measures its endpoints' capacity (or reuses the stored measurement), then serves")
@@ -267,13 +343,20 @@ def init(argv: list[str]) -> None:
     step("Done")
     for g in gpus:
         eid = endpoint_ids[g.index]
-        info(f"endpoint {eid}: {chosen[g.index]} on GPU {g.index}, service verathos-engine-{eid}")
+        info(f"endpoint {eid}: {chosen[g.index]} on GPU {g.index}, service {engine_services[eid].name}")
     info(f"miner: http://{public_ip}:{port}, service {MINER}"
          + (" (testing: nothing published on chain)" if args.no_publish else ""))
     info(f"configuration: {config_path}; state: {config['state_dir']}")
     info(f"status:  {manager.status_command(record.services)}")
     info(f"logs:    {manager.log_command(MINER)}")
     info(f"after editing the configuration: {manager.restart_command([MINER])}")
-    info(f"check from another machine: curl http://{public_ip}:{port}/v1/manifest")
+    address = urlsplit(axon_base(public_ip, port)).netloc
+    if role == "worker":
+        info(f"check from another machine: curl http://{address}{ENDPOINTS_PATH}")
+        info("list this machine on the primary, with every other worker (comma-separated):")
+        print(f"      bash ~/verathos/scripts/install.sh miner --yes --peers {address}", flush=True)
+        info(f'or add "{address}" to "peers" in the primary\'s miner.json and restart its miner')
+    else:
+        info(f"check from another machine: curl http://{address}/v1/manifest")
     for line in common.script_commands("miner", home, " --no-publish" if args.no_publish else ""):
         info(line)

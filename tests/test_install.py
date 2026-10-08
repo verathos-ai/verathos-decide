@@ -107,6 +107,63 @@ def test_the_miner_configuration_keeps_what_the_setup_does_not_manage(tmp_path) 
     MinerConfig.model_validate(config)
 
 
+def test_the_role_comes_from_the_options_or_the_configuration(tmp_path) -> None:
+    """Fully answered on the command line: --worker on a worker, --peers on the primary; a run with --yes alone
+    keeps the role configured before."""
+    from verathos.install.miner import choose_role
+
+    ui = common.Prompter(assume_yes=True)
+
+    def options(**given) -> argparse.Namespace:
+        return argparse.Namespace(**{"worker": False, "peers": None, **given})
+
+    assert choose_role(ui, options(), {}) == "primary"
+    assert choose_role(ui, options(), {"role": "worker"}) == "worker"
+    assert choose_role(ui, options(worker=True), {}) == "worker"
+    assert choose_role(ui, options(peers="154.54.100.137:20017"), {"role": "worker"}) == "primary"
+    with pytest.raises(SystemExit, match="not both"):
+        choose_role(ui, options(worker=True, peers="154.54.100.137:20017"), {})
+
+
+def test_a_worker_and_its_primary_are_configured_for_one_hotkey(tmp_path) -> None:
+    """A worker's endpoint ids are its own (its name, or its IP address) and it has no peers; the primary lists the
+    workers' public addresses, kept on the next run unless --peers replaces them."""
+    from verathos.install.miner import endpoint_prefix, parse_peers
+
+    prefix = endpoint_prefix("worker", None, "154.54.100.137", [])
+    assert prefix == "154-54-100-137-"
+    assert endpoint_prefix("worker", None, "8.8.8.8", ["154-54-100-137-gpu0", "154-54-100-137-gpu1"]) == prefix
+    assert endpoint_prefix("worker", "a100-sxm", "8.8.8.8", [prefix + "gpu0"]) == "a100-sxm-"
+    assert endpoint_prefix("worker", None, "2606:4700::1111", []).startswith("v6-")
+    assert endpoint_prefix("primary", None, "8.8.8.8", [prefix + "gpu0"]) == ""
+    with pytest.raises(SystemExit, match="--name"):
+        endpoint_prefix("worker", "A100_SXM", "8.8.8.8", [])
+
+    def configure(existing: dict, role: str, ip: str, ids: list[str], peers: list[str] | None) -> dict:
+        config = miner_config(existing, network="test", netuid=405, wallet_name="decide", hotkey_name="sybil",
+                              public_ip=ip, port=20017, endpoints={e: ("kev-4b", 8008 + i) for i, e in enumerate(ids)},
+                              managed_before={e["endpoint_id"] for e in existing.get("endpoints", [])},
+                              home=tmp_path, role=role,
+                              peers=peers)
+        MinerConfig.model_validate(config)
+        return config
+
+    worker = configure({}, "worker", "154.54.100.137", [prefix + "gpu0", prefix + "gpu1"], None)
+    assert worker["role"] == "worker" and "peers" not in worker
+    assert [e["endpoint_id"] for e in worker["endpoints"]] == ["154-54-100-137-gpu0", "154-54-100-137-gpu1"]
+
+    peers = parse_peers("154.54.100.137:20017, [2606:4700::1111]:8091")
+    assert peers == ["http://154.54.100.137:20017", "http://[2606:4700::1111]:8091"]
+    for bad in ("10.0.0.1:8091", "154.54.100.137", "localhost:8091", "[::ffff:8.8.8.8]:80"):
+        with pytest.raises(SystemExit, match="--peers"):
+            parse_peers(bad)
+    primary = configure({}, "primary", "40.119.45.15", ["gpu0"], peers)
+    assert primary["role"] == "primary" and primary["peers"] == peers
+    assert configure(primary, "primary", "40.119.45.15", ["gpu0"], None)["peers"] == peers  # --yes keeps them
+    assert "peers" not in configure(primary, "primary", "40.119.45.15", ["gpu0"], [])  # --peers ''
+    assert "peers" not in configure(primary, "worker", "40.119.45.15", ["x-gpu0"], None)
+
+
 def test_the_validator_configuration_keeps_remote_references_and_settings(tmp_path) -> None:
     existing = {"references": {"kev-4b": "http://127.0.0.1:8101", "clef-flash": {"url": "https://ref.example/x",
                                                                                  "api_key": "k"}},
@@ -261,3 +318,4 @@ def test_install_script_parses_and_documents_its_options() -> None:
     assert subprocess.run(["bash", "-n", str(script)]).returncode == 0
     usage = subprocess.run(["bash", str(script), "--help"], capture_output=True, text=True)
     assert usage.returncode == 0 and "--source" in usage.stdout and "uninstall" in usage.stdout
+    assert "--worker" in usage.stdout and "--peers" in usage.stdout

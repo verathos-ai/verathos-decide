@@ -18,6 +18,8 @@
 # Every other option goes to `verathos-<role> init`, for example:
 #   --yes --wallet <name> --hotkey <name> --network finney|test|<ws url> --netuid <n>
 #   miner: --public-ip <ip> --port <port> --model <id>[,<id>...] --gpus <i,j> --no-publish
+#          --worker [--name <name>]  (a worker machine of the hotkey; set up the workers first)
+#          --peers <ip:port>[,...]   (on the primary: every worker; replaces the list)
 #   validator: --device auto|cpu|gpu --dry-run
 set -euo pipefail
 

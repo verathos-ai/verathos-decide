@@ -92,13 +92,6 @@ def detect_public_ip(timeout_s: float = 5.0) -> str | None:
     return None
 
 
-def is_public(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except ValueError:
-        return False
-
-
 def port_free(port: int, host: str = "0.0.0.0") -> bool:
     """Whether a listening socket can bind ``host:port`` now."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
