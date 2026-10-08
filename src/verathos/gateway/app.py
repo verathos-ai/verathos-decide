@@ -254,76 +254,78 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
     tried: set[str] = set()
     unclear: list[Endpoint] = []
     rejected: list[Endpoint] = []
-    excused: list[Endpoint] = []
-    result = "busy"
-    for attempt in range(g.config.max_attempts):
-        remaining = deadline - g.clock()
-        if remaining <= 0.05:
-            break
-        endpoint = g.router.pick(model_id, tried, observe=counted)
-        if endpoint is None:
-            if not attempt and g.router.down(model_id):
-                result = "down"
-            break
-        if attempt:
-            metrics.RETRIES.inc()
-        tried.add(endpoint.route.hotkey)
-        g.router.started(endpoint, observe=counted)
-        outcome: Outcome | None = None
-        attempt_started = g.clock()
-        note = {"endpoint": endpoint.key}
-        try:
-            exchange = await g.upstream.call(endpoint.route, checked.raw, checked.body, checked.request_sha256,
-                                             checked.parsed, min(g.config.attempt_timeout_s, remaining),
-                                             min_tokens=checked.min_tokens)
-            outcome = Outcome.ANSWERED
-            note["outcome"] = "answered"
-        except UpstreamFailure as failure:
-            metrics.UPSTREAM_FAILURES.labels(failure.kind).inc()
-            if times := _throttled(f"{endpoint.key} {failure.kind}"):
-                log.info("an attempt at %s failed: %s, blamed on %s (%d times since last logged)", endpoint.key,
-                         failure, failure.blame, times)
-            note.update(outcome="failed", kind=failure.kind, blame=failure.blame, detail=str(failure))
-            if failure.exchange is not None:
-                g.sampler.proof(failure.exchange)
-            if failure.blame == "miner":
+    unsettled: list[Endpoint] = []  # breaker probes that ended counting neither way, yet
+    try:
+        result = "busy"
+        for attempt in range(g.config.max_attempts):
+            remaining = deadline - g.clock()
+            if remaining <= 0.05:
+                break
+            endpoint = g.router.pick(model_id, tried, observe=counted)
+            if endpoint is None:
+                if not attempt and g.router.down(model_id):
+                    result = "down"
+                break
+            if attempt:
+                metrics.RETRIES.inc()
+            tried.add(endpoint.route.hotkey)
+            g.router.started(endpoint, observe=counted)
+            probe = endpoint.breaker.probing  # this attempt is the breaker's one probe
+            outcome: Outcome | None = None
+            attempt_started = g.clock()
+            note = {"endpoint": endpoint.key}
+            try:
+                exchange = await g.upstream.call(endpoint.route, checked.raw, checked.body, checked.request_sha256,
+                                                 checked.parsed, min(g.config.attempt_timeout_s, remaining),
+                                                 min_tokens=checked.min_tokens)
+                outcome = Outcome.ANSWERED
+                note["outcome"] = "answered"
+            except UpstreamFailure as failure:
+                metrics.UPSTREAM_FAILURES.labels(failure.kind).inc()
+                if times := _throttled(f"{endpoint.key} {failure.kind}"):
+                    log.info("an attempt at %s failed: %s, blamed on %s (%d times since last logged)", endpoint.key,
+                             failure, failure.blame, times)
+                note.update(outcome="failed", kind=failure.kind, blame=failure.blame, detail=str(failure))
+                if failure.exchange is not None:
+                    g.sampler.proof(failure.exchange)
+                if failure.blame == "miner":
+                    outcome, result = Outcome.FAILED, "failed"
+                elif failure.blame == "busy":
+                    outcome = Outcome.BUSY
+                elif failure.blame == "gateway":  # this host's own fault: no miner is told off for it
+                    result = "failed"
+                elif failure.blame == "rejected":
+                    unclear.append(endpoint)
+                    rejected.append(endpoint)
+                    result = "rejected" if result != "failed" else result
+                else:
+                    unclear.append(endpoint)
+                    result = "failed"
+                continue
+            except Exception as exc:
+                log.exception("an attempt at %s failed", endpoint.key)
+                metrics.UPSTREAM_FAILURES.labels("unexpected").inc()
+                note.update(outcome="failed", kind="unexpected", detail=type(exc).__name__)
                 outcome, result = Outcome.FAILED, "failed"
-            elif failure.blame == "busy":
-                outcome = Outcome.BUSY
-            elif failure.blame == "gateway":  # this host's own fault: no miner is told off for it
-                excused.append(endpoint)
-                result = "failed"
-            elif failure.blame == "rejected":
-                unclear.append(endpoint)
-                rejected.append(endpoint)
-                result = "rejected" if result != "failed" else result
-            else:
-                unclear.append(endpoint)
-                result = "failed"
-            continue
-        except Exception as exc:
-            log.exception("an attempt at %s failed", endpoint.key)
-            metrics.UPSTREAM_FAILURES.labels("unexpected").inc()
-            note.update(outcome="failed", kind="unexpected", detail=type(exc).__name__)
-            outcome, result = Outcome.FAILED, "failed"
-            continue
-        finally:
-            seconds = g.clock() - attempt_started
-            g.router.finished(endpoint, outcome, seconds, observe=counted, why=note.get("detail", ""))
-            note["ms"] = round(1000 * seconds, 1)
-            if attempts is not None:
-                attempts.append(note)
-        for other in unclear:
-            g.router.penalize(other, observe=counted)
-        for other in excused:
+                continue
+            finally:
+                seconds = g.clock() - attempt_started
+                g.router.finished(endpoint, outcome, seconds, observe=counted, why=note.get("detail", ""))
+                if outcome is None and probe:
+                    unsettled.append(endpoint)
+                note["ms"] = round(1000 * seconds, 1)
+                if attempts is not None:
+                    attempts.append(note)
+            for other in unclear:
+                g.router.penalize(other, observe=counted)
+            metrics.UPSTREAM_SECONDS.labels(model_id).observe(seconds)
+            return dataclasses.replace(exchange, seconds=seconds)
+        if len(rejected) == 1:
+            g.router.refused(rejected[0], observe=counted)
+        return result
+    finally:  # unless penalized, a probe that counted neither way stays so, also when the request is cancelled
+        for other in unsettled:
             g.router.settled(other)
-        metrics.UPSTREAM_SECONDS.labels(model_id).observe(seconds)
-        return dataclasses.replace(exchange, seconds=seconds)
-    for other in unclear + excused:
-        g.router.settled(other)
-    if len(rejected) == 1:
-        g.router.refused(rejected[0], observe=counted)
-    return result
 
 
 async def final_writes(g: Gateway) -> None:

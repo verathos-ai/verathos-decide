@@ -532,6 +532,24 @@ def test_a_probe_that_times_out_doubles_the_open_time_once_another_miner_answers
     assert b.breaker.open_s == 2 * OPEN_S and not b.breaker.probing
 
 
+def test_a_probe_whose_request_is_cancelled_does_not_keep_the_breaker_closed_to_probes(tmp_path) -> None:
+    from verathos.gateway.app import check_request, forward
+
+    s = Setup(tmp_path, {"10.0.0.1": Slow("kev-4b", 5.0)})
+    (endpoint,) = s.router._pools["kev-4b"].endpoints
+    for _ in range(BREAKER_FAILURES):
+        s.router.started(endpoint)
+        s.router.finished(endpoint, Outcome.FAILED)
+    endpoint.breaker.open_until = 0.0  # its open time is over: the next request probes it
+    checked = check_request(s.gateway, json.dumps(REQUEST).encode())
+
+    async def cancelled():
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(forward(s.gateway, checked, s.gateway.clock()), 0.2)
+    asyncio.run(cancelled())
+    assert not endpoint.breaker.probing and endpoint.in_flight == 0
+
+
 class Observer:
     def __init__(self) -> None:
         self.offers: dict[str, int] = {}
