@@ -321,9 +321,10 @@ def test_a_light_validator_never_contacts_miners_or_loads_references(tmp_path, m
     assert [s["uids"] for s in chain.set] == [[3, 7, 12]]
 
 
-def auditor_and_light(tmp_path, cat: catalog.Catalog):
-    """The auditor's epochs (run_epoch with no endpoints, publishing on its board), and a light validator following
-    it: -> (chain, light validator, a function running the auditor's epoch and returning the weights it set)."""
+def auditor_and_light(tmp_path, cat: catalog.Catalog, verdicts=None):
+    """The auditor's epochs (run_epoch with no endpoints and ``verdicts``, publishing on its board), and a light
+    validator following it: -> (chain, light validator, a function running the auditor's epoch and returning the
+    weights it set)."""
     from verathos.validator import __main__ as validator_main
     from verathos.validator.discovery import Identities, ManifestCache
 
@@ -335,11 +336,15 @@ def auditor_and_light(tmp_path, cat: catalog.Catalog):
     chain.get_all_commitments = lambda netuid: {}
 
     async def no_verdicts(client, epoch):
-        return None
+        return None if verdicts is None else verdicts(owner.ss58_address, epoch)
+
+    async def no_evidence(evidence, references, cat, budget_s=None):
+        return []
 
     throughput = SimpleNamespace(auditor_hotkey=owner.ss58_address, manifests=ManifestCache(60.0),
                                  identities=Identities(), holding=lambda: False, verdicts=no_verdicts,
-                                 update_slots=lambda miners, neurons, epoch: None)
+                                 update_slots=lambda miners, neurons, epoch: None, auditor=SimpleNamespace(),
+                                 proven_invalid=no_evidence)
     current = SimpleNamespace(catalog=cat, for_epoch=lambda st, block: cat,
                               accepted=lambda: {cat.digest(): cat.mechanism})
     auditor_cfg = SimpleNamespace(netuid=405, mechid=None, references={}, dry_run=False)
@@ -400,6 +405,39 @@ def test_the_miner_share_steps_down_by_epoch_and_light_validators_set_the_audito
         follower.step()
         assert chain.set[-1] == published
     assert [stepping.scoring.miner_share_at(e) for e in (103, 104, 10**6)] == [0.26, 0.15, 0.15]
+
+
+def test_the_usage_pool_is_part_of_what_the_auditor_sets_and_light_validators_set_the_same(tmp_path) -> None:
+    """The hotkeys that served paying users get the period's usage share on top of their scores; the auditor
+    publishes the weights with it and the share, and a light validator sets exactly those."""
+    from verathos.throughput.feed import Verdicts
+    from verathos.throughput.usage import Burn, Emission, close
+
+    document = CAT.document()
+    buyback = kp().ss58_address
+    pooled = catalog.Catalog.parse({**document, "scoring": {**document["scoring"], "usage_pool": {
+        "mode": "burned", "fraction": 1.0, "period_epochs": 2, "buyback_coldkey": buyback}}})
+    emission = Emission(alpha_out=10**9, owner_cut=11796, mechanism=0, mechanisms=1)
+    record = close(49, pool=pooled.scoring.usage_pool, cat=pooled, epoch_blocks=BLOCKS,  # epoch 100 pays period 49
+                   paid={(hotkey, "gpu0", "kev-4b"): n for hotkey, n in (("hkA", 300), ("hkB", 100), ("hkZ", 100))},
+                   coldkeys={}, emission=emission,
+                   burns=[Burn(block=50 * 2 * BLOCKS - 9, event_index=0, coldkey=buyback, hotkey="hkX",
+                               amount=40 * 10**9)])
+
+    def verdicts(auditor: str, epoch: int) -> Verdicts:
+        return Verdicts(netuid=405, auditor=auditor, epoch=epoch, credits=[], invalid=[],
+                        usage=record.model_dump(mode="json"))
+    chain, follower, board, auditor_epoch = auditor_and_light(tmp_path, pooled, verdicts)
+    state = ScoreState(ema={"hkA/gpu0": 0.6, "hkB/gpu0": 0.2}, uid_of={"hkA/gpu0": 1, "hkB/gpu0": 2})
+    published = auditor_epoch(state, 100)
+    network = NetworkStatus.model_validate_json(board.network())
+    share = record.share
+    assert 0 < share < 1 - 0.59 and network.usage_share == round(share * 4 / 5, 6)  # hkZ holds no UID
+    assert network.weights == dict(zip(published["uids"], published["weights"]))
+    assert network.weights == pytest.approx({0: 0.41 - share * 4 / 5, 1: 0.75 * 0.59 + share * 3 / 5,
+                                             2: 0.25 * 0.59 + share * 1 / 5})
+    follower.step()
+    assert chain.set[-1] == published
 
 
 def test_the_auditor_and_light_validators_set_weights_on_the_catalogs_mechanism(tmp_path) -> None:

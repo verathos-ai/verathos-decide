@@ -1,9 +1,10 @@
 """The usage pool: weight on top of the scores for the hotkeys that served paying users, sized each period from the
-buyback's burns or the users' payments, recorded and signed by the auditor."""
+buyback's burns or the users' payments, recorded and signed by the auditor, and set alike by every validator."""
 
 from __future__ import annotations
 
 import dataclasses
+import logging
 import time
 from types import SimpleNamespace
 
@@ -15,17 +16,21 @@ from verathos import catalog
 from verathos.protocol import signing
 from verathos.protocol.gateway import ServedCount
 from verathos.throughput.auditor import SCAN_REACH_BLOCKS, Auditor, Slot
-from verathos.throughput.feed import VERDICTS_DOMAIN
+from verathos.throughput.feed import VERDICTS_DOMAIN, Verdicts
 from verathos.throughput.policy import AuditPolicy
 from verathos.throughput.usage import (
     Burn,
     Emission,
+    UsageRecord,
     burns_in,
     close,
     contradiction,
     record_of,
     sized_share,
 )
+from verathos.validator.__main__ import weights_to_set
+from verathos.validator.scoring import ScoreState, weights
+from verathos.validator.usage import take, usage_weights
 
 BUYBACK = kp().ss58_address
 OTHER = kp().ss58_address
@@ -133,6 +138,124 @@ def test_a_record_whose_figures_do_not_follow_from_its_inputs_is_inconsistent() 
                     paid=paid({"hkA": 10**9}), coldkeys={}, emission=SN96, tao_usd=300.0, alpha_tao=0.004)
     assert "revenue" in revenue.model_copy(update={"revenue_usd": 1000.0}).inconsistency()
     assert "lacks" in revenue.model_copy(update={"tao_usd": None}).inconsistency()
+
+
+# ---- weights ----
+
+def record(share: float, served: dict[str, int], period: int = 2, coldkeys: dict | None = None,
+           cat: catalog.Catalog | None = None) -> UsageRecord:
+    """A record of ``period`` sized to ``share``, as consistent as the auditor's."""
+    cat = cat or with_pool(BURNED)
+    end = (period + 1) * 360
+    period_emission = SN96.miner_alpha_per_block() * 360
+    amount = round(share * period_emission * 10**9)
+    built = close(period, pool=cat.scoring.usage_pool, cat=cat, epoch_blocks=180, paid=paid(served),
+                  coldkeys=coldkeys or {}, emission=SN96,
+                  burns=[Burn(block=end - 5, event_index=0, coldkey=BUYBACK, hotkey="hkX", amount=amount)])
+    assert built.share == pytest.approx(share, abs=1e-6) and built.inconsistency() is None
+    return built
+
+
+HOTKEYS = {0: "owner", 1: "hkA", 2: "hkB", 3: "hkC"}
+
+
+def test_usage_weights_split_the_share_by_paid_input_tokens_on_top_of_the_capacity_weights() -> None:
+    cat = with_pool(BURNED)  # miner share 0.59: at most 0.41 for the pool
+    r = record(0.1, {"hkA": 300, "hkB": 100})
+    usage = usage_weights(r, cat, 6, HOTKEYS)  # epoch 6 is in period 3: it pays period 2
+    assert usage == pytest.approx({1: 0.075, 2: 0.025})
+    capacity = {2: 0.5, 3: 0.5}
+    w = weights_to_set(capacity, HOTKEYS, "owner", 0.59, usage)
+    assert w == pytest.approx({0: 1 - 0.59 - 0.1, 1: 0.075, 2: 0.59 * 0.5 + 0.025, 3: 0.59 * 0.5})
+    assert sum(w.values()) == pytest.approx(1.0)
+    assert usage_weights(r, cat, 7, HOTKEYS) == usage  # every epoch of the period pays it alike
+    assert usage_weights(r, cat, 8, HOTKEYS) == {} and usage_weights(r, cat, 5, HOTKEYS) == {}  # other periods: none
+    assert weights_to_set({}, HOTKEYS, "owner", 0.59, usage) == pytest.approx({0: 0.9, 1: 0.075, 2: 0.025})
+
+
+def test_the_usage_share_is_at_most_what_the_miner_share_leaves_and_the_rest_stays_on_the_owners_uid() -> None:
+    big = record(0.6, {"hkA": 1})
+    assert usage_weights(big, with_pool(BURNED), 6, HOTKEYS) == {1: pytest.approx(0.41)}  # capped at 1 - 0.59
+    stepping = with_pool(BURNED, miner_share={"from": 0.59, "to": 0.15, "start_epoch": 6, "epochs": 4})
+    assert stepping.scoring.miner_share_at(7) == 0.48  # the share steps down: the cap rises with it
+    assert usage_weights(big, stepping, 6, HOTKEYS) == {1: pytest.approx(0.41)}
+    assert usage_weights(big, stepping, 7, HOTKEYS) == {1: pytest.approx(0.52)}
+    w = weights_to_set({2: 1.0}, HOTKEYS, "owner", 0.48, usage_weights(big, stepping, 7, HOTKEYS))
+    assert w == pytest.approx({1: 0.52, 2: 0.48}) and 0 not in w  # nothing left for the owner's UID
+    everything = with_pool(BURNED, miner_share=1.0)
+    assert usage_weights(big, everything, 6, HOTKEYS) == {}  # the miner share leaves nothing
+
+
+def test_excluded_and_departed_hotkeys_get_no_usage_pay_and_their_part_stays_on_the_owners_uid() -> None:
+    fleet = kp().ss58_address
+    cat = with_pool({**BURNED, "excluded": [fleet, OWNER_COLDKEY]})
+    hotkeys = {0: "owner", 1: "hkA", 2: "hkB", 3: fleet}
+    r = record(0.2, {"hkA": 100, "hkB": 100, fleet: 100, "hkGone": 100}, coldkeys={"hkB": OWNER_COLDKEY}, cat=cat)
+    usage = usage_weights(r, cat, 6, hotkeys)
+    assert usage == {1: pytest.approx(0.05)}  # hkB by its coldkey, the fleet hotkey by name, hkGone holds no UID
+    assert weights_to_set({1: 1.0}, hotkeys, "owner", 0.59, usage) == pytest.approx({0: 0.36, 1: 0.64})
+
+
+def test_without_the_pool_or_without_paid_usage_the_weights_are_todays() -> None:
+    capacity = {1: 0.75, 2: 0.25}
+    today = weights_to_set(capacity, HOTKEYS, "owner", 0.59)
+    assert usage_weights(record(0.1, {"hkA": 1}), with_pool(None), 6, HOTKEYS) == {}
+    assert usage_weights(None, with_pool(BURNED), 6, HOTKEYS) == {}
+    assert usage_weights(record(0.1, {}), with_pool(BURNED), 6, HOTKEYS) == {}  # burned, but nobody paid
+    assert weights_to_set(capacity, HOTKEYS, "owner", 0.59, {}) == today
+    assert weights_to_set({}, HOTKEYS, "owner", 0.59, {}) == {0: 1.0}
+    assert weights_to_set(capacity, HOTKEYS, "owner", 1.0, {}) == capacity
+    unowned = {1: "hkA", 2: "hkB"}  # the owner hotkey holds no UID: the miners get it all, in proportion
+    assert weights_to_set(capacity, unowned, "owner", 0.59, {1: 0.41}) == pytest.approx(
+        {1: 0.59 * 0.75 + 0.41, 2: 0.59 * 0.25})
+
+
+def test_every_validator_sets_the_same_weights_from_the_same_record_and_averages() -> None:
+    """Two validators whose averages were folded in another order, taking the record from the same verdicts, set the
+    same weights to the last digit."""
+    cat = with_pool(BURNED)
+    r = record(0.123457, {"hkA": 7, "hkB": 11, "hkC": 13})
+    verdicts = Verdicts(netuid=405, auditor="a", epoch=6, credits=[], invalid=[], usage=r.model_dump(mode="json"))
+    ema = {"hkA/gpu0": 0.3, "hkB/gpu0": 0.1, "hkC/gpu1": 0.2, "hkC/gpu0": 0.05}
+    out = []
+    for order in (sorted(ema), sorted(ema, reverse=True)):
+        state = ScoreState(ema={k: ema[k] for k in order}, uid_of={k: {"hkA": 1, "hkB": 2, "hkC": 3}[k[:3]]
+                                                                  for k in order})
+        taken = take(state, verdicts, cat, 6)
+        out.append(weights_to_set(weights(state, HOTKEYS), HOTKEYS, "owner", cat.scoring.miner_share_at(6),
+                                  usage_weights(taken, cat, 6, HOTKEYS)))
+    assert out[0] == out[1] and sum(out[0].values()) == pytest.approx(1.0)
+
+
+def test_a_validator_takes_a_record_once_per_period_keeps_it_and_refuses_one_that_does_not_hold(caplog) -> None:
+    cat = with_pool(BURNED)
+    r = record(0.1, {"hkA": 1})
+    stated = Verdicts(netuid=405, auditor="a", epoch=6, credits=[], invalid=[], usage=r.model_dump(mode="json"))
+    state, checked = ScoreState(), []
+
+    def check(rec):
+        checked.append(rec.period)
+        return None
+    assert take(state, stated, cat, 6, check) == r and checked == [2]
+    assert take(state, None, cat, 7, check) == r and checked == [2]  # no verdicts: the record kept pays the epoch
+    assert take(state, stated, cat, 7, check) == r and checked == [2]  # taken once
+    assert take(state, None, cat, 8, check) is None  # the next period needs the next record
+    assert take(ScoreState(), stated, cat, 8) is None  # a record of another period pays nothing
+    assert take(state, stated, with_pool(None), 6) is None
+
+    contradicted = ScoreState()
+    with caplog.at_level(logging.ERROR, logger="verathos.validator"):
+        assert take(contradicted, stated, cat, 6, lambda rec: "the chain has no such burn") is None
+    assert "refused" in caplog.text and contradicted.usage_refused == "the chain has no such burn"
+    assert take(contradicted, stated, cat, 7) is None  # refused for the whole period
+    tampered = Verdicts(netuid=405, auditor="a", epoch=6, credits=[], invalid=[],
+                        usage={**r.model_dump(mode="json"), "share": 0.3})
+    assert take(ScoreState(), tampered, cat, 6) is None
+
+    def unreachable(rec):
+        raise ConnectionError("node down")
+    assert take(ScoreState(), stated, cat, 6, unreachable) == r  # unchecked: the auditor's word
+    assert record_of({"period": 1}) is None and record_of("x") is None
 
 
 # ---- the chain ----
@@ -282,6 +405,8 @@ def test_the_auditor_records_the_buybacks_burns_and_the_paid_usage_of_a_period_a
     assert r.share == round(36.0 / (SN96.miner_alpha_per_block() * 360), 6)
     at(auditor, 7 * 180 + 1)
     assert record_of(auditor.verdicts(7).verdicts.model_extra["usage"]) == r  # every epoch of period 3 states it
+    usage = usage_weights(take(ScoreState(), v, cat, 6), cat, 6, HOTKEYS)
+    assert usage == pytest.approx({1: r.share * 0.8, 2: r.share * 0.2})
 
 
 def test_the_first_verdicts_of_a_period_wait_briefly_for_the_record_and_blocks_out_of_reach_do_not_count(
@@ -328,7 +453,8 @@ def test_in_revenue_mode_the_auditor_records_the_paid_usage_at_the_prices_of_the
 
 
 def test_a_new_period_length_starts_periods_of_other_blocks_and_nothing_is_paid_twice(tmp_path) -> None:
-    """The auditor gives no record to a period overlapping one recorded before."""
+    """The auditor gives no record to a period overlapping one recorded before; a validator pays a record only for the
+    blocks of the period its catalog makes."""
     burns = {b: [Burn(block=b, event_index=0, coldkey=BUYBACK, hotkey="hkX", amount=10**9)] for b in (900, 1200, 1500)}
     catalogs = [with_pool(BURNED)]  # periods of 2 epochs: 360 blocks
     chain = UsageChain(4 * 180 + 1, burns)
@@ -351,3 +477,7 @@ def test_a_new_period_length_starts_periods_of_other_blocks_and_nothing_is_paid_
     at(auditor, 12 * 180 + 2)
     later = record_of(auditor.verdicts(12).verdicts.model_extra["usage"])
     assert (later.first_block, later.end_block, later.basis) == (1440, 2160, 1.0)  # the burn at 1500 only
+
+    stated = Verdicts(netuid=405, auditor="a", epoch=6, credits=[], invalid=[], usage=first.model_dump(mode="json"))
+    longer = with_pool({**BURNED, "period_epochs": 3})  # epoch 6 is the first of period 2, of blocks [1080, 1620)
+    assert take(ScoreState(), stated, longer, 6) is None and usage_weights(first, longer, 6, HOTKEYS) == {}

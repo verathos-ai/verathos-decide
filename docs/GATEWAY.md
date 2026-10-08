@@ -101,11 +101,11 @@ The gateway also reports, every 5 s, how many requests each endpoint answered it
 Miners serve the gateway before the auditor's test traffic; what an endpoint answers the gateway inside a test's
 measured window counts as delivered, so serving users never costs a miner credit (`THROUGHPUT_AUDIT.md`). The input
 tokens per model are the users' demand; of them, the paid ones (`paid_input_tokens`) set, at each model's catalog
-`price`, the models' emission shares (`SCORING.md`). Usage is paid when its account is prepaid, has topped up, and
-its free credit is spent: its balance is no more than its top-ups. Free credit (a sign-up grant, the demo) is spent
-first, as the totals count paid usage, so an account that only ever had free credit is unpaid, one that bought credit
-is paid once its grants are used, and accounts that are not prepaid (invoiced, internal) are unpaid. Admin requests
-are never paid.
+`price`, the models' emission shares, and per endpoint its part of the usage pool (`SCORING.md`). Usage is paid
+when its account is prepaid, has topped up, and its free credit is spent: its balance is no more than its top-ups.
+Free credit (a sign-up grant, the demo) is spent first, as the totals count paid usage, so an account that only ever
+had free credit is unpaid, one that bought credit is paid once its grants are used, and accounts that are not prepaid
+(invoiced, internal) are unpaid. Admin requests are never paid.
 
 ## Privacy of user requests
 

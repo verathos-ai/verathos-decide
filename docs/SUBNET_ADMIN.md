@@ -11,7 +11,7 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[chain,ops]"
 
 `status` shows the UID cap, the mechanisms and their emission split, the owner hotkey, the committed catalog digest
 and its mechanism, the digest of the catalog shipped with this code, the current epoch and the committed catalog's
-miner share in it.
+miner share in it, and its usage pool with the current period.
 
 ## Mechanisms
 
@@ -42,8 +42,8 @@ configuration) overrides the catalog's; leave it unset.
 The catalog lists the served models (pinned weights, engine and engine revision, verification tolerances, the
 standard request mix `workload`, `price`, `anchor_share`, `first_test_rps`, `relative_speed`, status), the
 [mechanism](#mechanisms), the epoch length, the scoring settings (`scoring`, including the
-[miner share](#miner-share)) and the throughput-audit policy (`throughput_audit`). Miners and validators use
-whichever catalog the owner hotkey commits; publishing a new one needs no code release.
+[miner share](#miner-share) and the [usage pool](#usage-pool)) and the throughput-audit policy (`throughput_audit`).
+Miners and validators use whichever catalog the owner hotkey commits; publishing a new one needs no code release.
 
 `price` is what users pay for the model, in USD per million input tokens, and the model's share of the emission
 follows what its users pay (`SCORING.md`). `anchor_share` is the model's share while
@@ -144,6 +144,45 @@ commit falls in (each epoch is scored under the catalog committed at its first b
 jump), and commit the catalog. `status` shows the current epoch and its share, and `commit-catalog` prints the share
 in the current epoch and when the change ends. Keep `start_epoch` and `epochs` in later catalogs, or the share jumps
 to what the new values give; changing `epoch_blocks` renumbers the epochs, so it moves the change too.
+
+## Usage pool
+
+`scoring.usage_pool` pays the hotkeys that served paying users on top of their scores, out of what the miner share
+leaves (`SCORING.md`). Without it, or with a miner share of 1, there is none.
+
+```json
+"usage_pool": {"mode": "burned", "fraction": 1.0, "period_epochs": 40,
+               "buyback_coldkey": "5...", "excluded": ["5...", "5..."]}
+```
+
+| Setting | Meaning |
+|---|---|
+| `mode` | `burned`: a period's pool is the alpha `buyback_coldkey` burned on the subnet in it; `revenue`: the period's paid usage, converted to alpha |
+| `fraction` | in (0, 1]: the share of that alpha the pool pays |
+| `period_epochs` | 1 to 400, default 40 (about a day): a period's pool is paid over the epochs of the next |
+| `buyback_coldkey` | `burned` mode: the coldkey whose `AlphaBurned` events on the subnet count |
+| `excluded` | hotkeys and coldkeys whose endpoints get no usage pay, such as the owner's own miners; their part stays on the owner's UID |
+
+The buyback coldkey is the owner side's own coldkey, published, not the subnet owner's coldkey (`commit-catalog`
+refuses that one): it signs every period, so it holds only the revenue it spends. It buys alpha and burns it from
+its own stake, with `add_stake` and `burn_alpha`, or `add_stake_burn` in one call. A burn counts in the period whose
+blocks it is in. With `fraction` 1 the pool pays the miners what was burned; a part of the purchase kept rather than
+burned (a fee) is not paid. In `revenue` mode no coldkey is read: the pool follows the gateway's paid usage whether or
+not alpha is bought with it.
+
+To enable it:
+
+1. Keep the miner share below 1: the pool takes at most `1 - miner_share`.
+2. Publish the buyback coldkey and the excluded keys, and commit a catalog with `usage_pool`. `commit-catalog` prints
+   the pool and the current period. The auditor reads the burns from the start of the period it adopts the catalog
+   in (from blocks its node still holds); that period's record is the first, paid over the next period.
+3. Burn from the buyback coldkey. The auditor logs each period it closes (`usage pool: period ... closed`), and every
+   validator each epoch's usage share.
+
+A period is its blocks: a new `period_epochs` or `epoch_blocks` starts periods of other blocks, and a new period that
+overlaps one already recorded has no record (its pool is not paid), so nothing counts twice. A new `buyback_coldkey`
+applies to the periods closed after the change: only its burns count in them. Run it on the test network first, with
+a test buyback coldkey and a short `period_epochs`.
 
 ## Throughput audit
 

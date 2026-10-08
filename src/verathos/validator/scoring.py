@@ -56,6 +56,8 @@ class ScoreState:
     held: dict[str, int] = field(default_factory=dict)  # key -> epochs in a row its average was held
     pins: dict[str, list] = field(default_factory=dict)  # model -> [what the catalog pins, the epoch that changed it]
     waited: dict[str, int] = field(default_factory=dict)  # references one at a time: model -> epochs in a row not run
+    usage_record: dict | None = None  # the usage pool's latest record taken (``validator.usage``), as JSON
+    usage_refused: str | None = None  # why that record was refused, if it was
     last_epoch: int | None = None  # the last epoch scored, so a restart does not score it again
     scale: int = SCORE_SCALE
 

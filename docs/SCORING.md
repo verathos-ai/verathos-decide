@@ -112,12 +112,13 @@ endpoints is on probation inherits the remaining probation, so renaming an endpo
 
 A UID's value is the sum of its endpoints' EMAs, normalised over all UIDs. Endpoints whose UID now belongs to another
 hotkey are ignored. The miners' values are then scaled to sum to the epoch's miner share, the catalog's
-`scoring.miner_share` (0.59 in the shipped catalog), and the subnet owner's UID gets the rest; the weights are set on
-the catalog's mechanism (`SUBNET_ADMIN.md`) once per epoch. The chain pays the subnet owner hotkey no incentive: it
-burns it, or recycles it under the subnet's `RecycleOrBurn` setting (`SUBNET_ADMIN.md`). The share is a constant or
-moves linearly from one value to another over a number of epochs; each epoch's comes from the catalog and the epoch
-number alone, rounded to 6 decimals, so every validator sets the same split. If no endpoint has a positive score, all
-weight goes to the subnet owner's UID. If the owner hotkey holds no UID, the miners' values are set as they are.
+`scoring.miner_share` (0.59 in the shipped catalog), the [usage pool](#usage-pool)'s weights are added, and the subnet
+owner's UID gets the rest; the weights are set on the catalog's mechanism (`SUBNET_ADMIN.md`) once per epoch. The
+chain pays the subnet owner hotkey no incentive: it burns it, or recycles it under the subnet's `RecycleOrBurn`
+setting (`SUBNET_ADMIN.md`). The share is a constant or moves linearly from one value to another over a number of
+epochs; each epoch's comes from the catalog and the epoch number alone, rounded to 6 decimals, so every validator
+sets the same split. If no endpoint has a positive score and the usage pool pays nobody, all weight goes to the
+subnet owner's UID. If the owner hotkey holds no UID, the miners' and the usage pool's weights are scaled to sum to 1.
 
 Everything above is what a full validator does. A full validator running its references one at a time scores the
 endpoints of the models it does not check in an epoch with the source's published results for them: the score the
@@ -125,3 +126,39 @@ source gave an endpoint enters its average as one it computed (zero on the sourc
 failure, held where the source could not check it), so its weights are one vector from both. A light validator
 (`VALIDATING.md`) scores nothing: it sets the weights the auditor publishes for the epoch (`GET /v1/network`, signed),
 exactly as the auditor sets them.
+
+## Usage pool
+
+The catalog's `scoring.usage_pool` (absent in the shipped catalog: off) pays the hotkeys whose endpoints answered
+paying users, on top of their scores, out of what the miner share leaves. Time runs in periods of `period_epochs`
+epochs (default 40, about a day); a period's pool is sized and recorded when it ends and paid over the epochs of the
+next.
+
+- **Size.** `burned`: the alpha the catalog's `buyback_coldkey` burned on the subnet in the period (its `AlphaBurned`
+  events). `revenue`: the period's paid usage at the models' `price`, counted when it is spent, in alpha at TAO's
+  price in USD when the period closed and the subnet's moving alpha price at the period's end. Either times
+  `fraction`, divided by the mechanism's miner emission over a period, at most 1, rounded to 6 decimals: the
+  period's usage share.
+- **Cap.** Each epoch of the next period pays the usage share, at most `1 - miner_share` of that epoch; beyond it
+  nothing more is paid.
+- **Split.** A hotkey gets `usage share x the paid input tokens its endpoints answered in the period / all of them`.
+  Paid input tokens are those of answers to accounts paying with bought credit (`GATEWAY.md`); free credit, the demo
+  and admin requests count none. Hotkeys the catalog's `excluded` lists, by hotkey or by coldkey, and hotkeys that
+  hold no UID now get nothing.
+
+The subnet owner's UID keeps whatever the scores and the usage pool leave: the parts of excluded and departed hotkeys,
+and a period's whole pool if nobody paid in it. Without the pool, or without paid usage, the weights are exactly what
+they are without it.
+
+`burned` mode is supply-neutral: the alpha it pays the miners was bought and destroyed before, and is no longer burned
+on the owner's UID. `revenue` mode is not: it pays the miners alpha the owner's UID would burn, whether or not any
+was bought, so as revenue grows less is burned.
+
+The auditor records each period (`THROUGHPUT_AUDIT.md`): the paid input tokens per hotkey, the burns or the revenue and
+the prices, and the miners' emission at the period's end block, and states the record, signed, with every verdicts
+document of the next period. Every full validator sets the same weights from it: it recomputes the record's figures from
+its inputs, and checks what its own node still holds of the burns and of the end block's emission and price (a pruned
+node keeps about 256 blocks; the rest it takes on the auditor's word, as it takes capacity). A record that fails either
+pays nothing at that validator for the period. A light validator sets the weights the auditor publishes, usage weights
+included. The network document states the epoch's `usage_share`, the share the usage weights sum to, and each hotkey's
+status its `usage_weight`.

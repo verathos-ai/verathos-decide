@@ -30,10 +30,12 @@ def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint],
           drifted: Collection[str] = (), user_availability: Mapping[str, float] | None = None,
           latency_factors: Mapping[str, float] | None = None,
           taken: Mapping[str, EndpointStatus] | None = None,
-          miner_share: float | None = None) -> dict[str, HotkeyStatus]:
-    """Status per hotkey after ``update`` has folded the epoch into ``state``; ``weights``: per UID, as set;
-    ``drifted``, ``user_availability`` and ``latency_factors`` per endpoint key, as scored; ``taken``: the source's
-    status of the endpoints whose results it gave (``validator.fallback``), whose checks and state they show."""
+          miner_share: float | None = None, usage_share: float | None = None,
+          usage_weights: Mapping[int, float] | None = None) -> dict[str, HotkeyStatus]:
+    """Status per hotkey after ``update`` has folded the epoch into ``state``; ``weights``: per UID, as set, and
+    ``usage_weights`` the usage pool's part of them; ``drifted``, ``user_availability`` and ``latency_factors`` per
+    endpoint key, as scored; ``taken``: the source's status of the endpoints whose results it gave
+    (``validator.fallback``), whose checks and state they show."""
     out: dict[str, HotkeyStatus] = {}
     for ep in endpoints:
         key, r = ep.key, results.get(ep.key)
@@ -70,8 +72,9 @@ def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint],
             status.state = "unanswered"
         out.setdefault(ep.hotkey, HotkeyStatus(
             hotkey=ep.hotkey, uid=ep.uid, weight=round((weights or {}).get(ep.uid, 0.0), 6), epoch=epoch,
-            epoch_blocks=epoch_blocks, endpoints=[], model_shares=model_shares or {},
-            miner_share=miner_share)).endpoints.append(status)
+            epoch_blocks=epoch_blocks, endpoints=[], model_shares=model_shares or {}, miner_share=miner_share,
+            usage_share=usage_share, usage_weight=round((usage_weights or {}).get(ep.uid, 0.0), 6),
+        )).endpoints.append(status)
     return out
 
 
@@ -97,12 +100,14 @@ class StatusBoard:
 
     def publish(self, by_hotkey: dict[str, HotkeyStatus], *, epoch: int | None = None, epoch_blocks: int | None = None,
                 model_shares: dict[str, float] | None = None, weights: dict[int, float] | None = None,
-                miner_share: float | None = None, mechanism: int | None = None) -> None:
+                miner_share: float | None = None, mechanism: int | None = None,
+                usage_share: float | None = None) -> None:
         """Replace the status with ``by_hotkey``. The network's document also states ``weights`` (per UID, as set)
-        and the ``mechanism`` they are set on, and the epoch, its length, the emission shares and the miner share (by
-        default the first hotkey's)."""
+        and the ``mechanism`` they are set on, and the epoch, its length, the emission shares, the miner share and the
+        usage share (by default the first hotkey's)."""
         network = _network(by_hotkey, epoch=epoch, epoch_blocks=epoch_blocks, model_shares=model_shares,
-                           weights=weights, miner_share=miner_share, mechanism=mechanism).model_dump_json().encode()
+                           weights=weights, miner_share=miner_share, mechanism=mechanism,
+                           usage_share=usage_share).model_dump_json().encode()
         with self._lock:
             self._by_hotkey, self._network = by_hotkey, network
             self.revision += 1
@@ -135,6 +140,6 @@ def _network(by_hotkey: dict[str, HotkeyStatus], **given) -> NetworkStatus:
     fields = {}
     if first is not None:
         fields = {"epoch": first.epoch, "epoch_blocks": first.epoch_blocks, "model_shares": first.model_shares,
-                  "miner_share": first.miner_share}
+                  "miner_share": first.miner_share, "usage_share": first.usage_share}
     fields.update({k: v for k, v in given.items() if v is not None})
     return NetworkStatus(**fields, hotkeys=hotkeys)

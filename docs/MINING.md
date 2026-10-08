@@ -8,8 +8,9 @@ measures each endpoint's capacity, publishes a signed manifest and answers signe
 Validators check every endpoint's answers against a reference computation (see `SCORING.md`), and the throughput
 audit (see `THROUGHPUT_AUDIT.md`) checks the capacity each endpoint declares. An endpoint's score is the capacity it
 proves, so hardware pays by its throughput per cost. The scores split the catalog's miner share of the mechanism's
-miner emission (0.59 in the shipped catalog); validators set the rest as weight on the subnet owner's UID, which the
-chain does not pay out (`SCORING.md`).
+miner emission (0.59 in the shipped catalog); with the catalog's usage pool, the hotkeys whose endpoints answered
+paying users get more on top, by the paid input tokens they answered; validators set the rest as weight on the subnet
+owner's UID, which the chain does not pay out (`SCORING.md`).
 
 ## Requirements
 
