@@ -173,6 +173,15 @@ serve the gateway before test traffic, so what an endpoint answered the gateway 
 measured window counts as delivered, next to the test's own replies: serving users never costs credit, and an
 answer held back cannot be moved into a window.
 
+Those answers count only once checked: a miner knows when a test runs, and could answer users with junk then and
+give the test its GPU. Per endpoint and test, the gateway draws one of the exchanges it sent the endpoint during the
+test's traffic and posts it, marked with the test's id, once the test's sessions end. Before evaluating an endpoint
+that answered users in the window, the auditor waits for these (up to two blocks after the sessions end) and
+recomputes the endpoint's: a wrong answer makes the result `invalid` and is evidence like any wrong answer to a user;
+a passing one lets the users' answers count. Without one (none came, or its recompute could not run then) the users'
+answers still count for the pass, but the credit is at most what the endpoint's own test replies prove; the
+exchange is then checked between tests like a proof.
+
 Tests alone cannot show what users get between them: a test is known shortly before it starts (its selection block
 is public) and its requests carry the auditor's session. So the gateway also reports, per endpoint and second, how
 often it considered the endpoint for a user request, how often the endpoint was not ready then (busy, failing,
@@ -218,6 +227,7 @@ How credits and wrong answers enter the score is in `SCORING.md`.
 | Serving test traffic from a lower-precision engine | the recomputed answers drift over a few tests and the credit goes |
 | Renaming or adding endpoints to make the auditor send more | a hotkey's test rate grows only from what its endpoints delivered |
 | Fast junk responses | receipts that do not bind scale delivered down; a signed wrong answer invalidates the hotkey |
+| Answering users with junk during a test, giving the test the GPU | the gateway's sample of the endpoint's answers to users in the test is recomputed before they count; without one the credit is at most its own test replies |
 | Responses built to break the auditor | size and nesting limits; each endpoint is evaluated on its own |
 | Flooding a competitor's endpoint with validator traffic during its test | one request at once per validator and endpoint, no larger than the model's standard requests, and behind the test's requests while they arrive |
 | Flooding it with gateway traffic during its test, or a miner refusing users then | what an endpoint answers the gateway inside the test's window counts as delivered, and displaces the test's requests one for one; refused users count as asked |

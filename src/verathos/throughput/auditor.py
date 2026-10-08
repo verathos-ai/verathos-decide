@@ -104,13 +104,14 @@ KEPT_PER_ENDPOINT = 8  # gateway samples kept per endpoint and epoch, of which g
 MAX_CHECK_ATTEMPTS = 3
 SAMPLE_BUDGET_S = 40.0  # per round of sample checks, under the lead time of a test
 SERVED_WAIT_S = 12.0  # after a test's window, for the gateways' last served counts
+TEST_SAMPLES_WAIT_S = 2 * BLOCK_TIME_S  # after a test's sessions end, for the gateways' samples of users' answers in it
 USER_RATE_S = 60.0  # a test leaves room for what the endpoint answered the gateways over this long ...
 USER_RATE_LAG_S = 10.0  # ... ending this long before the test (the gateways report every few seconds)
 MIN_TEST_SHARE = 0.1  # a test sends at least this share of the tested rate itself
 USERS_BEFORE_S = (80.0, 20.0)  # an endpoint's usual user rate: [window start - 80 s, window start - 20 s)
 SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _DEMAND_SCHEMA = """
 CREATE TABLE demand (epoch INTEGER NOT NULL, model_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
     ema REAL NOT NULL, PRIMARY KEY (epoch, model_id));
@@ -121,8 +122,10 @@ CREATE TABLE users (epoch INTEGER NOT NULL, hotkey TEXT NOT NULL, endpoint_id TE
     PRIMARY KEY (epoch, hotkey, endpoint_id, model_id));
 """
 _RESULTS_INDEX = "CREATE INDEX IF NOT EXISTS results_by_endpoint ON results (hotkey, endpoint_id);"
+_SAMPLES_BY_TEST = "CREATE INDEX IF NOT EXISTS samples_by_test ON samples (test_id, hotkey, endpoint_id);"
 # from version -> the statements that bring it one version up
-_MIGRATIONS = {4: _DEMAND_SCHEMA, 5: _USERS_SCHEMA, 6: _RESULTS_INDEX}
+_MIGRATIONS = {4: _DEMAND_SCHEMA, 5: _USERS_SCHEMA, 6: _RESULTS_INDEX,
+               7: "ALTER TABLE samples ADD COLUMN test_id TEXT; " + _SAMPLES_BY_TEST}
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
 
 
@@ -301,16 +304,18 @@ CREATE TABLE samples (
     endpoint_id TEXT NOT NULL, model_id TEXT NOT NULL, request_id TEXT NOT NULL, request TEXT NOT NULL,
     response TEXT NOT NULL, proof INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
     evidence TEXT, drift_sum REAL NOT NULL DEFAULT 0, drift_count INTEGER NOT NULL DEFAULT 0,
-    attempts INTEGER NOT NULL DEFAULT 0, checked_epoch INTEGER);
+    attempts INTEGER NOT NULL DEFAULT 0, checked_epoch INTEGER, test_id TEXT);
 CREATE INDEX samples_by_state ON samples (state, epoch);
 CREATE INDEX samples_by_endpoint ON samples (hotkey, endpoint_id, epoch);
 CREATE TABLE verdicts (epoch INTEGER PRIMARY KEY, document TEXT NOT NULL);
-""" + _DEMAND_SCHEMA + _USERS_SCHEMA + _RESULTS_INDEX
+""" + _DEMAND_SCHEMA + _USERS_SCHEMA + _RESULTS_INDEX + _SAMPLES_BY_TEST
 # test states: running -> unconfirmed -> confirmed | void
 _SCRUB = "request = '{}', response = ''"  # a user's request and answers are kept only until their check
 # sample states: pending -> checked | skipped (its endpoint's checks for the epoch were done) | unchecked (no
 # reference for the model, its recompute kept failing, or it was not checked within the next epoch). A sample counts
 # (evidence, drift) in the epoch its check finished: verdicts for an epoch depend only on checks finished before it.
+# A sample with a test_id is the gateways' pick from an endpoint's answers to users in that test: checked when the
+# test is evaluated, or like a proof between tests if it came late or its recompute could not run then.
 
 
 class Store:
@@ -446,34 +451,49 @@ class Store:
     # ---- gateway samples ----
 
     def add_sample(self, *, sample_id: str, epoch: int, gateway: str, hotkey: str, endpoint_id: str, model_id: str,
-                   request_id: str, request: dict[str, Any], response: str, proof: bool) -> bool:
-        """Keep a sample, unless its endpoint already has ``KEPT_PER_ENDPOINT`` in the epoch (a proof is always kept)
-        or it is known."""
+                   request_id: str, request: dict[str, Any], response: str, proof: bool,
+                   test_id: str | None = None) -> bool:
+        """Keep a sample, unless its endpoint already has ``KEPT_PER_ENDPOINT`` in the epoch (a proof is always kept;
+        a test's sample (``test_id``) is kept once per endpoint and test, besides those) or it is known."""
         with self._lock:
-            (count,), = self._db.execute("SELECT COUNT(*) FROM samples WHERE hotkey = ? AND endpoint_id = ? AND "
-                                         "epoch = ? AND proof = 0", (hotkey, endpoint_id, epoch)).fetchall()
-            if count >= KEPT_PER_ENDPOINT and not proof:
-                return False
+            if test_id is not None:
+                if self._db.execute("SELECT 1 FROM samples WHERE test_id = ? AND hotkey = ? AND endpoint_id = ?",
+                                    (test_id, hotkey, endpoint_id)).fetchall():
+                    return False
+            else:
+                (count,), = self._db.execute(
+                    "SELECT COUNT(*) FROM samples WHERE hotkey = ? AND endpoint_id = ? AND epoch = ? AND proof = 0 "
+                    "AND test_id IS NULL", (hotkey, endpoint_id, epoch)).fetchall()
+                if count >= KEPT_PER_ENDPOINT and not proof:
+                    return False
             cursor = self._db.execute(
                 "INSERT OR IGNORE INTO samples (sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, "
-                "request, response, proof, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+                "request, response, proof, state, test_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
                 (sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, json.dumps(request), response,
-                 int(proof)))
+                 int(proof), test_id))
             return cursor.rowcount == 1
 
+    def test_sample(self, test_id: str, hotkey: str, endpoint_id: str) -> tuple[str, str, str, str] | None:
+        """The pending sample of the endpoint's answers to users in the test: (sample_id, request_id, request,
+        response), or None."""
+        rows = self._query("SELECT sample_id, request_id, request, response FROM samples WHERE test_id = ? "
+                           "AND hotkey = ? AND endpoint_id = ? AND state = 'pending'", (test_id, hotkey, endpoint_id))
+        return rows[0] if rows else None
+
     def samples_to_check(self, epoch: int, per_endpoint: int, rng: random.Random) -> list[tuple]:
-        """The samples to check now: every pending proof, and per endpoint and epoch (this one and the last) random
-        pending samples until ``per_endpoint`` are checked; the rest of a done endpoint's are skipped, and pending
-        ones of older epochs given up. In the order to check them: proofs, then every endpoint's first sample (the
-        endpoints in random order), then every second one, so a round cut short checks as many endpoints as it can.
+        """The samples to check now: every pending proof and test's sample, and per endpoint and epoch (this one and
+        the last) random pending samples until ``per_endpoint`` are checked; the rest of a done endpoint's are
+        skipped, and pending ones of older epochs given up. In the order to check them: proofs and tests' samples,
+        then every endpoint's first sample (the endpoints in random order), then every second one, so a round cut
+        short checks as many endpoints as it can.
         -> [(sample_id, gateway, hotkey, endpoint_id, model_id, request_id, request, response)]"""
         self._query(f"UPDATE samples SET state = 'unchecked', reason = 'not checked within the next epoch', "
                     f"{_SCRUB} WHERE state = 'pending' AND epoch < ?", (epoch - 1,))
         rows = self._query("SELECT sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, request, "
-                           "response, proof FROM samples WHERE state = 'pending'")
+                           "response, proof OR test_id IS NOT NULL FROM samples WHERE state = 'pending'")
         checked = {(hk, ep, e): n for hk, ep, e, n in self._query(
             "SELECT hotkey, endpoint_id, epoch, COUNT(*) FROM samples WHERE state = 'checked' AND proof = 0 "
-            "AND epoch >= ? GROUP BY hotkey, endpoint_id, epoch", (epoch - 1,))}
+            "AND test_id IS NULL AND epoch >= ? GROUP BY hotkey, endpoint_id, epoch", (epoch - 1,))}
         groups: dict[tuple[str, str, int], list[tuple]] = {}
         chosen = [r for r in rows if r[9]]
         for r in rows:
@@ -609,6 +629,14 @@ def _beyond(total: float, count: int, tolerance: Tolerance) -> bool:
     """Whether ``count`` compared probabilities summing to ``total`` exceed the tolerance's mean, once they are
     enough to judge."""
     return count >= tolerance.min_probabilities and total / count > tolerance.mean_abs
+
+
+def _gateway_evidence(hotkey: str, endpoint_id: str, model_id: str, request_id: str, fault: str,
+                      response: dict[str, Any]) -> Evidence:
+    """Evidence of a wrong answer to a user: the miner's receipt only, as user requests are not published."""
+    return Evidence(hotkey=hotkey, endpoint_id=endpoint_id, model_id=model_id,
+                    test_id=f"{GATEWAY_EVIDENCE}-{request_id}", reason=fault, request_id=request_id, request={},
+                    response=json.dumps({"receipt": response["receipt"]}))
 
 
 def _tolerance_in(cat: catalog_module.Catalog) -> Callable[[str], Tolerance | None]:
@@ -817,6 +845,10 @@ class Auditor:
         window_s = (result.started_at_ms / 1000 + plan["warmup_s"], result.started_at_ms / 1000 + plan["warmup_s"]
                     + policy.test_s)
         await asyncio.sleep(max(0.0, window_s[1] + SERVED_WAIT_S - time.time()))  # the gateways' last counts
+        if any(self.served_in(t.slot.hotkey, t.slot.endpoint_id, *window_s) for t in targets):
+            # users were answered in the window: wait for the gateways' samples of those answers (they follow the
+            # start block on their own chain view)
+            await asyncio.sleep(max(0.0, start_ms / 1000 + policy.session_s + TEST_SAMPLES_WAIT_S - time.time()))
         recomputes, scales = checks.for_test(), self.user_scales(window_s)
         order = list(range(len(targets)))
         secrets.SystemRandom().shuffle(order)  # which endpoints' checks wait longest under pressure: unpredictable
@@ -899,7 +931,8 @@ class Auditor:
                                     request=sample.request, response=sample.response)
                 break
         drift = {"drift_sum": drift_sum, "drift_count": drift_count}
-        delivered = round((r.completed * (valid / len(r.samples) if r.samples else 1.0) + gateway) / policy.test_s, 2)
+        own = r.completed * (valid / len(r.samples) if r.samples else 1.0) / policy.test_s
+        delivered = round(own + gateway / policy.test_s, 2)
         # Miners serve users first: users answered beyond what the test left of the tested rate displaced test requests
         # one for one, so the test's requests count as asked only up to what the users' answers leave of it. Users
         # refused count in full.
@@ -907,15 +940,47 @@ class Auditor:
         asked = (users_asked + own_asked) / policy.test_s
         if evidence is not None:
             return Result(target, "invalid", evidence.reason, delivered, 0.0, evidence=evidence, **latency, **drift)
-        credited = credit(target.tested_rps, delivered, policy, asked)
+        users_fault = await self._check_users(test, slot, model, recomputes, place[1] + place[0]) if gateway else ""
+        if users_fault:
+            return Result(target, "invalid", f"a sampled answer to a user in the test is wrong: {users_fault}",
+                          delivered, 0.0, **latency, **drift)
+        credited, unchecked = credit(target.tested_rps, delivered, policy, asked), ""
+        if users_fault is None:  # answers to users in the test that no checked sample covers prove no capacity
+            credited = min(credited, round(own, 2))
+            unchecked = "its answers to users in the test are unchecked: credited only its replies to the test"
         if delivered >= policy.pass_fraction * asked:
-            return Result(target, "passed", "", delivered, credited, **latency, **drift)
+            return Result(target, "passed", unchecked, delivered, credited, **latency, **drift)
         reason = f"delivered {delivered:.1f} of {asked:.1f} requests/s asked"
         if gateway:
             reason += f" ({gateway / policy.test_s:.1f} of them to the gateway)"
         if valid < len(r.samples):
             reason += f", {len(r.samples) - valid} of {len(r.samples)} sampled responses without a valid receipt"
-        return Result(target, "partial", reason, delivered, credited, **latency, **drift)
+        return Result(target, "partial", f"{reason}; {unchecked}" if unchecked else reason, delivered, credited,
+                      **latency, **drift)
+
+    async def _check_users(self, test: ScheduledTest, slot: Slot, model: catalog_module.CatalogModel | None,
+                           recomputes: Recomputes, rank: float) -> str | None:
+        """Check the gateways' sample of the endpoint's answers to users in the test: -> why they are wrong, "" if
+        they pass (or, without a reference for the model, are well formed, as test answers then), None if there is
+        no sample or its recompute could not run (it is checked between tests then)."""
+        row = await asyncio.to_thread(self.store.test_sample, test.test_id, slot.hotkey, slot.endpoint_id)
+        if row is None or model is None:
+            return None
+        sample_id, request_id, request_json, response = row
+        parsed = json.loads(response)
+        fault, comparison = await recomputes.check(slot.model_id, json.loads(request_json), parsed["answers"],
+                                                   model.tolerance, recompute_answers=True,
+                                                   claimed=claimed_tokens(parsed), rank=rank)
+        if fault is None and comparison is None:
+            checks = recomputes.checks
+            return None if slot.model_id in checks.references or slot.model_id in checks.screens else ""
+        evidence = None if fault is None else _gateway_evidence(slot.hotkey, slot.endpoint_id, slot.model_id,
+                                                                request_id, fault, parsed)
+        await asyncio.to_thread(self._finish_checked, sample_id, fault, evidence, comparison)
+        if evidence is not None:
+            log.warning("answer of %s/%s to a user in the test of epoch %d is wrong: %s", slot.hotkey,
+                        slot.endpoint_id, test.epoch, fault)
+        return fault or ""
 
     # ---- gateway samples ----
 
@@ -951,7 +1016,8 @@ class Auditor:
                             "relays what it is sent through the gateway", s.hotkey, s.endpoint_id)
             kept += self.store.add_sample(sample_id=sample_id, epoch=epoch, gateway=gateway, hotkey=s.hotkey,
                                           endpoint_id=s.endpoint_id, model_id=s.model_id, request_id=nonce,
-                                          request=s.request, response=s.response, proof=readable(answers) is None)
+                                          request=s.request, response=s.response, proof=readable(answers) is None,
+                                          test_id=s.test_id if s.test_id and self.store.known(s.test_id) else None)
         return kept
 
     async def check_samples(self, checks: Checks) -> None:
@@ -981,10 +1047,8 @@ class Auditor:
                 if not self._tests_running and time.monotonic() <= recomputes.deadline:
                     self.store.failed_check(sample_id)
                 return
-            evidence = None if fault is None else Evidence(  # user requests are not published: the receipt only
-                hotkey=hotkey, endpoint_id=endpoint_id, model_id=model_id,
-                test_id=f"{GATEWAY_EVIDENCE}-{request_id}", reason=fault, request_id=request_id, request={},
-                response=json.dumps({"receipt": parsed["receipt"]}))
+            evidence = None if fault is None else _gateway_evidence(hotkey, endpoint_id, model_id, request_id, fault,
+                                                                    parsed)
             await asyncio.to_thread(self._finish_checked, sample_id, fault, evidence, comparison)
             if evidence is not None:
                 log.warning("gateway answer of %s/%s is wrong: %s", hotkey, endpoint_id, fault)

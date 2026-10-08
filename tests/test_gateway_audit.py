@@ -51,6 +51,16 @@ def request(i: int) -> dict:
     return {**REQUEST, "state": f"{REQUEST['state']} Ticket {i}."}
 
 
+def add_test_samples(auditor, test: ScheduledTest, slots) -> None:
+    """The gateways' sample of each endpoint's answers to users in the test: well formed, and no reference to
+    recompute them."""
+    for s in slots:
+        assert auditor.store.add_sample(sample_id=f"t-{s.key}", epoch=test.epoch, gateway="gw", hotkey=s.hotkey,
+                                        endpoint_id=s.endpoint_id, model_id=s.model_id, request_id="n",
+                                        request=REQUEST, response=json.dumps({"answers": {"q": {"noul": 0.5}}}),
+                                        proof=False, test_id=test.test_id)
+
+
 def test_a_catalog_gateway_is_not_held_to_the_per_caller_limit() -> None:
     miner_kp, gateway = kp(), kp()
 
@@ -271,15 +281,67 @@ def test_what_an_endpoint_answers_the_gateway_during_a_test_counts_as_delivered(
     counts = [ServedCount(hotkey="hk", endpoint_id="gpu0", second=start + i, answered=10) for i in range(17)]
     assert auditor.accept_served(counts) == 17
     test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+    add_test_samples(auditor, test, [slot])
 
     async def evaluate(completed: int):
         return await auditor.evaluate(test, Target(slot, 20.0), _result("hk/gpu0", completed=completed),
                                       Checks({}, {}).for_test(), auditor.policy, window)
 
     result = asyncio.run(evaluate(160))  # 10/s of the test's own and 10/s to the gateway
-    assert result.outcome == "passed" and result.delivered_rps == pytest.approx(20.0)
+    assert result.outcome == "passed" and result.delivered_rps == pytest.approx(20.0) == result.credited_rps
     assert json.loads(result.detail)["gateway_answered"] == pytest.approx(160.0)
     assert auditor.accept_served([ServedCount(hotkey="unknown", endpoint_id="gpu0", second=start, answered=5)]) == 0
+
+
+def test_answers_to_users_in_a_test_count_once_the_gateways_sample_of_them_is_checked(tmp_path) -> None:
+    """An endpoint cannot answer users with junk while a test runs and give the test its GPU: its answers to users in
+    the test count as delivered only once the gateways' sample of them passes the check; a wrong one is evidence, and
+    without a sample only its replies to the test are credited."""
+    import time as time_module
+
+    from tests.test_throughput import _result
+    from verathos.protocol.gateway import ServedCount
+
+    gateway = kp()
+    keys = {name: kp() for name in ("honest", "junk", "unsampled")}
+    apps = {"honest": miner(keys["honest"], MockEngine("kev-4b"), gateway),
+            "junk": miner(keys["junk"], MockEngine("kev-4b", salt="uniform junk"), gateway)}
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()
+    slots = {name: Slot(k.ss58_address, "gpu0", f"http://{name}/e/gpu0", "kev-4b", 20.0) for name, k in keys.items()}
+    auditor.update_slots(list(slots.values()))
+    test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+    auditor.store.add_test(test)
+
+    async def sampled(name: str) -> GatewaySample:
+        r = await exchange(apps[name], gateway, keys[name], request(1))
+        return GatewaySample(hotkey=keys[name].ss58_address, endpoint_id="gpu0", model_id="kev-4b",
+                             request=request(1), response=r.text, test_id=test.test_id)
+
+    samples = [asyncio.run(sampled(name)) for name in apps]
+    assert auditor.accept_samples(gateway.ss58_address, samples) == 2
+    assert auditor.accept_samples(gateway.ss58_address, samples) == 0  # once per endpoint and test
+    start = int(time_module.time()) - 30
+    window = (start + 0.5, start + 16.5)
+    assert auditor.accept_served([ServedCount(hotkey=k.ss58_address, endpoint_id="gpu0", second=start + i,
+                                              attempts=10, answered=10) for k in keys.values() for i in range(17)])
+
+    def evaluate(name: str):
+        r = _result(slots[name].key, sent=160, completed=160)  # 10/s of the test's own, 10/s to users
+        return asyncio.run(auditor.evaluate(test, Target(slots[name], 20.0), r,
+                                            Checks({"kev-4b": MockEngine("kev-4b")}, {}).for_test(), auditor.policy,
+                                            window))
+
+    honest, junk, unsampled = evaluate("honest"), evaluate("junk"), evaluate("unsampled")
+    assert honest.outcome == "passed" and honest.credited_rps == pytest.approx(20.0)
+    assert junk.outcome == "invalid" and junk.credited_rps == 0.0 and "answer to a user" in junk.reason
+    assert unsampled.outcome == "passed" and unsampled.credited_rps == pytest.approx(10.0)
+    assert "unchecked" in unsampled.reason
+    auditor.store.set_state(test.test_id, "confirmed")
+    auditor.chain.head_block = 4 * 180 + 1
+    auditor.follower.poll()
+    (evidence,) = auditor.verdicts(4).verdicts.invalid
+    assert evidence.hotkey == keys["junk"].ss58_address and evidence.from_gateway
 
 
 def test_a_test_leaves_room_for_the_users_an_endpoint_serves(tmp_path) -> None:
@@ -360,6 +422,7 @@ def test_a_test_is_judged_against_what_the_endpoint_was_asked(tmp_path) -> None:
     assert auditor.accept_served(counts, report_id="r1") == len(counts)
     assert auditor.accept_served(counts[:1], report_id="r1") == 0  # the same report again
     test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+    add_test_samples(auditor, test, slots.values())
     scale = auditor.user_scales(window)["kev-4b"]
 
     def evaluate(name: str):
@@ -393,6 +456,7 @@ def test_users_above_their_usual_rate_displace_test_requests_at_no_cost(tmp_path
                for n in slots for i in range(17)]
     assert auditor.accept_served(counts) == len(counts)
     test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+    add_test_samples(auditor, test, slots.values())
     scale = auditor.user_scales(window)["kev-4b"]
 
     def evaluate(name: str, completed_per_s: int):
@@ -564,9 +628,10 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
 
     from verathos.throughput.auditor import SCHEMA_VERSION, Store
 
-    Store(tmp_path / "old.sqlite")  # a version 4 database: today's without the demand and users tables
+    Store(tmp_path / "old.sqlite")  # a version 4 database: today's without what later versions added
     db = sqlite3.connect(tmp_path / "old.sqlite")
-    db.executescript("DROP TABLE demand; DROP TABLE users; "
+    db.executescript("DROP TABLE demand; DROP TABLE users; DROP INDEX results_by_endpoint; DROP INDEX samples_by_test; "
+                     "ALTER TABLE samples DROP COLUMN test_id; "
                      "INSERT INTO tests VALUES ('kept', 3, 560, 'h', 565, 'confirmed', ''); "
                      "PRAGMA user_version = 4;")
     db.close()
@@ -574,6 +639,7 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
     assert store._query("SELECT test_id FROM tests") == [("kept",)]
     assert store._query("PRAGMA user_version")[0][0] == SCHEMA_VERSION
     assert store.demand_ema(10) == {}
+    assert "test_id" in {column[1] for column in store._query("PRAGMA table_info(samples)")}
 
 
 def test_verdicts_take_a_few_queries_whatever_the_number_of_endpoints(tmp_path) -> None:

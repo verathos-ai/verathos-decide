@@ -74,13 +74,19 @@ class SignedRoutes(BaseModel):
 
 class GatewaySample(BaseModel):
     """One sampled exchange; a post is ``{"samples": [...]}`` with up to ``MAX_SAMPLES_PER_POST`` of them within
-    ``MAX_SAMPLES_BYTES``, each judged on its own."""
+    ``MAX_SAMPLES_BYTES``, each judged on its own.
+
+    ``test_id`` marks the exchange the gateway drew, per endpoint and test, from those it sent the endpoint during the
+    test's traffic (``throughput.policy.ScheduledTest.test_id``), posted once the test's sessions end
+    (``AuditPolicy.session_s`` after the start block). The auditor counts the endpoint's answers to users in that test
+    as delivered only once this exchange is checked."""
 
     hotkey: str
     endpoint_id: str
     model_id: str
     request: dict[str, Any]
     response: str = Field(max_length=MAX_RESPONSE_BYTES)  # the response body as received: answers and receipt
+    test_id: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
 
 
 # Latency bucket i holds answers that took [BASE x RATIO^i, BASE x RATIO^(i + 1)) ms; the last one all slower ones.
