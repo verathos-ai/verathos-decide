@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "verathos"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Decision-model network on Bittensor: typed answers with calibrated probabilities, verified by reference recomputation"
 requires-python = ">=3.12"
 license = "MIT"
@@ -32,6 +32,9 @@ verathos-build-loadgen = "verathos.throughput.loadgen:build"
 verathos-subnet = "verathos.subnet.admin:main"
 verathos-engine = "verathos.engine.__main__:main"
 verathos-gateway = "verathos.gateway.__main__:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "verathos.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

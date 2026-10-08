@@ -305,6 +305,7 @@ stay). Wallets are never touched.
 | `the kev-9b reference did not start: ...` | its log, `~/.verathos/validator/references/kev-9b.log`; `another process holds its port`: a reference service of a resident setup still runs, run the installer again |
 | `the kev-9b reference needs about 42 GiB of RAM, even one at a time` | the largest reference needs that much free memory: free or add some, or `--device` for a GPU |
 | `no reference engine configured for the active models` | the catalog activated a model: run the command again |
+| `this validator's release is too old to set weights` | the subnet owner retired this release (`WeightsVersionKey`): update the code |
 | `the subnet's catalog is not available` | the subnet owner's axon serves it; add a mirror to `catalog_mirrors` in `validator.json` |
 | `this is the subnet owner's hotkey` | the owner's validator also serves the catalog and runs the throughput audit: set `public_host` and `port`, and build the load generator ([1. Install](#1-install)) |
 | `curl: command not found`, `coldkeypub.txt not found`, no services after a container restart, `local changes in ... stop the update`, slow downloads | as for miners (`MINING.md`) |
@@ -431,8 +432,8 @@ A light validator, each epoch (`epoch_blocks` from the catalog, default 180 bloc
    this netuid, was signed within 5 minutes of the validator's clock (the source signs it again every 30 s), is for
    the current or the previous epoch and for a later epoch than the weights it set last;
 3. sets exactly those weights (the subnet owner's UID's included; UIDs it does not list get none) on the mechanism of
-   the catalog it follows (or `mechid`), as a full validator sets its own: the subnet's weights version key,
-   commit-reveal where the subnet has it, retried once per block up to 10 times; and logs the epoch, the source, the
+   the catalog it follows (or `mechid`), as a full validator sets its own: this release's weights version key
+   ([Releases](SUBNET_ADMIN.md#releases-and-the-weights-version-key)), commit-reveal where the subnet has it, retried once per block up to 10 times; and logs the epoch, the source, the
    number of UIDs and the highest weights;
 4. without a document that verifies by the same point of the next epoch, when the next results can come, sets
    nothing for the epoch and logs why, once; the weights it set before stay on chain.

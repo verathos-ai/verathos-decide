@@ -16,7 +16,7 @@ from bittensor_wallet import Keypair
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from verathos import catalog
+from verathos import catalog, release
 from verathos.protocol.status import NETWORK_DOMAIN, NETWORK_PATH, STATUS_MAX_AGE_S, NetworkStatus, sign_document
 from verathos.validator import chain as validator_chain
 from verathos.validator import light
@@ -49,6 +49,7 @@ class Chain:
         self.neurons = {owner: neuron(0, *SOURCE_AXON), own: neuron(5)}
         self.set: list[dict] = []
         self.last_update: dict[int, list[int]] = {}  # per mechanism, per UID
+        self.version_floor = 7  # the subnet's WeightsVersionKey
         self.substrate = SimpleNamespace(query=self.query)
 
     def query(self, module: str, item: str, params: list):
@@ -56,7 +57,8 @@ class Chain:
             mechanism, netuid = divmod(params[0], 4096)  # the chain keeps each mechanism's apart
             assert netuid == 405
             return SimpleNamespace(value=self.last_update.get(mechanism, []))
-        return SimpleNamespace(value=7)  # the weights version key
+        assert item == "WeightsVersionKey"
+        return SimpleNamespace(value=self.version_floor)
 
     def get_current_block(self) -> int:
         return self.block
@@ -156,8 +158,8 @@ def test_a_light_validator_sets_exactly_the_weights_its_source_published(tmp_pat
     chain.block += 3
     v.step()
     assert chain.set == [{"netuid": 405, "uids": [3, 7, 12], "weights": [WEIGHTS[3], WEIGHTS[7], WEIGHTS[12]],
-                          "mechid": CAT.mechanism, "version_key": 7}]  # exactly, the version key and the catalog's
-    # mechanism, as full ones use
+                          "mechid": CAT.mechanism, "version_key": release.weights_version_key()}]  # exactly, with
+    # this release's version key and on the catalog's mechanism, as full ones
     assert fetched == [f"http://{SOURCE_AXON[0]}:{SOURCE_AXON[1]}{NETWORK_PATH}"] * 2
     assert (f"epoch 100: set the weights of the subnet owner's validator {owner.ss58_address}: 3 UIDs, top 3: 0.512, "
             "7: 0.300, 12: 0.188") in caplog.messages
@@ -454,3 +456,25 @@ def test_weights_wait_out_the_rate_limit_of_their_own_mechanism(tmp_path, monkey
     chain.last_update[1][5] = chain.block - 100
     slept.clear()
     assert validator_main.set_weights(settings, chain, wallet, WEIGHTS, 1) and slept == [] and len(chain.set) == 2
+
+
+def test_a_validator_whose_release_the_subnet_retired_sets_no_weights_and_says_why(tmp_path, monkeypatch,
+                                                                                    caplog) -> None:
+    """The chain refuses weights below the subnet's WeightsVersionKey: a validator of an older release does not try,
+    and logs that it needs an update; one at or above the key sets them."""
+    from verathos.validator import __main__ as validator_main
+
+    caplog.set_level(logging.INFO, logger="verathos.validator")
+    owner, own = kp(), kp()
+    chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET + 5)
+    chain.version_floor = release.weights_version_key() + 1  # the owner retired this release
+    monkeypatch.setattr(validator_main.time, "sleep", lambda s: pytest.fail("refused at once, not retried"))
+    assert not validator_main.set_weights(config(tmp_path), chain, SimpleNamespace(hotkey=own), WEIGHTS, 1)
+    too_old = (f"this validator's release is too old to set weights: the subnet's weights version key is "
+               f"{chain.version_floor}, above its own {release.weights_version_key()} (verathos ")
+    assert chain.set == [] and any(m.startswith("weights not set: " + too_old) for m in caplog.messages)
+    v = validator(tmp_path, chain, own, [document(owner, 100)])
+    assert v.step() == light.POLL_S and chain.set == [] and v.why.startswith(too_old)
+    chain.version_floor = release.weights_version_key()
+    v.step()
+    assert [s["version_key"] for s in chain.set] == [release.weights_version_key()]

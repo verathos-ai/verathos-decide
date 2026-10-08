@@ -22,7 +22,7 @@ from pathlib import Path
 import bittensor as bt
 from bittensor_wallet import Keypair
 
-from verathos import catalog
+from verathos import __version__, catalog, release
 from verathos.subnet.chain import committed_catalog, current_catalog
 
 MAX_UIDS_TWO_MECHANISMS = 128  # chain rule: max UIDs x mechanism count <= 256
@@ -96,6 +96,9 @@ def status(st: bt.Subtensor, netuid: int) -> None:
         "catalog_mechanism": cat.mechanism if cat else None,
         "epoch": epoch,
         "miner_share": cat.scoring.miner_share_at(epoch) if cat else None,
+        "weights_version_key": q("SubtensorModule", "WeightsVersionKey", [netuid]).value,
+        "release": __version__,
+        "release_weights_version_key": release.weights_version_key(),
     }, indent=2), flush=True)
 
 

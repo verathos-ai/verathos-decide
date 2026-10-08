@@ -11,7 +11,8 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[chain,ops]"
 
 `status` shows the UID cap, the mechanisms and their emission split, the owner hotkey, the committed catalog digest
 and its mechanism, the digest of the catalog shipped with this code, the current epoch and the committed catalog's
-miner share in it.
+miner share in it, the subnet's weights version key and this release's
+([Releases](#releases-and-the-weights-version-key)).
 
 ## Mechanisms
 
@@ -154,6 +155,20 @@ or `void` results should have identifiable causes. If the audit misbehaves (for 
 cannot carry the network's test traffic), publish a catalog with `"mode": "observe"`: tests still run and are
 recorded, validators count declared capacities (up to each model's `first_test_rps`) and apply no evidence. `docs/THROUGHPUT_AUDIT.md` describes every
 setting.
+
+## Releases and the weights version key
+
+A release is a version `major.minor.patch`, `__version__` in `src/verathos/__init__.py` (the package version reads
+it), and the commit tagged `v<version>`. Validators send `major x 1,000,000 + minor x 1,000 + patch` as the weights
+version key (1.0.0: 1,000,000) and log it at start; minor and patch stay below 1000. The chain refuses weights whose
+key is below the subnet's `WeightsVersionKey`, so raising it retires every validator on an older release: such a
+validator sets no weights and logs `this validator's release is too old to set weights`. A newer release needs no
+change on chain. The validators of the earlier Verathos code send 2004: a `WeightsVersionKey` of 1,000,000 retires
+all of them while every validator of this code keeps setting weights.
+
+Raise it from the subnet owner coldkey (AdminUtils `sudo_set_weights_version_key`, as
+`btcli sudo set --netuid 96 --param weights_version --value 1000000`), and only once the validators that should keep
+setting weights run a release at or above it.
 
 ## Test network first
 

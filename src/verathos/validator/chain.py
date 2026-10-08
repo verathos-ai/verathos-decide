@@ -9,10 +9,15 @@ from bittensor.core.extrinsics.weights import commit_timelocked_weights_extrinsi
 from bittensor.core.settings import DEFAULT_PERIOD
 from bittensor.utils import get_mechid_storage_index
 
+from verathos import __version__, release
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator.discovery import Neuron
 
 log = logging.getLogger(__name__)
+
+
+class ReleaseTooOld(Exception):
+    """The subnet's weights version key is above this release's: the chain refuses its weights."""
 
 
 def snapshot(subtensor: bt.Subtensor, netuid: int) -> tuple[list[Neuron], dict[int, str]]:
@@ -38,13 +43,24 @@ def weights_wait(subtensor: bt.Subtensor, netuid: int, mechid: int, uid: int) ->
     return max(0, int(subtensor.weights_rate_limit(netuid)) - (block - int(last[uid])))
 
 
+def weights_version_key(subtensor: bt.Subtensor, netuid: int) -> int:
+    """This release's weights version key (``release``). Raises ReleaseTooOld when the subnet's
+    ``WeightsVersionKey``, the lowest key the chain accepts weights with, is above it."""
+    floor = int(subtensor.substrate.query("SubtensorModule", "WeightsVersionKey", [netuid]).value or 0)
+    own = release.weights_version_key()
+    if floor > own:
+        raise ReleaseTooOld(f"this validator's release is too old to set weights: the subnet's weights version key is "
+                            f"{floor}, above its own {own} (verathos {__version__}); update it")
+    return own
+
+
 def submit_weights(subtensor: bt.Subtensor, wallet: bt.Wallet, netuid: int, mechid: int,
                    weights: dict[int, float]) -> bool:
-    """Set weights on ``mechid`` with the subnet's weights version key as the floor, committed for a timed reveal
-    where the subnet has commit-reveal on. The extrinsics are called directly: the SDK's ``set_weights`` checks the
-    rate limit of mechanism 0 only, which holds back a set on another mechanism after one on mechanism 0 and lets
-    through one the chain refuses."""
-    version_key = max(int(subtensor.substrate.query("SubtensorModule", "WeightsVersionKey", [netuid]).value or 0), 1)
+    """Set weights on ``mechid`` with this release's weights version key, committed for a timed reveal where the
+    subnet has commit-reveal on; raises ReleaseTooOld if the chain would refuse the key. The extrinsics are called
+    directly: the SDK's ``set_weights`` checks the rate limit of mechanism 0 only, which holds back a set on another
+    mechanism after one on mechanism 0 and lets through one the chain refuses."""
+    version_key = weights_version_key(subtensor, netuid)
     uids = sorted(weights)
     values = [weights[u] for u in uids]
     if subtensor.commit_reveal_enabled(netuid=netuid):

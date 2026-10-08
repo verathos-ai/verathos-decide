@@ -27,7 +27,7 @@ from typing import Any, NamedTuple
 import bittensor as bt
 import httpx
 
-from verathos import catalog
+from verathos import __version__, catalog, release
 from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator import chain, light, status
@@ -398,8 +398,12 @@ def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: di
             log.info("the chain allows this UID's next weights on mechanism %d in %d blocks; setting them then",
                      mechid, wait)
             time.sleep(wait * BLOCK_TIME_S)
-        if chain.submit_weights(st, wallet, cfg.netuid, mechid, w):
-            return True
+        try:
+            if chain.submit_weights(st, wallet, cfg.netuid, mechid, w):
+                return True
+        except chain.ReleaseTooOld as exc:
+            log.error("weights not set: %s", exc)
+            return False
         log.warning("setting weights failed (attempt %d of %d); retrying in one block", attempt, WEIGHT_ATTEMPTS)
         time.sleep(BLOCK_TIME_S)
     return False
@@ -423,6 +427,7 @@ def main() -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     wallet = bt.Wallet(name=cfg.wallet_name, hotkey=cfg.hotkey_name)
     st = bt.Subtensor(network=cfg.network)
+    log.info("verathos %s, weights version key %d", __version__, release.weights_version_key())
     current = CatalogFollower(st, cfg.network, cfg.netuid, catalog.CatalogStore(cfg.catalog_dir), cfg.catalog_mirrors,
                               state_path=cfg.state_dir.expanduser() / "catalog_followed.json")
     if cfg.mode == "light":  # no references, no miners: the source's verified weights
@@ -431,6 +436,10 @@ def main() -> None:
                   once=args.once)
         st.close()
         return
+    try:
+        chain.weights_version_key(st, cfg.netuid)
+    except chain.ReleaseTooOld as exc:
+        log.critical("%s", exc)
     secret = load_secret(state_dir)
     state_path = state_dir / "scores.json"
     state = ScoreState.load(state_path)

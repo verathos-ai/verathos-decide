@@ -37,6 +37,7 @@ from verathos.protocol.manifest import axon_base
 from verathos.protocol.status import MAX_NETWORK_BYTES, NETWORK_DOMAIN, NETWORK_PATH, NetworkStatus, unverified
 from verathos.subnet.chain import CHAIN_ERRORS, one_line
 from verathos.throughput.policy import BLOCK_TIME_S
+from verathos.validator.chain import ReleaseTooOld, weights_version_key
 from verathos.validator.config import ValidatorConfig
 
 log = logging.getLogger("verathos.validator")
@@ -146,12 +147,16 @@ class LightValidator:
         return find_source(self.st, self.cfg.netuid, owner, self.cfg.source_hotkey)
 
     def permit(self) -> str | None:
-        """Why this hotkey cannot set weights; None if it can."""
+        """Why this validator cannot set weights; None if it can."""
         neuron = self.st.get_neuron_for_pubkey_and_subnet(self.hotkey, self.cfg.netuid)
         if neuron is None or neuron.is_null:
             return f"this hotkey is not registered on netuid {self.cfg.netuid}"
         if not neuron.validator_permit:
             return "this hotkey holds no validator permit, which setting weights takes"
+        try:
+            weights_version_key(self.st, self.cfg.netuid)
+        except ReleaseTooOld as exc:
+            return str(exc)
         return None
 
     def due(self, block: int) -> int:
