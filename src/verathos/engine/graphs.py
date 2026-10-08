@@ -3,7 +3,8 @@
 A pass costs the CPU about the same to launch at any size, so only small passes are limited by the launches: there a
 graph replay is several times faster, while a pass of a few thousand tokens keeps the GPU busier than the CPU and runs
 as fast eagerly. Graphs therefore cover every bucket of at most ``max_tokens`` tokens, and all of them are captured at
-start-up, so serving never stalls on a capture; larger passes run eagerly.
+start-up, so serving never stalls on a capture; larger passes run eagerly. If a capture fails, no graph is kept and
+every pass runs eagerly.
 
 Every graph reads its inputs from one shared input buffer and writes its output into one shared output buffer (views
 of the bucket's shape at the start of each), and the graphs share one memory pool, so the memory held across graphs
@@ -47,15 +48,18 @@ class GraphedForward:
         self.hidden_size = hidden_size
         self.ids = torch.zeros(max_tokens, dtype=torch.long, device=device)
         self.out = torch.empty(max_tokens * hidden_size, dtype=dtype, device=device)
-        self.pool = torch.cuda.graph_pool_handle()
+        self.pool = None
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+
+    def shapes(self) -> list[tuple[int, int]]:
+        """The (batch, length) buckets that get a graph."""
+        return [(batch, length) for batch in self.batch_sizes
+                for length in range(self.length_step, self.max_tokens // batch + 1, self.length_step)]
 
     def graphed_batch(self, rows: int, length: int) -> int | None:
         """The graph batch size a pass of ``rows`` rows of ``length`` tokens is padded to, or None to run it eagerly."""
         batch = next((size for size in self.batch_sizes if size >= rows), None)
-        if batch is None or length % self.length_step or batch * length > self.max_tokens:
-            return None
-        return batch
+        return batch if (batch, length) in self.graphs else None
 
     def _views(self, batch: int, length: int) -> tuple[torch.Tensor, torch.Tensor]:
         n = batch * length
@@ -75,13 +79,25 @@ class GraphedForward:
         self.graphs[(batch, length)] = graph
 
     @torch.inference_mode()
-    def capture_all(self) -> None:
+    def capture_all(self) -> bool:
+        """Capture every bucket's graph. On a failure (a kernel that cannot be captured, or no memory left for the
+        graphs) drop them all, so every pass runs eagerly; False then."""
         start = time.perf_counter()
-        for batch in self.batch_sizes:
-            for length in range(self.length_step, self.max_tokens // batch + 1, self.length_step):
+        try:
+            self.pool = torch.cuda.graph_pool_handle()
+            for batch, length in self.shapes():
                 self._capture(batch, length)
+        except Exception as exc:
+            self.graphs.clear()
+            self.pool = None
+            torch.cuda.synchronize()  # a device that fails here too is broken: the engine does not start
+            torch.cuda.empty_cache()
+            log.warning("capturing CUDA graphs failed (%s: %s); every pass runs eagerly, which is slower for small "
+                        "batches", type(exc).__name__, exc)
+            return False
         log.info("captured %d CUDA graphs (passes up to %d tokens) in %.0f s", len(self.graphs), self.max_tokens,
                  time.perf_counter() - start)
+        return True
 
     def __call__(self, ids: torch.Tensor) -> torch.Tensor:
         """Hidden states for right-padded ids [B, T]. A graph's output is a view into the shared output buffer: read it

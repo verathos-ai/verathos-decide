@@ -1,8 +1,10 @@
 """HTTP server around a decision engine: ``POST /v1/systemone`` and ``GET /v1/models``.
 
 Requests are prepared (validated and tokenized) in worker threads as they arrive, then queued for one device thread,
-which takes everything waiting, up to ``max_batch`` requests, and runs it as one ``engine.run`` call. A request that
-arrives while a batch runs joins the next one, so batches grow with load and a lone request waits for nobody.
+which takes everything waiting, up to ``max_batch`` requests, lets the engine split it into passes and runs them one
+after the other, answering each pass's requests when it ends. A request that arrives while passes run joins the next
+batch, so batches grow with load and a lone request waits for nobody. A failed pass of several requests runs them
+again one at a time, so only a request that fails on its own (one too long for the memory, say) gets an error.
 """
 
 from __future__ import annotations
@@ -26,11 +28,15 @@ log = logging.getLogger(__name__)
 class Engine(Protocol):
     def prepare(self, body: dict[str, Any]) -> Any: ...
 
+    def passes(self, items: list[Any]) -> list[list[int]]:
+        """The items' indexes grouped into the passes that run them."""
+        ...
+
     def run(self, items: list[Any]) -> list[dict[str, Any]]: ...
 
 
 class Batcher:
-    """One device thread running queued prepared requests in batches."""
+    """One device thread running queued prepared requests in passes."""
 
     def __init__(self, engine: Engine, max_batch: int = 64) -> None:
         self.engine = engine
@@ -52,15 +58,35 @@ class Batcher:
                     pending.append(self.queue.get_nowait())
                 except queue.Empty:
                     break
-            try:
-                results = self.engine.run([item for item, _ in pending])
-            except Exception as exc:  # a failed batch fails each of its requests, the thread keeps serving
-                log.exception("batch of %d failed", len(pending))
-                for _, future in pending:
-                    future.set_exception(exc)
+            pending = [(item, future) for item, future in pending if future.set_running_or_notify_cancel()]
+            if not pending:
                 continue
-            for (_, future), result in zip(pending, results):
-                future.set_result(result)
+            try:
+                passes = self.engine.passes([item for item, _ in pending])
+            except Exception:
+                log.exception("grouping %d requests into passes failed; running them one at a time", len(pending))
+                passes = [[i] for i in range(len(pending))]
+            for indexes in passes:
+                self._run([pending[i] for i in indexes])
+
+    def _run(self, pending: list[tuple[Any, Future]]) -> None:
+        try:
+            results = self.engine.run([item for item, _ in pending])
+        except Exception as exc:
+            if len(pending) > 1:
+                log.warning("a pass of %d requests failed (%s: %s); running them one at a time", len(pending),
+                            type(exc).__name__, exc)
+                for one in pending:
+                    self._run([one])
+                return
+            if isinstance(exc, ValueError):
+                log.info("request refused: %s", exc)
+            else:
+                log.exception("request failed")
+            pending[0][1].set_exception(exc)
+            return
+        for (_, future), result in zip(pending, results):
+            future.set_result(result)
 
 
 def create_app(engine: Engine, served_models: list[dict[str, Any]] | None = None, max_batch: int = 64) -> FastAPI:

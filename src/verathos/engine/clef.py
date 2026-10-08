@@ -9,8 +9,10 @@ Two paths:
   float32 on CPU as the reference.
 - ``fast`` (CUDA, bfloat16): the backbone runs as ``verathos.engine.qwen35.Backbone`` on right-padded batches replayed
   from CUDA graphs (``verathos.engine.graphs``); the head runs for the whole pass at once
-  (``verathos.engine.clef_head``). Requests are tokenized as they
-  arrive and batched by length under a token budget.
+  (``verathos.engine.clef_head``). Requests are tokenized as they arrive and batched by length under a token budget.
+
+Both serve text requests only: a request with ``images`` or ``videos`` is refused, so the release never fetches or
+decodes media and both paths answer the same requests.
 """
 
 from __future__ import annotations
@@ -53,10 +55,12 @@ def _validate(body: dict[str, Any]) -> None:
             raise ValueError(f"{question_id}: type must be noul, choice, or score")
         if question["type"] != "noul" and not question.get("criteria"):
             raise ValueError(f"{question_id}: criteria must not be empty")
+    if body.get("images") or body.get("videos"):
+        raise ValueError("images and videos are not served; requests are text")
 
 
 class ReferenceEngine:
-    """The release's ``systemone``, one request at a time."""
+    """The release's ``systemone``, one request per pass, so each is answered as soon as it is computed."""
 
     def __init__(self, path: Path, device: str, dtype: str) -> None:
         import torch
@@ -70,6 +74,9 @@ class ReferenceEngine:
     def prepare(self, body: dict[str, Any]) -> Prepared:
         _validate(body)
         return Prepared(body, None)
+
+    def passes(self, items: list[Prepared]) -> list[list[int]]:
+        return [[i] for i in range(len(items))]
 
     def run(self, items: list[Prepared]) -> list[dict[str, Any]]:
         return [self.module.systemone(self.model, self.processor, item.body) for item in items]
@@ -126,7 +133,7 @@ class FastEngine:
         _validate(body)
         return Prepared(body, self.module.encode_record(self.tokenizer, body, max_length=self.max_length))
 
-    def _batches(self, items: list[Prepared]) -> list[list[int]]:
+    def passes(self, items: list[Prepared]) -> list[list[int]]:
         """Indexes grouped by length: each group's padded size stays within the token budget (a single longer request
         forms its own group)."""
         from verathos.engine.graphs import bucket_length
@@ -162,7 +169,7 @@ class FastEngine:
     def run(self, items: list[Prepared]) -> list[dict[str, Any]]:
         out: list[dict[str, Any] | None] = [None] * len(items)
         with self.torch.inference_mode():
-            for group in self._batches(items):
+            for group in self.passes(items):
                 logits = self._pass([items[i].encoded for i in group])
                 for i, record_logits in zip(group, logits):
                     out[i] = self._answer(items[i], record_logits)
@@ -188,9 +195,13 @@ def load(repo: str, revision: str, *, device: str, dtype: str, fast: bool | None
     """The engine for a pinned Clef release: the fast path on CUDA in bfloat16 unless ``fast`` is False."""
     from huggingface_hub import snapshot_download
 
-    path = Path(snapshot_download(repo, revision=revision))
     if fast is None:
         fast = device.startswith("cuda") and dtype == "bfloat16"
+    if fast and importlib.util.find_spec("fla") is None:
+        raise RuntimeError("the bfloat16 GPU path needs flash-linear-attention at the version that "
+                           "verathos/engine/qwen35.py pins (FLA_VERSION; install.sh miner installs it); "
+                           "--dtype float32 runs the release's own code instead")
+    path = Path(snapshot_download(repo, revision=revision))
     engine = FastEngine(path, device) if fast else ReferenceEngine(path, device, dtype)
     log.info("loaded %s@%s on %s (%s, %s)", repo, revision[:12], device, dtype, "fast" if fast else "reference")
     return engine

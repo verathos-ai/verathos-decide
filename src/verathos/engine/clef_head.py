@@ -8,7 +8,8 @@ records of a pass together:
 - option queries attend to their record's memory, and fields to their record's fields and memory, as padded
   [records, items, width] batches whose key padding masks hide other records' padding;
 - the per-question option routing softmax and the option logits over flat [options] tensors indexed by question.
-Rounding differs from the release's per-record loop only where a sum is ordered differently.
+Rounding differs from the release's per-record loop where a sum is ordered differently, and in the option routing
+(scores, softmax and weighted sum), which runs in float32 where the release rounds each step to the model's dtype.
 """
 
 from __future__ import annotations
