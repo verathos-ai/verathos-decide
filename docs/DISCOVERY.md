@@ -45,6 +45,9 @@ Rules:
   endpoint at a time; after a failure it gets no further challenge for that hotkey in the epoch. A manifest that
   names someone else's server therefore costs that server at most one challenge per validator and epoch, and no
   other traffic.
+- While a hotkey's axon serves no manifest that is accepted (it is down, or restarting), validators and the auditor
+  keep using the one it last served, for up to 3 epochs and only while the commitment still names its digest: the
+  endpoints on the miner's other machines keep their checks and tests while the machine serving the manifest is out.
 - A manifest names the catalog it was built for. Validators accept the current catalog and, for one epoch after a
   change, the previous one, while miners re-publish (they check every minute).
 - A catalog is accepted only if its digest equals the subnet owner hotkey's current commitment. A copy ships with

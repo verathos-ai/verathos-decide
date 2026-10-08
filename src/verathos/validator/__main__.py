@@ -30,7 +30,7 @@ from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator import chain, status
 from verathos.validator.audit import audit_epoch
 from verathos.validator.config import ReferenceEngine, ValidatorConfig
-from verathos.validator.discovery import DiscoveredEndpoint, Identities, discover
+from verathos.validator.discovery import DiscoveredEndpoint, discover
 from verathos.validator.follow import CatalogFollower
 from verathos.validator.references import transitioning, wrong_revision
 from verathos.validator.scoring import (
@@ -179,7 +179,8 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     # No pool limit: a miner's hanging connections must not delay requests to the others.
     limits = httpx.Limits(max_connections=None, max_keepalive_connections=256)
     async with httpx.AsyncClient(limits=limits) as client:
-        miners = await discover(neurons, cfg.netuid, cfg.mechid, client, {cat.digest(), *current.accepted()})
+        miners = await discover(neurons, cfg.netuid, cfg.mechid, client, {cat.digest(), *current.accepted()},
+                                throughput.manifests)
         throughput.update_slots(miners, neurons, epoch)
         endpoints = [e for m in miners for e in m.endpoints() if e.endpoint.tier == "open"
                      and cat.get(e.endpoint.model_id) is not None and cat.get(e.endpoint.model_id).status != "retired"]
@@ -287,7 +288,7 @@ def main() -> None:
         raise SystemExit(f"no reference engine configured for the active models {missing}")
     throughput = Throughput.start(network=cfg.network, netuid=cfg.netuid, mechid=cfg.mechid,
                                   current=lambda: current.catalog, st=st, wallet=wallet, references=cfg.references,
-                                  screens=cfg.audit_screens, state_dir=state_dir, identities=Identities())
+                                  screens=cfg.audit_screens, state_dir=state_dir)
     board = StatusBoard(state_dir / "status.json")
     is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)
     if is_owner or throughput.auditor is not None:

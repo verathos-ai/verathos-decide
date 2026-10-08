@@ -1,8 +1,9 @@
 """Find miners and their endpoints from chain state, and check that each endpoint is the hotkey's.
 
 Input is a chain snapshot (hotkey, axon and commitment per UID); output is the accepted manifests. Only hotkeys
-with a manifest commitment and an axon on a public address are contacted. A manifest may list endpoints on any public
-host, so an endpoint gets traffic only once it proved control at its URL (``Identities``).
+with a manifest commitment and an axon on a public address are contacted; a manifest accepted before stands in for a
+while when the axon is out (``ManifestCache``). A manifest may list endpoints on any public host, so an endpoint gets
+traffic only once it proved control at its URL (``Identities``).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import asyncio
 import logging
 import secrets
 import threading
+import time
 from collections.abc import Collection
 from dataclasses import dataclass
 
@@ -23,6 +25,7 @@ from verathos.protocol.http import request_json
 from verathos.protocol.manifest import (
     Endpoint,
     Manifest,
+    ManifestRejected,
     accept,
     axon_base,
     committed_digest,
@@ -86,36 +89,77 @@ class DiscoveredMiner:
         return [DiscoveredEndpoint(self.uid, self.hotkey, self.axon, e) for e in self.manifest.endpoints]
 
 
+class ManifestCache:
+    """The last manifest each hotkey's axon served that was accepted. While the axon serves none that is (it is down,
+    or restarting), the hotkey's endpoints are taken from this one, for at most ``hold_s`` after it was last fetched
+    and only while the hotkey's commitment still names it: endpoints on the miner's other machines keep their
+    traffic while the machine serving its manifest is out."""
+
+    def __init__(self, hold_s: float) -> None:
+        self.hold_s = hold_s
+        self._lock = threading.Lock()
+        self._accepted: dict[str, tuple[float, str, Manifest]] = {}  # hotkey -> (when, its digest, manifest)
+
+    def put(self, hotkey: str, manifest_digest: str, manifest: Manifest) -> None:
+        with self._lock:
+            self._accepted[hotkey] = (time.monotonic(), manifest_digest, manifest)
+
+    def get(self, n: Neuron, catalog_digests: Collection[str]) -> tuple[float, Manifest] | None:
+        """(seconds since it was fetched, the manifest), if it may stand in for the axon's (see the class)."""
+        with self._lock:
+            held = self._accepted.get(n.hotkey)
+        if held is None or held[1] != committed_digest(n.commitment) or held[2].catalog_digest not in catalog_digests:
+            return None
+        age = time.monotonic() - held[0]
+        return (age, held[2]) if age <= self.hold_s else None
+
+    def prune(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._accepted = {k: v for k, v in self._accepted.items() if now - v[0] <= self.hold_s}
+
+
 async def _fetch_manifest(n: Neuron, netuid: int, mechid: int, client: httpx.AsyncClient,
-                          catalog_digests: Collection[str]) -> DiscoveredMiner | None:
+                          catalog_digests: Collection[str], cache: ManifestCache | None) -> DiscoveredMiner | None:
     base = axon_base(n.axon_ip, n.axon_port)
     try:
+        if not is_public(n.axon_ip) or not 0 < n.axon_port < 65536:
+            raise ManifestRejected("the axon is not on a public address")
         document = await request_json(client, "GET", base + "/v1/manifest", limit=MAX_MANIFEST_BYTES,
                                       timeout=FETCH_TIMEOUT_S)
         manifest = accept(document, hotkey=n.hotkey, netuid=netuid, mechid=mechid, commitment=n.commitment,
                           catalog_digests=catalog_digests)
     except Exception as e:  # whatever a neuron serves, it only costs that neuron its discovery
-        log.info("uid %d manifest not accepted: %s", n.uid, str(e) or type(e).__name__)
-        return None
+        held = cache.get(n, catalog_digests) if cache is not None else None
+        if held is None:
+            log.info("uid %d manifest not accepted: %s", n.uid, str(e) or type(e).__name__)
+            return None
+        log.info("uid %d manifest not accepted (%s); using the one it commits, fetched %.0f min ago", n.uid,
+                 str(e) or type(e).__name__, held[0] / 60)
+        return DiscoveredMiner(n.uid, n.hotkey, None, held[1])
+    if cache is not None:
+        cache.put(n.hotkey, committed_digest(n.commitment), manifest)
     return DiscoveredMiner(n.uid, n.hotkey, base, manifest)
 
 
 async def discover(neurons: list[Neuron], netuid: int, mechid: int, client: httpx.AsyncClient,
-                   catalog_digests: Collection[str]) -> list[DiscoveredMiner]:
-    """Fetch and accept the manifest of every neuron that has a manifest commitment and an axon on a public address.
+                   catalog_digests: Collection[str], cache: ManifestCache | None = None) -> list[DiscoveredMiner]:
+    """Fetch and accept the manifest of every neuron that has a manifest commitment, from its axon on a public
+    address, or from ``cache`` while the axon serves none that is accepted.
 
     ``catalog_digests`` are the catalogs a manifest may be built for: the current one, plus the previous one while
     miners re-publish after a change.
     """
-    candidates = [n for n in neurons if committed_digest(n.commitment) is not None and is_public(n.axon_ip)
-                  and 0 < n.axon_port < 65536]
+    candidates = [n for n in neurons if committed_digest(n.commitment) is not None]
     limit = asyncio.Semaphore(FETCH_CONCURRENCY)
 
     async def fetch(n: Neuron) -> DiscoveredMiner | None:
         async with limit:
-            return await _fetch_manifest(n, netuid, mechid, client, catalog_digests)
+            return await _fetch_manifest(n, netuid, mechid, client, catalog_digests, cache)
 
     found = await asyncio.gather(*(fetch(n) for n in candidates))
+    if cache is not None:
+        cache.prune()
     return [m for m in found if m is not None]
 
 

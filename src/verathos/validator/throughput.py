@@ -27,13 +27,14 @@ from verathos.throughput import feed
 from verathos.throughput.auditor import Auditor, Slot
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.follow import ScheduleFollower
-from verathos.throughput.policy import AuditPolicy
+from verathos.throughput.policy import BLOCK_TIME_S, AuditPolicy
 from verathos.validator import chain as validator_chain
 from verathos.validator.config import ReferenceEngine
-from verathos.validator.discovery import DiscoveredMiner, Identities, Neuron, discover
+from verathos.validator.discovery import DiscoveredMiner, Identities, ManifestCache, Neuron, discover
 
 log = logging.getLogger(__name__)
 SLOT_REFRESH_S = 120.0
+MANIFEST_HOLD_EPOCHS = 3  # how long a manifest accepted before stands in while its axon is out
 VERDICTS_RETRY_S = 30.0
 VERDICTS_WAIT_S = 300.0
 
@@ -52,20 +53,20 @@ def slots(miners: list[DiscoveredMiner]) -> list[Slot]:
 class Throughput:
     def __init__(self, *, netuid: int, mechid: int, policy: AuditPolicy, auditor_hotkey: str,
                  chain: SubtensorChainView, auditor: Auditor | None = None,
-                 follower: ScheduleFollower | None = None, identities: Identities | None = None) -> None:
+                 follower: ScheduleFollower | None = None) -> None:
         self.netuid, self.mechid, self.policy, self.auditor_hotkey, self.chain = (netuid, mechid, policy,
                                                                                   auditor_hotkey, chain)
         self.auditor, self.follower = auditor, follower
-        self.identities = identities or Identities()
-        self._known: dict[str, tuple[str | None, list[Slot]]] = {}
+        # what the validator knows of the miners, shared by its canary audit and the auditor's refresh
+        self.identities = Identities()
+        self.manifests = ManifestCache(MANIFEST_HOLD_EPOCHS * policy.epoch_blocks * BLOCK_TIME_S)
         self._last: feed.Verdicts | None = None
 
     @classmethod
     def start(cls, *, network: str, netuid: int, mechid: int, current: Callable[[], catalog.Catalog],
               st: bt.Subtensor, wallet: bt.Wallet, references: dict[str, ReferenceEngine],
-              screens: dict[str, ReferenceEngine], state_dir: Path, identities: Identities) -> Throughput:
-        """The auditor role if this validator's hotkey is the subnet owner's, else a schedule follower.
-        ``identities``: the validator's record of who proved control where, shared with its canary audit."""
+              screens: dict[str, ReferenceEngine], state_dir: Path) -> Throughput:
+        """The auditor role if this validator's hotkey is the subnet owner's, else a schedule follower."""
         policy = current().audit_policy()
         auditor_hotkey = st.get_subnet_owner_hotkey(netuid)
         chain = SubtensorChainView(network, netuid)
@@ -74,18 +75,19 @@ class Throughput:
             follower.start()
             log.info("throughput tests are run by %s; applying its verdicts", auditor_hotkey)
             return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
-                       follower=follower, identities=identities)
+                       follower=follower)
         auditor = Auditor(netuid=netuid, mechid=mechid, keypair=wallet.hotkey, chain=chain, policy=policy,
                           catalog=current, references=references, screens=screens,
                           db_path=state_dir / "throughput.sqlite")
         auditor.start()
         log.info("throughput auditor running (%s mode)", policy.mode)
         return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
-                   auditor=auditor, identities=identities)
+                   auditor=auditor)
 
     def set_policy(self, policy: AuditPolicy) -> None:
         """Adopt the policy of a newly committed catalog."""
         self.policy = policy
+        self.manifests.hold_s = MANIFEST_HOLD_EPOCHS * policy.epoch_blocks * BLOCK_TIME_S
         (self.auditor or self.follower).set_policy(policy)
 
     def holding(self) -> bool:
@@ -123,28 +125,20 @@ class Throughput:
                       client: httpx.AsyncClient) -> list[DiscoveredMiner]:
         """Discover the miners, and challenge the endpoints a test would target that have not proven control at their
         URL this epoch (auditor only)."""
-        miners = await discover(neurons, self.netuid, self.mechid, client, catalog_digests)
+        miners = await discover(neurons, self.netuid, self.mechid, client, catalog_digests, self.manifests)
         await self.identities.verify([e for m in miners for e in m.endpoints() if testable(e.endpoint)], epoch,
                                      self.auditor.keypair, client)
         return miners
 
     def update_slots(self, miners: list[DiscoveredMiner], neurons: list[Neuron], epoch: int) -> None:
-        """Replace the tested endpoints with the discovered ones that proved control at their URL in ``epoch`` or the
-        one before. A hotkey whose manifest could not be fetched this time keeps its endpoints while its commitment is
-        unchanged, so one failed fetch does not drop it from a test."""
+        """Replace the tested endpoints with the discovered ones (``manifests`` holds a hotkey's while its axon is
+        out) that proved control at their URL in ``epoch`` or the one before."""
         if self.auditor is None:
             return
         if not miners and any(n.commitment for n in neurons):
             log.warning("no miner could be discovered; keeping the endpoints known before")
             return  # a failed discovery must not empty the tests and the gateways' routes
-        commitments = {n.hotkey: n.commitment for n in neurons}
-        known = {m.hotkey: (commitments.get(m.hotkey), slots([m])) for m in miners}
-        for hotkey, (commitment, kept) in self._known.items():
-            if hotkey not in known and commitment is not None and commitments.get(hotkey) == commitment:
-                known[hotkey] = (commitment, kept)
-        self._known = known
-        self.auditor.update_slots([s for _, kept in known.values() for s in kept
-                                   if self.identities.verified(s.key, s.url, epoch - 1)])
+        self.auditor.update_slots([s for s in slots(miners) if self.identities.verified(s.key, s.url, epoch - 1)])
 
     # ---- verdicts ----
 

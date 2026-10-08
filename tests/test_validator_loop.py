@@ -267,6 +267,52 @@ def test_endpoints_on_several_machines_are_checked_where_they_are_and_another_se
     assert transport.seen[victim, "identity"] == 2 and (victim, "systemone") not in transport.seen
 
 
+def test_a_manifest_accepted_before_stands_in_while_the_axon_is_out() -> None:
+    """The machine serving the manifest goes down: the endpoints on the hotkey's other machine keep their canaries,
+    while the commitment still names that manifest and for at most the cache's hold time."""
+    from verathos.validator.discovery import Identities, ManifestCache
+
+    validator, hotkey = kp(), kp()
+    axon, worker = "10.0.5.1", "10.0.5.2"
+    apps, commit = multi_host_miner(hotkey, validator, {axon: ["gpu0"], worker: ["w-gpu0"]},
+                                    {"gpu0": axon, "w-gpu0": worker})
+    cache, identities, down = ManifestCache(hold_s=3600.0), Identities(), set()
+
+    class Transport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.inner = HostRouter(apps)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.url.host in down:
+                raise httpx.ConnectError("down")
+            return await self.inner.handle_async_request(request)
+
+    def epoch(n: int, commitment: str = commit):
+        async def run():
+            async with httpx.AsyncClient(transport=Transport()) as client:
+                found = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commitment)], 405, 1, client,
+                                       {catalog.load().digest()}, cache)
+                results = await audit_epoch([e for m in found for e in m.endpoints()], epoch=n, secret=b"k" * 32,
+                                            keypair=validator, references={"kev-4b": MockEngine("kev-4b")},
+                                            tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client,
+                                            netuid=405, mechid=1, pool_size=4, per_endpoint=2,
+                                            identities=identities)
+                return found, {r.endpoint.endpoint.endpoint_id: r for r in results.values()}
+
+        return asyncio.run(run())
+
+    (found,), results = epoch(1)
+    assert found.axon == f"http://{axon}:80" and all(r.answered == 2 for r in results.values())
+    down.add(axon)
+    (found,), results = epoch(2)
+    assert found.axon is None and [e.endpoint_id for e in found.manifest.endpoints] == ["gpu0", "w-gpu0"]
+    assert results["w-gpu0"].identity_ok and results["w-gpu0"].answered == 2
+    assert not results["gpu0"].identity_ok and results["gpu0"].sent == 0
+    assert epoch(3, commitment_value("1" * 64))[0] == []  # the hotkey committed another manifest
+    cache.hold_s = 0.0
+    assert epoch(4)[0] == []  # held long enough
+
+
 def test_a_validator_notices_when_the_subnet_owner_hotkey_moves() -> None:
     """Its role (auditor or follower) and the auditor it trusts are set at its start: a new owner hotkey means a
     restart."""

@@ -226,12 +226,16 @@ Per epoch (`epoch_blocks` from the catalog, default 180 blocks) the validator:
    applies a new audit policy at once; each epoch is scored under the catalog committed at its first block, so
    models, tolerances and the epoch length change for every validator at the same epoch;
 2. reads axons and commitments and accepts each miner's manifest if it is signed by the hotkey, matches the
-   committed digest, lists its endpoints on the hotkey's axon and was built for the current catalog (or, for one
-   epoch after a change, the previous one);
-3. challenges each endpoint to sign a nonce with the listing hotkey;
+   committed digest, lists its endpoints at public addresses (the axon or the miner's other machines, `DISCOVERY.md`)
+   and was built for the current catalog (or, for one epoch after a change, the previous one). While a hotkey's axon
+   serves no acceptable manifest, the one it last served stands in for up to 3 epochs, as long as the commitment
+   still names it, so the endpoints on the miner's other machines keep their checks;
+3. challenges each endpoint at its URL to sign a nonce with the listing hotkey, while it computes the references;
+   a host that is not the hotkey's gets no more than one challenge per epoch;
 4. derives the epoch's canaries from its secret, computes the references (within 30% of the canaries' time), sends
-   each endpoint its subset of the canaries computed, spread over the rest of the first `canary_spread_fraction` of
-   the epoch (holding them while a throughput test runs), and checks every signed receipt;
+   each endpoint that passed its challenge its subset of the canaries computed, spread over the rest of the first
+   `canary_spread_fraction` of the epoch (holding them while a throughput test runs), and checks every signed
+   receipt;
 5. reads the auditor's verdicts for the epoch: each endpoint's proven capacity, what users got from it (readiness
    and latency), each model's user demand, and any proven wrong answers;
 6. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
