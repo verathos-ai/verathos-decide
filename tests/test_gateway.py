@@ -635,6 +635,49 @@ def test_gcra_allows_the_burst_then_the_rate() -> None:
     assert limiter.check("other", 2.0, 3, 0.5) == 0.0
 
 
+def test_a_table_that_drops_every_route_of_an_active_model_is_refused(tmp_path, caplog) -> None:
+    from verathos.gateway.routes import Refused, dropped_models
+
+    auditor, clock = kp(), Clock()
+    clock.now = 10.0
+
+    def signed(issued_s: float, *routes_: Route) -> SignedRoutes:
+        return SignedRoutes.create(Routes(netuid=405, auditor=auditor.ss58_address, epoch=3,
+                                          issued_ms=int(issued_s * 1000), catalog_digest="0" * 64,
+                                          routes=list(routes_)), auditor)
+
+    served = {"doc": signed(5, route(kp(), "m"))}
+    app = FastAPI()
+
+    @app.get("/v1/routes")
+    async def get_routes():
+        return served["doc"].model_dump(mode="json")
+
+    async def url():
+        return "http://auditor"
+
+    t = RouteTable(client=httpx.AsyncClient(transport=HostRouter({"auditor": app})), auditor_url=url,
+                   auditor_hotkey=auditor.ss58_address, netuid=405, path=tmp_path / "routes.json", clock=clock)
+    cat = catalog.load()
+
+    def guard(new: Routes) -> None:  # as the gateway adopts a table, with the table's catalog
+        if dropped_models(t.table, new, cat) and not t.stale():
+            raise Refused("it drops every route of kev-4b")
+    t.on_change.append(guard)
+    assert asyncio.run(t.refresh()) and t.table.issued_ms == 5000
+    served["doc"] = signed(6)  # the auditor lost its view of the miners
+    assert not asyncio.run(t.refresh()) and t.table.issued_ms == 5000
+    assert any(r.levelname == "ERROR" and "refused" in r.message for r in caplog.records)
+    served["doc"] = signed(7, route(kp(), "n"))  # other endpoints of the model: taken
+    assert asyncio.run(t.refresh()) and t.table.issued_ms == 7000
+    retired = catalog.Catalog.parse({**cat.document(), "models": [
+        {**m, "status": "retired"} if m["model_id"] == "kev-4b" else m for m in cat.document()["models"]]})
+    assert dropped_models(t.table, signed(8).routes, retired) == []  # a model retired by its catalog may go
+    t.stale_s, clock.now = 60.0, 7 + 61.0
+    served["doc"] = signed(68)
+    assert asyncio.run(t.refresh()) and t.table.routes == []  # stale: the auditor's newer word is taken
+
+
 def test_routes_are_taken_only_from_the_auditor_and_newer(tmp_path) -> None:
     auditor = kp()
 

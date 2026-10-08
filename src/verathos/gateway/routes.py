@@ -5,6 +5,10 @@ than ``MAX_AHEAD_S`` ahead of this host's clock (one dated in the future would s
 then, across restarts), and everything that depends on it (its catalog) could be set up. The last good table is kept
 on disk too, so a restarted gateway serves at once. While the auditor serves no newer table, the gateway keeps using
 the last one; past ``STALE_EPOCHS`` epochs it says so in the log and in ``/ready``.
+
+A newer table that drops every route of a model its catalog still has active (``dropped_models``) is refused, and the
+current one kept: an auditor that lost its view of the miners must not take a model off the gateway. Once the current
+table is stale, the auditor's newer word is taken.
 """
 
 from __future__ import annotations
@@ -36,6 +40,19 @@ def stale_after_s(cat: catalog_module.Catalog) -> float:
     return STALE_EPOCHS * cat.epoch_blocks * BLOCK_TIME_S
 
 
+def dropped_models(current: Routes | None, new: Routes, cat: catalog_module.Catalog) -> list[str]:
+    """The models active in ``cat`` (the new table's catalog) that the current table routes and the new one does
+    not route at all."""
+    if current is None:
+        return []
+    dropped = {r.model_id for r in current.routes} - {r.model_id for r in new.routes}
+    return sorted(m for m in dropped if (model := cat.get(m)) is not None and model.status == "active")
+
+
+class Refused(Exception):
+    """A table that is signed and newer, but not used (raised by an ``on_change`` callback)."""
+
+
 class RouteTable:
     def __init__(self, *, client: httpx.AsyncClient, auditor_url: Callable[[], Awaitable[str | None]],
                  auditor_hotkey: str, netuid: int, path: Path, clock: Callable[[], float] = time.time) -> None:
@@ -56,19 +73,29 @@ class RouteTable:
             return False
         return self.table is None or signed.routes.issued_ms > self.table.issued_ms
 
-    async def _adopt(self, signed: SignedRoutes) -> None:
-        for callback in self.on_change:
-            result = callback(signed.routes)
-            if asyncio.iscoroutine(result):
-                await result
+    async def _adopt(self, signed: SignedRoutes) -> bool:
+        try:
+            for callback in self.on_change:
+                result = callback(signed.routes)
+                if asyncio.iscoroutine(result):
+                    await result
+        except Refused as exc:
+            if self._throttled(f"refused {signed.routes.issued_ms}"):
+                log.error("routes of epoch %d refused: %s", signed.routes.epoch, exc)
+            return False
         self.table = signed.routes
+        return True
+
+    def stale(self) -> bool:
+        """Whether the routes in use are older than ``stale_s``."""
+        return (self.table is not None and self.stale_s is not None
+                and self.clock() - self.table.issued_ms / 1000 > self.stale_s)
 
     async def load(self) -> None:
         """Adopt the table kept on disk, if any and valid."""
         try:
             signed = SignedRoutes.model_validate_json(self.path.read_text())
-            if self._accept(signed):
-                await self._adopt(signed)
+            if self._accept(signed) and await self._adopt(signed):
                 log.info("routes from %s loaded: %d endpoints", self.path, len(signed.routes.routes))
         except Exception as exc:
             log.warning("routes on disk not used: %s: %s", type(exc).__name__, exc)
@@ -81,9 +108,8 @@ class RouteTable:
         document = await request_json(self.client, "GET", url.rstrip("/") + ROUTES_PATH, limit=MAX_ROUTES_BYTES,
                                       timeout=15.0)
         signed = SignedRoutes.model_validate(document)
-        if not self._accept(signed):
+        if not self._accept(signed) or not await self._adopt(signed):
             return False
-        await self._adopt(signed)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(signed.model_dump_json())
@@ -101,7 +127,7 @@ class RouteTable:
             if self.table is not None:
                 age = self.clock() - self.table.issued_ms / 1000
                 metrics.ROUTES_AGE.set(age)
-                if self.stale_s is not None and age > self.stale_s and self._throttled("stale"):
+                if self.stale() and self._throttled("stale"):
                     log.warning("the routes in use are %.0f min old: the auditor serves no newer ones, so endpoints "
                                 "that lost their credit since may still be used", age / 60)
             await asyncio.sleep(poll_s)

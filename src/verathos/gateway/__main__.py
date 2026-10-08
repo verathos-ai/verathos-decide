@@ -48,7 +48,7 @@ from verathos.gateway.app import (
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.router import Router
-from verathos.gateway.routes import RouteTable, stale_after_s
+from verathos.gateway.routes import Refused, RouteTable, dropped_models, stale_after_s
 from verathos.gateway.sampler import Sampler, TestFollower
 from verathos.gateway.served import ServedCounter
 from verathos.gateway.upstream import Upstream
@@ -104,10 +104,14 @@ async def serve(config: GatewayConfig) -> None:
             url = await auditor_url()
             sources = [url.rstrip("/") + catalog_module.CATALOG_PATH] if url else []
             cat = await asyncio.to_thread(catalog_module.resolve, table.catalog_digest, store=store, sources=sources)
-            current[0] = cat
             if keypair.ss58_address not in cat.gateways:
                 log.error("this gateway's hotkey %s is not among catalog %s's gateways: miners will refuse it",
                           keypair.ss58_address, cat.digest()[:12])
+        dropped = dropped_models(routes.table, table, cat)
+        if dropped and not routes.stale():
+            raise Refused(f"it drops every route of {', '.join(dropped)}, still active in its catalog; keeping the "
+                          f"routes of epoch {routes.table.epoch}")
+        current[0] = cat
         router.max_latency_s = cat.audit_policy().max_latency_s
         routes.stale_s = stale_after_s(cat)
         endpoints = {(r.hotkey, r.endpoint_id, r.model_id) for r in table.routes}

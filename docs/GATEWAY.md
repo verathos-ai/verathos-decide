@@ -128,7 +128,9 @@ table is signed by the auditor hotkey. The gateway polls it every 30 s, uses onl
 hotkey, newer than its own and issued at most 5 minutes ahead of its clock, and keeps the last good one on disk. A new
 endpoint is routable once its first throughput test is credited. While the auditor serves no newer table the gateway
 keeps using its own; older than 3 epochs, the routes are stale: the log says so every 10 minutes, and `GET /ready`
-(still 200) shows it (`"routes": {"age_s": ..., "stale": true}`).
+(still 200) shows it (`"routes": {"age_s": ..., "stale": true}`). A newer table that drops every route of a model its
+catalog still has active is refused, with an error in the log, and the current one kept: an auditor that lost its
+view of the miners does not take a model off the gateway. Once the current table is stale, the newer one is taken.
 
 ## Setup
 
