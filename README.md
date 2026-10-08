@@ -10,12 +10,30 @@ gateway serves users from that proven capacity, and a sample of the answers user
 Discovery, the model catalog and the audit policy live in native chain state (axons and commitments); there is no
 EVM and no central registry.
 
+## Run a miner or a validator
+
+On Ubuntu 22.04 or 24.04, with a registered wallet's hotkey on the machine (`hotkeys/<hotkey>` and `coldkeypub.txt`
+under `~/.bittensor/wallets/<wallet>/`; the coldkey stays elsewhere):
+
+```bash
+# a miner: NVIDIA GPUs, a public IP address and one open TCP port
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
+
+# a validator: a hotkey with a validator permit; the reference models run on GPUs or in RAM
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator
+```
+
+The command installs what the machine needs, asks a few questions (each has a default), and runs everything as
+system services. Run it again to update. What it asks, what it installs, how to check, update and uninstall, and
+the manual installation: [Mining](docs/MINING.md#quick-start-one-command),
+[Validating](docs/VALIDATING.md#quick-start-one-command).
+
 ## Documentation
 
 | | |
 |---|---|
-| [Mining](docs/MINING.md) | hardware, install, engines, configuration, running a miner |
-| [Validating](docs/VALIDATING.md) | reference engines, configuration, running a validator and the auditor |
+| [Mining](docs/MINING.md) | hardware, one-command and manual install, engines, configuration, running a miner |
+| [Validating](docs/VALIDATING.md) | one-command and manual install, reference engines, configuration, the auditor |
 | [Scoring](docs/SCORING.md) | how answers are verified and scored |
 | [Throughput audit](docs/THROUGHPUT_AUDIT.md) | declared capacity, the network-wide tests, verdicts, policy |
 | [Gateway](docs/GATEWAY.md) | user traffic: keys, limits, routing, answer checks, running it |
@@ -34,8 +52,9 @@ src/verathos/
   gateway/     verathos-gateway: user traffic to the proven capacity
   engine/      verathos-engine for model families served from their repository code (Clef)
   subnet/      chain helpers miners and validators share, and the verathos-subnet admin CLI
+  install/     guided setup: verathos-miner init, verathos-validator init, uninstall
 native/loadgen/  Rust load generator the auditor drives the tests with
-scripts/       miner probe
+scripts/       installer, miner probe
 docs/
 ```
 

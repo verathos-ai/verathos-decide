@@ -11,7 +11,8 @@ proves, so hardware pays by its throughput per cost.
 
 ## Requirements
 
-- Linux, Python 3.12, `git`, and what the engines need (NVIDIA drivers for GPU engines).
+- Linux (the one-command install: Ubuntu 22.04 or 24.04), Python 3.12, `git`, and what the engines need (NVIDIA
+  drivers for GPU engines).
 - One GPU per endpoint. Any GPU that runs the model's engine works; a GPU shared by several endpoints is credited
   once, split between them.
 - A public IP address and one open TCP port for the miner service. Validators and the auditor reach endpoints only
@@ -19,7 +20,128 @@ proves, so hardware pays by its throughput per cost.
   receipts are signed). A test sends every endpoint its declared rate for about 20 s: the connection must carry it.
 - A hotkey registered on the subnet; the miner machine needs the hotkey and `coldkeypub.txt`, never the coldkey.
 
-## 1. Register
+## Quick start (one command)
+
+Register the hotkey first ([1. Register](#1-register)) and copy the hotkey and the coldkey's public key to the
+miner machine: `~/.bittensor/wallets/<wallet>/hotkeys/<hotkey>` and `~/.bittensor/wallets/<wallet>/coldkeypub.txt`.
+The installer never creates, imports or reads a coldkey. Then, on the miner machine, as root or a user with sudo:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
+```
+
+It shows its plan before it changes anything, and asks:
+
+| Question | Default |
+|---|---|
+| Wallet/hotkey | the hotkey on the machine, or the one set up before |
+| Public IP address of this machine | detected |
+| Public TCP port of the miner | 8091 |
+| Model for each kind of GPU | the first active catalog model that fits the GPU's memory |
+
+To answer on the command line instead, add `--yes` and the options:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner --yes \
+    --wallet miner --hotkey default --port 8091 --model kev-4b
+```
+
+| Option | Meaning |
+|---|---|
+| `--wallet`, `--hotkey` | the wallet and hotkey |
+| `--public-ip`, `--port` | the address validators reach the miner at |
+| `--model` | one model for every GPU, or one per GPU in order (`kev-4b,kev-9b`) |
+| `--gpus` | the GPUs to serve on (`0,1`; default all) |
+| `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
+| `--no-publish` | try the machine before registering: the miner serves and measures, but writes nothing on chain |
+| `--no-service` | set everything up, and print the commands to run instead of installing services |
+| `--source`, `--ref`, `--dir` | the code from another git URL, git bundle or tarball; a branch, tag or commit; another directory than `~/verathos` |
+
+What it does:
+1. installs `git`, `curl`, `build-essential` (the engine compiles its GPU kernels on first use) and, in a container
+   without systemd, `supervisor`; then uv and Python 3.12;
+2. puts the code in `~/verathos` with its Python environment, and `verathos-miner` and `verathos-validator` on the
+   `PATH`;
+3. checks the hotkey, its registration, the subnet's catalog and the GPUs;
+4. installs the Kev engine at the catalog's `engine.revision` and downloads the weights at `hf_revision` (and the
+   base model at `base_revision`). The engines run offline from that copy, so they serve exactly the pinned
+   revisions;
+5. writes the configuration, `~/.verathos/miner.json` ([4. Configure](#4-configure));
+6. starts one engine per GPU (`verathos-engine-gpu0`, ...) on `127.0.0.1` and the miner (`verathos-miner`) as
+   services, waits for the engines to load, and shows the capacity measurement (a few minutes) until the miner
+   serves.
+
+| Path | |
+|---|---|
+| `~/verathos` | code and its Python environment |
+| `~/.verathos/miner.json` | configuration |
+| `~/.verathos/miner/` | capacity measurements and the last published manifest |
+| `~/.verathos/engines/`, `~/.verathos/hf/` | engines (one per pinned revision) and model weights |
+| `/etc/systemd/system/verathos-*.service` | services; in a container `/etc/supervisor/conf.d/verathos-*.conf`, with logs in `/var/log/verathos/` |
+
+### Check that it works
+
+The setup ends once the miner serves:
+
+```
+endpoint gpu0 (kev-4b): 14.5 requests/s at concurrency 4 (runs 14.5, 15.0, 15.0, 14.0, 14.0), declares 13.8
+serving 1 endpoints on port 8091; throughput tests are accepted from 5D...; status is logged once per epoch
+```
+
+and prints the commands for its services:
+
+| | systemd | supervisord (containers) |
+|---|---|---|
+| status | `systemctl status verathos-miner verathos-engine-gpu0` | `supervisorctl status` |
+| miner log | `journalctl -u verathos-miner -f` | `tail -f /var/log/verathos/verathos-miner.log` |
+| engine log | `journalctl -u verathos-engine-gpu0 -f` | `tail -f /var/log/verathos/verathos-engine-gpu0.log` |
+| restart after editing `miner.json` | `systemctl restart verathos-miner` | `supervisorctl restart verathos-miner` |
+
+From another machine, `curl http://<public ip>:<port>/v1/manifest` returns the signed manifest with each endpoint's
+declared capacity; requests without a permitted caller's signature get `403`. Once per epoch the miner logs what the
+validators saw ([Reading the log](#reading-the-log)).
+
+### Update
+
+Run the command again; `--yes` keeps every earlier answer:
+
+```bash
+bash ~/verathos/scripts/install.sh miner --yes
+```
+
+It updates the code from where it was installed, and the engines and weights when the catalog pins new revisions.
+The miner restarts and reuses its capacity measurement while nothing it depends on changed; an engine restarts only
+when its revision or settings changed.
+
+### Uninstall
+
+```bash
+bash ~/verathos/scripts/install.sh uninstall
+```
+
+stops and removes the services, the code, the engines and the weights. The configuration and state in `~/.verathos`
+stay for a later install; `--purge` deletes them too. Wallets are never touched.
+
+### Troubleshooting
+
+| Problem | What to do |
+|---|---|
+| `curl: command not found` | minimal images lack it: `apt-get update && apt-get install -y curl`, then the command again |
+| `hotkey ... is not registered on netuid 96` | register it ([1. Register](#1-register)) and run the command again; `--no-publish` tries the machine first |
+| `coldkeypub.txt not found` | copy `~/.bittensor/wallets/<wallet>/coldkeypub.txt` from the machine holding the wallet |
+| `no NVIDIA GPU found` | install the NVIDIA driver; in a container, start it with the GPUs passed through |
+| `the NVIDIA driver supports CUDA 12.x` | the engines need a driver for CUDA 12.8 or newer |
+| `port ... is in use` | choose another port with `--port` |
+| validators cannot reach the miner | `curl http://<public ip>:<port>/v1/manifest` from another machine must answer: open the port for inbound TCP (`ufw allow <port>/tcp`, the provider's firewall). Behind port forwarding, as in most rented containers, the outside port must be the same as the port inside: the axon has one port |
+| an engine keeps stopping | its log says why; out of GPU memory: another model, or a GPU free of other work |
+| `no endpoint could be measured` | the engine logs: the measurement needs the engines answering |
+| no services after a container restart | containers start no services by themselves: run the command again, or `supervisord -c /etc/supervisor/supervisord.conf` |
+| `local changes in ... stop the update` | the installer manages `~/verathos`: see `git -C ~/verathos status` and discard the changes |
+| downloads slow or rate limited | use a Hugging Face token: `export HF_TOKEN=<token>` before the command |
+
+## Manual installation
+
+### 1. Register
 
 ```bash
 btcli subnet register --netuid 96 --wallet.name <wallet> --wallet.hotkey <hotkey>
@@ -28,7 +150,7 @@ btcli subnet register --netuid 96 --wallet.name <wallet> --wallet.hotkey <hotkey
 Copy `~/.bittensor/wallets/<wallet>/coldkeypub.txt` and `~/.bittensor/wallets/<wallet>/hotkeys/<hotkey>` to the
 same paths on the miner machine.
 
-## 2. Install
+### 2. Install
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -37,7 +159,7 @@ uv venv -p 3.12 .venv
 VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"
 ```
 
-## 3. Start one engine per GPU
+### 3. Start one engine per GPU
 
 Which model to serve is yours to choose. Each active model has its own share of the emission, split among the
 endpoints serving it by proven capacity (`SCORING.md`); the shares follow what users pay for each model through the
@@ -73,7 +195,7 @@ uv venv -p 3.12 /opt/clef && VIRTUAL_ENV=/opt/clef uv pip install -e ".[clef]"
 CUDA_VISIBLE_DEVICES=2 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8010
 ```
 
-## 4. Configure
+### 4. Configure
 
 `miner.json`:
 
@@ -104,7 +226,7 @@ CUDA_VISIBLE_DEVICES=2 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --rev
 | `catalog_dir` | local catalog store (default `~/.verathos/catalog`) |
 | `state_dir` | capacity measurements and the last published manifest (default `~/.verathos/miner`) |
 
-## 5. Run
+### 5. Run
 
 ```bash
 .venv/bin/verathos-miner --config miner.json
@@ -195,6 +317,8 @@ needs to be done by hand, but:
   and credited less than that.
 
 ## Updating
+
+A miner set up with the one-command install updates by running it again ([Update](#update)). A manual installation:
 
 ```bash
 git pull && VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"

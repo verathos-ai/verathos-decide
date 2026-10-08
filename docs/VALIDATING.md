@@ -10,7 +10,7 @@ role at startup from the chain.
 
 ## Requirements
 
-- Linux, Python 3.12, `git`.
+- Linux (the one-command install: Ubuntu 22.04 or 24.04), Python 3.12, `git`.
 - A hotkey registered on the subnet with a validator permit.
 - One reference engine per catalog model. The reference is the model run in fp32; CPU is enough because each
   canary is computed once per epoch and reused for every endpoint, so the reference work does not grow with the
@@ -31,7 +31,113 @@ role at startup from the chain.
 - A public IP of its own: behind most NATs a machine cannot reach other machines that share its public IP through
   that IP, so a validator next to miners on one NAT cannot send them canaries.
 
-## 1. Install
+## Quick start (one command)
+
+Copy the hotkey and the coldkey's public key to the validator machine:
+`~/.bittensor/wallets/<wallet>/hotkeys/<hotkey>` and `~/.bittensor/wallets/<wallet>/coldkeypub.txt`. The installer
+never creates, imports or reads a coldkey. Then, on Ubuntu 22.04 or 24.04, as root or a user with sudo:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator
+```
+
+It asks for the wallet/hotkey (default: the hotkey on the machine, or the one set up before), shows its plan and
+asks to go ahead. Without questions:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --yes \
+    --wallet validator --hotkey default
+```
+
+| Option | Meaning |
+|---|---|
+| `--wallet`, `--hotkey` | the wallet and hotkey |
+| `--device` | where the references run: `auto` (on GPUs while they fit, smallest model first, the rest in RAM), `cpu` or `gpu` |
+| `--dry-run` | compute weights without setting them; `--no-dry-run` sets them again |
+| `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
+| `--no-service`, `--source`, `--ref`, `--dir` | as for miners (`MINING.md`) |
+
+What it does:
+1. installs `git`, `curl` and, in a container without systemd, `supervisor`; then uv and Python 3.12;
+2. puts the code in `~/verathos` with its Python environment, and `verathos-validator` on the `PATH`;
+3. checks the hotkey, its registration and validator permit, and reads the catalog the subnet owner commits;
+4. places a float32 reference engine for every `active` model in the free memory: on a GPU while one has room,
+   otherwise in RAM;
+
+   | Model | Memory of its float32 reference |
+   |---|---|
+   | Kev-4B | about 21 GiB |
+   | Kev-9B | about 42 GiB |
+
+5. installs the Kev engine at `engine.revision`, without the fused kernels (they change float32 results), and
+   downloads the weights at `hf_revision` and the base model at `base_revision`; the references run offline from
+   that copy;
+6. writes `~/.verathos/validator.json` ([3. Configure](#3-configure)) with the `references` and `state_dir`
+   (`~/.verathos/validator`: the canary secret and the score history; keep it);
+7. starts the references (`verathos-reference-kev-4b`, ...) on `127.0.0.1` and the validator
+   (`verathos-validator`) as services, waits for the references to load, and shows the validator's start.
+
+Code, engines, weights and services live where they do for miners (`MINING.md`).
+
+### Check that it works
+
+The setup ends with the validator's first lines:
+
+```
+throughput tests are run by 5D...; applying its verdicts
+epoch 45406: 3 miners, 3 open endpoints
+```
+
+At the end of each epoch it logs the emission shares, a line per endpoint checked and the weights:
+
+```
+  5CzN.../gpu0 epoch_verdict=insufficient answered=7/7 identity=True mean_abs=0.0013 proven_rps=7.6 users=1.00 score=0.191
+dry run (mechanism 1 configured dry): weights {1: 0.57, 12: 0.43}
+```
+
+A validator restarted in an epoch it already scored starts with the next one.
+
+| | systemd | supervisord (containers) |
+|---|---|---|
+| status | `systemctl status verathos-validator verathos-reference-kev-4b verathos-reference-kev-9b` | `supervisorctl status` |
+| validator log | `journalctl -u verathos-validator -f` | `tail -f /var/log/verathos/verathos-validator.log` |
+| reference log | `journalctl -u verathos-reference-kev-4b -f` | `tail -f /var/log/verathos/verathos-reference-kev-4b.log` |
+| restart after editing `validator.json` | `systemctl restart verathos-validator` | `supervisorctl restart verathos-validator` |
+
+### Update
+
+```bash
+bash ~/verathos/scripts/install.sh validator --yes
+```
+
+updates the code, and the engines and weights when the catalog pins new revisions; it adds a reference when the
+catalog activates a model. References keep running unless their revision or settings changed; the validator
+restarts.
+
+### Uninstall
+
+```bash
+bash ~/verathos/scripts/install.sh uninstall
+```
+
+stops and removes the services, the code, the engines and the weights. The configuration and state in `~/.verathos`
+(with the canary secret and the score history) stay; `--purge` deletes them too. Wallets are never touched.
+
+### Troubleshooting
+
+| Problem | What to do |
+|---|---|
+| `UID ... has no validator permit yet` | miners answer only validators with a permit, which follows the stake |
+| `the kev-9b reference needs about 42 GiB ...; not enough is free` | free memory or add some; `--device` chooses between GPU and RAM |
+| `... of 16 canaries without a reference answer this epoch` | the reference's log: it is down, or too slow to compute the canaries within the epoch's reference time ([Requirements](#requirements)) |
+| `no reference engine configured for the active models` | the catalog activated a model: run the command again |
+| `the subnet's catalog is not available` | the subnet owner's axon serves it; add a mirror to `catalog_mirrors` in `validator.json` |
+| `this is the subnet owner's hotkey` | the owner's validator also serves the catalog and runs the throughput audit: set `public_host` and `port`, and build the load generator ([1. Install](#1-install)) |
+| `curl: command not found`, `coldkeypub.txt not found`, no services after a container restart, `local changes in ... stop the update`, slow downloads | as for miners (`MINING.md`) |
+
+## Manual installation
+
+### 1. Install
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -47,7 +153,7 @@ curl -sSf https://sh.rustup.rs | sh -s -- -y
 .venv/bin/verathos-build-loadgen
 ```
 
-## 2. Start the reference engines
+### 2. Start the reference engines
 
 The reference defines the right answer, so it runs exactly what the catalog pins: the engine at `engine.revision`
 and the weights at `hf_revision`, in float32.
@@ -68,7 +174,7 @@ needs about 36 GB of RAM in fp32.
 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8103 --device cpu --dtype float32
 ```
 
-## 3. Configure
+### 3. Configure
 
 `validator.json`:
 
@@ -96,13 +202,14 @@ needs about 36 GB of RAM in fp32.
 Scoring settings (canaries, statistical window, EMA, probation) come from the catalog, so every validator applies
 the same ones.
 
-## 4. Run
+### 4. Run
 
 ```bash
 .venv/bin/verathos-validator --config validator.json
 ```
 
-Run it under a supervisor (systemd, pm2) that restarts it.
+Run it under a supervisor (systemd, pm2) that restarts it. At start it waits until its reference engines answer
+(at most 15 minutes), so references restarted with it can load their models before an epoch needs them.
 
 Per epoch (`epoch_blocks` from the catalog, default 180 blocks) the validator:
 1. uses the catalog the subnet owner commits (shipped copy, local store, owner's axon, mirrors; any copy is
