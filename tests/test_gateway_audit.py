@@ -491,3 +491,68 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
     assert store._query("SELECT test_id FROM tests") == [("kept",)]
     assert store._query("PRAGMA user_version")[0][0] == SCHEMA_VERSION
     assert store.demand_ema(10) == {}
+
+
+def test_verdicts_take_a_few_queries_whatever_the_number_of_endpoints(tmp_path) -> None:
+    """The drift tallies are grouped queries: building the credits of 4,096 endpoints with 30 epochs of tests takes
+    a handful of statements, not two per endpoint."""
+    import time as time_module
+
+    auditor = _auditor(tmp_path)
+    store = auditor.store
+    endpoints = [(f"hk{h}", f"gpu{e}") for h in range(128) for e in range(32)]
+    tests = [ScheduledTest(epoch, epoch * 180 + 20, block_hash(epoch * 180 + 20).hex(), epoch * 180 + 25)
+             for epoch in range(30)]
+    with store._lock:
+        store._db.execute("BEGIN")
+        store._db.executemany("INSERT INTO tests VALUES (?, ?, ?, ?, ?, 'confirmed', '')",
+                              [(t.test_id, t.epoch, t.selection_block, t.selection_hash, t.start_block) for t in tests])
+        store._db.executemany(
+            "INSERT INTO results VALUES (?, ?, ?, 'kev-4b', 20, 20, 20, 20, 'passed', '', 400, 900, '{}', NULL, ?, 40)",
+            [(t.test_id, hk, ep, 0.4 if hk == "hk7" else 0.0) for t in tests for hk, ep in endpoints])
+        store._db.execute("COMMIT")
+    statements = []
+    store._db.set_trace_callback(statements.append)
+    started = time_module.monotonic()
+    credits = store.credits(28, 29, auditor.policy, lambda m: KEV.tolerance)
+    took = time_module.monotonic() - started
+    store._db.set_trace_callback(None)
+    assert len(credits) == len(endpoints) and len(statements) <= 6
+    assert {c.hotkey for c in credits if c.drift} == {"hk7"}  # 320 probabilities off by 0.01 each: beyond mean_abs
+    assert took < 3.0
+
+
+def test_a_sample_check_never_blocks_the_auditors_event_loop_while_verdicts_are_built(tmp_path) -> None:
+    import threading
+    import time as time_module
+
+    gateway, miner_kp = kp(), kp()
+    honest = miner(miner_kp, MockEngine("kev-4b"), gateway)
+    response = asyncio.run(exchange(honest, gateway, miner_kp, request(1)))
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "http://x/e/gpu0", "kev-4b", 40.0)])
+    sample = GatewaySample(hotkey=miner_kp.ss58_address, endpoint_id="gpu0", model_id="kev-4b", request=request(1),
+                           response=response.text)
+    assert auditor.accept_samples(gateway.ss58_address, [sample]) == 1
+    auditor._verdicts_lock.acquire()  # verdicts being built in another thread
+    threading.Timer(0.5, auditor._verdicts_lock.release).start()
+
+    async def run() -> int:
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        task = asyncio.create_task(ticker())
+        started = time_module.monotonic()
+        await auditor.check_samples(Checks({"kev-4b": MockEngine("kev-4b")}, {}))
+        task.cancel()
+        assert time_module.monotonic() - started >= 0.4  # the check waited for the verdicts ...
+        return ticks
+
+    assert asyncio.run(run()) > 20  # ... while the loop went on
+    assert auditor.store._query("SELECT state FROM samples")[0][0] == "checked"

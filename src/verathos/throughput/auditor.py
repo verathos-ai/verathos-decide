@@ -108,7 +108,7 @@ MIN_TEST_SHARE = 0.1  # a test sends at least this share of the tested rate itse
 USERS_BEFORE_S = (80.0, 20.0)  # an endpoint's usual user rate: [window start - 80 s, window start - 20 s)
 SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _DEMAND_SCHEMA = """
 CREATE TABLE demand (epoch INTEGER NOT NULL, model_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
     ema REAL NOT NULL, PRIMARY KEY (epoch, model_id));
@@ -118,7 +118,9 @@ CREATE TABLE users (epoch INTEGER NOT NULL, hotkey TEXT NOT NULL, endpoint_id TE
     offered INTEGER NOT NULL, refused INTEGER NOT NULL, answers INTEGER NOT NULL, latency TEXT NOT NULL,
     PRIMARY KEY (epoch, hotkey, endpoint_id, model_id));
 """
-_MIGRATIONS = {4: _DEMAND_SCHEMA, 5: _USERS_SCHEMA}  # from version -> the statements that bring it one version up
+_RESULTS_INDEX = "CREATE INDEX IF NOT EXISTS results_by_endpoint ON results (hotkey, endpoint_id);"
+# from version -> the statements that bring it one version up
+_MIGRATIONS = {4: _DEMAND_SCHEMA, 5: _USERS_SCHEMA, 6: _RESULTS_INDEX}
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
 
 
@@ -301,7 +303,7 @@ CREATE TABLE samples (
 CREATE INDEX samples_by_state ON samples (state, epoch);
 CREATE INDEX samples_by_endpoint ON samples (hotkey, endpoint_id, epoch);
 CREATE TABLE verdicts (epoch INTEGER PRIMARY KEY, document TEXT NOT NULL);
-""" + _DEMAND_SCHEMA + _USERS_SCHEMA
+""" + _DEMAND_SCHEMA + _USERS_SCHEMA + _RESULTS_INDEX
 # test states: running -> unconfirmed -> confirmed | void
 _SCRUB = "request = '{}', response = ''"  # a user's request and answers are kept only until their check
 # sample states: pending -> checked | skipped (its endpoint's checks for the epoch were done) | unchecked (no
@@ -396,42 +398,35 @@ class Store:
             "SELECT r.hotkey, r.endpoint_id, COUNT(*) FROM results r JOIN tests t USING (test_id) "
             "WHERE t.state = 'confirmed' AND r.credited_rps > 0 AND t.epoch <= ? GROUP BY r.hotkey, r.endpoint_id",
             (last_epoch,))}
+        tests, gateway = self._drift_tallies(last_epoch, policy.drift_window_tests)
         credits = []
         for hk, ep in sorted(targeted):
             if (hk, ep) not in counted:
                 continue
             model_id, credited, latency, epoch = counted[hk, ep]
             tolerance = tolerance_of(model_id)
-            drift = (self._drifted(hk, ep, model_id, last_epoch, policy.drift_window_tests, tolerance)
-                     or self._gateway_drifted(hk, ep, model_id, last_epoch, policy.drift_window_tests, tolerance))
+            drift = tolerance is not None and (_beyond(*tests.get((hk, ep, model_id), (0.0, 0)), tolerance)
+                                               or _beyond(*gateway.get((hk, ep, model_id), (0.0, 0)), tolerance))
             credits.append(Credit(hotkey=hk, endpoint_id=ep, model_id=model_id, credited_rps=0.0 if drift else credited,
                                   latency_ms=latency, test_epoch=epoch, drift=drift,
                                   qualified=passed.get((hk, ep), 0) >= policy.qualification_tests))
         return credits
 
-    def _drifted(self, hotkey: str, endpoint_id: str, model_id: str, last_epoch: int, tests: int,
-                 tolerance: Tolerance | None) -> bool:
-        """Whether the endpoint's recomputed answers over its last ``tests`` confirmed tests drift beyond the
-        model's mean tolerance (once they cover enough probabilities)."""
-        if tolerance is None:
-            return False
-        rows = self._query(
-            "SELECT r.drift_sum, r.drift_count FROM results r JOIN tests t USING (test_id) WHERE r.hotkey = ? "
-            "AND r.endpoint_id = ? AND r.model_id = ? AND t.state = 'confirmed' AND t.epoch <= ? "
-            "ORDER BY t.epoch DESC, t.start_block DESC LIMIT ?", (hotkey, endpoint_id, model_id, last_epoch, tests))
-        return _beyond(sum(r[0] for r in rows), sum(r[1] for r in rows), tolerance)
-
-    def _gateway_drifted(self, hotkey: str, endpoint_id: str, model_id: str, last_epoch: int, epochs: int,
-                         tolerance: Tolerance | None) -> bool:
-        """Whether the endpoint's checked gateway answers of the last ``epochs`` epochs drift beyond the model's
-        mean tolerance (once they cover enough probabilities)."""
-        if tolerance is None:
-            return False
-        (total, count), = self._query(
-            "SELECT COALESCE(SUM(drift_sum), 0), COALESCE(SUM(drift_count), 0) FROM samples WHERE hotkey = ? "
-            "AND endpoint_id = ? AND model_id = ? AND state = 'checked' AND checked_epoch BETWEEN ? AND ?",
-            (hotkey, endpoint_id, model_id, last_epoch - epochs + 1, last_epoch))
-        return _beyond(total, count, tolerance)
+    def _drift_tallies(self, last_epoch: int, window: int) -> tuple[dict, dict]:
+        """Per (hotkey, endpoint, model): the recomputed answers' summed differences and count over its last
+        ``window`` confirmed tests, and over its checked gateway answers of the last ``window`` epochs. Two grouped
+        queries, whatever the number of endpoints."""
+        tests = {(hk, ep, m): (total, count) for hk, ep, m, total, count in self._query(
+            "SELECT hotkey, endpoint_id, model_id, SUM(drift_sum), SUM(drift_count) FROM ("
+            "SELECT r.hotkey, r.endpoint_id, r.model_id, r.drift_sum, r.drift_count, ROW_NUMBER() OVER ("
+            "PARTITION BY r.hotkey, r.endpoint_id, r.model_id ORDER BY t.epoch DESC, t.start_block DESC) AS n "
+            "FROM results r JOIN tests t USING (test_id) WHERE t.state = 'confirmed' AND t.epoch <= ?) "
+            "WHERE n <= ? GROUP BY hotkey, endpoint_id, model_id", (last_epoch, window))}
+        gateway = {(hk, ep, m): (total, count) for hk, ep, m, total, count in self._query(
+            "SELECT hotkey, endpoint_id, model_id, SUM(drift_sum), SUM(drift_count) FROM samples "
+            "WHERE state = 'checked' AND checked_epoch BETWEEN ? AND ? GROUP BY hotkey, endpoint_id, model_id",
+            (last_epoch - window + 1, last_epoch))}
+        return tests, gateway
 
     def evidence(self, first_epoch: int, last_epoch: int) -> list[Evidence]:
         """The first wrong answer proven against each hotkey in the epoch range: in a confirmed test, or in a checked
@@ -971,11 +966,7 @@ class Auditor:
                 hotkey=hotkey, endpoint_id=endpoint_id, model_id=model_id,
                 test_id=f"{GATEWAY_EVIDENCE}-{request_id}", reason=fault, request_id=request_id, request={},
                 response=json.dumps({"receipt": parsed["receipt"]}))
-            with self._verdicts_lock:  # labelled with an epoch whose verdicts are not served yet
-                self.store.finish_sample(sample_id, "checked", fault or "", evidence,
-                                         comparison.sum_abs if comparison else 0.0,
-                                         comparison.count if comparison else 0,
-                                         checked_epoch=self.follower.head // self.policy.epoch_blocks)
+            await asyncio.to_thread(self._finish_checked, sample_id, fault, evidence, comparison)
             if evidence is not None:
                 log.warning("gateway answer of %s/%s is wrong: %s", hotkey, endpoint_id, fault)
 
@@ -985,6 +976,15 @@ class Auditor:
                 log.error("checking gateway sample of %s/%s failed: %s", row[2], row[3], outcome)
                 self.store.finish_sample(row[0], "unchecked",
                                          f"the auditor could not check it: {type(outcome).__name__}")
+
+    def _finish_checked(self, sample_id: str, fault: str | None, evidence: Evidence | None,
+                        comparison: RequestComparison | None) -> None:
+        """Record a checked sample, labelled with an epoch whose verdicts are not served yet: under the verdicts'
+        lock, which building them holds a while, so never on the auditor's event loop."""
+        with self._verdicts_lock:
+            self.store.finish_sample(sample_id, "checked", fault or "", evidence,
+                                     comparison.sum_abs if comparison else 0.0, comparison.count if comparison else 0,
+                                     checked_epoch=self.follower.head // self.policy.epoch_blocks)
 
     # ---- gateway served counts ----
 
