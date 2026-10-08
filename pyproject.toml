@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.9",
     "bittensor-wallet>=4.0",
     "httpx>=0.27",
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]
