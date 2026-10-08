@@ -711,6 +711,38 @@ def test_invalid_keys_are_limited_before_the_database(tmp_path) -> None:
     assert len(lookups) == FAILED_KEY_BURST
 
 
+def test_unknown_keys_from_everywhere_reach_the_database_only_within_a_global_budget(tmp_path) -> None:
+    """Many addresses (an IPv6 /48 has 65,536 /64s) sending random keys: only keys another process may have created
+    since the last reload are looked up, a few per second for all clients together."""
+    import secrets
+
+    from verathos.gateway.accounts import UNLISTED_LOOKUPS_BURST
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    s.accounts.clock = Clock()  # the budget does not refill while the test runs, however slowly
+    lookups = []
+    load = s.accounts._load
+
+    async def counted(h):
+        lookups.append(h)
+        return await load(h)
+    s.accounts._load = counted
+
+    async def run():
+        await s.accounts.load_keys()
+        for _ in range(500):
+            assert await s.accounts.authenticate("vd_" + secrets.token_hex(32)) is None
+        assert len(lookups) <= UNLISTED_LOOKUPS_BURST + 1
+        assert (await s.accounts.authenticate(s.key)).account == "acme"  # a listed key is always looked up
+        mine = await s.accounts.create_key("acme", "made here")
+        assert (await s.accounts.authenticate(mine)).account == "acme"  # listed at once
+        elsewhere = await Accounts(s.engine).create_key("acme", "made by another process")
+        assert await s.accounts.authenticate(elsewhere) is None  # the budget is spent: until the reload
+        await s.accounts.load_keys()
+        assert (await s.accounts.authenticate(elsewhere)).account == "acme"
+    asyncio.run(run())
+
+
 def test_what_miners_answer_the_gateway_reaches_the_auditor(tmp_path) -> None:
     s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
     for _ in range(3):

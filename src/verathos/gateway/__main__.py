@@ -109,8 +109,12 @@ async def serve(config: GatewayConfig) -> None:
         """The background work runs with the server; on shutdown (SIGTERM included) usage, samples and served
         counts are written before the process ends."""
         await routes.load()
+        try:
+            await accounts.load_keys()
+        except Exception as exc:
+            log.warning("keys not loaded, every key is looked up until they are: %s: %s", type(exc).__name__, exc)
         tasks = [asyncio.create_task(t) for t in (routes.run(), meter.run(), sampler.run(), served.run(),
-                                                     mark_states_forever(gateway))]
+                                                     accounts.run(), mark_states_forever(gateway))]
         log.info("gateway %s on %s:%d (auditor %s, %d instance(s))", keypair.ss58_address, config.listen_host,
                  config.port, auditor_hotkey, config.instances)
         try:

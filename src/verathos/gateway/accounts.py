@@ -6,6 +6,11 @@ revoked key or a changed limit applies within that time), an unknown key for ``N
 own, so unknown keys never push valid ones out; concurrent lookups of one key share one query. For an account with
 a monthly quota, a lookup also has the usage meter read the account's month.
 
+The hashes of the keys not revoked are kept in memory (``load_keys``, every ``KEYS_RELOAD_S`` and at each key this
+process creates): a key not among them is looked up only within a budget shared by all clients
+(``UNLISTED_LOOKUPS_PER_S``), for a key another process created since the last reload, so a flood of unknown keys
+from many addresses never reaches the database. While the budget is spent, such a key is refused until the reload.
+
 Credit is a ledger (``credits``): each entry names the payment or grant it records (``reference``), so recording one
 twice adds it once. The account's balance is kept with it: the entries minus the cost of the usage written.
 """
@@ -15,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import hashlib
+import logging
 import re
 import secrets
 import time
@@ -27,7 +33,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from verathos.gateway.db import accounts, api_keys, credits, usage_daily
+from verathos.gateway.limits import RateLimiter
 from verathos.gateway.usage import UsageMeter
+
+log = logging.getLogger(__name__)
 
 KEY_PREFIX = "vd_"
 PREFIX_CHARS = 16
@@ -35,6 +44,8 @@ _KEY = re.compile(r"vd_[0-9a-f]{64}")
 CACHE_TTL_S = 60.0
 NEGATIVE_TTL_S = 10.0
 MAX_CACHED = 100_000
+KEYS_RELOAD_S = 60.0
+UNLISTED_LOOKUPS_PER_S, UNLISTED_LOOKUPS_BURST = 20.0, 100  # keys not among the loaded hashes, all clients together
 CREDIT_KINDS = ("grant", "topup", "adjust")  # free credit, a payment, an operator's correction (either sign)
 
 
@@ -73,6 +84,8 @@ class Accounts:
         self._known: dict[str, tuple[float, Principal]] = {}
         self._unknown: dict[str, float] = {}
         self._loading: dict[str, asyncio.Future[Principal | None]] = {}
+        self._hashes: set[str] | None = None  # the keys not revoked, as loaded; None: not loaded, every key looked up
+        self._unlisted = RateLimiter()
 
     # ---- the request path ----
 
@@ -86,6 +99,9 @@ class Accounts:
         if known is not None and known[0] > now:
             return known[1]
         if self._unknown.get(h, 0.0) > now:
+            return None
+        if self._hashes is not None and h not in self._hashes and h not in self._loading and self._unlisted.check(
+                "unlisted", UNLISTED_LOOKUPS_PER_S, UNLISTED_LOOKUPS_BURST, now):
             return None
         loading = self._loading.get(h)
         if loading is None:  # a task of its own: a waiter giving up (its deadline) stops no one else's lookup
@@ -126,6 +142,21 @@ class Accounts:
             await self.meter.read_month(account_id)
         return Principal(account_id, key_id, name, rate, burst, quota, bool(prepaid))
 
+    async def load_keys(self) -> None:
+        """Load the hashes of the keys not revoked."""
+        async with self.engine.connect() as conn:
+            self._hashes = set((await conn.execute(select(api_keys.c.key_hash).where(
+                api_keys.c.revoked_at.is_(None)))).scalars())
+
+    async def run(self, every_s: float = KEYS_RELOAD_S) -> None:
+        while True:
+            await asyncio.sleep(every_s)
+            try:
+                await self.load_keys()
+            except Exception as exc:
+                log.warning("keys not reloaded (keeping %s): %s: %s",
+                            "none" if self._hashes is None else len(self._hashes), type(exc).__name__, exc)
+
     # ---- administration ----
 
     async def create_account(self, name: str, *, rate_rps: float, burst: int, monthly_quota: int | None = None,
@@ -161,6 +192,8 @@ class Accounts:
                 raise LookupError(f"no account {account!r}")
             await conn.execute(insert(api_keys).values(account_id=account_id, key_hash=key_hash(key),
                                                        prefix=key[:PREFIX_CHARS], name=name, expires_at=expires_at))
+        if self._hashes is not None:
+            self._hashes.add(key_hash(key))
         return key
 
     async def revoke_key(self, account: str, prefix: str) -> int:

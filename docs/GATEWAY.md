@@ -24,7 +24,10 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
 
 1. **Key.** `Authorization: Bearer vd_...`. Keys are looked up by their SHA-256 and cached for 60 s, so a revoked
    key or a changed limit applies within a minute. An address (IPv6: a /64) sending invalid keys is limited to 2 per
-   second (bursts of 20) before any lookup.
+   second (bursts of 20) before any lookup. The hashes of the keys not revoked are loaded every minute (and a key
+   made through this process's admin API at once); a key not among them is looked up only within a budget all
+   clients share (20 per second), so random keys from many addresses never load the database. While that budget is
+   spent, a key made through another process is refused until the next load.
 2. **Limits.** The account's rate (requests/s and burst, GCRA), applied to each of its keys, and its monthly quota
    (UTC calendar month) for the account. A key or credit check that needs the database waits for it at most 5 s
    (then 503), and every database statement is bounded (10 s, 5 s waiting for a lock), so a stalled database
