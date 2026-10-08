@@ -20,11 +20,6 @@ def snapshot(subtensor: bt.Subtensor, netuid: int) -> tuple[list[Neuron], dict[i
     return neurons, dict(enumerate(mg.hotkeys))
 
 
-def owner_uid(subtensor: bt.Subtensor, netuid: int, hotkey_of_uid: dict[int, str]) -> int | None:
-    owner = subtensor.get_subnet_owner_hotkey(netuid)
-    return next((uid for uid, hk in hotkey_of_uid.items() if hk == owner), None)
-
-
 def mechanism_ready(subtensor: bt.Subtensor, netuid: int, mechid: int) -> bool:
     return subtensor.get_mechanism_count(netuid) > mechid
 

@@ -1,17 +1,38 @@
 # Validating
 
-A validator discovers miners from chain state, sends every endpoint a few canary requests per epoch, compares the
-answers with its own reference computation, and sets weights on mechanism 1. How answers are compared and scored
-is in `SCORING.md`.
+A validator sets weights on mechanism 1 once per epoch. It runs in one of two modes (`mode` in `validator.json`;
+`--light` or `--full` for the installer).
 
-Every validator takes part in the throughput audit (`THROUGHPUT_AUDIT.md`). The subnet owner's validator is the
-auditor and runs the tests; every other validator applies the auditor's signed verdicts. Each validator finds its
-role at startup from the chain.
+## Two modes
+
+| | Light (the default) | Full |
+|---|---|---|
+| What it does | sets the weights the subnet owner's validator (the auditor) publishes each epoch, once their signature verifies | discovers miners, sends every endpoint canary requests, compares the answers with its own float32 references, applies the auditor's signed throughput verdicts, scores, sets weights |
+| Requests to miners | none | identity challenges and canaries to every endpoint |
+| Hardware | a small Linux machine, no GPU | a float32 reference engine per active model, in RAM or on GPUs (Kev-4B and Kev-9B: about 63 GiB of RAM) |
+| Stake | a validator permit | a validator permit and the catalog's `validator_min_stake` (10,000), or miners refuse it |
+| Download | the code | the code, the engines and the model weights (tens of GB) |
+
+Light validators follow the auditor's results; full validators check the answers independently. The subnet owner's
+validator is the auditor and always runs full.
+
+A full validator discovers miners from chain state, sends every endpoint a few canary requests per epoch, compares
+the answers with its own reference computation, and sets weights. How answers are compared and scored is in
+`SCORING.md`. Every full validator takes part in the throughput audit (`THROUGHPUT_AUDIT.md`): the auditor runs the
+tests; every other full validator applies the auditor's signed verdicts. Each validator finds its role at startup
+from the chain.
 
 ## Requirements
 
+Both modes:
 - Linux (the one-command install: Ubuntu 22.04 or 24.04), Python 3.12, `git`.
-- A hotkey registered on the subnet with a validator permit and at least the catalog's
+- A hotkey registered on the subnet with a validator permit, which setting weights takes.
+
+A light validator needs nothing more: no GPU, no reference engine, no stake beyond the permit and no public IP. It
+reads the chain and the auditor's `GET /v1/network`, and keeps its clock within 5 minutes of the auditor's (NTP).
+
+A full validator also needs:
+- The stake miners require of a validator's hotkey: at least the catalog's
   `scoring.validator_min_stake` of stake (10,000 in the shipped catalog), counted as the metagraph's `S`: alpha stake
   plus TAO stake weighted as for validator permits. Miners refuse any other validator; one below logs a CRITICAL line
   at its start and every epoch, and sends no requests and sets no weights while it stays below. The auditor (the
@@ -45,11 +66,16 @@ Copy the hotkey and the coldkey's public key to the validator machine:
 never creates, imports or reads a coldkey. Then, on Ubuntu 22.04 or 24.04, as root or a user with sudo:
 
 ```bash
+# light (the default for a hotkey that is not the subnet owner's)
 curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator
+
+# full
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --full
 ```
 
-It asks for the wallet/hotkey (default: the hotkey on the machine, or the one set up before), shows its plan and
-asks to go ahead. Without questions:
+It asks for the wallet/hotkey (default: the hotkey on the machine, or the one set up before) and the mode (default:
+the one set up before, else light), shows its plan with the mode and what it needs, and asks to go ahead. Without
+questions:
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --yes \
@@ -59,12 +85,13 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | Option | Meaning |
 |---|---|
 | `--wallet`, `--hotkey` | the wallet and hotkey |
+| `--light`, `--full` | the mode; without either, the one set up before (a validator set up before modes existed is full), else light; the subnet owner's hotkey is always full. The options for references below are for full validators |
 | `--device` | where the references run: `auto` (on GPUs while they fit, smallest model first, the rest in RAM), `cpu` or `gpu` |
 | `--dry-run` | compute weights without setting them; `--no-dry-run` sets them again |
 | `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
 | `--no-service`, `--source`, `--ref`, `--dir` | as for miners (`MINING.md`) |
 
-What it does:
+What it does (a full validator; light, see below):
 1. installs `git`, `curl` and, in a container without systemd, `supervisor`; then uv and Python 3.12;
 2. puts the code in `~/verathos` with its Python environment, and `verathos-validator` on the `PATH`;
 3. checks the hotkey, its registration and validator permit, and reads the catalog the subnet owner commits;
@@ -86,9 +113,21 @@ What it does:
 
 Code, engines, weights and services live where they do for miners (`MINING.md`).
 
+In light mode it skips steps 4 and 5, writes `mode: light` and no references, and starts only the validator. On a
+machine that ran a full validator, it removes the reference services; their engines and weights stay until uninstall.
+Running it again with `--yes` keeps the mode; `--full` or `--light` changes it.
+
 ### Check that it works
 
-The setup ends with the validator's first lines:
+A light validator's setup ends with its first line, and each epoch, once the auditor has published its results
+(from about 60% into the epoch), it logs the weights it set:
+
+```
+light mode: setting the weights the subnet owner's validator publishes each epoch, once its document verifies; no requests to miners
+epoch 45406: set the weights of the subnet owner's validator 5D...: 41 UIDs, top 12: 0.081, 3: 0.074, 27: 0.069, 8: 0.052, 30: 0.047
+```
+
+A full validator's setup ends with its first lines:
 
 ```
 throughput tests are run by 5D...; applying its verdicts
@@ -102,11 +141,11 @@ At the end of each epoch it logs the emission shares, a line per endpoint checke
 dry run (mechanism 1 configured dry): weights {1: 0.57, 12: 0.43}
 ```
 
-A validator restarted in an epoch it already scored starts with the next one.
+A validator restarted in an epoch it already scored (or, light, whose weights it set) starts with the next one.
 
 | | systemd | supervisord (containers) |
 |---|---|---|
-| status | `systemctl status verathos-validator verathos-reference-kev-4b verathos-reference-kev-9b` | `supervisorctl status` |
+| status | `systemctl status verathos-validator` (full: and `verathos-reference-kev-4b verathos-reference-kev-9b`) | `supervisorctl status` |
 | validator log | `journalctl -u verathos-validator -f` | `tail -f /var/log/verathos/verathos-validator.log` |
 | reference log | `journalctl -u verathos-reference-kev-4b -f` | `tail -f /var/log/verathos/verathos-reference-kev-4b.log` |
 | restart after editing `validator.json` | `systemctl restart verathos-validator` | `supervisorctl restart verathos-validator` |
@@ -121,6 +160,8 @@ updates the code, and the engines and weights when the catalog pins new revision
 catalog activates a model. References keep running unless their revision or settings changed; the validator
 restarts.
 
+It keeps the mode. A light validator has only its code to update.
+
 ### Uninstall
 
 ```bash
@@ -134,7 +175,9 @@ stops and removes the services, the code, the engines and the weights. The confi
 
 | Problem | What to do |
 |---|---|
-| `UID ... has no validator permit yet` | miners answer only validators with a permit, which follows the stake |
+| `UID ... has no validator permit yet` | the chain takes weights, and miners answer, only from validators with a permit, which follows the stake |
+| `epoch ...: no weights set: no results of the source verified by block ...` | light: the reason follows. The auditor's axon unreachable, or its results not out yet, cost that epoch only, and the weights set before stay on chain; `not signed within 300 s of this machine's clock`: sync the clock (NTP); `it lists no weights` or `it is not signed`: the auditor runs an older release |
+| `this is the subnet owner's hotkey: its validator is the auditor ... runs in full mode` | the owner's validator is never light: `install.sh validator --full` |
 | `miners refuse validators below validator_min_stake` | add stake to the hotkey until its `S` reaches the catalog's minimum; miners see it within 10 minutes |
 | `the kev-9b reference needs about 42 GiB ...; not enough is free` | free memory or add some; `--device` chooses between GPU and RAM |
 | `... of 16 canaries without a reference answer this epoch` | the reference's log: it is down, or too slow to compute the canaries within the epoch's reference time ([Requirements](#requirements)) |
@@ -161,7 +204,9 @@ curl -sSf https://sh.rustup.rs | sh -s -- -y
 .venv/bin/verathos-build-loadgen
 ```
 
-### 2. Start the reference engines
+A light validator needs nothing else: go on with [3. Configure](#3-configure).
+
+### 2. Start the reference engines (full)
 
 The reference defines the right answer, so it runs exactly what the catalog pins: the engine at `engine.revision`
 and the weights at `hf_revision`, in float32.
@@ -192,7 +237,7 @@ model in place, the validator logs it as critical: restart the reference on them
 
 ### 3. Configure
 
-`validator.json`:
+`validator.json` of a light validator:
 
 ```json
 {
@@ -200,18 +245,33 @@ model in place, the validator logs it as critical: restart the reference on them
   "netuid": 96,
   "wallet_name": "<wallet>",
   "hotkey_name": "<hotkey>",
+  "mode": "light"
+}
+```
+
+of a full validator:
+
+```json
+{
+  "network": "finney",
+  "netuid": 96,
+  "wallet_name": "<wallet>",
+  "hotkey_name": "<hotkey>",
+  "mode": "full",
   "references": {"kev-4b": "http://127.0.0.1:8101", "kev-9b": "http://127.0.0.1:8102"}
 }
 ```
 
 | Field | Default | Meaning |
 |---|---|---|
+| `mode` | `full` | `light` or `full` ([Two modes](#two-modes)); the subnet owner's validator does not start in light mode |
+| `source_hotkey` | the subnet owner's | light: the validator whose published weights to set; another validator must hold a validator permit and serve its results (a full validator with `public_host`) |
 | `mechid` | 1 | mechanism the weights are set on |
-| `references` | | model id -> the model's fp32 reference engine: a URL, or `{"url", "api_key"}` for a remote engine behind https (the Kev server takes its key from `KEV_API_KEY`). Every `active` model needs one: the validator does not start without, and stops when a new catalog activates a model it has none for; `candidate` models without one are not audited by this validator |
+| `references` | {} | full: model id -> the model's fp32 reference engine: a URL, or `{"url", "api_key"}` for a remote engine behind https (the Kev server takes its key from `KEV_API_KEY`). Every `active` model needs one: the validator does not start without, and stops when a new catalog activates a model it has none for; `candidate` models without one are not audited by this validator. Light validators ignore it |
 | `audit_screens` | {} | auditor only: model id -> a bf16 engine (same forms) that screens the sampled test answers; an answer it flags counts as wrong only once the fp32 reference confirms it |
-| `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database |
-| `dry_run` | false | compute weights without setting them |
-| `public_host`, `port` | -, 8091 | public IP and port of the validator's service; needed by the subnet owner and the auditor |
+| `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database; light: the last epoch whose weights it set |
+| `dry_run` | false | compute weights without setting them (light: log the weights it would set) |
+| `public_host`, `port` | -, 8091 | public IP and port of the validator's service; needed by the subnet owner and the auditor. A full validator that sets them serves its status and the weights it sets there, for light validators that name it in `source_hotkey` |
 | `catalog_mirrors` | [] | extra catalog sources, URL templates with `{digest}`, tried after the owner's axon |
 | `catalog_dir` | `~/.verathos/catalog` | local catalog store; the owner's validator serves catalogs from it |
 
@@ -225,10 +285,26 @@ the same ones.
 ```
 
 Run it under a supervisor (systemd, pm2) that restarts it: the validator also exits by itself when the subnet owner
-hotkey changes, to start again under the new auditor. At start it waits until its reference engines answer (at most
-15 minutes), so references restarted with it can load their models before an epoch needs them.
+hotkey changes, to start again under the new auditor. At start a full validator waits until its reference engines
+answer (at most 15 minutes), so references restarted with it can load their models before an epoch needs them.
 
-Per epoch (`epoch_blocks` from the catalog, default 180 blocks) the validator:
+A light validator, each epoch (`epoch_blocks` from the catalog, default 180 blocks):
+1. waits until the source (the subnet owner's validator, or `source_hotkey`) can have scored the epoch: the source
+   publishes its results after its canaries, from `canary_spread_fraction` (0.6) of the epoch on;
+2. then every 30 s fetches the source's `GET /v1/network` from the axon the chain lists for the source hotkey, and
+   sets the weights in it only if the document is signed by the source hotkey under `verathos/network-status/v1` for
+   this netuid, was signed within 5 minutes of the validator's clock (the source signs it again every 30 s), is for
+   the current or the previous epoch and for a later epoch than the weights it set last;
+3. sets exactly those weights (UIDs it does not list get none) on `mechid`, as a full validator sets its own: the
+   subnet's weights version key, commit-reveal where the subnet has it, retried once per block up to 10 times; and
+   logs the epoch, the source, the number of UIDs and the highest weights;
+4. without a document that verifies by the same point of the next epoch, when the next results can come, sets
+   nothing for the epoch and logs why, once; the weights it set before stay on chain.
+
+It sends no request to any miner and runs no reference engine. With an auditor of an older release, whose document
+lists no weights or is not signed, it sets no weights.
+
+Per epoch a full validator:
 1. uses the catalog the subnet owner commits (shipped copy, local store, owner's axon, mirrors; any copy is
    checked against the committed digest). The validator checks the commitment every minute in the background and
    applies a new audit policy at once; each epoch is scored under the catalog committed at its first block, so
@@ -258,7 +334,7 @@ rest of their epoch).
 
 ## Throughput audit
 
-Every validator follows the test schedule from chain data and holds its canaries while a test's traffic runs. It
+Every full validator follows the test schedule from chain data and holds its canaries while a test's traffic runs. It
 fetches the auditor's verdicts for the epoch from the auditor's axon (`GET /v1/throughput/<epoch>`), checks they are
 signed by the auditor hotkey, and scores each endpoint by the capacity credited there for the model it serves now.
 It applies a wrong answer proven in a test only after checking the miner's receipt in the evidence and, if it runs
@@ -268,22 +344,25 @@ issued to a catalog gateway and takes the auditor's word for the wrongness, as i
 recent test; without any, no endpoint has proven capacity that epoch. In `observe` mode it counts declared
 capacities, up to the model's `first_test_rps`, and fetches nothing.
 
-Validators that run a service (the subnet owner's and the auditor's) also serve each hotkey's status for its miners
-at `GET /v1/status/<hotkey>`: the UID and its share of the weights set, per endpoint the state in the last epoch
-(scored, qualifying, candidate, drifted, failed, invalid, probation), its checks, declared and proven capacity, how
-ready users found it, its latency factor and scores, and the hotkey's results in the auditor's last 10 tests (at
-most 64 endpoints each). `GET /v1/network` serves every hotkey's status of the last epoch at once (without the test
-results, built once per epoch), for network dashboards.
+Validators that run a service (the subnet owner's, which is the auditor, and full validators with `public_host`)
+also serve each hotkey's status for its miners at `GET /v1/status/<hotkey>`: the UID and its share of the weights
+set, per endpoint the state in the last epoch (scored, qualifying, candidate, drifted, failed, invalid, probation),
+its checks, declared and proven capacity, how ready users found it, its latency factor and scores, and the hotkey's
+results in the auditor's last 10 tests (at most 64 endpoints each). `GET /v1/network` serves every hotkey's status of
+the last epoch at once (without the test results, built once per epoch) and `weights`, per UID exactly the weights
+the validator set after the epoch, for network dashboards and light validators. The validator publishes it before it
+sets those weights, and a restarted one serves the last epoch's until its next.
 
-Both documents are signed with the validator's hotkey, the subnet owner's: the status's fields plus `netuid`,
-`auditor` (the signing hotkey) and `issued_ms`, signed as canonical JSON (sorted keys, no whitespace) under the
-domain `verathos/status/v1` (a hotkey's status) or `verathos/network-status/v1` (the network's) into `signature`
-(`protocol/status.py`). Miners act on the test results in their status only once it verifies against the subnet
-owner hotkey; a reader that does not check ignores the four fields.
+Both documents are signed with the validator's hotkey: the status's fields plus `netuid`, `auditor` (the signing
+hotkey) and `issued_ms`, signed as canonical JSON (sorted keys, no whitespace) under the domain `verathos/status/v1`
+(a hotkey's status) or `verathos/network-status/v1` (the network's) into `signature` (`protocol/status.py`). Miners
+act on the test results in their status only once it verifies against the subnet owner hotkey, and light validators
+on the weights only once it verifies against their source; a reader that does not check ignores the four fields.
 
 These routes are public and share the auditor's process and uplink. A hotkey's status is built at most every 30 s
 (sooner once an epoch is scored or a test recorded, confirmed or voided) and may be cached as long
-(`Cache-Control: public, max-age=30`); the network's is signed once per epoch. Each client address (an IPv4 address,
+(`Cache-Control: public, max-age=30`); the network's is built once per epoch and signed again at most every 30 s, so
+its `issued_ms` shows it is served now. Each client address (an IPv4 address,
 or an IPv6 /64) gets a burst of 10 status requests, then one every 5 s, and HTTP 429 with `Retry-After` beyond, so
 about 24 miner machines polling every two minutes fit behind one address; the service tracks at most 4,096 addresses
 at once. Behind a reverse proxy on the same host, the client's address comes from `X-Forwarded-For`, which the

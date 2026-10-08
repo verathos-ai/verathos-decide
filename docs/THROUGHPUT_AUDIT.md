@@ -10,8 +10,8 @@ machines behind many hotkeys delivers its capacity once, however it is spread. T
 is proven throughput, so miners choose hardware by throughput per cost.
 
 One validator runs the tests: the auditor, which is the subnet owner's validator. It publishes signed verdicts
-every validator applies. Every setting lives in the catalog the subnet owner
-commits on chain.
+every full validator applies; light validators set the weights it publishes (`VALIDATING.md`). Every setting lives
+in the catalog the subnet owner commits on chain.
 
 | | Code |
 |---|---|

@@ -5,9 +5,10 @@ from __future__ import annotations
 import ipaddress
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
+from bittensor_wallet import Keypair
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from verathos.miner.engine import HttpEngine
@@ -49,8 +50,13 @@ class ValidatorConfig(BaseModel):
     mechid: int = 1
     wallet_name: str
     hotkey_name: str
-    references: dict[str, ReferenceEngine] = Field(description="model_id -> the model's reference engine in fp32 (a "
-                                                   "URL, or {url, api_key})")
+    mode: Literal["full", "light"] = Field("full", description="full: check the miners and score them; light: set the "
+                                           "weights a source validator publishes each epoch, without contacting "
+                                           "miners (not for the subnet owner's validator, the auditor)")
+    source_hotkey: str | None = Field(None, description="Light mode: the validator whose published weights to set, "
+                                      "if not the subnet owner's; it must hold a validator permit")
+    references: dict[str, ReferenceEngine] = Field(default_factory=dict, description="Full mode: model_id -> the "
+                                                   "model's reference engine in fp32 (a URL, or {url, api_key})")
     audit_screens: dict[str, ReferenceEngine] = Field(default_factory=dict, description="Auditor only: model_id -> a "
                                                       "faster bf16 engine that screens sampled answers; an answer it "
                                                       "flags counts only once the fp32 reference confirms it")
@@ -67,6 +73,16 @@ class ValidatorConfig(BaseModel):
     @classmethod
     def _public_ip(cls, value: str | None) -> str | None:
         return None if value is None else public_ip(value)
+
+    @field_validator("source_hotkey")
+    @classmethod
+    def _ss58(cls, value: str | None) -> str | None:
+        if value is not None:
+            try:
+                Keypair(ss58_address=value)
+            except ValueError:
+                raise ValueError(f"{value!r} is not a hotkey (SS58 address)") from None
+        return value
 
     @field_validator("references", "audit_screens", mode="before")
     @classmethod

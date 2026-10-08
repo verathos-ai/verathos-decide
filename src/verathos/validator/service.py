@@ -4,15 +4,16 @@ The subnet owner's validator serves catalogs by digest (``GET /v1/catalog/{diges
 fetch a newly committed catalog; as the throughput auditor it serves its signed verdicts
 (``GET /v1/throughput/{epoch}``), and to the subnet's gateways the routes and the intake for sampled exchanges
 (``protocol.gateway``). It serves each hotkey's status (``GET /v1/status/{hotkey}``, see ``validator.status``) and all
-of them at once (``GET /v1/network``), both signed with its hotkey (``protocol.status``). Other validators run no
+of them at once with the weights it set (``GET /v1/network``, which light validators follow), both signed with its
+hotkey (``protocol.status``). A full validator with a ``public_host`` serves these two as well; other validators run no
 service.
 
 A hotkey's signed status is built at most once per ``STATUS_CACHE_S`` (sooner once the board publishes an epoch or the
-auditor records, confirms or voids a test), and may be cached as long. A client address (an IPv4 address, or an IPv6
-/64) gets a burst of ``STATUS_BURST`` status requests, then one per ``STATUS_EVERY_S``; beyond, HTTP 429 with
-``Retry-After``. Miners poll their status every 2 minutes per machine, so one address holds about 24 machines' polls.
-Behind a reverse proxy on the same host, the address is the client's from ``X-Forwarded-For``, which uvicorn takes
-from loopback peers only.
+auditor records, confirms or voids a test), and may be cached as long; the network's is built once per epoch and
+signed again at most as often. A client address (an IPv4 address, or an IPv6 /64) gets a burst of ``STATUS_BURST``
+status requests, then one per ``STATUS_EVERY_S``; beyond, HTTP 429 with ``Retry-After``. Miners poll their status
+every 2 minutes per machine, so one address holds about 24 machines' polls. Behind a reverse proxy on the same host,
+the address is the client's from ``X-Forwarded-For``, which uvicorn takes from loopback peers only.
 """
 
 from __future__ import annotations
@@ -144,18 +145,24 @@ def add_status_route(app: FastAPI, board: StatusBoard, auditor: Auditor | None, 
                         headers={"Cache-Control": f"public, max-age={STATUS_CACHE_S:.0f}"})
 
 
-def add_network_route(app: FastAPI, board: StatusBoard, keypair: Keypair, netuid: int) -> None:
-    """``GET /v1/network``: every hotkey's status of the board's epoch, signed once per epoch."""
-    signed: list[tuple[int, bytes]] = []  # [(board revision, signed body)]
+def add_network_route(app: FastAPI, board: StatusBoard, keypair: Keypair, netuid: int, *,
+                      clock: Callable[[], float] = time.monotonic) -> None:
+    """``GET /v1/network``: every hotkey's status of the board's epoch and the weights set, built once per epoch and
+    signed again at most every ``STATUS_CACHE_S``, so its ``issued_ms`` shows a light validator it is served now."""
+    lock = threading.Lock()
+    signed: list[tuple[float, int, bytes]] = []  # [(signed at, board revision, signed body)]
 
     @app.get(NETWORK_PATH)
     def get_network():
-        revision, body = board.versioned_network()
-        if not signed or signed[0][0] != revision:
-            document = sign_document(json.loads(body), keypair, netuid=netuid, domain=NETWORK_DOMAIN,
-                                     now_ms=int(time.time() * 1000))
-            signed[:] = [(revision, json.dumps(document, separators=(",", ":")).encode())]
-        return Response(signed[0][1], media_type="application/json",
+        now = clock()
+        with lock:
+            if not signed or signed[0][1] != board.revision or now - signed[0][0] >= STATUS_CACHE_S:
+                revision, body = board.versioned_network()
+                document = sign_document(json.loads(body), keypair, netuid=netuid, domain=NETWORK_DOMAIN,
+                                         now_ms=int(time.time() * 1000))
+                signed[:] = [(now, revision, json.dumps(document, separators=(",", ":")).encode())]
+            body = signed[0][2]
+        return Response(body, media_type="application/json",
                         headers={"Cache-Control": f"public, max-age={STATUS_CACHE_S:.0f}"})
 
 
@@ -266,4 +273,5 @@ def start_service(*, st: bt.Subtensor, wallet: bt.Wallet, netuid: int, public_ho
         time.sleep(0.1)
     serve_axon(st, wallet, netuid, public_host, port)
     log.info("validator service on port %d (%s)", port, ", ".join(
-        role for role, on in (("catalog", store is not None), ("throughput verdicts", auditor is not None)) if on))
+        role for role, on in (("status and weights", True), ("catalog", store is not None),
+                              ("throughput verdicts", auditor is not None)) if on))
