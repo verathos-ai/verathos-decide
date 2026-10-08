@@ -227,7 +227,10 @@ def test_a_model_whose_every_miner_fails_is_unavailable_not_busy(tmp_path) -> No
 
 
 def test_the_status_says_per_model_what_users_get(tmp_path) -> None:
+    from verathos.gateway.app import STATUS_TTL_S
+
     s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": MockEngine("kev-4b")})
+    s.gateway.clock = clock = Clock()
 
     async def status():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=s.app), base_url="http://gw") as c:
@@ -245,8 +248,28 @@ def test_the_status_says_per_model_what_users_get(tmp_path) -> None:
         s.client._transport._t[host] = Unreachable()
     for _ in range(BREAKER_FAILURES + 1):
         s.many(1)
+    assert asyncio.run(status())[1]["kev-4b"]["state"] == "operational"  # computed at most every STATUS_TTL_S
+    clock.now += STATUS_TTL_S
     _, models = asyncio.run(status())
     assert models["kev-4b"]["state"] == "unavailable" and models["kev-4b"]["availability_24h"] == 0.0
+
+
+def test_the_public_status_is_computed_at_most_every_few_seconds(tmp_path) -> None:
+    from verathos.gateway.app import STATUS_TTL_S
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    s.gateway.clock = clock = Clock()
+    summary, computed = s.gateway.stats.summary, []
+    s.gateway.stats.summary = lambda model: computed.append(model) or summary(model)
+
+    async def calls(n: int):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=s.app), base_url="http://gw") as c:
+            return [(await c.get("/v1/status")).json() for _ in range(n)]
+    first = asyncio.run(calls(50))
+    assert len(computed) == 2 and all(doc == first[0] for doc in first)  # once per model, whoever asks
+    clock.now += STATUS_TTL_S
+    asyncio.run(calls(1))
+    assert len(computed) == 4
 
 
 def test_an_answer_without_a_binding_receipt_is_not_returned(tmp_path) -> None:

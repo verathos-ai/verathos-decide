@@ -236,7 +236,8 @@ curl -s https://<gateway>/v1/systemone -H "Authorization: Bearer $KEY" -H "Conte
 `weights.revision`, `base_model`) and whether it is `available` now (a routable endpoint that is not failing).
 `GET /health` answers while the process runs.
 
-`GET /v1/status` (public, cacheable for 15 s) says per model what users get from this gateway process:
+`GET /v1/status` (public; computed at most every 15 s and cacheable as long) says per model what users get from
+this gateway process:
 
 ```json
 {"updated_at": "2026-10-07T17:40:00+00:00", "since": "2026-10-07T16:15:00+00:00",

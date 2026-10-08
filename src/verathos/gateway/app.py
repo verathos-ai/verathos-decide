@@ -68,6 +68,7 @@ FAILED_KEY_RATE, FAILED_KEY_BURST = 2.0, 20  # invalid keys per client address (
 ANSWER_ENVELOPE_BYTES = 4096  # the receipt, the usage and the response's own fields
 ACCOUNTS_WAIT_S = 5.0  # a request's key or credit check, at most; the miners' deadline starts after them
 FINAL_WRITE_S = 10.0  # each write at shutdown, at most
+STATUS_TTL_S = 15.0  # the models' states and the status are computed at most this often (it is public)
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _throttled = Throttle()
 
@@ -344,6 +345,14 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
     app = FastAPI(title="Verathos gateway", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     trusted = [ipaddress.ip_network(n, strict=False) for n in g.config.trusted_proxies]
     in_flight = 0
+    computed: dict[str, tuple[float, Any]] = {}
+
+    def recent(name: str, compute: Callable[[], Any]) -> Any:
+        """``compute()``, computed again only after ``STATUS_TTL_S``."""
+        now = g.clock()
+        if name not in computed or now - computed[name][0] >= STATUS_TTL_S:
+            computed[name] = (now, compute())
+        return computed[name][1]
 
     def reject(status: int, kind: str, message: str, request_id: str, retry_after: float | None = None,
                model: str = "-") -> JSONResponse:
@@ -380,27 +389,30 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
         cat = g.catalog()
-        states = mark_states(g)
+        states = recent("states", lambda: mark_states(g))
         data = [] if cat is None else [{
             "id": m.model_id, "object": "model", "max_state_tokens": m.max_state_tokens,
             "price": {"usd_per_million_input_tokens": m.price, "usd_per_million_output_tokens": 0},
-            "available": states[m.model_id] != "unavailable", "license": m.license,
+            "available": states.get(m.model_id, "unavailable") != "unavailable", "license": m.license,
             "weights": {"repo": m.hf_repo, "revision": m.hf_revision},
             "base_model": {"repo": m.base_repo, "revision": m.base_revision} if m.base_repo else None,
         } for m in cat.models if m.status == "active"]
         return {"object": "list", "data": data}
 
-    @app.get("/v1/status")
-    async def status():
+    def status_document() -> dict[str, Any]:
         models = []
         for model_id, state in mark_states(g).items():
             health = g.router.health(model_id)
             models.append({"id": model_id, "state": state, "endpoints": health["endpoints"],
                            "capacity_rps": health["capacity_rps"], **g.stats.summary(model_id)})
         utc = dt.UTC
-        return JSONResponse({"updated_at": dt.datetime.now(utc).isoformat(timespec="seconds"),
-                             "since": dt.datetime.fromtimestamp(g.stats.since, utc).isoformat(timespec="seconds"),
-                             "models": models}, headers={"Cache-Control": "public, max-age=15"})
+        return {"updated_at": dt.datetime.now(utc).isoformat(timespec="seconds"),
+                "since": dt.datetime.fromtimestamp(g.stats.since, utc).isoformat(timespec="seconds"), "models": models}
+
+    @app.get("/v1/status")
+    async def status():
+        return JSONResponse(recent("status", status_document),
+                            headers={"Cache-Control": f"public, max-age={STATUS_TTL_S:.0f}"})
 
     @app.post("/v1/systemone")
     async def systemone(request: Request):
