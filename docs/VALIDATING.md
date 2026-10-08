@@ -19,15 +19,16 @@ role at startup from the chain.
   `scoring.validator_requests_per_epoch` requests per endpoint and epoch (by default 4 x `canary_pool_size`, 64),
   more than three times what an epoch's canaries and identity challenges take; a refusal for it in the log is a
   fault of the validator.
-- One reference engine per catalog model. The reference is the model run in fp32; CPU is enough because each
-  canary is computed once per epoch and reused for every endpoint, so the reference work does not grow with the
-  number of miners: 16 canaries per model and epoch (`canary_pool_size`). They are computed within 30% of the
-  canaries' time, about 6.5 minutes per epoch, the models side by side; a slower reference computes fewer of them
-  (each endpoint then gets fewer canaries) and never delays the epoch. Measured on a rented server CPU: Kev-4B 3.4 s
-  and Kev-9B 6.6 s per request; on 12 cores shared with other work Kev-9B took 16-29 s, which still computes 16
+- One reference engine per active catalog model, and optionally per candidate model to check its endpoints too. The
+  reference is the model run in fp32; CPU is enough because each canary is computed once per epoch and reused for every
+  endpoint, so the reference work does not grow with the number of miners: 16 canaries per model and epoch
+  (`canary_pool_size`). They are computed within 30% of the canaries' time, about 6.5 minutes per epoch, the models side
+  by side (a candidate's reference on the same CPU shares it with the active ones); a slower reference computes fewer of
+  them (each endpoint then gets fewer canaries) and never delays the epoch. Measured on a rented server CPU: Kev-4B
+  3.4 s and Kev-9B 6.6 s per request; on 12 cores shared with other work Kev-9B took 16-29 s, which still computes 16
   canaries alone and 8 next to Kev-4B. The fp32 weights alone take about 16 GB and 36 GB of RAM. A GPU in fp32 is
-  faster. Rechecking the auditor's evidence on the references takes at most a tenth of the epoch; what is not
-  rechecked by then is taken on the auditor's word, as when a reference is down.
+  faster. Rechecking the auditor's evidence on the references takes at most a tenth of the epoch; what is not rechecked
+  by then is taken on the auditor's word, as when a reference is down.
 - The auditor additionally needs Rust (rustup) and `build-essential` for the load generator, a public IP and one
   open TCP port with an uplink for the network's test traffic, and fast recomputes: 2 answers per endpoint and
   test, within 15 minutes. A bf16 screen per model on a GPU does that (on an A100, Kev-4B recomputes about 6
@@ -60,6 +61,7 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 |---|---|
 | `--wallet`, `--hotkey` | the wallet and hotkey |
 | `--device` | where the references run: `auto` (on GPUs while they fit, smallest model first, the rest in RAM), `cpu` or `gpu` |
+| `--candidates` | also run references for the catalog's candidate models, in the memory the active ones leave; a later run keeps them, `--no-candidates` removes them |
 | `--dry-run` | compute weights without setting them; `--no-dry-run` sets them again |
 | `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
 | `--no-service`, `--source`, `--ref`, `--dir` | as for miners (`MINING.md`) |
@@ -68,14 +70,16 @@ What it does:
 1. installs `git`, `curl` and, in a container without systemd, `supervisor`; then uv and Python 3.12;
 2. puts the code in `~/verathos` with its Python environment, and `verathos-validator` on the `PATH`;
 3. checks the hotkey, its registration and validator permit, and reads the catalog the subnet owner commits;
-4. places a float32 reference engine for every `active` model in the free memory: on a GPU while one has room,
-   otherwise in RAM;
+4. places a float32 reference engine for every `active` model in the free memory, smallest first: on the GPU with
+   the most free memory while one has room, otherwise in RAM. With `--candidates` it then places the `candidate`
+   models (checked, scored zero) in what is left, and leaves out one that does not fit; the plan names every model's
+   place and memory;
 
-   | Model | float32 reference in RAM | on a GPU |
-   |---|---|---|
-   | Kev-4B | about 21 GiB | about 27 GiB |
-   | Kev-9B | about 42 GiB | about 48 GiB |
-   | Clef-flash | about 41 GiB | about 47 GiB |
+   | Model | Status | float32 reference in RAM | on a GPU |
+   |---|---|---|---|
+   | Kev-4B | active | about 21 GiB | about 27 GiB |
+   | Kev-9B | active | about 42 GiB | about 48 GiB |
+   | Clef-flash | candidate | about 41 GiB | about 47 GiB |
 
 5. installs each model's engine without the fused kernels (they change float32 results): the Kev engine at
    `engine.revision` for Kev models, `verathos-engine` from this code for Clef models, which runs the model
@@ -139,6 +143,7 @@ stops and removes the services, the code, the engines and the weights. The confi
 | `UID ... has no validator permit yet` | miners answer only validators with a permit, which follows the stake |
 | `miners refuse validators below validator_min_stake` | add stake to the hotkey until its `S` reaches the catalog's minimum; miners see it within 10 minutes |
 | `the kev-9b reference needs about 42 GiB ...; not enough is free` | free memory or add some; `--device` chooses between GPU and RAM |
+| `clef-flash (candidate ...): no reference, not enough memory left` | a candidate's reference is optional: free memory and run the command again, or leave it to other validators |
 | `... of 16 canaries without a reference answer this epoch` | the reference's log: it is down, or too slow to compute the canaries within the epoch's reference time ([Requirements](#requirements)) |
 | `no reference engine configured for the active models` | the catalog activated a model: run the command again |
 | `the subnet's catalog is not available` | the subnet owner's axon serves it; add a mirror to `catalog_mirrors` in `validator.json` |
@@ -178,8 +183,8 @@ CUDA_VISIBLE_DEVICES="" KEV_DTYPE=fp32 .venv/bin/python -m kev.serve --run model
 Run them on CPU without `flash-linear-attention` installed.
 Clef models use `verathos-engine` in float32, which runs the model repository's own inference code one request at a
 time; install it as for miners (`MINING.md`) but without `flash-linear-attention`. `clef-flash` is a `candidate`:
-its endpoints are checked but not scored, which lets the network measure it before the owner activates it; it
-needs about 36 GB of RAM in fp32.
+its endpoints are checked but not scored, which lets the network measure it before the owner activates it; its
+reference needs about 41 GiB of RAM (47 GiB on a GPU).
 
 ```bash
 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8103 --device cpu --dtype float32

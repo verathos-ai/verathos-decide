@@ -28,6 +28,20 @@ system services. Run it again to update. What it asks, what it installs, how to 
 the manual installation: [Mining](docs/MINING.md#quick-start-one-command),
 [Validating](docs/VALIDATING.md#quick-start-one-command).
 
+Models of the shipped catalog (the installers read the catalog the subnet owner commits on chain):
+
+| Model | Status | Miner: GPU memory, bfloat16 | Validator reference, float32: RAM or GPU memory |
+|---|---|---|---|
+| `kev-4b` | active | about 15 GiB | about 21 GiB or 27 GiB |
+| `kev-9b` | active | about 26 GiB | about 42 GiB or 48 GiB |
+| `clef-flash` | candidate | about 21 GiB | about 41 GiB or 47 GiB |
+
+`active` models are scored; `candidate` models are checked by validators but score zero. A miner serves one model per
+GPU: by default the first active model that fits, and its plan lists the others that fit; `--model` names one model
+for every GPU, or one per GPU in order (`--model kev-4b,clef-flash`). A validator runs each active model's reference
+on a GPU while one has room, smallest first, and in RAM otherwise; `--candidates` adds the candidates' references
+where memory is left.
+
 ## Documentation
 
 | | |

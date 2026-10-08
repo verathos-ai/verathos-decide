@@ -39,7 +39,7 @@ engines and services:
 | Wallet/hotkey | the hotkey on the machine, or the one set up before |
 | Public IP address of this machine | detected |
 | Public TCP port of the miner | 8091 |
-| Model for each kind of GPU | the first active catalog model that fits the GPU's memory |
+| Model for each kind of GPU | the model it served before, else the first active catalog model that fits ([Models](#models)) |
 
 To answer on the command line instead, add `--yes` and the options:
 
@@ -52,7 +52,7 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 |---|---|
 | `--wallet`, `--hotkey` | the wallet and hotkey |
 | `--public-ip`, `--port` | the address validators reach the miner at |
-| `--model` | one model for every GPU, or one per GPU in order (`kev-4b,kev-9b`) |
+| `--model` | one model for every GPU, or one per GPU in order (`kev-4b,clef-flash`) ([Models](#models)) |
 | `--gpus` | the GPUs to serve on (`0,1`; default all) |
 | `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
 | `--no-publish` | try the machine before registering: the miner serves and measures, but writes nothing on chain; once the hotkey is registered, run the command again without it |
@@ -67,9 +67,10 @@ What it does:
 2. puts the code in `~/verathos` with its Python environment, and `verathos-miner` and `verathos-validator` on the
    `PATH`;
 3. checks the hotkey, its registration, the subnet's catalog and the GPUs;
-4. installs each chosen model's engine (the Kev engine at the catalog's `engine.revision` for Kev models,
-   `verathos-engine` from this code for Clef models) and downloads the weights at `hf_revision` (and the base model
-   at `base_revision`). The engines run offline from that copy, so they serve exactly the pinned revisions;
+4. installs each chosen model's engine with `flash-linear-attention` at the version the engine pins (the Kev engine
+   at the catalog's `engine.revision` for Kev models, `verathos-engine` from this code for Clef models) and downloads
+   the weights at `hf_revision` (and the base model at `base_revision`). The engines run offline from that copy, so
+   they serve exactly the pinned revisions;
 5. writes the configuration, `~/.verathos/miner.json` ([4. Configure](#4-configure));
 6. starts one engine per GPU (`verathos-engine-gpu0`, ...) on `127.0.0.1` and the miner (`verathos-miner`) as
    services, waits for the engines to load, and shows the capacity measurement (a few minutes) until the miner
@@ -82,6 +83,32 @@ What it does:
 | `~/.verathos/miner/` | capacity measurements and the caps tests set on them, the last published manifest and the endpoints this machine serves |
 | `~/.verathos/engines/`, `~/.verathos/hf/` | engines (one per pinned Kev revision, one for Clef) and model weights |
 | `/etc/systemd/system/verathos-*.service` | services; in a container `/etc/supervisor/conf.d/verathos-*.conf`, with logs in `/var/log/verathos/` |
+
+### Models
+
+| Model | Status | GPU memory (bfloat16) | Engine |
+|---|---|---|---|
+| `kev-4b` | active | about 15 GiB | Kev |
+| `kev-9b` | active | about 26 GiB | Kev |
+| `clef-flash` | candidate | about 21 GiB | `verathos-engine` (Clef) |
+
+These are the shipped catalog's models; the installer reads the catalog on chain and lists its models with the
+memory each needs. Active models are scored. A candidate is checked by validators but scores zero until the subnet
+owner activates it: serving one helps measure it and earns nothing yet.
+
+Each GPU serves one model: the one it served before, else the first active model that fits its memory. The plan
+says why and what else fits, for example on one A100:
+
+```
+GPU 0 (NVIDIA A100 80GB PCIe, 80 GiB): kev-4b, endpoint gpu0, engine on 127.0.0.1:8008
+kev-4b, the first active model that fits. Also fit: kev-9b, clef-flash (candidate)
+another choice: --model <id> for every GPU, or one per GPU in order, as in --model kev-9b
+```
+
+`--model` names one model for every GPU (`--model kev-9b`), or one per GPU in the order of their numbers, which mixes
+models on one machine (`--model kev-4b,clef-flash` on two GPUs); a candidate is served only when chosen. On a
+terminal the installer also asks once per kind of GPU. Which active model earns more depends on the GPU and on how
+many others serve it ([3. Start one engine per GPU](#3-start-one-engine-per-gpu)).
 
 ### Check that it works
 
@@ -235,9 +262,10 @@ Keep each engine on its own GPU and bind it to localhost.
 
 Clef models run on `verathos-engine`, which loads the encoding and the head from the inference code shipped in the
 model repository at the pinned revision. On a GPU in bfloat16 it batches the requests that arrive together and runs
-the Qwen3.5 backbone on fused kernels, with CUDA graphs for small passes; it needs a GPU with at least 24 GB (about
-20 GB in use for Clef-flash) and takes about half a minute after loading to capture its graphs. Install it in its
-own environment with the kernels at the version the engine pins:
+the Qwen3.5 backbone on fused kernels, with CUDA graphs for small passes; Clef-flash needs about 21 GiB of GPU memory
+(a 24 GB GPU), and capturing the graphs takes up to a minute after loading (if capturing fails, every pass runs
+without graphs, which is slower for small batches). Install it in its own environment with the kernels at the
+version the engine pins:
 
 ```bash
 uv venv -p 3.12 /opt/clef && VIRTUAL_ENV=/opt/clef uv pip install -e ".[clef]"
@@ -471,4 +499,4 @@ From another machine, with a hotkey the miner accepts (for example a gateway hot
 ```
 
 It checks the manifest against the chain, the endpoint's identity signature and receipts, and compares 30 answers
-with stored CPU fp32 reference answers (the fixture covers `kev-4b`).
+with stored CPU fp32 reference answers (fixtures for `kev-4b` and `clef-flash`: `drift-clef-flash-CPUfp32.json`).
