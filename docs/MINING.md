@@ -287,9 +287,10 @@ On start the miner:
 2. starts its service: the manifest (`GET /v1/manifest`, on a worker its endpoints, `GET /v1/endpoints`) and the
    endpoints (`/e/<endpoint_id>/v1/...`) on one port;
 3. waits until every engine answers, then measures the endpoints' capacity through its own service, all at once (a
-   few minutes; see `THROUGHPUT_AUDIT.md`), or reuses the stored measurements if nothing they depend on changed.
-   Meanwhile it serves the manifest it last published. An endpoint that cannot be measured is withdrawn, and the
-   miner stops only if none is left;
+   few minutes; see `THROUGHPUT_AUDIT.md`), or reuses the stored measurements if nothing they depend on changed. A
+   machine that served endpoints before waits for a throughput test already selected
+   ([When the miner measures](#when-the-miner-measures)). Meanwhile it serves the manifest it last published. An
+   endpoint that cannot be measured is withdrawn, and the miner stops only if none is left;
 4. signs a manifest listing its endpoints and their declared capacity (on a primary with `peers`, the workers' too),
    points its axon at `public_host:port` (`serve_axon`) and commits the manifest digest (`set_commitment`); both are
    free and only sent when they change, so a restart with the same configuration and measurements writes nothing. A
@@ -299,8 +300,8 @@ On start the miner:
    catalog changed what a measurement depends on (a model's request mix or `max_latency_s`); when an engine changed
    (its version, weights or settings), it measures again; when an endpoint fell short in its last two throughput
    tests, it measures again and declares at most what the endpoint delivered in them
-   ([Falling short](#falling-short)). A failed measurement keeps the current manifest, and a measurement that a
-   throughput test interrupts is retried later.
+   ([Falling short](#falling-short)). A failed measurement keeps the current manifest, a measurement that a
+   throughput test interrupts is retried later, and one that waits for a test starts after it.
 
 Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted from
 hotkeys holding a validator permit and at least the catalog's `scoring.validator_min_stake` of stake (the
@@ -392,13 +393,32 @@ needs to be done by hand, but:
   from the latency its users see. An endpoint that declares more than it serves is tested at about what it serves,
   and credited less than that.
 
+### When the miner measures
+
+A measurement loads the machine's engines for a few minutes: a test meanwhile would find them busy and credit less,
+and the measurement would count less too. So the miner follows the public test schedule on the chain, and whatever
+the reason to measure (the start, a new catalog, a changed engine, a shortfall, `--remeasure`), it starts no
+measurement from a test's selection block until one block after its traffic: the `lead_blocks` before the traffic
+(5 blocks, about 60 s, by default) and the traffic itself. The endpoints keep serving what they declare meanwhile:
+
+```
+the throughput test of epoch 45418 is selected, its traffic from block 8175283: measuring after it
+measuring the capacity of 1 endpoints (about 3 minutes)
+```
+
+Before an epoch's test is selected nobody knows when it comes, so the miner measures. If the test starts during the
+measurement, its traffic stops the measurement within one request, inside the test's unmeasured warmup, and the
+measurement is tried again after the test. A machine that serves no endpoint yet (its first start) measures at once:
+no test reaches it.
+
 ### Falling short
 
 The tests measure what an endpoint serves under real conditions, and their result counts over the miner's own
 measurement. When, in a status the subnet owner signed ([Reading the log](#reading-the-log)), an endpoint's last two
 counted tests (confirmed, not void) were both `BELOW the tested rate`, with less delivered than the rate tested, at
-the rate it declares now, the miner measures again by itself: all the machine's endpoints in the same rounds, as at
-the start, while they keep serving (requests from gateways and validators go before the measurement's). The endpoint then declares the new measurement with the usual margin, but
+the rate it declares now, the miner measures again by itself ([When the miner measures](#when-the-miner-measures)):
+all the machine's endpoints in the same rounds, as at the start, while they keep serving (requests from gateways and
+validators go before the measurement's). The endpoint then declares the new measurement with the usual margin, but
 at most the higher rate it delivered in those two tests:
 
 ```

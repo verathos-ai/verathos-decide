@@ -17,7 +17,7 @@ commits on chain.
 |---|---|
 | Schedule, policy, test sessions | `src/verathos/throughput/policy.py`, `throughput/follow.py` |
 | Standard request mix | `throughput/workload.py` |
-| The miner's measurement | `throughput/measure.py`, `miner/shortfall.py` (after tests fell short) |
+| The miner's measurement | `throughput/measure.py`, `miner/timing.py` (when), `miner/shortfall.py` (after tests fell short) |
 | Admission on the miner (tests yield to other traffic) | `miner/admission.py`, `miner/app.py` |
 | Auditor and load generator | `throughput/auditor.py`, `throughput/loadgen.py`, `native/loadgen` |
 | Verdicts | `throughput/feed.py`, `validator/throughput.py` |
@@ -47,10 +47,13 @@ takes a few minutes. It is stored in `state_dir/capacity.json` together with a f
 endpoint's model with its pinned weight and engine revisions, engine URL and `max_concurrency`, `max_latency_s`, the
 scalar fields of the engine's `GET /v1/models` document, and the request mix) and is reused until one of them
 changes. The miner checks its engines every minute and measures again when one changed; `--remeasure` measures
-again, for example after a hardware change. A measurement steps aside when the auditor's test traffic reaches the
-miner and is retried later. An endpoint whose engine does not answer, or answers a single request slower than
-`max_latency_s`, is withdrawn from the manifest; the others are served. Until its first measurement is done, a
-restarted miner serves the manifest it last published.
+again, for example after a hardware change. Whatever its reason, a measurement does not start from a test's selection
+block until one block after its traffic: the miner reads the schedule (below) before it measures (`miner/timing.py`).
+A machine that serves no endpoint yet measures at once, as no test reaches it. A measurement steps aside when the
+auditor's test traffic reaches the miner (a test selected after it started), within one request and inside the
+test's unmeasured warmup, and is retried after the test. An endpoint whose engine does not answer, or answers a
+single request slower than `max_latency_s`, is withdrawn from the manifest; the others are served. Until its first
+measurement is done, a restarted miner serves the manifest it last published.
 
 A test measures under real conditions, and its result counts over the miner's measurement. The miner reads its test
 results from the auditor's status (`GET /v1/status/<hotkey>`, its results in the auditor's last 10 tests) and acts on

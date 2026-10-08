@@ -1,9 +1,11 @@
-"""The miner's start: its service runs first, the capacity is measured through it, and the manifest declares it. Its
-background loops log a lost chain connection in one line."""
+"""The miner's start: its service runs first, the capacity is measured through it, and the manifest declares it. A
+measurement waits for a throughput test already selected. Its background loops log a lost chain connection in one
+line."""
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import logging
 import socket
@@ -19,13 +21,17 @@ from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
 from tests.mock_engine import MockEngine
+from tests.test_throughput import FakeChain, block_hash
 from verathos import catalog
 from verathos.miner import __main__ as miner_main
 from verathos.miner import chain as miner_chain
 from verathos.miner.app import create_app
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import EngineError
+from verathos.miner.timing import MeasurementWindow
 from verathos.throughput import measure
+from verathos.throughput.follow import ScheduleFollower
+from verathos.throughput.policy import AuditPolicy, Schedule, ScheduledTest
 
 
 class CapacityEngine:
@@ -117,6 +123,49 @@ def test_a_test_arriving_at_the_start_delays_the_first_manifest_instead_of_stopp
     assert publisher.testing() and publisher.test_arriving()  # no measurement starts now; validators wait
     publisher.test_seen -= miner_main.TEST_ARRIVING_S
     assert publisher.testing() and not publisher.test_arriving()  # the traffic is over: users and validators alike
+
+
+def scheduled(epoch: int, policy: AuditPolicy) -> ScheduledTest:
+    """The epoch's test on ``FakeChain``."""
+    schedule = Schedule(policy)
+    return next(t for b in range(epoch * policy.epoch_blocks, (epoch + 1) * policy.epoch_blocks)
+                if (t := schedule.observe(b, block_hash(b))))
+
+
+def test_a_measurement_waits_from_a_tests_selection_until_its_traffic_is_over(caplog) -> None:
+    policy = AuditPolicy()
+    test = scheduled(1, policy)
+    chain = FakeChain(head=policy.epoch_blocks)
+    window = MeasurementWindow(ScheduleFollower(chain, policy))
+
+    def at(head: int) -> str | None:
+        chain.head_block = head
+        deferral = window.deferral()
+        return deferral and deferral.line
+
+    # Not selected yet: nobody knows when it comes, so the miner measures, and test traffic stops the measurement.
+    assert at(policy.epoch_blocks) is None and at(test.selection_block - 1) is None
+    selected = (f"the throughput test of epoch 1 is selected, its traffic from block {test.start_block}: measuring "
+                "after it")
+    assert at(test.selection_block) == at(test.start_block) == selected
+    assert at(test.start_block + policy.traffic_blocks + 1) == selected  # a block of margin after its traffic
+    assert at(test.start_block + policy.traffic_blocks + 2) is None  # its traffic is over
+    assert at(2 * policy.epoch_blocks + 1) is None  # the next epoch's test is not selected yet
+    shorter = dataclasses.replace(policy, lead_blocks=2)
+    window.set_policy(shorter)  # a new catalog's policy applies at once
+    later = scheduled(2, shorter)
+    assert later.start_block == later.selection_block + 2
+    assert at(later.selection_block) == (f"the throughput test of epoch 2 is selected, its traffic from block "
+                                         f"{later.start_block}: measuring after it")
+
+    class Unreachable:
+        def head(self):
+            raise ConnectionRefusedError(111, "Connection refused")
+
+    caplog.set_level(logging.WARNING)
+    assert MeasurementWindow(ScheduleFollower(Unreachable(), policy)).deferral() is None  # test traffic still stops it
+    assert caplog.messages == ["the test schedule could not be read (ConnectionRefusedError: [Errno 111] Connection "
+                               "refused); measuring now, test traffic stops it"]
 
 
 def test_a_lost_chain_connection_is_one_warning_line_and_a_programming_error_keeps_its_traceback(

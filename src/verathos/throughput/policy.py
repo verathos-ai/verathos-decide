@@ -192,6 +192,10 @@ class Schedule:
         test = self._tests.get(block // self.policy.epoch_blocks)
         return test is not None and test.held(block, self.policy)
 
+    def test(self, epoch: int) -> ScheduledTest | None:
+        """The epoch's test, once its selection block was observed."""
+        return self._tests.get(epoch)
+
 
 # ---- sessions ----
 

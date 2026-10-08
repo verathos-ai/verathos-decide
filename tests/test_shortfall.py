@@ -15,7 +15,8 @@ import pytest
 import uvicorn
 from bittensor_wallet import Keypair
 
-from tests.test_miner_publisher import CapacityEngine, free_port
+from tests.test_miner_publisher import CapacityEngine, free_port, scheduled
+from tests.test_throughput import FakeChain
 from verathos import catalog
 from verathos.miner import __main__ as miner_main
 from verathos.miner import status as miner_status
@@ -24,11 +25,13 @@ from verathos.miner.config import MinerConfig
 from verathos.miner.peers import Peers, merged
 from verathos.miner.shortfall import COOLDOWN_EPOCHS, OUTAGE_SHARE, Shortfalls
 from verathos.miner.status import StatusWatcher
+from verathos.miner.timing import Deferral, MeasurementDeferred, MeasurementWindow
 from verathos.protocol.manifest import Endpoint
 from verathos.protocol.receipts import SignedReceipt
 from verathos.protocol.requests import sign_request
 from verathos.protocol.status import STATUS_DOMAIN, HotkeyStatus, ThroughputOutcome, sign_document
 from verathos.throughput import measure
+from verathos.throughput.follow import ScheduleFollower
 from verathos.throughput.measure import Measurement, MeasurementInterrupted
 
 CATALOG = catalog.load()
@@ -306,6 +309,89 @@ def test_only_tests_in_a_status_the_subnet_owner_signed_make_the_miner_measure_a
     watcher.poll_once()
     assert publisher.tests == [outcome(45417), outcome(45418)]
     assert publisher.measure_shortfalls() and declared(publisher) == {"gpu0": 10.5}
+
+
+def test_a_measurement_for_a_shortfall_waits_for_a_selected_test_and_a_first_start_measures_at_once(
+        tmp_path, monkeypatch, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="verathos.miner")
+    monkeypatch.setattr(miner_main, "measure_and_store", functools.partial(measure.measure_and_store, run_s=0.2))
+    monkeypatch.setattr(miner_main, "wait_ready", functools.partial(measure.wait_ready, timeout_s=0.5))
+    keypair, port, policy = kp(), free_port(), CATALOG.audit_policy()
+    config = MinerConfig.model_validate({
+        "netuid": 405, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5", "port": port,
+        "listen_host": "127.0.0.1", "state_dir": str(tmp_path),
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:9",
+                       "max_concurrency": 8}]})
+    publisher = miner_main.Publisher(config, SimpleNamespace(hotkey=keypair), CATALOG, publish_on_chain=False,
+                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"))
+    test = scheduled(1, policy)
+    chain = FakeChain(head=test.selection_block)  # the test of epoch 1 is selected, its traffic still to come
+    publisher.window = MeasurementWindow(ScheduleFollower(chain, policy))
+    engine = CapacityEngine(rps=100)
+    app = create_app(config=config, keypair=keypair, manifest=lambda: publisher.signed, engines={"gpu0": engine},
+                     authorized=lambda hk: False, auditors=publisher.auditors, admissions=publisher.admissions,
+                     serving=lambda: publisher.serving)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    threading.Thread(target=server.run, daemon=True).start()
+    while not server.started:
+        time.sleep(0.05)
+    try:
+        assert publisher.adopt(CATALOG)  # a first start measures at once: no test reaches this machine yet
+        rate = declared(publisher)["gpu0"]
+        publisher.note_tests([outcome(45417, delivered=round(0.8 * rate, 2), rate=rate),
+                              outcome(45418, delivered=round(0.7 * rate, 2), rate=rate)])
+        calls = engine.calls
+        for _ in range(2):  # two rounds of the miner's watch
+            assert publisher.measure_shortfalls() and publisher.interrupted
+        assert engine.calls == calls + 2  # one readiness request each, no measurement
+        assert publisher.shortfalls.cap("gpu0") is None and declared(publisher)["gpu0"] == rate
+        chain.head_block = test.start_block + 1  # its traffic runs
+        assert publisher.measure_shortfalls() and publisher.interrupted and engine.calls == calls + 3
+        messages = caplog.messages
+        assert sum("fell short in tests 45417 and 45418" in m for m in messages) == 1  # logged once while it waits
+        assert messages.count(f"the throughput test of epoch 1 is selected, its traffic from block {test.start_block}: "
+                              "measuring after it") == 1
+        chain.head_block = test.start_block + policy.traffic_blocks + 2  # its traffic is over
+        assert publisher.measure_shortfalls() and not publisher.interrupted
+        assert engine.calls > calls + 50 and declared(publisher)["gpu0"] == round(0.8 * rate, 2)
+    finally:
+        server.should_exit = True
+
+
+def test_while_a_measurement_waits_the_miner_says_once_why_it_is_wanted(tmp_path, monkeypatch, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="verathos.miner")
+    publisher, _ = publisher_with(tmp_path, {"gpu0": 12.0})
+    assert publisher.adopt(CATALOG)
+    measuring, waiting = publisher._measure, "the throughput test of epoch 1 is selected: measuring after it"
+
+    async def deferred(*args, **kwargs):
+        raise MeasurementDeferred(Deferral(1, waiting))
+
+    publisher._measure, publisher.engines_changed = deferred, lambda: True
+    chain, store = SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"), catalog.CatalogStore(tmp_path)
+    monkeypatch.setattr(miner_main, "committed_catalog", lambda st, netuid: CATALOG.digest())
+    monkeypatch.setattr(miner_main, "publish", lambda st, wallet, config, signed: None)
+    publisher.publish(chain)
+    caplog.clear()
+    for _ in range(3):  # rounds of the miner's watch
+        assert publisher.follow(chain, store) is chain and publisher.interrupted
+    assert caplog.messages == ["an engine changed; measuring again", waiting]
+
+    newer = CATALOG.model_copy(update={"scoring": CATALOG.scoring.model_copy(update={"ema_alpha": 0.3})})
+    monkeypatch.setattr(miner_main, "committed_catalog", lambda st, netuid: newer.digest())
+    monkeypatch.setattr(miner_main, "current_catalog", lambda *args: newer)
+    caplog.clear()
+    for _ in range(3):
+        assert publisher.follow(chain, store) is chain and publisher.interrupted
+    assert caplog.messages == [f"catalog {newer.digest()[:12]} committed; adopted after the measurement it needs"]
+    publisher._measure = measuring
+    caplog.clear()
+    assert publisher.follow(chain, store) is chain and not publisher.interrupted
+    assert f"catalog {newer.digest()[:12]} committed; endpoints rebuilt" in caplog.messages
+    publisher._measure = deferred  # the next wait says again why
+    caplog.clear()
+    assert publisher.follow(chain, store) is chain and publisher.interrupted
+    assert caplog.messages == ["an engine changed; measuring again", waiting]
 
 
 def test_users_are_served_while_an_endpoint_that_fell_short_is_measured_again(tmp_path, monkeypatch, caplog) -> None:

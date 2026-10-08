@@ -55,6 +55,15 @@ class ScheduleFollower:
         """Whether a test's traffic runs at the head (validators hold their canaries). Never waits for a poll."""
         return self.schedule.held(self.head)
 
+    def due(self) -> ScheduledTest | None:
+        """The epoch's test from its selection block at the head until its traffic is over (with
+        ``ScheduledTest.held``'s block of margin after it), as far as the blocks fed tell; None otherwise."""
+        with self._lock:
+            test = self.schedule.test(self.head // self.policy.epoch_blocks)
+            if test is not None and self.head <= test.start_block + self.policy.traffic_blocks + 1:
+                return test
+            return None
+
     def start(self, interval_s: float = POLL_S) -> None:
         """Follow in a background thread (validators that only hold canaries)."""
 
