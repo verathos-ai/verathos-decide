@@ -275,10 +275,11 @@ curl -s https://<gateway>/v1/systemone -H "Authorization: Bearer $KEY" -H "Conte
              "signature": "..."}}
 ```
 
-`GET /v1/models` lists the catalog's active models, each with its state limit (`max_state_tokens`), the input it
-accepts (`input_modalities`: `["text"]`, a state of plain text or JSON, for every model), price
-(`price.usd_per_million_input_tokens`; `usd_per_million_output_tokens` is 0), license, weights (`weights.repo`,
-`weights.revision`, `base_model`) and whether it is `available` now (a routable endpoint that is not failing).
+`GET /v1/models` (computed at most every 15 s) lists the catalog's active models, each with its state limit
+(`max_state_tokens`), the input it accepts (`input_modalities`: `["text"]`, a state of plain text or JSON, for every
+model), price (`price.usd_per_million_input_tokens`; `usd_per_million_output_tokens` is 0), license, weights
+(`weights.repo`, `weights.revision`, `base_model`), whether it is `available` now (a routable endpoint that is not
+failing), and its `state` and `latency_ms` as `GET /v1/status` gives them.
 `GET /health` answers while the process runs.
 
 `GET /v1/status` (public; computed at most every 15 s and cacheable as long) says per model what users get from

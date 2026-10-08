@@ -2,8 +2,8 @@
 
     POST /v1/systemone   a SystemOne request with ``Authorization: Bearer <key>`` -> the answers, the usage, the
                          miner's signed receipt and the request id
-    GET  /v1/models      the catalog's active models: state limit, accepted input, price, weights, and whether
-                         available now
+    GET  /v1/models      the catalog's active models: state limit, accepted input, price, weights, whether
+                         available now, state and latency
     GET  /v1/status      per model: operational, degraded or unavailable; endpoints, capacity, latency, success
     GET  /health         the process is up
     GET  /ready          routes are loaded and the gateway is in the catalog (503 otherwise), and how old they are
@@ -426,19 +426,21 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         routes = g.routes_state()
         return {"ready": True, "routes": {"age_s": routes["age_s"], "stale": routes["stale"]}}
 
-    @app.get("/v1/models")
-    async def models() -> dict[str, Any]:
-        cat = g.catalog()
-        states = recent("states", lambda: mark_states(g))
-        data = [] if cat is None else [{
+    def models_document() -> dict[str, Any]:
+        cat, states = g.catalog(), mark_states(g)
+        return {"object": "list", "data": [] if cat is None else [{
             "id": m.model_id, "object": "model", "max_state_tokens": m.max_state_tokens,
             "input_modalities": list(INPUT_MODALITIES),
             "price": {"usd_per_million_input_tokens": m.price, "usd_per_million_output_tokens": 0},
-            "available": states.get(m.model_id, "unavailable") != "unavailable", "license": m.license,
-            "weights": {"repo": m.hf_repo, "revision": m.hf_revision},
+            "available": states.get(m.model_id, "unavailable") != "unavailable",
+            "state": states.get(m.model_id, "unavailable"), "latency_ms": g.stats.latency(m.model_id),
+            "license": m.license, "weights": {"repo": m.hf_repo, "revision": m.hf_revision},
             "base_model": {"repo": m.base_repo, "revision": m.base_revision} if m.base_repo else None,
-        } for m in cat.models if m.status == "active"]
-        return {"object": "list", "data": data}
+        } for m in cat.models if m.status == "active"]}
+
+    @app.get("/v1/models")
+    async def models() -> dict[str, Any]:
+        return recent("models", models_document)
 
     def status_document() -> dict[str, Any]:
         models = []
