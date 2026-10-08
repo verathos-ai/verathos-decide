@@ -6,13 +6,15 @@
     POST /e/{endpoint_id}/v1/identity      signed caller challenge -> hotkey signature proving endpoint control
     GET  /health
 
-Every machine of a hotkey runs this service with the same callers: validators with a permit, gateways, the auditor's
-test sessions. Test traffic carries the auditor's session for this endpoint and test instead of a per-request
-signature (see ``throughput.policy``); its receipts name the auditor as caller and the request id as nonce.
+Every machine of a hotkey runs this service with the same callers: validators with a permit and the minimum stake,
+the auditor, gateways, the auditor's test sessions. Test traffic carries the auditor's session for this endpoint and
+test instead of a per-request signature (see ``throughput.policy``); its receipts name the auditor as caller and the
+request id as nonce.
 
 Callers other than gateways (validators) need only their canaries: one request at once per endpoint, at most the size
-of the model's largest standard request (``caller_request_bytes``), and while test traffic arrives their requests wait
-behind it (``admission``). More would crowd out a test.
+of the model's largest standard request (``caller_request_bytes``), at most the catalog's budget of requests per
+endpoint and epoch (``admission.RequestBudget``), and while test traffic arrives their requests wait behind it
+(``admission``). More would crowd out a test, or serve a validator as a free inference service.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
@@ -30,7 +33,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from verathos.miner.admission import BEHIND_TESTS, REGULAR, TEST, Admission
+from verathos.miner.admission import BEHIND_TESTS, REGULAR, TEST, Admission, RequestBudget
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
@@ -88,6 +91,7 @@ def create_app(
     testing: Callable[[], bool] = lambda: False,
     gateways: Callable[[], Collection[str]] | None = None,
     catalog_digest: Callable[[], str] | None = None,
+    budget: RequestBudget | None = None,
 ) -> FastAPI:
     """``manifest`` gives the hotkey's manifest this machine serves (None on a worker), ``host_endpoints`` this
     machine's own endpoints document (None until there is one). ``auditors`` gives the hotkeys whose test sessions are
@@ -97,7 +101,8 @@ def create_app(
     ``max_state_tokens`` a model's limit (``api.prompt_chars``); ``max_caller_request`` the largest request of a model
     callers other than gateways may send (``caller_request_bytes``); ``gateways`` the callers exempt from the
     per-caller limits (default: the configured ``gateway_hotkeys``); ``catalog_digest`` the catalog receipts name
-    (default: the manifest's)."""
+    (default: the manifest's); ``budget`` the requests each caller other than a gateway may send an endpoint per
+    epoch (default: no limit)."""
     app = FastAPI(title="Verathos miner")
     nonces = NonceCache()
     endpoints = {e.endpoint_id: e for e in config.endpoints}
@@ -127,9 +132,9 @@ def create_app(
             return None
         return bytes(body)
 
-    async def authenticate(request: Request):
+    async def authenticate(request: Request, endpoint_id: str):
         """-> (caller, body, None) or (None, None, error response). The claimed caller must be permitted before its
-        body is read or its signature checked."""
+        body is read or its signature checked; a caller other than a gateway is then counted against its budget."""
         if not authorized(request.headers.get(HDR_HOTKEY, "")):
             return None, None, error(403, "caller is not a permitted validator or gateway")
         body = await read_body(request)
@@ -139,6 +144,12 @@ def create_app(
             caller = verify_request(dict(request.headers), request.method, request.url.path, body, hotkey, nonces)
         except RequestRejected as e:
             return None, None, error(401, str(e))
+        if budget is not None and caller.hotkey not in gateways():
+            wait_s = budget.take(caller.hotkey, endpoint_id)
+            if wait_s is not None:
+                return None, None, JSONResponse(
+                    status_code=429, headers={"Retry-After": str(max(1, math.ceil(wait_s)))},
+                    content={"error": f"this caller's {budget.limit()} requests to the endpoint this epoch are used"})
         return caller, body, None
 
     async def authenticate_test(request: Request, endpoint_id: str):
@@ -184,7 +195,7 @@ def create_app(
     async def identity(endpoint_id: str, request: Request):
         if endpoint_id not in endpoints or not listed(endpoint_id):
             return error(404, "unknown endpoint")
-        caller, body, rejected = await authenticate(request)
+        caller, body, rejected = await authenticate(request, endpoint_id)
         if rejected:
             return rejected
         try:
@@ -201,7 +212,8 @@ def create_app(
             return error(404, "unknown endpoint")
         received_ms = int(time.time() * 1000)
         test = HDR_SESSION in request.headers
-        caller, body, rejected = await (authenticate_test(request, endpoint_id) if test else authenticate(request))
+        caller, body, rejected = await (authenticate_test(request, endpoint_id) if test
+                                        else authenticate(request, endpoint_id))
         if rejected:
             return rejected
         try:

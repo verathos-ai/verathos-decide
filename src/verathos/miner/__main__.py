@@ -28,7 +28,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from verathos import catalog
-from verathos.miner.admission import Admission
+from verathos.miner.admission import Admission, RequestBudget
 from verathos.miner.app import caller_request_bytes, create_app
 from verathos.miner.chain import PermitAuthorizer, build_host_endpoints, build_manifest, own_endpoints, publish
 from verathos.miner.config import EndpointConfig, MinerConfig
@@ -348,10 +348,13 @@ def permits(config: MinerConfig, publisher: Publisher) -> PermitAuthorizer:
                             lambda: publisher.catalog.scoring.validator_min_stake)
 
 
-def build_app(config: MinerConfig, keypair, publisher: Publisher, authorized: Callable[[str], bool],
+def build_app(config: MinerConfig, keypair, publisher: Publisher, authorizer: PermitAuthorizer,
               engines: dict[str, Engine]) -> FastAPI:
-    """This machine's miner service, primary or worker alike: callers are permitted validators (``authorized``),
-    gateways and the auditor's test sessions, each within its limits."""
+    """This machine's miner service, primary or worker alike: callers are those ``authorizer`` admits (``permits``)
+    and the auditor's test sessions, each within its limits; a validator within the catalog's request budget per
+    endpoint and epoch."""
+    budget = RequestBudget(lambda: publisher.catalog.scoring.request_budget(),
+                           lambda: authorizer.epoch(publisher.catalog.epoch_blocks))
 
     def max_state_tokens(model_id: str) -> int | None:
         model = publisher.catalog.get(model_id)
@@ -362,11 +365,11 @@ def build_app(config: MinerConfig, keypair, publisher: Publisher, authorized: Ca
         return caller_request_bytes(model_id, model.workload) if model is not None else None
 
     return create_app(config=config, keypair=keypair, manifest=lambda: publisher.signed,
-                      host_endpoints=lambda: publisher.local, engines=engines, authorized=authorized,
+                      host_endpoints=lambda: publisher.local, engines=engines, authorized=authorizer,
                       auditors=publisher.auditors, admissions=publisher.admissions, serving=lambda: publisher.serving,
                       max_state_tokens=max_state_tokens, max_caller_request=max_caller_request,
                       on_test_traffic=publisher.note_test_traffic, testing=publisher.test_arriving,
-                      gateways=publisher.gateways, catalog_digest=lambda: publisher.catalog.digest())
+                      gateways=publisher.gateways, catalog_digest=lambda: publisher.catalog.digest(), budget=budget)
 
 
 def resolve_catalog(subtensor: bt.Subtensor, config: MinerConfig) -> catalog.Catalog:

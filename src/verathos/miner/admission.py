@@ -5,12 +5,15 @@ only slows it down); the others wait by class, then in order. Regular requests f
 then the auditor's test traffic, then validators' requests while test traffic arrives (``BEHIND_TESTS``). A request is
 admitted only while no request of its class or a higher one waits, and a request that finds the queue full takes the
 place of the newest waiting request of the lowest class below its own.
+
+Before that, a validator's requests to an endpoint are counted per epoch (``RequestBudget``).
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
 
 QUEUE_FACTOR = 4  # requests that may wait, per engine slot
 WAIT_S = 30.0
@@ -60,3 +63,25 @@ class Admission:
         while self.inflight < self.limit and any(self._queues):
             self.inflight += 1
             next(q for q in self._queues if q).popleft().set_result(True)
+
+
+class RequestBudget:
+    """Requests per caller and endpoint and epoch, at most ``limit()`` (``scoring.request_budget``): what a validator
+    needs for its canaries and identity challenges, so no staker can use a miner as a free inference service.
+    ``clock`` gives the epoch and the seconds until the next one."""
+
+    def __init__(self, limit: Callable[[], int], clock: Callable[[], tuple[int, float]]) -> None:
+        self.limit, self.clock = limit, clock
+        self._epoch: int | None = None
+        self._spent: dict[tuple[str, str], int] = {}
+
+    def take(self, caller: str, endpoint_id: str) -> float | None:
+        """Count one request: None if it is within the budget, else the seconds until the next epoch."""
+        epoch, left_s = self.clock()
+        if epoch != self._epoch:
+            self._epoch, self._spent = epoch, {}
+        spent = self._spent.get((caller, endpoint_id), 0)
+        if spent >= self.limit():
+            return left_s
+        self._spent[caller, endpoint_id] = spent + 1
+        return None

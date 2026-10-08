@@ -308,8 +308,9 @@ as test traffic under a session the auditor signed. Other callers are refused be
 request body is read; bodies are capped at 1 MiB and must arrive within 10 s, and a request's state, question ids,
 instructions and criteria together may hold at most 4 characters per token of the model's `max_state_tokens`. A
 validator gets one request at once per endpoint (HTTP 429 beyond that), each no larger than the largest request of
-the model's request mix (HTTP 413), and while the auditor's test traffic arrives its requests wait behind the test's;
-gateways are not limited. The miner signs only well-formed answers (one distribution per question over its options,
+the model's request mix (HTTP 413), at most the catalog's `scoring.validator_requests_per_epoch` per endpoint and
+epoch (default 4 x `canary_pool_size`, 64; beyond, HTTP 429 with `Retry-After` until the next epoch), and while the
+auditor's test traffic arrives its requests wait behind the test's; gateways and test traffic are not limited. The miner signs only well-formed answers (one distribution per question over its options,
 with the `noul`, `choice` and `score` derived from it; fields other than an answer type's own are dropped before
 signing): an engine that returns anything else gets an error back to the caller, never a signed receipt. The auditor
 recomputes a sample of the answers given to the subnet's gateway, as it does test answers: serve users the same

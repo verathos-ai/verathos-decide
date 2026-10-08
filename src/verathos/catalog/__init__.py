@@ -92,6 +92,18 @@ class Scoring(BaseModel):
     validator_min_stake: float = Field(0.0, ge=0, description="Stake a validator needs for miners to answer it, as "
                                        "the metagraph's S (alpha plus weighted TAO), the stake validator permits "
                                        "follow; 0: every validator with a permit")
+    validator_requests_per_epoch: int | None = Field(None, ge=1, description="Requests a validator may send one "
+                                                     "endpoint per epoch (canaries and identity challenges); beyond "
+                                                     "them miners answer 429 until the next epoch. Default: "
+                                                     "``request_budget``")
+
+    def request_budget(self) -> int:
+        """``validator_requests_per_epoch``, by default 4 x ``canary_pool_size``. In one pass of an epoch a validator
+        sends an endpoint at most ``canaries_per_endpoint`` (at most ``canary_pool_size``) requests in the canaries'
+        slots, each a canary or a retried identity challenge, and three more challenges (at the epoch's start, one
+        followed by a canary in the same slot, one from the auditor's discovery): the default holds more than three
+        passes, so an epoch run again after a validator failure stays within it."""
+        return self.validator_requests_per_epoch or 4 * self.canary_pool_size
 
 
 class Catalog(BaseModel):

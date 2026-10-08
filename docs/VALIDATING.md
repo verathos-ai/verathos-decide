@@ -15,7 +15,10 @@ role at startup from the chain.
   `scoring.validator_min_stake` of stake (10,000 in the shipped catalog), counted as the metagraph's `S`: alpha stake
   plus TAO stake weighted as for validator permits. Miners refuse any other validator; one below logs a CRITICAL line
   at its start and every epoch, and sends no requests and sets no weights while it stays below. The auditor (the
-  subnet owner's validator) is answered whatever its stake.
+  subnet owner's validator) is answered whatever its stake. Each validator gets at most the catalog's
+  `scoring.validator_requests_per_epoch` requests per endpoint and epoch (by default 4 x `canary_pool_size`, 64),
+  more than three times what an epoch's canaries and identity challenges take; a refusal for it in the log is a
+  fault of the validator.
 - One reference engine per catalog model. The reference is the model run in fp32; CPU is enough because each
   canary is computed once per epoch and reused for every endpoint, so the reference work does not grow with the
   number of miners: 16 canaries per model and epoch (`canary_pool_size`). They are computed within 30% of the

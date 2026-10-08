@@ -235,6 +235,52 @@ class CapacityEngine:
             return await self.engine.answer(request)
 
 
+def test_a_validator_gets_its_request_budget_per_endpoint_and_epoch(tmp_path, monkeypatch) -> None:
+    """Canaries and identity challenges, counted per validator, endpoint and epoch; beyond the catalog's budget 429
+    until the next epoch. Gateways and the auditor's test traffic are not counted."""
+    from verathos.miner.admission import RequestBudget
+
+    clock = [(7, 30.4)]
+    budget = RequestBudget(lambda: 2, lambda: clock[0])
+    assert [budget.take("v", "gpu0") for _ in range(3)] == [None, None, 30.4]
+    assert budget.take("v", "gpu1") is None and budget.take("w", "gpu0") is None
+    clock[0] = (8, 2160.0)
+    assert budget.take("v", "gpu0") is None
+
+    miner, validator, gateway, auditor = kp(), kp(), kp(), kp()
+    chain = FakeSubtensor({validator.ss58_address: 1e6}, auditor.ss58_address)
+    monkeypatch.setattr(miner_chain.bt, "Subtensor", lambda *a, **k: chain)
+    cfg = config("198.51.100.7", 20017, ["gpu0"], tmp_path, gateway_hotkeys=[gateway.ss58_address])
+    tight = CATALOG.model_copy(update={"scoring": CATALOG.scoring.model_copy(
+        update={"validator_requests_per_epoch": 3})})
+    assert CATALOG.scoring.request_budget() == 4 * CATALOG.scoring.canary_pool_size
+    assert tight.scoring.request_budget() == 3
+    publisher = miner_main.Publisher(cfg, SimpleNamespace(hotkey=miner), tight, publish_on_chain=False,
+                                     subtensor=chain)
+    authorizer = miner_main.permits(cfg, publisher)
+    epoch, left_s = authorizer.epoch(tight.epoch_blocks)  # the chain's head at block 907
+    assert epoch == 5 and 0 < left_s <= (6 * 180 - 907) * 12
+    client = TestClient(miner_main.build_app(cfg, miner, publisher, authorizer, {"gpu0": MockEngine("kev-4b")}))
+
+    def call(caller: Keypair, path: str = "/e/gpu0/v1/systemone", payload: dict = REQUEST):
+        body = json.dumps(payload).encode()
+        signed = sign_request(caller, "POST", path, body, miner.ss58_address)
+        return client.post(path, content=body, headers={"Content-Type": "application/json", **signed})
+
+    assert call(validator, "/e/gpu0/v1/identity", {"challenge": "ab" * 16}).status_code == 200
+    assert [call(validator).status_code for _ in range(3)] == [200, 200, 429]
+    refused = call(validator, "/e/gpu0/v1/identity", {"challenge": "ab" * 16})
+    assert refused.status_code == 429 and 0 < int(refused.headers["Retry-After"]) <= left_s + 1
+    assert all(call(gateway).status_code == 200 for _ in range(5))
+    session = Session(netuid=405, auditor=auditor.ss58_address, miner_hotkey=miner.ss58_address, endpoint_id="gpu0",
+                      test_id="t" * 64, not_after_ms=int(time.time() * 1000) + 30_000)
+    assert all(client.post("/e/gpu0/v1/systemone", json=REQUEST, headers={
+        **session_headers(session, auditor), HDR_REQUEST_ID: secrets.token_hex(16)}).status_code == 200
+        for _ in range(5))
+    authorizer._head = (6 * 180, time.monotonic())  # the next epoch
+    assert call(validator).status_code == 200
+
+
 def test_two_machines_end_to_end(tmp_path, monkeypatch) -> None:
     """A primary on one port and a worker on another, each its own miner service: the primary lists the worker's
     endpoints, a validator challenges and sends canaries to every endpoint at its own machine, and the auditor tests

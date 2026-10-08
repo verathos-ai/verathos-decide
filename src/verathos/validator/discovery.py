@@ -196,6 +196,7 @@ class Identities:
         self._passed: dict[tuple[str, str], int] = {}  # (endpoint key, url) -> latest epoch it passed
         self._hosts: dict[tuple[str, str], int] = {}  # (hotkey, host) -> latest epoch an endpoint passed there
         self._failed: dict[tuple[str, str], int] = {}  # (hotkey, host) -> latest epoch a challenge there failed
+        self._tried: dict[tuple[str, str], int] = {}  # (endpoint key, url) -> latest epoch it was challenged
         self._busy: set[tuple[str, str]] = set()  # (hotkey, host) not the hotkey's, with a challenge under way
 
     def verified(self, key: str, url: str, since_epoch: int) -> bool:
@@ -209,14 +210,23 @@ class Identities:
             return ep.host == ep.axon or self._hosts.get((ep.hotkey, ep.host), -1) >= epoch - 1
 
     async def verify(self, endpoints: list[DiscoveredEndpoint], epoch: int, keypair: Keypair,
-                     client: httpx.AsyncClient, *, concurrency: int = IDENTITY_CONCURRENCY) -> None:
-        """Challenge the endpoints that have not passed at their URL in ``epoch`` (see the class)."""
+                     client: httpx.AsyncClient, *, retry: bool = True,
+                     concurrency: int = IDENTITY_CONCURRENCY) -> None:
+        """Challenge the endpoints that have not passed at their URL in ``epoch`` (see the class); without ``retry``
+        only those not challenged in it yet."""
         slots = asyncio.Semaphore(concurrency)
         hosts: dict[tuple[str, str], list[DiscoveredEndpoint]] = {}
         for ep in endpoints:
             hosts.setdefault((ep.hotkey, ep.host), []).append(ep)
 
+        def due(ep: DiscoveredEndpoint) -> bool:
+            with self._lock:
+                return (self._passed.get((ep.key, ep.url), -1) < epoch
+                        and (retry or self._tried.get((ep.key, ep.url), -1) < epoch))
+
         async def challenge(ep: DiscoveredEndpoint) -> bool:
+            with self._lock:
+                self._tried[ep.key, ep.url] = epoch
             async with slots:
                 ok = await verify_identity(ep, keypair, client)
             if ok:
@@ -232,18 +242,18 @@ class Identities:
                     for ep in group:
                         if self.own(ep, epoch):
                             break
-                        if not self.verified(ep.key, ep.url, epoch) and not await challenge(ep):
+                        if due(ep) and not await challenge(ep):
                             with self._lock:
                                 self._failed[key] = epoch
                             return
                 finally:
                     with self._lock:
                         self._busy.discard(key)
-            await asyncio.gather(*(challenge(ep) for ep in group if not self.verified(ep.key, ep.url, epoch)))
+            await asyncio.gather(*(challenge(ep) for ep in group if due(ep)))
 
         await asyncio.gather(*(at_host(key, group) for key, group in hosts.items()))
         with self._lock:
-            for table in (self._passed, self._hosts, self._failed):
+            for table in (self._passed, self._hosts, self._failed, self._tried):
                 for stale in [k for k, e in table.items() if e < epoch - 1]:
                     del table[stale]
 

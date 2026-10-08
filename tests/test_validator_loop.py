@@ -206,9 +206,11 @@ class Counting(httpx.AsyncBaseTransport):
         return await self.inner.handle_async_request(request)
 
 
-def multi_host_miner(hotkey: Keypair, validator: Keypair, hosts: dict[str, list[str]], listed: dict[str, str]):
+def multi_host_miner(hotkey: Keypair, validator: Keypair, hosts: dict[str, list[str]], listed: dict[str, str],
+                     budget=None):
     """A hotkey's miner services: ``hosts`` maps each host it runs to the endpoints served there, ``listed`` maps
-    every endpoint its manifest lists to the host named in it (which may be someone else's)."""
+    every endpoint its manifest lists to the host named in it (which may be someone else's); ``budget``: the
+    validators' request budget."""
     digest = catalog.load().digest()
     kev = catalog.load().get("kev-4b")
     signed = SignedManifest.create(Manifest(
@@ -223,7 +225,7 @@ def multi_host_miner(hotkey: Keypair, validator: Keypair, hosts: dict[str, list[
         apps[host] = create_app(config=config, keypair=hotkey, manifest=lambda: signed,
                                 engines={e: MockEngine("kev-4b") for e in served},
                                 authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set(),
-                                serving=lambda served=served: served,
+                                serving=lambda served=served: served, budget=budget,
                                 max_caller_request=lambda m: caller_request_bytes(m, kev.workload))
     return apps, commitment_value(signed.manifest.digest())
 
@@ -265,6 +267,65 @@ def test_endpoints_on_several_machines_are_checked_where_they_are_and_another_se
     assert transport.seen[victim, "identity"] == 1 and transport.seen[worker, "identity"] == 2
     asyncio.run(epoch(8))
     assert transport.seen[victim, "identity"] == 2 and (victim, "systemone") not in transport.seen
+
+
+def test_a_validator_stays_within_the_miners_request_budget(caplog) -> None:
+    """In an epoch a validator sends an endpoint at most canaries_per_endpoint + 3 requests, however its identity
+    challenges fare and however often the auditor's discovery looks; over the budget the miner answers 429, which
+    the validator logs as its own fault."""
+    from verathos.miner.admission import RequestBudget
+    from verathos.validator.discovery import Identities
+
+    validator, hotkey = kp(), kp()
+    axon = "10.0.7.1"
+    apps, commit = multi_host_miner(hotkey, validator, {axon: ["gpu0"]}, {"gpu0": axon})
+    lost = [True]
+
+    class Transport(Counting):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if lost[0] and request.url.path.endswith("/v1/identity"):
+                self.seen[request.url.host, "identity"] = self.seen.get((request.url.host, "identity"), 0) + 1
+                return httpx.Response(504)
+            return await super().handle_async_request(request)
+
+    transport, identities = Transport(apps), Identities()
+    budget = catalog.load().scoring.request_budget()
+
+    def epoch(n: int) -> int:
+        async def run():
+            async with httpx.AsyncClient(transport=transport) as client:
+                (found,) = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commit)], 405, 1, client,
+                                          {catalog.load().digest()})
+                for _ in range(3):  # the auditor's discovery, before and after the canaries
+                    await identities.verify(found.endpoints(), n, validator, client, retry=False)
+                await audit_epoch(found.endpoints(), epoch=n, secret=b"k" * 32, keypair=validator,
+                                  references={"kev-4b": MockEngine("kev-4b")},
+                                  tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client, netuid=405,
+                                  mechid=1, pool_size=16, per_endpoint=10, identities=identities)
+                await identities.verify(found.endpoints(), n, validator, client, retry=False)
+
+        before = sum(n for (host, kind), n in transport.seen.items() if host == axon and kind != "manifest")
+        asyncio.run(run())
+        return sum(n for (host, kind), n in transport.seen.items() if host == axon and kind != "manifest") - before
+
+    assert epoch(1) == 1 + 1 + 10 <= budget  # all lost: the first discovery, the epoch's start, each canary slot
+    lost[0] = False
+    assert epoch(2) == 1 + 10  # one challenge, ten canaries
+
+    apps, commit = multi_host_miner(hotkey, validator, {axon: ["gpu0"]}, {"gpu0": axon},
+                                    budget=RequestBudget(lambda: 4, lambda: (3, 60.0)))
+
+    async def over_budget():
+        async with httpx.AsyncClient(transport=HostRouter(apps)) as client:
+            (found,) = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commit)], 405, 1, client,
+                                      {catalog.load().digest()})
+            return (await audit_epoch(found.endpoints(), epoch=3, secret=b"k" * 32, keypair=validator,
+                                      references={"kev-4b": MockEngine("kev-4b")}, tolerances={"kev-4b": Tolerance()},
+                                      client=client, netuid=405, mechid=1, pool_size=8, per_endpoint=6))
+
+    (result,) = asyncio.run(over_budget()).values()
+    assert result.identity_ok and result.answered == 3 and result.errors == ["refused: HTTP 429"] * 3
+    assert "over the catalog's request budget" in caplog.text
 
 
 def test_a_manifest_accepted_before_stands_in_while_the_axon_is_out() -> None:

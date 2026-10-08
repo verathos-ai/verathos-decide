@@ -100,6 +100,12 @@ async def _canary(result: EndpointResult, request: dict[str, Any], reference: di
     try:
         data = await request_json(client, "POST", ep.url + "/v1/systemone", content=body, headers=headers,
                                   limit=MAX_REPLY_BYTES, timeout=timeout_s)
+    except httpx.HTTPStatusError as e:
+        result.errors.append(f"refused: HTTP {e.response.status_code}")
+        if e.response.status_code == 429 and "retry-after" in e.response.headers:
+            log.error("%s refused a canary: this validator's requests to it this epoch are over the catalog's "
+                      "request budget, which a validator never needs; a fault of this validator", ep.key)
+        return
     except (httpx.HTTPError, TimeoutError, ValueError) as e:
         result.errors.append(f"request failed: {type(e).__name__}")
         return

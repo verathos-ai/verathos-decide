@@ -123,11 +123,11 @@ class Throughput:
 
     async def refresh(self, neurons: list[Neuron], catalog_digests: Collection[str], epoch: int,
                       client: httpx.AsyncClient) -> list[DiscoveredMiner]:
-        """Discover the miners, and challenge the endpoints a test would target that have not proven control at their
-        URL this epoch (auditor only)."""
+        """Discover the miners, and challenge the endpoints a test would target that were not challenged at their URL
+        this epoch yet (auditor only): the epoch's canary audit tries again, within the miners' request budget."""
         miners = await discover(neurons, self.netuid, self.mechid, client, catalog_digests, self.manifests)
         await self.identities.verify([e for m in miners for e in m.endpoints() if testable(e.endpoint)], epoch,
-                                     self.auditor.keypair, client)
+                                     self.auditor.keypair, client, retry=False)
         return miners
 
     def update_slots(self, miners: list[DiscoveredMiner], neurons: list[Neuron], epoch: int) -> None:

@@ -139,8 +139,9 @@ Gateway answers); test requests beyond its spare capacity otherwise go undeliver
 
 A caller other than a gateway (the catalog's `gateways`, or one in the miner's own `gateway_hotkeys`) needs only its
 canaries, so it gets one request at once per endpoint, each no larger (as canonical JSON) than the largest request
-of the model's request mix (HTTP 413 beyond), and while the auditor's test traffic arrives at the miner (its last
-request came within 5 s) its requests wait behind the test's. Validators hold their canaries during a test, so honest
+of the model's request mix (HTTP 413 beyond), at most the catalog's `scoring.validator_requests_per_epoch` per
+endpoint and epoch (by default 4 x `canary_pool_size`), and while the auditor's test traffic arrives at the miner
+(its last request came within 5 s) its requests wait behind the test's. Validators hold their canaries during a test, so honest
 ones never wait; a validator cannot crowd a competitor's test out with priority traffic. The miner signs only well-formed
 answers: an engine fault returns an error, never a signed wrong answer.
 
@@ -236,6 +237,7 @@ How credits and wrong answers enter the score is in `SCORING.md`.
 | Flooding a competitor's endpoint with validator traffic during its test | one request at once per validator and endpoint, no larger than the model's standard requests, and behind the test's requests while they arrive |
 | Flooding it with gateway traffic during its test, or a miner refusing users then | what an endpoint answers the gateway inside the test's window counts as delivered, and displaces the test's requests one for one; refused users count as asked |
 | Caching or sharing answers | every request is unique |
+| A staker using miners as a free inference service through validator requests | miners answer only validators with the catalog's `validator_min_stake`, each within a budget of requests per endpoint and epoch that canaries and identity challenges need |
 | Listing someone else's server as an endpoint, to aim the test's traffic at it | only endpoints that signed the auditor's challenge at their URL are tested; that server gets one challenge per epoch |
 
 What a test proves is that an endpoint delivers its declared rate on about 60 s notice: test traffic is
