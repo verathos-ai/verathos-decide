@@ -276,4 +276,6 @@ The auditor needs:
 
 Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers), `verdicts`
 (as served), `demand` (users' input tokens per model) and `users` (what users got from each endpoint), the last 30
-epochs).
+epochs). A catalog with another `epoch_blocks` renumbers it (a test by its selection block, the rest by the first
+block of its epoch; the verdicts served for the old epochs are dropped), so credits, test rates, demand and wrong
+answers carry on.

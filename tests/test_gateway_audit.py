@@ -628,14 +628,14 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
 
     from verathos.throughput.auditor import SCHEMA_VERSION, Store
 
-    Store(tmp_path / "old.sqlite")  # a version 4 database: today's without what later versions added
+    Store(tmp_path / "old.sqlite", epoch_blocks=180)  # today's, less what versions 5 on added
     db = sqlite3.connect(tmp_path / "old.sqlite")
-    db.executescript("DROP TABLE demand; DROP TABLE users; DROP INDEX results_by_endpoint; DROP INDEX samples_by_test; "
-                     "ALTER TABLE samples DROP COLUMN test_id; "
+    db.executescript("DROP TABLE demand; DROP TABLE users; DROP TABLE meta; DROP INDEX results_by_endpoint; "
+                     "DROP INDEX samples_by_test; ALTER TABLE samples DROP COLUMN test_id; "
                      "INSERT INTO tests VALUES ('kept', 3, 560, 'h', 565, 'confirmed', ''); "
                      "PRAGMA user_version = 4;")
     db.close()
-    store = Store(tmp_path / "old.sqlite")
+    store = Store(tmp_path / "old.sqlite", epoch_blocks=180)
     assert store._query("SELECT test_id FROM tests") == [("kept",)]
     assert store._query("PRAGMA user_version")[0][0] == SCHEMA_VERSION
     assert store.demand_ema(10) == {}

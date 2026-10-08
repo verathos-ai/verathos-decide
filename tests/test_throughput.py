@@ -592,6 +592,49 @@ def test_served_verdicts_do_not_change_with_the_policy(tmp_path) -> None:
     assert auditor.verdicts(4) is first
 
 
+def test_a_new_epoch_length_renumbers_the_auditors_history_instead_of_wiping_it(tmp_path) -> None:
+    """Tests, results, users' tallies, demand and wrong answers survive a change of ``epoch_blocks``, while running
+    and across a restart: credits, test rates and evidence carry on."""
+    from verathos.throughput.auditor import Result, Target, UserTally
+    from verathos.throughput.feed import GATEWAY_EVIDENCE, Evidence
+
+    chain = FakeChain(head=100 * 180 + 40)
+    auditor = Auditor(netuid=405, mechid=1, keypair=kp(), chain=chain, policy=AuditPolicy(), catalog=catalog.load,
+                      references={}, db_path=tmp_path / "t.sqlite")
+    slot = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 30.0)
+    auditor.update_slots([slot])
+    test = ScheduledTest(100, 18_020, block_hash(18_020).hex(), 18_025)
+    auditor.store.add_test(test)
+    auditor.store.add_results(test.test_id, [Result(Target(slot, 30.0), "passed", "", 30.0, 25.0, 350.0)])
+    auditor.store.set_state(test.test_id, "confirmed")
+    auditor.store.add_sample(sample_id="s", epoch=99, gateway="gw", hotkey="hk-wrong", endpoint_id="gpu0",
+                             model_id="kev-4b", request_id="n", request={}, response="{}", proof=False)
+    auditor.store.finish_sample("s", "checked", "wrong", Evidence(
+        hotkey="hk-wrong", endpoint_id="gpu0", model_id="kev-4b", test_id=f"{GATEWAY_EVIDENCE}-n", reason="wrong",
+        request_id="n", request={}, response="{}"), checked_epoch=100)
+    auditor.store.close_demand(99, {"kev-4b": 2160 * 100}, 2160.0, 0.1)
+    auditor.store.close_users(99, {("hk", "gpu0", "kev-4b"): UserTally(10, 2, 8, {50: 8})})
+    auditor.store.close_users(98, {("hk", "gpu0", "kev-4b"): UserTally(5, 0, 5, {50: 5})})
+    auditor.follower.poll()
+    auditor.settle()
+
+    auditor.set_policy(dataclasses.replace(auditor.policy, epoch_blocks=360))
+    chain.head_block = 51 * 360 + 1  # the test's epoch is 50 now
+    auditor.follower.poll()
+    auditor.settle()
+    (credit_,) = auditor.verdicts(51).verdicts.credits
+    assert (credit_.endpoint_id, credit_.credited_rps, credit_.test_epoch) == ("gpu0", 25.0, 50)
+    assert [e.hotkey for e in auditor.verdicts(51).verdicts.invalid] == ["hk-wrong"]
+    assert auditor.store.last_delivered()[slot.key][1] == 30.0  # the next test grows from it, not from scratch
+    assert auditor.store.demand_ema(49) == {"kev-4b": pytest.approx(10.0)}
+    assert auditor.store.demand_ema(50) == {"kev-4b": pytest.approx(9.0)}  # the average goes on from it
+    assert auditor.store.users(49)[("hk", "gpu0", "kev-4b")] == UserTally(15, 2, 13, {50: 13})  # merged
+
+    restarted = Auditor(netuid=405, mechid=1, keypair=auditor.keypair, chain=chain, policy=AuditPolicy(),
+                        catalog=catalog.load, references={}, db_path=tmp_path / "t.sqlite")  # back to 180
+    assert restarted.store._query("SELECT epoch FROM tests") == [(100,)]
+
+
 def test_an_auditor_database_of_another_schema_starts_over(tmp_path) -> None:
     import sqlite3
 
@@ -600,7 +643,7 @@ def test_an_auditor_database_of_another_schema_starts_over(tmp_path) -> None:
     db = sqlite3.connect(tmp_path / "t.sqlite")
     db.executescript("CREATE TABLE tests (test_id TEXT); CREATE TABLE results (old TEXT); PRAGMA user_version = 1;")
     db.close()
-    store = Store(tmp_path / "t.sqlite")
+    store = Store(tmp_path / "t.sqlite", epoch_blocks=180)
     assert store._query("PRAGMA user_version") == [(SCHEMA_VERSION,)]
     assert store.last_delivered() == {}
 

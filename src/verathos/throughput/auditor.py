@@ -111,7 +111,7 @@ MIN_TEST_SHARE = 0.1  # a test sends at least this share of the tested rate itse
 USERS_BEFORE_S = (80.0, 20.0)  # an endpoint's usual user rate: [window start - 80 s, window start - 20 s)
 SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 _DEMAND_SCHEMA = """
 CREATE TABLE demand (epoch INTEGER NOT NULL, model_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
     ema REAL NOT NULL, PRIMARY KEY (epoch, model_id));
@@ -123,9 +123,10 @@ CREATE TABLE users (epoch INTEGER NOT NULL, hotkey TEXT NOT NULL, endpoint_id TE
 """
 _RESULTS_INDEX = "CREATE INDEX IF NOT EXISTS results_by_endpoint ON results (hotkey, endpoint_id);"
 _SAMPLES_BY_TEST = "CREATE INDEX IF NOT EXISTS samples_by_test ON samples (test_id, hotkey, endpoint_id);"
+_META_SCHEMA = "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"  # epoch_blocks: the rows' numbering
 # from version -> the statements that bring it one version up
 _MIGRATIONS = {4: _DEMAND_SCHEMA, 5: _USERS_SCHEMA, 6: _RESULTS_INDEX,
-               7: "ALTER TABLE samples ADD COLUMN test_id TEXT; " + _SAMPLES_BY_TEST}
+               7: "ALTER TABLE samples ADD COLUMN test_id TEXT; " + _SAMPLES_BY_TEST, 8: _META_SCHEMA}
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
 
 
@@ -138,6 +139,13 @@ class UserTally:
     refused: int = 0
     answers: int = 0
     latency: dict[int, int] = field(default_factory=dict)
+
+    def add(self, other: UserTally) -> None:
+        self.offered += other.offered
+        self.refused += other.refused
+        self.answers += other.answers
+        for bucket, n in other.latency.items():
+            self.latency[bucket] = self.latency.get(bucket, 0) + n
 
 
 class BoundedEngine:
@@ -308,7 +316,7 @@ CREATE TABLE samples (
 CREATE INDEX samples_by_state ON samples (state, epoch);
 CREATE INDEX samples_by_endpoint ON samples (hotkey, endpoint_id, epoch);
 CREATE TABLE verdicts (epoch INTEGER PRIMARY KEY, document TEXT NOT NULL);
-""" + _DEMAND_SCHEMA + _USERS_SCHEMA + _RESULTS_INDEX + _SAMPLES_BY_TEST
+""" + _DEMAND_SCHEMA + _USERS_SCHEMA + _RESULTS_INDEX + _SAMPLES_BY_TEST + _META_SCHEMA
 # test states: running -> unconfirmed -> confirmed | void
 _SCRUB = "request = '{}', response = ''"  # a user's request and answers are kept only until their check
 # sample states: pending -> checked | skipped (its endpoint's checks for the epoch were done) | unchecked (no
@@ -319,10 +327,11 @@ _SCRUB = "request = '{}', response = ''"  # a user's request and answers are kep
 
 
 class Store:
-    """Tests, results and sampled gateway exchanges, kept for ``KEEP_EPOCHS`` epochs. A database of another schema
-    version is started over."""
+    """Tests, results and sampled gateway exchanges, kept for ``KEEP_EPOCHS`` epochs, numbered by epochs of
+    ``epoch_blocks`` (a new epoch length renumbers them: ``renumber``). A database of another schema version is
+    started over."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, epoch_blocks: int) -> None:
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._lock = threading.Lock()
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
@@ -332,15 +341,50 @@ class Store:
         if version != SCHEMA_VERSION:
             self._db.executescript("BEGIN; DROP TABLE IF EXISTS results; DROP TABLE IF EXISTS tests; "
                                    "DROP TABLE IF EXISTS samples; DROP TABLE IF EXISTS verdicts; "
-                                   "DROP TABLE IF EXISTS demand; DROP TABLE IF EXISTS users;" + _SCHEMA
+                                   "DROP TABLE IF EXISTS demand; DROP TABLE IF EXISTS users; "
+                                   "DROP TABLE IF EXISTS meta;" + _SCHEMA
                                    + f"PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;")
             log.info("auditor database %s started for schema %d", path, SCHEMA_VERSION)
         self._query("UPDATE tests SET state = 'void', reason = 'the auditor restarted during the test' "
                     "WHERE state = 'running'")
+        numbered = self._query("SELECT value FROM meta WHERE key = 'epoch_blocks'")
+        self.epoch_blocks = int(numbered[0][0]) if numbered else epoch_blocks
+        self.renumber(epoch_blocks)
 
     def _query(self, sql: str, params: Iterable[Any] = ()) -> list[tuple]:
         with self._lock:
             return self._db.execute(sql, tuple(params)).fetchall()
+
+    def renumber(self, epoch_blocks: int) -> None:
+        """Number the rows by epochs of ``epoch_blocks``: a test by its selection block, anything else by its
+        epoch's first block. Rows that fall into one new epoch merge: users' tallies add up, the latest demand
+        stands. Verdicts served for the old epochs are dropped: they cover epochs that no longer exist."""
+        old, new = self.epoch_blocks, epoch_blocks
+        with self._lock:
+            self._db.execute("BEGIN")
+            self._db.execute("INSERT OR REPLACE INTO meta VALUES ('epoch_blocks', ?)", (str(new),))
+            if old != new:
+                self._db.execute("UPDATE tests SET epoch = selection_block / ?", (new,))
+                self._db.execute("UPDATE samples SET epoch = epoch * ? / ?, checked_epoch = checked_epoch * ? / ?",
+                                 (old, new, old, new))
+                self._db.execute("DELETE FROM verdicts")
+                demand: dict[tuple[int, str], tuple] = {}
+                for epoch, model, tokens, ema in self._db.execute("SELECT * FROM demand ORDER BY epoch").fetchall():
+                    demand[epoch * old // new, model] = (epoch * old // new, model, tokens, ema)
+                users: dict[tuple, UserTally] = {}
+                for epoch, hk, ep, model, offered, refused, answers, latency in self._db.execute(
+                        "SELECT * FROM users").fetchall():
+                    users.setdefault((epoch * old // new, hk, ep, model), UserTally()).add(UserTally(
+                        offered, refused, answers, {int(b): n for b, n in json.loads(latency).items()}))
+                self._db.execute("DELETE FROM demand")
+                self._db.executemany("INSERT INTO demand VALUES (?, ?, ?, ?)", list(demand.values()))
+                self._db.execute("DELETE FROM users")
+                self._db.executemany("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                     [(*key, t.offered, t.refused, t.answers, json.dumps(t.latency, sort_keys=True))
+                                      for key, t in users.items()])
+                log.info("auditor database renumbered from epochs of %d blocks to epochs of %d", old, new)
+            self._db.execute("COMMIT")
+        self.epoch_blocks = new
 
     def known(self, test_id: str) -> bool:
         return bool(self._query("SELECT 1 FROM tests WHERE test_id = ?", (test_id,)))
@@ -348,7 +392,8 @@ class Store:
     def add_test(self, test: ScheduledTest) -> None:
         self._query("INSERT INTO tests (test_id, epoch, selection_block, selection_hash, start_block, state) "
                     "VALUES (?, ?, ?, ?, ?, 'running')",
-                    (test.test_id, test.epoch, test.selection_block, test.selection_hash, test.start_block))
+                    (test.test_id, test.selection_block // self.epoch_blocks, test.selection_block,
+                     test.selection_hash, test.start_block))
 
     def set_state(self, test_id: str, state: str, reason: str = "") -> None:
         self._query("UPDATE tests SET state = ?, reason = ? WHERE test_id = ?", (state, reason, test_id))
@@ -601,11 +646,8 @@ class Store:
                 "delivered_rps", "credited_rps", "latency_p50_ms", "latency_p95_ms")
         return [ThroughputOutcome(**dict(zip(keys, row))) for row in rows]
 
-    def prune(self, before_epoch: int, after_epoch: int | None = None) -> None:
-        """Forget epochs before ``before_epoch``, and after ``after_epoch`` (numbered under a shorter epoch
-        length)."""
-        if after_epoch is not None:
-            self._prune_after(after_epoch)
+    def prune(self, before_epoch: int) -> None:
+        """Forget epochs before ``before_epoch``."""
         with self._lock:
             self._db.execute("DELETE FROM results WHERE test_id IN (SELECT test_id FROM tests WHERE epoch < ?)",
                              (before_epoch,))
@@ -614,15 +656,6 @@ class Store:
             self._db.execute("DELETE FROM verdicts WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM demand WHERE epoch < ?", (before_epoch,))
             self._db.execute("DELETE FROM users WHERE epoch < ?", (before_epoch,))
-
-    def _prune_after(self, after_epoch: int) -> None:
-        with self._lock:
-            self._db.execute("BEGIN")
-            self._db.execute("DELETE FROM results WHERE test_id IN (SELECT test_id FROM tests WHERE epoch > ?)",
-                             (after_epoch,))
-            for table in ("tests", "samples", "verdicts", "demand", "users"):
-                self._db.execute(f"DELETE FROM {table} WHERE epoch > ?", (after_epoch,))
-            self._db.execute("COMMIT")
 
 
 def _beyond(total: float, count: int, tolerance: Tolerance) -> bool:
@@ -684,7 +717,7 @@ class Auditor:
         self.hotkey = keypair.ss58_address
         self.policy, self.catalog, self.runner = policy, catalog, runner
         self.reference_specs, self.screen_specs = references, screens or {}
-        self.store = Store(db_path)
+        self.store = Store(db_path, epoch_blocks=policy.epoch_blocks)
         self.follower = ScheduleFollower(chain, policy)
         self._slots: list[Slot] = []
         self._discovered = False  # whether _slots holds a discovery yet
@@ -705,8 +738,25 @@ class Auditor:
     # ---- inputs ----
 
     def set_policy(self, policy: AuditPolicy) -> None:
-        """Adopt a new policy for the tests and verdicts to come; verdicts already served stay as they are."""
-        self.policy = policy
+        """Adopt a new policy for the tests and verdicts to come; verdicts already served stay as they are. A new
+        epoch length renumbers what the auditor holds (``Store.renumber``), so no history is lost."""
+        old, new = self.policy.epoch_blocks, policy.epoch_blocks
+        with self._verdicts_lock, self._demand_lock:  # what numbers rows by epoch holds one of them
+            if old != new:
+                self.store.renumber(new)
+                self._verdicts, self._pruned_epoch = {}, -1
+                demand: dict[int, dict[str, int]] = {}
+                for epoch, tokens in self._demand.items():
+                    merged = demand.setdefault(epoch * old // new, {})
+                    for model, n in tokens.items():
+                        merged[model] = merged.get(model, 0) + n
+                users: dict[int, dict[tuple[str, str, str], UserTally]] = {}
+                for epoch, tallies in self._users.items():
+                    merged_users = users.setdefault(epoch * old // new, {})
+                    for key, tally in tallies.items():
+                        merged_users.setdefault(key, UserTally()).add(tally)
+                self._demand, self._users = demand, users
+            self.policy = policy
         self.follower.set_policy(policy)
 
     def update_slots(self, slots: list[Slot]) -> None:
@@ -1159,10 +1209,11 @@ class Auditor:
     def settle(self) -> None:
         """Confirm tests whose selection block is final with the hash they were selected by; void the others. Close
         the users' demand of finished epochs."""
-        epoch = self.follower.head // self.policy.epoch_blocks
-        if epoch != self._pruned_epoch:
-            self.store.prune(epoch - KEEP_EPOCHS, epoch + 2)
-            self._pruned_epoch = epoch
+        with self._demand_lock:  # not while a new epoch length renumbers the rows
+            epoch = self.follower.head // self.policy.epoch_blocks
+            if epoch != self._pruned_epoch:
+                self.store.prune(epoch - KEEP_EPOCHS)
+                self._pruned_epoch = epoch
         if self.follower.head > 0:
             self.close_epoch(epoch)
         unconfirmed = self.store.unconfirmed()
