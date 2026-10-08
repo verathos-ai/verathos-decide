@@ -6,7 +6,9 @@ out of the pool), then sends each endpoint its assigned subset of the canaries c
 as signed requests, checks every receipt, and compares the answers with the reference. The reference work does not
 grow with the number of endpoints, and a slow reference shrinks the pool instead of delaying the epoch. Nothing a
 miner returns can abort the epoch: every reply is size- and time-bounded and every parse failure is recorded against
-that endpoint.
+that endpoint. An endpoint gets canaries only once it proved control at its URL in the epoch
+(``discovery.Identities``), while the references are computed; at its hotkey's own hosts a failed challenge is tried
+again before each canary.
 """
 
 from __future__ import annotations
@@ -31,12 +33,11 @@ from verathos.protocol.requests import HDR_NONCE, sign_request
 from verathos.throughput.policy import AuditPolicy
 from verathos.validator.canaries import assignment, canary_pool
 from verathos.validator.compare import EndpointTally, RequestComparison, Tolerance, compare_request
-from verathos.validator.discovery import DiscoveredEndpoint, verify_identity
+from verathos.validator.discovery import DiscoveredEndpoint, Identities
 
 log = logging.getLogger(__name__)
 HOLD_POLL_S = 2.0
 MAX_HOLD_WAIT_S = 120.0
-IDENTITY_CONCURRENCY = 256
 MAX_REPLY_BYTES = 1 << 20
 REFERENCE_SHARE = 0.3  # of an epoch's audit time, the most the canaries' reference answers may take
 
@@ -89,15 +90,15 @@ async def _canary(result: EndpointResult, request: dict[str, Any], reference: di
                   keypair: Keypair, client: httpx.AsyncClient, netuid: int, mechid: int, timeout_s: float) -> None:
     """Send one canary and record its outcome. A request the endpoint declines (no 2xx reply within ``timeout_s``)
     costs availability; a reply whose receipt does not bind it, or whose answers are malformed, fails the request
-    outright. A receipt that binds it proves control of the endpoint as the identity challenge does."""
+    outright."""
     ep = result.endpoint
-    path = ep.path_prefix + "/v1/systemone"
     body = json.dumps(request).encode()
-    headers = {"Content-Type": "application/json", **sign_request(keypair, "POST", path, body, ep.hotkey)}
+    headers = {"Content-Type": "application/json",
+               **sign_request(keypair, "POST", ep.path_prefix + "/v1/systemone", body, ep.hotkey)}
     result.sent += 1
     t0 = time.monotonic()
     try:
-        data = await request_json(client, "POST", ep.base_url + path, content=body, headers=headers,
+        data = await request_json(client, "POST", ep.url + "/v1/systemone", content=body, headers=headers,
                                   limit=MAX_REPLY_BYTES, timeout=timeout_s)
     except (httpx.HTTPError, TimeoutError, ValueError) as e:
         result.errors.append(f"request failed: {type(e).__name__}")
@@ -115,7 +116,6 @@ async def _canary(result: EndpointResult, request: dict[str, Any], reference: di
                  and r_.caller_hotkey == keypair.ss58_address and r_.request_nonce == headers[HDR_NONCE]
                  and r_.netuid == netuid and r_.mechid == mechid)
         comparison = compare_request(reference, got, result.tolerance) if bound else None
-        result.identity_ok = result.identity_ok or bound
     except Exception as e:  # anything a reply can make the parser or comparison raise fails the request
         result.errors.append(f"malformed reply: {type(e).__name__}")
         result.tally.add(_invalid("malformed reply"))
@@ -128,19 +128,27 @@ async def _canary(result: EndpointResult, request: dict[str, Any], reference: di
 
 async def _audit_endpoint(result: EndpointResult, canaries: list[tuple[dict[str, Any], dict[str, dict[str, float]]]],
                           keypair: Keypair, client: httpx.AsyncClient, spread_s: float, rng: random.Random,
-                          holding: Callable[[], bool], netuid: int, mechid: int,
-                          identity_slots: asyncio.Semaphore, timeout_s: float) -> None:
+                          holding: Callable[[], bool], netuid: int, mechid: int, identities: Identities, epoch: int,
+                          timeout_s: float) -> None:
+    """Send the endpoint its canaries, each only while it has proven control at its URL this epoch."""
     ep = result.endpoint
-    async with identity_slots:  # the wait for a slot is not part of the endpoint's time limit
-        result.identity_ok = await verify_identity(ep, keypair, client)
     for request, reference in canaries:
+        if not result.identity_ok and not identities.own(ep, epoch):
+            break  # not the hotkey's host: no traffic
         if spread_s:
             await asyncio.sleep(rng.uniform(0, spread_s))
         waited = 0.0
         while holding() and waited < MAX_HOLD_WAIT_S:
             await asyncio.sleep(HOLD_POLL_S)  # a throughput test is running
             waited += HOLD_POLL_S
+        if not result.identity_ok:
+            await identities.verify([ep], epoch, keypair, client)
+            result.identity_ok = identities.verified(ep.key, ep.url, epoch)
+            if not result.identity_ok:
+                continue
         await _canary(result, request, reference, keypair, client, netuid, mechid, timeout_s)
+    if not result.identity_ok:
+        result.errors.append("identity not proven at its URL")
 
 
 async def audit_epoch(
@@ -159,25 +167,28 @@ async def audit_epoch(
     budget_s: float | None = None,
     holding: Callable[[], bool] = lambda: False,
     request_timeout_s: float = AuditPolicy.request_timeout_s,
+    identities: Identities | None = None,
 ) -> dict[str, EndpointResult]:
     """Audit every endpoint whose model has a reference engine, within ``budget_s`` (None: references unbounded,
     canaries at once), each canary within ``request_timeout_s`` as test requests are. Returns results keyed by
     endpoint key; endpoints without a usable canary this epoch (no reference engine, or no reference answer) have no
-    result."""
+    result. ``identities``: the validator's record of who proved control where (default: a new one)."""
     start = time.monotonic()
+    identities = identities or Identities()
     deadline = None if budget_s is None else start + REFERENCE_SHARE * budget_s
     models = [m for m in sorted({e.endpoint.model_id for e in endpoints}) if m in references]
     for model_id in sorted({e.endpoint.model_id for e in endpoints} - set(models)):
         log.info("no reference engine for %s; its endpoints are not audited this epoch", model_id)
     canaries = {m: canary_pool(secret, epoch, m, pool_size) for m in models}
-    answers = await asyncio.gather(*(reference_answers(canaries[m], references[m], deadline) for m in models))
+    audited = [e for e in endpoints if e.endpoint.model_id in models]
+    *answers, _ = await asyncio.gather(*(reference_answers(canaries[m], references[m], deadline) for m in models),
+                                       identities.verify(audited, epoch, keypair, client))
     pools = {m: [(c, a) for c, a in zip(canaries[m], got) if a is not None] for m, got in zip(models, answers)}
     spread_s = 0.0 if budget_s is None else max(start + budget_s - time.monotonic(), 0.0) / max(per_endpoint, 1)
 
     results: dict[str, EndpointResult] = {}
     tasks = []
     rng = random.Random(int.from_bytes(secret[:8], "big") ^ epoch)
-    identity_slots = asyncio.Semaphore(IDENTITY_CONCURRENCY)
     for ep in endpoints:
         pool = pools.get(ep.endpoint.model_id)
         if pool is None:
@@ -185,10 +196,11 @@ async def audit_epoch(
         picked = [pool[i] for i in assignment(secret, epoch, ep.key, len(pool), per_endpoint)]
         if not picked:
             continue
-        res = EndpointResult(ep, tolerances[ep.endpoint.model_id])
+        res = EndpointResult(ep, tolerances[ep.endpoint.model_id],
+                             identity_ok=identities.verified(ep.key, ep.url, epoch))
         results[ep.key] = res
         tasks.append(_audit_endpoint(res, picked, keypair, client, spread_s, random.Random(rng.random()), holding,
-                                     netuid, mechid, identity_slots, request_timeout_s))
+                                     netuid, mechid, identities, epoch, request_timeout_s))
     for res, outcome in zip(results.values(), await asyncio.gather(*tasks, return_exceptions=True)):
         if isinstance(outcome, BaseException):  # an aborted audit verifies nothing, so it fails
             log.error("audit of %s failed: %r", res.endpoint.key, outcome)

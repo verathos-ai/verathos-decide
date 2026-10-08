@@ -33,6 +33,8 @@ from verathos.throughput.policy import (
 from verathos.throughput.workload import Workload, make_request
 from verathos.validator.throughput import Throughput, slots
 
+pytestmark = pytest.mark.usefixtures("lab_network")
+
 KEV = catalog.load().get("kev-4b")
 
 
@@ -409,6 +411,61 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
     assert last[over][2] and not last[honest][2]
     rates = {t.slot.key: t.tested_rps for t in auditor.targets(auditor.policy)}
     assert rates[over] == pytest.approx(min(1.1 * last[over][1], 80.0), rel=0.02)
+
+
+def test_the_auditor_tests_an_endpoint_only_once_it_proved_control_at_its_url(tmp_path) -> None:
+    """A manifest may name any public host: the auditor's test traffic goes only to endpoints that answered its
+    identity challenge at their URL in this epoch or the last."""
+    from verathos.protocol.manifest import commitment_value
+    from verathos.validator.discovery import Neuron
+
+    auditor_kp, miner_kp, other_kp = kp(), kp(), kp()
+    axon, other = "10.0.4.1", "10.0.4.2"
+    digest = catalog.load().digest()
+    signed = SignedManifest.create(Manifest(
+        netuid=405, mechid=1, hotkey=miner_kp.ss58_address, catalog_digest=digest, endpoints=[
+            Endpoint(endpoint_id=e, url=f"http://{host}:80/e/{e}", model_id="kev-4b", capacity_rps=20.0)
+            for e, host in (("gpu0", axon), ("gpu1", other))]), miner_kp)
+
+    def app(host: str, keypair: Keypair, endpoint_id: str):
+        config = MinerConfig.model_validate({
+            "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": 80,
+            "endpoints": [{"endpoint_id": endpoint_id, "model_id": "kev-4b", "engine_url": "http://unused"}]})
+        return create_app(config=config, keypair=keypair, manifest=lambda: signed,
+                          engines={endpoint_id: MockEngine("kev-4b")},
+                          authorized=lambda hk: hk == auditor_kp.ss58_address, auditors=lambda: set(),
+                          serving=lambda: {endpoint_id})
+
+    apps = {axon: app(axon, miner_kp, "gpu0"), other: app(other, other_kp, "gpu1")}  # gpu1's host is another's
+    challenges_lost = []
+
+    class Transport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.inner = HostRouter(apps)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if challenges_lost and request.url.path.endswith("/v1/identity"):
+                return httpx.Response(504)
+            return await self.inner.handle_async_request(request)
+
+    auditor = Auditor(netuid=405, mechid=1, keypair=auditor_kp, chain=FakeChain(head=5 * 180), policy=AuditPolicy(),
+                      catalog=catalog.load, references={}, db_path=tmp_path / "throughput.sqlite")
+    throughput = Throughput(netuid=405, mechid=1, policy=auditor.policy, auditor_hotkey=auditor_kp.ss58_address,
+                            chain=auditor.chain, auditor=auditor)
+    neurons = [Neuron(1, miner_kp.ss58_address, axon, 80, commitment_value(signed.manifest.digest()))]
+
+    def refresh(epoch: int) -> list[str]:
+        async def run():
+            async with httpx.AsyncClient(transport=Transport()) as client:
+                return await throughput.refresh(neurons, {digest}, epoch, client)
+
+        throughput.update_slots(asyncio.run(run()), neurons, epoch)
+        return [t.slot.endpoint_id for t in auditor.targets(auditor.policy)]
+
+    assert refresh(5) == ["gpu0"]
+    challenges_lost.append(True)  # its challenges are lost from now on: the last epoch's proof still counts
+    assert refresh(6) == ["gpu0"]
+    assert refresh(7) == []
 
 
 def test_a_test_whose_selection_block_is_not_final_is_void(tmp_path) -> None:

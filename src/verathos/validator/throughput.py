@@ -21,6 +21,7 @@ import httpx
 
 from verathos import catalog
 from verathos.miner.engine import Engine
+from verathos.protocol.manifest import Endpoint
 from verathos.protocol.receipts import issued_receipt, parse_response, signed_answers
 from verathos.throughput import feed
 from verathos.throughput.auditor import Auditor, Slot
@@ -29,7 +30,7 @@ from verathos.throughput.follow import ScheduleFollower
 from verathos.throughput.policy import AuditPolicy
 from verathos.validator import chain as validator_chain
 from verathos.validator.config import ReferenceEngine
-from verathos.validator.discovery import DiscoveredMiner, Neuron, discover
+from verathos.validator.discovery import DiscoveredMiner, Identities, Neuron, discover
 
 log = logging.getLogger(__name__)
 SLOT_REFRESH_S = 120.0
@@ -37,27 +38,34 @@ VERDICTS_RETRY_S = 30.0
 VERDICTS_WAIT_S = 300.0
 
 
+def testable(e: Endpoint) -> bool:
+    """Whether the auditor tests the endpoint: open, with a declared capacity."""
+    return e.tier == "open" and e.capacity_rps > 0
+
+
 def slots(miners: list[DiscoveredMiner]) -> list[Slot]:
-    """Every open endpoint with a declared capacity: what the auditor tests."""
+    """Every endpoint the auditor tests."""
     return [Slot(m.hotkey, e.endpoint_id, e.url, e.model_id, e.capacity_rps)
-            for m in miners for e in m.manifest.endpoints if e.tier == "open" and e.capacity_rps > 0]
+            for m in miners for e in m.manifest.endpoints if testable(e)]
 
 
 class Throughput:
     def __init__(self, *, netuid: int, mechid: int, policy: AuditPolicy, auditor_hotkey: str,
                  chain: SubtensorChainView, auditor: Auditor | None = None,
-                 follower: ScheduleFollower | None = None) -> None:
+                 follower: ScheduleFollower | None = None, identities: Identities | None = None) -> None:
         self.netuid, self.mechid, self.policy, self.auditor_hotkey, self.chain = (netuid, mechid, policy,
                                                                                   auditor_hotkey, chain)
         self.auditor, self.follower = auditor, follower
+        self.identities = identities or Identities()
         self._known: dict[str, tuple[str | None, list[Slot]]] = {}
         self._last: feed.Verdicts | None = None
 
     @classmethod
     def start(cls, *, network: str, netuid: int, mechid: int, current: Callable[[], catalog.Catalog],
               st: bt.Subtensor, wallet: bt.Wallet, references: dict[str, ReferenceEngine],
-              screens: dict[str, ReferenceEngine], state_dir: Path) -> Throughput:
-        """The auditor role if this validator's hotkey is the subnet owner's, else a schedule follower."""
+              screens: dict[str, ReferenceEngine], state_dir: Path, identities: Identities) -> Throughput:
+        """The auditor role if this validator's hotkey is the subnet owner's, else a schedule follower.
+        ``identities``: the validator's record of who proved control where, shared with its canary audit."""
         policy = current().audit_policy()
         auditor_hotkey = st.get_subnet_owner_hotkey(netuid)
         chain = SubtensorChainView(network, netuid)
@@ -66,14 +74,14 @@ class Throughput:
             follower.start()
             log.info("throughput tests are run by %s; applying its verdicts", auditor_hotkey)
             return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
-                       follower=follower)
+                       follower=follower, identities=identities)
         auditor = Auditor(netuid=netuid, mechid=mechid, keypair=wallet.hotkey, chain=chain, policy=policy,
                           catalog=current, references=references, screens=screens,
                           db_path=state_dir / "throughput.sqlite")
         auditor.start()
         log.info("throughput auditor running (%s mode)", policy.mode)
         return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
-                   auditor=auditor)
+                   auditor=auditor, identities=identities)
 
     def set_policy(self, policy: AuditPolicy) -> None:
         """Adopt the policy of a newly committed catalog."""
@@ -98,21 +106,32 @@ class Throughput:
             while True:  # at once, then every interval: a restarted auditor tests and routes from the start
                 try:
                     neurons, _ = validator_chain.snapshot(st, self.netuid)
-                    self.update_slots(asyncio.run(self._discover(neurons, catalog_digests())), neurons)
+                    epoch = st.get_current_block() // self.policy.epoch_blocks
+                    self.update_slots(asyncio.run(self._refresh(neurons, catalog_digests(), epoch)), neurons, epoch)
                 except Exception:
                     log.exception("throughput slot refresh failed")
                 time.sleep(interval_s)
 
         threading.Thread(target=run, name="throughput-slots", daemon=True).start()
 
-    async def _discover(self, neurons: list[Neuron], catalog_digests: Collection[str]) -> list[DiscoveredMiner]:
+    async def _refresh(self, neurons: list[Neuron], catalog_digests: Collection[str],
+                       epoch: int) -> list[DiscoveredMiner]:
         async with httpx.AsyncClient() as client:
-            return await discover(neurons, self.netuid, self.mechid, client, catalog_digests)
+            return await self.refresh(neurons, catalog_digests, epoch, client)
 
-    def update_slots(self, miners: list[DiscoveredMiner], neurons: list[Neuron]) -> None:
-        """Replace the tested endpoints with the discovered ones. A hotkey whose manifest could not be fetched this
-        time keeps its endpoints while its commitment is unchanged, so one failed fetch does not drop it from a
-        test."""
+    async def refresh(self, neurons: list[Neuron], catalog_digests: Collection[str], epoch: int,
+                      client: httpx.AsyncClient) -> list[DiscoveredMiner]:
+        """Discover the miners, and challenge the endpoints a test would target that have not proven control at their
+        URL this epoch (auditor only)."""
+        miners = await discover(neurons, self.netuid, self.mechid, client, catalog_digests)
+        await self.identities.verify([e for m in miners for e in m.endpoints() if testable(e.endpoint)], epoch,
+                                     self.auditor.keypair, client)
+        return miners
+
+    def update_slots(self, miners: list[DiscoveredMiner], neurons: list[Neuron], epoch: int) -> None:
+        """Replace the tested endpoints with the discovered ones that proved control at their URL in ``epoch`` or the
+        one before. A hotkey whose manifest could not be fetched this time keeps its endpoints while its commitment is
+        unchanged, so one failed fetch does not drop it from a test."""
         if self.auditor is None:
             return
         if not miners and any(n.commitment for n in neurons):
@@ -124,7 +143,8 @@ class Throughput:
             if hotkey not in known and commitment is not None and commitments.get(hotkey) == commitment:
                 known[hotkey] = (commitment, kept)
         self._known = known
-        self.auditor.update_slots([s for _, kept in known.values() for s in kept])
+        self.auditor.update_slots([s for _, kept in known.values() for s in kept
+                                   if self.identities.verified(s.key, s.url, epoch - 1)])
 
     # ---- verdicts ----
 

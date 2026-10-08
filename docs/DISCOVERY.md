@@ -27,11 +27,24 @@ Miners and the model catalog are discovered from native chain state only. No EVM
 ```
 
 Rules:
+- Only hotkeys with a manifest commitment and an axon on a public address are contacted.
 - A manifest is accepted only if it is signed by the hotkey that owns the axon, is for this netuid and mechanism,
-  its digest equals that hotkey's current commitment, and every endpoint URL is `http://<axon ip>:<axon port>/e/<id>`.
-  A miner therefore cannot show different endpoint lists to different validators, nor claim hosts other than its
-  own axon. The manifest depends only on the miner's configuration, its capacity measurements and the catalog, so a
-  restart does not change the commitment.
+  its digest equals that hotkey's current commitment, and every endpoint URL is exactly
+  `http://<ip>:<port>/e/<endpoint_id>`: the IP a public unicast address written as the chain writes axons (not
+  private, shared, loopback, link-local, multicast, reserved, unspecified or documentation, and not an IPv6 form of
+  an IPv4 address), the port 1-65535, nothing else. The host is the axon or any other machine of the miner. A
+  manifest lists at most 64 endpoints on at most 64 hosts. A miner therefore cannot show different endpoint lists to
+  different validators. The manifest depends only on the miner's configuration, its capacity measurements and the
+  catalog, so a restart does not change the commitment.
+- An endpoint gets traffic only once it proved control at its URL: it signs a fresh challenge with the listing
+  hotkey (`POST /e/<endpoint_id>/v1/identity`). Validators challenge every endpoint each epoch before its first
+  canary; the auditor tests an endpoint only if it passed at that URL in the current or the previous epoch, and
+  gateways route only to endpoints the auditor credits, at public addresses. At the hotkey's own hosts (the axon,
+  while it serves the manifest, and hosts where one of its endpoints passed in this epoch or the last) endpoints are
+  challenged together, and a failed challenge is tried again before each canary. Any other host is challenged one
+  endpoint at a time; after a failure it gets no further challenge for that hotkey in the epoch. A manifest that
+  names someone else's server therefore costs that server at most one challenge per validator and epoch, and no
+  other traffic.
 - A manifest names the catalog it was built for. Validators accept the current catalog and, for one epoch after a
   change, the previous one, while miners re-publish (they check every minute).
 - A catalog is accepted only if its digest equals the subnet owner hotkey's current commitment. A copy ships with
@@ -39,8 +52,7 @@ Rules:
   proves them. A new commitment takes effect without a code release.
 - Signatures and digests cover the JSON documents exactly as published (canonical encoding of the parsed JSON), so
   nodes whose code knows fewer fields still agree on them. Responses from other neurons are size- and time-bounded.
-- Endpoint control (each endpoint signs a validator nonce with the listing hotkey) and the throughput audit
-  (declared capacity, see `THROUGHPUT_AUDIT.md`) are separate checks applied after discovery.
+- The throughput audit (declared capacity, see `THROUGHPUT_AUDIT.md`) is a separate check applied after discovery.
 
 Chain limits (read from subtensor main and testnet 405 on 2026-10-06):
 - `serve_axon`: no fee (`Pays::No`), at most once per `ServingRateLimit` = 50 blocks (about 10 minutes). Needed only

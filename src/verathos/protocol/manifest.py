@@ -7,8 +7,10 @@ Discovery uses only native chain state:
   version.
 
 A fetched manifest is accepted only if its signature verifies against the hotkey, its digest equals the hotkey's
-current commitment, and every endpoint URL is on the hotkey's axon. Signature and digest cover the JSON exactly as
-received, so nodes running different code versions agree on them.
+current commitment, and every endpoint URL is ``http://<ip>:<port>/e/<endpoint_id>`` on a public unicast address: the
+axon, or another machine of the miner. Signature and digest cover the JSON exactly as received, so nodes running
+different code versions agree on them. A listed host gets traffic only once the endpoint proved control at its URL
+(``validator.discovery.Identities``).
 """
 
 from __future__ import annotations
@@ -27,7 +29,11 @@ from verathos.protocol.canonical import digest
 MANIFEST_DOMAIN = "verathos/manifest/v1"
 COMMITMENT_PREFIX = "verathos/manifest/v1 sha256:"
 MAX_ENDPOINTS = 64
+MAX_HOSTS = 64  # distinct hosts (ip:port) per manifest
 _ENDPOINT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+_ENDPOINT_URL = re.compile(r"^http://(?:\[([0-9a-f:]+)\]|([0-9.]+)):([0-9]{1,5})/e/[^/?#]*$")
+# IPv6 forms that stand for an IPv4 address (mapped, NAT64, 6to4): a host's IPv4 address is listed as itself
+_TRANSLATED = tuple(ipaddress.ip_network(n) for n in ("::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16"))
 
 
 class Endpoint(BaseModel):
@@ -102,13 +108,13 @@ class ManifestRejected(Exception):
 
 
 def axon_base(ip: str, port: int) -> str:
-    """The base URL of an axon (``http://ip:port``)."""
+    """The base URL of a miner service at ``ip:port``, the axon or another machine (``http://ip:port``)."""
     return f"http://[{ip}]:{port}" if ":" in ip else f"http://{ip}:{port}"
 
 
-def endpoint_url(axon: str, endpoint_id: str) -> str:
-    """The URL of an endpoint on its hotkey's axon; manifests must list exactly this URL."""
-    return f"{axon}/e/{endpoint_id}"
+def endpoint_url(host: str, endpoint_id: str) -> str:
+    """The URL of an endpoint on the miner service at ``host`` (``axon_base``); manifests list exactly this URL."""
+    return f"{host}/e/{endpoint_id}"
 
 
 def public_ip(value: str) -> str:
@@ -117,7 +123,40 @@ def public_ip(value: str) -> str:
     return str(ipaddress.ip_address(value))
 
 
-def accept(document: Any, *, hotkey: str, netuid: int, mechid: int, axon: str, commitment: str | None,
+def public_unicast(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Whether validators, the auditor and gateways may connect to ``ip``: a global unicast address (not private,
+    loopback, link-local, multicast, reserved or unspecified), and not an IPv6 form of an IPv4 address."""
+    if ip.version == 6 and any(ip in network for network in _TRANSLATED):
+        return False
+    return ip.is_global and not ip.is_multicast and not ip.is_reserved
+
+
+def is_public(value: str) -> bool:
+    """Whether ``value`` is an IP address literal that is ``public_unicast``."""
+    try:
+        return public_unicast(ipaddress.ip_address(value))
+    except ValueError:
+        return False
+
+
+def endpoint_host(url: str, endpoint_id: str) -> str | None:
+    """The host (``http://ip:port``) of an endpoint URL in the one form a manifest may list: exactly
+    ``http://<ip>:<port>/e/<endpoint_id>``, the IP a ``public_unicast`` literal as the chain writes it (``public_ip``)
+    and the port in 1-65535; None for any other URL."""
+    match = _ENDPOINT_URL.match(url)
+    if match is None:
+        return None
+    try:
+        ip = ipaddress.ip_address(match[1] or match[2])
+    except ValueError:
+        return None
+    host = axon_base(str(ip), int(match[3]))
+    if not public_unicast(ip) or not 0 < int(match[3]) < 65536 or url != endpoint_url(host, endpoint_id):
+        return None
+    return host
+
+
+def accept(document: Any, *, hotkey: str, netuid: int, mechid: int, commitment: str | None,
            catalog_digests: Collection[str]) -> Manifest:
     """Validator-side acceptance of a fetched manifest document (the parsed JSON body). Raises ManifestRejected."""
     if not isinstance(document, dict) or not isinstance(document.get("manifest"), dict):
@@ -140,7 +179,13 @@ def accept(document: Any, *, hotkey: str, netuid: int, mechid: int, axon: str, c
         raise ManifestRejected("manifest is for another hotkey, netuid or mechanism")
     if manifest.catalog_digest not in catalog_digests:
         raise ManifestRejected("manifest was built for another catalog")
+    hosts = set()
     for e in manifest.endpoints:
-        if e.url != endpoint_url(axon, e.endpoint_id):
-            raise ManifestRejected(f"endpoint {e.endpoint_id} is not served at the hotkey's axon")
+        host = endpoint_host(e.url, e.endpoint_id)
+        if host is None:
+            raise ManifestRejected(f"endpoint {e.endpoint_id}: its URL is not http://<public IP>:<port>/e/"
+                                   f"{e.endpoint_id}")
+        hosts.add(host)
+    if len(hosts) > MAX_HOSTS:
+        raise ManifestRejected(f"more than {MAX_HOSTS} hosts")
     return manifest

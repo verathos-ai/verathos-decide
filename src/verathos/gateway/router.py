@@ -33,6 +33,7 @@ from typing import Protocol
 from verathos.gateway import metrics
 from verathos.gateway.logs import Throttle
 from verathos.protocol.gateway import Route, Routes
+from verathos.protocol.manifest import endpoint_host
 
 log = logging.getLogger(__name__)
 
@@ -126,10 +127,17 @@ class Router:
         self._throttled = Throttle(clock=clock)
 
     def update(self, routes: Routes) -> None:
-        """Adopt a new table; endpoints that stay keep their load and breaker."""
+        """Adopt a new table; endpoints that stay keep their load and breaker. A route is used only at a URL a
+        manifest may list (``protocol.manifest.endpoint_host``: a public address, any machine of the miner), so not
+        even a table the auditor signed can send this process's requests into a private network."""
         known = {(e.key, e.route.url): e for pool in self._pools.values() for e in pool.endpoints}
         grouped: dict[str, list[Endpoint]] = {}
         for route in routes.routes:
+            if endpoint_host(route.url, route.endpoint_id) is None:
+                if times := self._throttled(f"{route.url} refused"):
+                    log.error("route %s/%s refused (%d times since last logged): %s is not a public endpoint URL",
+                              route.hotkey, route.endpoint_id, times, route.url)
+                continue
             cap = max(1, math.ceil(route.credited_rps * self.max_latency_s * self.share))
             endpoint = known.get((f"{route.hotkey}/{route.endpoint_id}", route.url))
             if endpoint is None:

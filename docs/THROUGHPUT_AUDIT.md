@@ -72,7 +72,9 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
 ## A test
 
 1. **Targets.** At the selection block the auditor takes every open endpoint listed in an accepted manifest with a
-   declared capacity and a model that is not retired. Each is tested at its declared rate, but at most
+   declared capacity and a model that is not retired, that signed the auditor's identity challenge at its URL in this
+   epoch or the last (`DISCOVERY.md`): test traffic goes only to machines that hold the hotkey, wherever the manifest
+   points. Each is tested at its declared rate, but at most
    `rate_growth` (2) times what it delivered in its last counted test, or `retest_growth` (1.1) times while one of
    its last `regrow_after` (3) counted tests fell short (at least `min_test_share` (1/8) of the model's
    `first_test_rps`), and at most `first_test_rps` before its first test of the model it serves now. A test probes far beyond what an endpoint has
@@ -234,6 +236,7 @@ How credits and wrong answers enter the score is in `SCORING.md`.
 | Flooding a competitor's endpoint with validator traffic during its test | one request at once per validator and endpoint, no larger than the model's standard requests, and behind the test's requests while they arrive |
 | Flooding it with gateway traffic during its test, or a miner refusing users then | what an endpoint answers the gateway inside the test's window counts as delivered, and displaces the test's requests one for one; refused users count as asked |
 | Caching or sharing answers | every request is unique |
+| Listing someone else's server as an endpoint, to aim the test's traffic at it | only endpoints that signed the auditor's challenge at their URL are tested; that server gets one challenge per epoch |
 
 What a test proves is that an endpoint delivers its declared rate on about 60 s notice: test traffic is
 recognisable by its session, so hardware used for other work between tests could be freed for the test.

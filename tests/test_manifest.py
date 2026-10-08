@@ -12,8 +12,11 @@ from verathos.protocol.manifest import (
     axon_base,
     commitment_value,
     committed_digest,
+    endpoint_host,
     endpoint_url,
 )
+
+pytestmark = pytest.mark.usefixtures("lab_network")
 
 CATALOG = "0" * 64
 AXON = axon_base("203.0.113.5", 8091)
@@ -35,8 +38,8 @@ def make(keypair: Keypair, **overrides) -> Manifest:
 
 
 def check(document, keypair: Keypair, *, commitment: str, hotkey: str | None = None, mechid: int = 1,
-          axon: str = AXON, catalogs=(CATALOG,)) -> Manifest:
-    return accept(document, hotkey=hotkey or keypair.ss58_address, netuid=405, mechid=mechid, axon=axon,
+          catalogs=(CATALOG,)) -> Manifest:
+    return accept(document, hotkey=hotkey or keypair.ss58_address, netuid=405, mechid=mechid,
                   commitment=commitment, catalog_digests=catalogs)
 
 
@@ -97,12 +100,43 @@ def test_rejects_other_hotkey_and_mechanism(keypair: Keypair) -> None:
         SignedManifest.create(make(keypair), other)
 
 
-def test_endpoints_must_be_on_the_hotkeys_axon(keypair: Keypair) -> None:
-    """Endpoint URLs feed the audit's grouping, so a manifest cannot claim hosts other than its own axon."""
-    signed = SignedManifest.create(make(keypair), keypair)
-    with pytest.raises(ManifestRejected, match="axon"):
-        check(signed.model_dump(mode="json"), keypair, commitment=commitment_value(signed.manifest.digest()),
-              axon=axon_base("198.51.100.9", 8091))
+def test_endpoints_may_be_on_several_machines(keypair: Keypair) -> None:
+    """One hotkey, GPUs on several machines: each endpoint is listed at its own machine's address."""
+    worker = axon_base("198.51.100.9", 20017)
+    endpoints = [*make(keypair).endpoints,
+                 Endpoint(endpoint_id="w1-gpu0", url=endpoint_url(worker, "w1-gpu0"), model_id="kev-4b",
+                          capacity_rps=30.0)]
+    signed = SignedManifest.create(make(keypair, endpoints=endpoints), keypair)
+    accepted = check(signed.model_dump(mode="json"), keypair, commitment=commitment_value(signed.manifest.digest()))
+    assert {endpoint_host(e.url, e.endpoint_id) for e in accepted.endpoints} == {AXON, worker}
+
+
+@pytest.mark.parametrize("url", [
+    "https://203.0.113.5:8091/e/gpu0", "http://203.0.113.5/e/gpu0", "http://203.0.113.5:8091/e/gpu0/",
+    "http://203.0.113.5:8091/e/gpu1", "http://203.0.113.5:8091/e/gpu0?x=1", "http://u@203.0.113.5:8091/e/gpu0",
+    "http://miner.example:8091/e/gpu0", "http://172.16.0.1:8091/e/gpu0", "http://203.0.113.5:0/e/gpu0",
+    "http://203.0.113.5:65536/e/gpu0", "http://203.0.113.5:08091/e/gpu0", "http://[2001:DB8::1]:8091/e/gpu0",
+    "http://[2001:db8:0::1]:8091/e/gpu0", "http://203.0.113.5:8091/x/e/gpu0"])
+def test_a_manifest_with_any_other_endpoint_url_is_rejected(keypair: Keypair, url: str) -> None:
+    """Exactly http://<public IP>:<port>/e/<endpoint_id>, as the chain writes the address; nothing else."""
+    endpoints = [Endpoint(endpoint_id="gpu0", url=url, model_id="kev-4b", capacity_rps=1.0)]
+    signed = SignedManifest.create(make(keypair, endpoints=endpoints), keypair)
+    with pytest.raises(ManifestRejected, match="URL"):
+        check(signed.model_dump(mode="json"), keypair, commitment=commitment_value(signed.manifest.digest()))
+
+
+def test_the_hosts_of_a_manifest_are_bounded(keypair: Keypair, monkeypatch) -> None:
+    from verathos.protocol import manifest
+
+    endpoints = [Endpoint(endpoint_id=f"gpu{i}", url=endpoint_url(axon_base(f"198.51.100.{i}", 80), f"gpu{i}"),
+                          model_id="kev-4b", capacity_rps=1.0) for i in range(1, 4)]
+    signed = SignedManifest.create(make(keypair, endpoints=endpoints), keypair)
+    commitment = commitment_value(signed.manifest.digest())
+    monkeypatch.setattr(manifest, "MAX_HOSTS", 3)
+    check(signed.model_dump(mode="json"), keypair, commitment=commitment)
+    monkeypatch.setattr(manifest, "MAX_HOSTS", 2)
+    with pytest.raises(ManifestRejected, match="more than 2 hosts"):
+        check(signed.model_dump(mode="json"), keypair, commitment=commitment)
 
 
 @pytest.mark.parametrize("capacity", [-1.0, 100_001.0, float("nan")])

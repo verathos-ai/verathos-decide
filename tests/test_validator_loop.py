@@ -12,6 +12,7 @@ import json
 import httpx
 import pytest
 from bittensor_wallet import Keypair
+from fastapi import Request
 
 from tests.mock_engine import MockEngine
 from verathos import catalog
@@ -23,6 +24,8 @@ from verathos.validator.canaries import assignment, canary_pool
 from verathos.validator.compare import Tolerance, Verdict
 from verathos.validator.discovery import Neuron, discover
 from verathos.validator.scoring import ScoreState, epoch_scores, record_window, update, weights
+
+pytestmark = pytest.mark.usefixtures("lab_network")
 
 
 class HostRouter(httpx.AsyncBaseTransport):
@@ -147,9 +150,10 @@ def test_epoch_scores_honest_and_zeroes_cheater() -> None:
     assert state.probation[f"{cheat_kp.ss58_address}/gpu0"] == 4
 
 
-def test_a_bound_canary_receipt_proves_control_and_a_canary_counts_only_within_the_request_timeout() -> None:
-    """A lost identity challenge does not zero an endpoint whose canary receipts bind it to its hotkey; a miner
-    holding canaries cannot stretch the epoch: one unanswered within request_timeout_s counts as unanswered."""
+def test_a_lost_challenge_at_the_axon_is_retried_and_a_canary_counts_only_within_the_request_timeout() -> None:
+    """At the host the hotkey's manifest was just fetched from, a lost identity challenge is tried again before each
+    canary; a miner holding canaries cannot stretch the epoch: one unanswered within request_timeout_s counts as
+    unanswered."""
 
     class Slow(MockEngine):
         async def answer(self, request):
@@ -164,17 +168,18 @@ def test_a_bound_canary_receipt_proves_control_and_a_canary_counts_only_within_t
         apps[host], commit = miner(host, keys[name], validator, engine)
         neurons.append(Neuron(uid, keys[name].ss58_address, host, 80, commit))
 
-    class IdentityLost(httpx.AsyncBaseTransport):
+    class FirstChallengeLost(httpx.AsyncBaseTransport):
         def __init__(self) -> None:
-            self.inner = HostRouter(apps)
+            self.inner, self.lost = HostRouter(apps), set()
 
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            if request.url.path.endswith("/v1/identity"):
+            if request.url.path.endswith("/v1/identity") and request.url.host not in self.lost:
+                self.lost.add(request.url.host)
                 return httpx.Response(504)
             return await self.inner.handle_async_request(request)
 
     async def run():
-        async with httpx.AsyncClient(transport=IdentityLost()) as client:
+        async with httpx.AsyncClient(transport=FirstChallengeLost()) as client:
             endpoints = [e for m in await discover(neurons, 405, 1, client, {catalog.load().digest()})
                          for e in m.endpoints()]
             return await audit_epoch(endpoints, epoch=1, secret=b"k" * 32, keypair=validator,
@@ -185,8 +190,81 @@ def test_a_bound_canary_receipt_proves_control_and_a_canary_counts_only_within_t
     results = asyncio.run(run())
     lost, slow = (results[f"{keys[n].ss58_address}/gpu0"] for n in ("lost", "slow"))
     assert lost.identity_ok and lost.answered == lost.sent == 2
-    assert not slow.identity_ok and (slow.sent, slow.answered) == (2, 0)
+    assert slow.identity_ok and (slow.sent, slow.answered) == (2, 0)
     assert slow.errors == ["request failed: TimeoutError"] * 2
+
+
+class Counting(httpx.AsyncBaseTransport):
+    """Routes like HostRouter and counts the requests per host and kind (the last path segment)."""
+
+    def __init__(self, apps: dict[str, object]) -> None:
+        self.inner, self.seen = HostRouter(apps), {}
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        kind = (request.url.host, request.url.path.rsplit("/", 1)[-1])
+        self.seen[kind] = self.seen.get(kind, 0) + 1
+        return await self.inner.handle_async_request(request)
+
+
+def multi_host_miner(hotkey: Keypair, validator: Keypair, hosts: dict[str, list[str]], listed: dict[str, str]):
+    """A hotkey's miner services: ``hosts`` maps each host it runs to the endpoints served there, ``listed`` maps
+    every endpoint its manifest lists to the host named in it (which may be someone else's)."""
+    digest = catalog.load().digest()
+    kev = catalog.load().get("kev-4b")
+    signed = SignedManifest.create(Manifest(
+        netuid=405, mechid=1, hotkey=hotkey.ss58_address, catalog_digest=digest,
+        endpoints=[Endpoint(endpoint_id=e, url=f"http://{host}:80/e/{e}", model_id="kev-4b", capacity_rps=40.0)
+                   for e, host in listed.items()]), hotkey)
+    apps = {}
+    for host, served in hosts.items():
+        config = MinerConfig.model_validate({
+            "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": 80,
+            "endpoints": [{"endpoint_id": e, "model_id": "kev-4b", "engine_url": "http://unused"} for e in served]})
+        apps[host] = create_app(config=config, keypair=hotkey, manifest=lambda: signed,
+                                engines={e: MockEngine("kev-4b") for e in served},
+                                authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set(),
+                                serving=lambda served=served: served,
+                                max_caller_request=lambda m: caller_request_bytes(m, kev.workload))
+    return apps, commitment_value(signed.manifest.digest())
+
+
+def test_endpoints_on_several_machines_are_checked_where_they_are_and_another_server_gets_one_challenge() -> None:
+    """One hotkey, endpoints on its axon and on a worker machine, each reached at its own URL; two more of its
+    endpoints name a server that is not the hotkey's (another miner's): that server gets one identity challenge per
+    epoch from the validator, however often the validator looks, and no canary."""
+    from verathos.validator.discovery import Identities
+
+    validator, hotkey, other = kp(), kp(), kp()
+    axon, worker, victim = "10.0.3.1", "10.0.3.2", "10.0.3.3"
+    apps, commit = multi_host_miner(hotkey, validator, {axon: ["gpu0"], worker: ["w-gpu0", "w-gpu1"]},
+                                    {"gpu0": axon, "w-gpu0": worker, "w-gpu1": worker, "v0": victim, "v1": victim})
+    apps[victim], _ = miner(victim, other, validator, MockEngine("kev-4b"))
+    transport, identities = Counting(apps), Identities()
+
+    async def epoch(n: int):
+        async with httpx.AsyncClient(transport=transport) as client:
+            (found,) = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commit)], 405, 1, client,
+                                      {catalog.load().digest()})
+            return found, await audit_epoch(found.endpoints(), epoch=n, secret=b"k" * 32, keypair=validator,
+                                            references={"kev-4b": MockEngine("kev-4b")},
+                                            tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client,
+                                            netuid=405, mechid=1, pool_size=4, per_endpoint=3,
+                                            identities=identities)
+
+    found, results = asyncio.run(epoch(7))
+    assert {e.host for e in found.endpoints()} == {f"http://{h}:80" for h in (axon, worker, victim)}
+    by_id = {r.endpoint.endpoint.endpoint_id: r for r in results.values()}
+    for e in ("gpu0", "w-gpu0", "w-gpu1"):
+        assert by_id[e].identity_ok and by_id[e].answered == by_id[e].sent == 3
+    assert transport.seen[worker, "systemone"] == 6  # the worker's endpoints were sent their canaries directly
+    for e in ("v0", "v1"):
+        assert not by_id[e].identity_ok and by_id[e].sent == 0 and by_id[e].errors == ["identity not proven at its URL"]
+    assert transport.seen[victim, "identity"] == 1 and (victim, "systemone") not in transport.seen
+
+    asyncio.run(epoch(7))  # the same epoch again (the auditor's refresh shares the record)
+    assert transport.seen[victim, "identity"] == 1 and transport.seen[worker, "identity"] == 2
+    asyncio.run(epoch(8))
+    assert transport.seen[victim, "identity"] == 2 and (victim, "systemone") not in transport.seen
 
 
 def test_a_validator_notices_when_the_subnet_owner_hotkey_moves() -> None:
@@ -467,38 +545,57 @@ def test_a_restarted_validator_does_not_score_the_same_epoch_twice(tmp_path) -> 
     assert ScoreState.load(tmp_path / "scores.json").last_epoch == 41
 
 
+def answers_challenges(app, keypair: Keypair, endpoint_id: str = "gpu0") -> None:
+    """Give ``app`` an identity route that signs challenges with ``keypair``, as a miner holding the hotkey does."""
+    from verathos.miner.app import IDENTITY_DOMAIN, identity_payload
+    from verathos.protocol import signing
+    from verathos.protocol.requests import HDR_HOTKEY
+
+    @app.post(f"/e/{endpoint_id}/v1/identity")
+    async def identity(request: Request):
+        payload = identity_payload(endpoint_id, (await request.json())["challenge"], request.headers[HDR_HOTKEY])
+        return {"signature": signing.sign(keypair, IDENTITY_DOMAIN, payload)}
+
+
 def test_hostile_replies_fail_the_endpoint_without_aborting_the_epoch() -> None:
-    """Malformed identity replies, NaN probabilities and junk receipts are recorded against the endpoint."""
+    """A malformed identity reply costs the endpoint its canaries; NaN probabilities and junk receipts from an
+    endpoint that proved control are recorded against it."""
     from fastapi import FastAPI
     from fastapi.responses import PlainTextResponse
 
     from verathos.validator.discovery import DiscoveredEndpoint
 
     validator, hostile_kp = kp(), kp()
-    app = FastAPI()
+    apps = {"10.0.0.9": FastAPI(), "10.0.0.10": FastAPI()}
+    answers_challenges(apps["10.0.0.9"], hostile_kp)
 
-    @app.post("/e/gpu0/v1/identity")
+    @apps["10.0.0.10"].post("/e/gpu0/v1/identity")
     async def identity():
         return PlainTextResponse('{"signature": 5}', media_type="application/json")
 
-    @app.post("/e/gpu0/v1/systemone")
-    async def systemone():
-        return PlainTextResponse('{"answers": {"q": {"noul": NaN}}, "receipt": []}', media_type="application/json")
+    for app in apps.values():
+        @app.post("/e/gpu0/v1/systemone")
+        async def systemone():
+            return PlainTextResponse('{"answers": {"q": {"noul": NaN}}, "receipt": []}',
+                                     media_type="application/json")
 
-    ep = DiscoveredEndpoint(1, hostile_kp.ss58_address, "http://10.0.0.9:80", Endpoint(
-        endpoint_id="gpu0", url="http://10.0.0.9:80/e/gpu0", model_id="kev-4b", capacity_rps=40.0))
+    signed, unsigned = (DiscoveredEndpoint(1, hostile_kp.ss58_address, f"http://{host}:80", Endpoint(
+        endpoint_id="gpu0", url=f"http://{host}:80/e/gpu0", model_id="kev-4b", capacity_rps=40.0))
+        for host in apps)
 
-    async def run():
-        async with httpx.AsyncClient(transport=HostRouter({"10.0.0.9": app})) as client:
-            return await audit_epoch([ep], epoch=1, secret=b"k" * 32, keypair=validator,
-                                     references={"kev-4b": MockEngine("kev-4b")},
-                                     tolerances={"kev-4b": Tolerance()}, client=client, netuid=405, mechid=1,
-                                     pool_size=4, per_endpoint=3)
+    async def run(ep):
+        async with httpx.AsyncClient(transport=HostRouter(apps)) as client:
+            return (await audit_epoch([ep], epoch=1, secret=b"k" * 32, keypair=validator,
+                                      references={"kev-4b": MockEngine("kev-4b")},
+                                      tolerances={"kev-4b": Tolerance()}, client=client, netuid=405, mechid=1,
+                                      pool_size=4, per_endpoint=3))[ep.key]
 
-    result = asyncio.run(run())[ep.key]
-    assert not result.identity_ok
+    result = asyncio.run(run(signed))
+    assert result.identity_ok
     assert result.sent == 3 and len(result.tally.hard_failures) == 3
     assert result.tally.verdict() is Verdict.FAIL_HARD
+    result = asyncio.run(run(unsigned))
+    assert not result.identity_ok and result.sent == 0 and not result.tally.hard_failures
 
 
 def test_non_finite_or_out_of_range_probabilities_are_malformed() -> None:
@@ -554,6 +651,7 @@ def test_huge_numbers_and_deep_json_are_malformed_not_fatal() -> None:
 
     validator, hostile_kp = kp(), kp()
     app = FastAPI()
+    answers_challenges(app, hostile_kp)
 
     @app.get("/v1/manifest")
     async def manifest():

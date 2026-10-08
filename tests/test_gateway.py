@@ -39,6 +39,8 @@ from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest
 from verathos.protocol.receipts import SignedReceipt
 from verathos.throughput.auditor import Checks, Slot
 
+pytestmark = pytest.mark.usefixtures("lab_network")
+
 
 class Clock:
     def __init__(self) -> None:
@@ -469,7 +471,7 @@ def test_the_router_spreads_by_capacity_and_respects_caps_and_breakers() -> None
     router = Router(share=1.0, max_latency_s=2.0, rng=random.Random(3), clock=clock)
     big, small = kp(), kp()
     router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=1, catalog_digest="0" * 64,
-                         routes=[route(big, "b", 30.0), route(small, "s", 10.0)]))
+                         routes=[route(big, "10.0.0.1", 30.0), route(small, "10.0.0.2", 10.0)]))
     counts = {big.ss58_address: 0, small.ss58_address: 0}
     for _ in range(2000):
         e = router.pick("kev-4b")
@@ -502,7 +504,7 @@ def test_the_router_spreads_by_capacity_and_respects_caps_and_breakers() -> None
     assert not b.breaker.is_open
 
     router.update(Routes(netuid=405, auditor="a", epoch=4, issued_ms=2, catalog_digest="0" * 64,
-                         routes=[route(big, "b", 30.0)]))
+                         routes=[route(big, "10.0.0.1", 30.0)]))
     assert router._pools["kev-4b"].endpoints == [b]  # kept with its state
 
 
@@ -510,7 +512,7 @@ def test_a_probe_that_times_out_doubles_the_open_time_once_another_miner_answers
     clock = Clock()
     router = Router(share=1.0, max_latency_s=2.0, rng=random.Random(3), clock=clock)
     router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=1, catalog_digest="0" * 64,
-                         routes=[route(kp(), "b", 30.0), route(kp(), "s", 10.0)]))
+                         routes=[route(kp(), "10.0.0.1", 30.0), route(kp(), "10.0.0.2", 10.0)]))
     (b, s) = router._pools["kev-4b"].endpoints
     for _ in range(BREAKER_FAILURES):
         router.started(b)
@@ -573,8 +575,8 @@ def test_an_endpoint_that_refuses_users_or_keeps_them_waiting_is_reported() -> N
     router = Router(share=1.0, max_latency_s=2.0, rng=random.Random(3), clock=clock, observer=observer)
     fast, slow = kp().ss58_address, kp().ss58_address
     router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=1, catalog_digest="0" * 64, routes=[
-        Route(hotkey=h, endpoint_id="gpu0", model_id="kev-4b", url=f"http://{h}/e/gpu0", credited_rps=20.0,
-              latency_ms=300.0) for h in (fast, slow)]))
+        Route(hotkey=h, endpoint_id="gpu0", model_id="kev-4b", url=f"http://10.0.0.{i}:8091/e/gpu0",
+              credited_rps=20.0, latency_ms=300.0) for i, h in enumerate((fast, slow), start=1)]))
     f, s = router._pools["kev-4b"].endpoints
 
     def considered(endpoint_hotkey: str, picks: int = 200) -> tuple[int, int]:

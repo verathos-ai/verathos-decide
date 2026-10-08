@@ -24,6 +24,8 @@ from verathos.throughput.feed import GATEWAY_EVIDENCE
 from verathos.throughput.policy import AuditPolicy, ScheduledTest
 from verathos.validator.throughput import Throughput
 
+pytestmark = pytest.mark.usefixtures("lab_network")
+
 PATH = "/e/gpu0/v1/systemone"
 
 
@@ -592,7 +594,7 @@ def test_a_discovery_that_finds_no_miner_keeps_the_endpoints_known(tmp_path) -> 
     auditor.update_slots([slot])
     throughput = Throughput(netuid=405, mechid=1, policy=auditor.policy, auditor_hotkey=auditor.hotkey,
                             chain=auditor.chain, auditor=auditor)
-    throughput.update_slots([], [Neuron(1, "hk", "1.2.3.4", 8091, "commitment")])  # every fetch failed
+    throughput.update_slots([], [Neuron(1, "hk", "1.2.3.4", 8091, "commitment")], 3)  # every fetch failed
     assert auditor._slots == [slot]
 
 

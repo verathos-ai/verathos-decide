@@ -114,8 +114,8 @@ answer to a user carries only the receipt. Validators check that the miner answe
 auditor's word for the wrongness, as they take it for capacity; test evidence, whose requests are synthetic, stays
 fully checkable by every validator.
 
-Between the gateway and the miners, requests and answers travel over plain HTTP: a route's URL is the miner's axon
-(`http://ip:port/e/<id>`), as the protocol has it. So do the sampled exchanges to the auditor, unless `auditor_url`
+Between the gateway and the miners, requests and answers travel over plain HTTP: a route's URL is the machine that
+serves the endpoint (`http://ip:port/e/<id>`), as the protocol has it. So do the sampled exchanges to the auditor, unless `auditor_url`
 points elsewhere. The signatures keep anyone from altering them, not from reading them: whoever is on the path
 between the gateway and a miner, or the auditor, can read the users' requests and answers. When the gateway runs next
 to the auditor, set `auditor_url` to its loopback or private address (for example `http://127.0.0.1:8091`), so the
@@ -123,10 +123,12 @@ samples never leave the host or the private network.
 
 ## Routes
 
-`GET /v1/routes` on the owner's validator: the endpoints listed in an accepted manifest now, credited in the current
-verdicts (the previous epoch's while the current ones wait for a test to settle; qualified, not drifted), of `active`
-models, whose hotkey has no wrong answer proven there or since, and is not on probation at the owner's validator;
-with their credited capacity and test latency. While the verdicts cover no confirmed test (the auditor missed the
+`GET /v1/routes` on the owner's validator: the endpoints listed in an accepted manifest now that proved control at
+their URL (`DISCOVERY.md`), credited in the current verdicts (the previous epoch's while the current ones wait for a
+test to settle; qualified, not drifted), of `active` models, whose hotkey has no wrong answer proven there or since,
+and is not on probation at the owner's validator; with their URL (the machine serving the endpoint, which need not be
+the axon), credited capacity and test latency. The gateway uses a route only at a URL a manifest may list, on a
+public address; any other is logged and left out, so not even a signed table can send it into a private network. While the verdicts cover no confirmed test (the auditor missed the
 tests or they were void), the credits come from the latest confirmed test the auditor holds, whatever its age. The
 table is signed by the auditor hotkey. The gateway polls it every 30 s, uses only tables signed by the subnet owner's
 hotkey, newer than its own and issued at most 5 minutes ahead of its clock, and keeps the last good one on disk. A new

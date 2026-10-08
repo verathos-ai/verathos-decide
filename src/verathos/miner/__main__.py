@@ -32,7 +32,7 @@ from verathos.miner.config import EndpointConfig, MinerConfig
 from verathos.miner.engine import HttpEngine
 from verathos.miner.status import StatusWatcher
 from verathos.protocol.http import raise_open_file_limit
-from verathos.protocol.manifest import SignedManifest, axon_base
+from verathos.protocol.manifest import SignedManifest, axon_base, is_public
 from verathos.subnet.chain import committed_catalog, current_catalog
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.measure import (
@@ -309,6 +309,9 @@ def main() -> None:
     args = parser.parse_args()
 
     config = MinerConfig.load(args.config)
+    if not args.no_publish and not is_public(config.public_host):
+        raise SystemExit(f"public_host {config.public_host} is not a public address: validators refuse endpoints "
+                         "there")
     wallet = bt.Wallet(name=config.wallet_name, hotkey=config.hotkey_name)
     subtensor = bt.Subtensor(network=config.network)
     cat = catalog.load() if args.no_publish else resolve_catalog(subtensor, config)

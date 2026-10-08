@@ -18,10 +18,12 @@ from verathos.miner.app import IDENTITY_DOMAIN, create_app, identity_payload
 from verathos.miner.config import MinerConfig
 from verathos.protocol import signing
 from verathos.protocol.api import distributions
-from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, accept, axon_base, commitment_value
+from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, accept, commitment_value
 from verathos.protocol.receipts import SignedReceipt
 from verathos.protocol.requests import sign_request
 from verathos.throughput.policy import HDR_REQUEST_ID, Session, session_headers
+
+pytestmark = pytest.mark.usefixtures("lab_network")
 
 REQUEST = {
     "model": "kev-4b",
@@ -66,7 +68,7 @@ def post(client: TestClient, caller: Keypair, miner: Keypair, path: str, payload
 def test_manifest_is_public_and_acceptable(setup) -> None:
     client, miner, *_ , manifest = setup
     assert accept(client.get("/v1/manifest").json(), hotkey=miner.ss58_address, netuid=405, mechid=1,
-                  axon=axon_base("203.0.113.5", 8091), commitment=commitment_value(manifest.manifest.digest()),
+                  commitment=commitment_value(manifest.manifest.digest()),
                   catalog_digests={manifest.manifest.catalog_digest})
 
 

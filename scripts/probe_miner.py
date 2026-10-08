@@ -24,7 +24,7 @@ from verathos import catalog
 from verathos.miner.app import IDENTITY_DOMAIN, identity_payload
 from verathos.protocol import signing
 from verathos.protocol.api import distributions
-from verathos.protocol.manifest import accept, axon_base
+from verathos.protocol.manifest import accept, axon_base, endpoint_host
 from verathos.protocol.receipts import SignedReceipt
 from verathos.protocol.requests import HDR_NONCE, sign_request
 from verathos.subnet.chain import current_catalog
@@ -89,16 +89,17 @@ def main() -> None:
     base = axon_base(axon.ip, axon.port)
     cat = current_catalog(st, args.netuid, catalog.CatalogStore(), [])
     document = json.loads(urllib.request.urlopen(base + "/v1/manifest", timeout=10).read())
-    manifest = accept(document, hotkey=hotkey, netuid=args.netuid, mechid=args.mechid, axon=base,
+    manifest = accept(document, hotkey=hotkey, netuid=args.netuid, mechid=args.mechid,
                       commitment=st.get_commitment(args.netuid, args.uid), catalog_digests={cat.digest()})
     print(f"manifest accepted: catalog {manifest.catalog_digest[:12]}, "
           f"endpoints {[e.endpoint_id for e in manifest.endpoints]}")
 
     caller = bt.Wallet(name=args.caller_wallet, hotkey=args.caller_hotkey).hotkey
     endpoint = next(e for e in manifest.endpoints if args.endpoint in (None, e.endpoint_id))
-    prefix = "/" + endpoint.url.split("/", 3)[3]
+    host, prefix = endpoint_host(endpoint.url, endpoint.endpoint_id), f"/e/{endpoint.endpoint_id}"
+    print(f"endpoint {endpoint.endpoint_id} at {host}" + (" (the axon)" if host == base else ""))
     challenge = secrets.token_hex(16)
-    ident = post(base, prefix + "/v1/identity", {"challenge": challenge}, caller, hotkey)
+    ident = post(host, prefix + "/v1/identity", {"challenge": challenge}, caller, hotkey)
     ok = signing.verify(
         hotkey, IDENTITY_DOMAIN,
         identity_payload(endpoint.endpoint_id, challenge, caller.ss58_address),
@@ -117,7 +118,7 @@ def main() -> None:
         body = json.dumps(request).encode()
         path = prefix + "/v1/systemone"
         headers = {"Content-Type": "application/json", **sign_request(caller, "POST", path, body, hotkey)}
-        response = json.loads(urllib.request.urlopen(urllib.request.Request(base + path, body, headers),
+        response = json.loads(urllib.request.urlopen(urllib.request.Request(host + path, body, headers),
                                                      timeout=120).read())
         latencies.append((time.time() - t0) * 1000)
         receipt = SignedReceipt.model_validate(response["receipt"])

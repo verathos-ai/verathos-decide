@@ -1,7 +1,8 @@
-"""Find miners and their endpoints from chain state.
+"""Find miners and their endpoints from chain state, and check that each endpoint is the hotkey's.
 
 Input is a chain snapshot (hotkey, axon and commitment per UID); output is the accepted manifests. Only hotkeys
-with a manifest commitment are contacted.
+with a manifest commitment and an axon on a public address are contacted. A manifest may list endpoints on any public
+host, so an endpoint gets traffic only once it proved control at its URL (``Identities``).
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import threading
 from collections.abc import Collection
 from dataclasses import dataclass
 
@@ -18,7 +20,15 @@ from bittensor_wallet import Keypair
 from verathos.miner.app import IDENTITY_DOMAIN, identity_payload
 from verathos.protocol import signing
 from verathos.protocol.http import request_json
-from verathos.protocol.manifest import Endpoint, Manifest, accept, axon_base, committed_digest
+from verathos.protocol.manifest import (
+    Endpoint,
+    Manifest,
+    accept,
+    axon_base,
+    committed_digest,
+    endpoint_host,
+    is_public,
+)
 from verathos.protocol.requests import sign_request
 
 log = logging.getLogger(__name__)
@@ -26,6 +36,8 @@ FETCH_TIMEOUT_S = 10.0
 FETCH_CONCURRENCY = 32
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_IDENTITY_BYTES = 4096
+IDENTITY_CONCURRENCY = 256
+CLAIM_POLL_S = 0.2
 
 
 @dataclass(frozen=True)
@@ -41,7 +53,7 @@ class Neuron:
 class DiscoveredEndpoint:
     uid: int
     hotkey: str
-    base_url: str
+    axon: str | None  # the axon its manifest was just fetched from (``axon_base``)
     endpoint: Endpoint
 
     @property
@@ -52,16 +64,26 @@ class DiscoveredEndpoint:
     def key(self) -> str:
         return f"{self.hotkey}/{self.endpoint.endpoint_id}"
 
+    @property
+    def url(self) -> str:
+        """Where the endpoint is reached; its path is ``path_prefix``."""
+        return self.endpoint.url
+
+    @property
+    def host(self) -> str:
+        """The miner service that serves it (``http://ip:port``)."""
+        return endpoint_host(self.endpoint.url, self.endpoint.endpoint_id) or self.endpoint.url
+
 
 @dataclass(frozen=True)
 class DiscoveredMiner:
     uid: int
     hotkey: str
-    base_url: str
+    axon: str | None
     manifest: Manifest
 
     def endpoints(self) -> list[DiscoveredEndpoint]:
-        return [DiscoveredEndpoint(self.uid, self.hotkey, self.base_url, e) for e in self.manifest.endpoints]
+        return [DiscoveredEndpoint(self.uid, self.hotkey, self.axon, e) for e in self.manifest.endpoints]
 
 
 async def _fetch_manifest(n: Neuron, netuid: int, mechid: int, client: httpx.AsyncClient,
@@ -70,8 +92,8 @@ async def _fetch_manifest(n: Neuron, netuid: int, mechid: int, client: httpx.Asy
     try:
         document = await request_json(client, "GET", base + "/v1/manifest", limit=MAX_MANIFEST_BYTES,
                                       timeout=FETCH_TIMEOUT_S)
-        manifest = accept(document, hotkey=n.hotkey, netuid=netuid, mechid=mechid, axon=base,
-                          commitment=n.commitment, catalog_digests=catalog_digests)
+        manifest = accept(document, hotkey=n.hotkey, netuid=netuid, mechid=mechid, commitment=n.commitment,
+                          catalog_digests=catalog_digests)
     except Exception as e:  # whatever a neuron serves, it only costs that neuron its discovery
         log.info("uid %d manifest not accepted: %s", n.uid, str(e) or type(e).__name__)
         return None
@@ -80,13 +102,13 @@ async def _fetch_manifest(n: Neuron, netuid: int, mechid: int, client: httpx.Asy
 
 async def discover(neurons: list[Neuron], netuid: int, mechid: int, client: httpx.AsyncClient,
                    catalog_digests: Collection[str]) -> list[DiscoveredMiner]:
-    """Fetch and accept the manifest of every neuron that has a manifest commitment and a served axon.
+    """Fetch and accept the manifest of every neuron that has a manifest commitment and an axon on a public address.
 
     ``catalog_digests`` are the catalogs a manifest may be built for: the current one, plus the previous one while
     miners re-publish after a change.
     """
-    candidates = [n for n in neurons
-                  if committed_digest(n.commitment) is not None and n.axon_ip not in ("", "0.0.0.0") and n.axon_port]
+    candidates = [n for n in neurons if committed_digest(n.commitment) is not None and is_public(n.axon_ip)
+                  and 0 < n.axon_port < 65536]
     limit = asyncio.Semaphore(FETCH_CONCURRENCY)
 
     async def fetch(n: Neuron) -> DiscoveredMiner | None:
@@ -98,16 +120,95 @@ async def discover(neurons: list[Neuron], netuid: int, mechid: int, client: http
 
 
 async def verify_identity(endpoint: DiscoveredEndpoint, keypair: Keypair, client: httpx.AsyncClient) -> bool:
-    """The endpoint must sign a fresh challenge with the hotkey that lists it."""
+    """The endpoint must sign a fresh challenge with the hotkey that lists it, at its URL."""
     challenge = secrets.token_hex(16)
-    path = endpoint.path_prefix + "/v1/identity"
     body = (f'{{"challenge":"{challenge}"}}').encode()
-    headers = {"Content-Type": "application/json", **sign_request(keypair, "POST", path, body, endpoint.hotkey)}
+    headers = {"Content-Type": "application/json",
+               **sign_request(keypair, "POST", endpoint.path_prefix + "/v1/identity", body, endpoint.hotkey)}
     try:
-        reply = await request_json(client, "POST", endpoint.base_url + path, content=body, headers=headers,
+        reply = await request_json(client, "POST", endpoint.url + "/v1/identity", content=body, headers=headers,
                                    limit=MAX_IDENTITY_BYTES, timeout=FETCH_TIMEOUT_S)
         signature = reply["signature"] if isinstance(reply, dict) else None
     except Exception:
         return False
     return signing.verify(endpoint.hotkey, IDENTITY_DOMAIN,
                           identity_payload(endpoint.endpoint.endpoint_id, challenge, keypair.ss58_address), signature)
+
+
+class Identities:
+    """Which endpoints proved control at their URL, by epoch: everything in a validator that sends miners traffic
+    asks here first.
+
+    A hotkey's own hosts are its axon, while its manifest was just fetched from there, and every host where one of its
+    endpoints passed this epoch or the last: there its endpoints are challenged at once, and again after a failure.
+    At any other host they are challenged one after another until one passes; once one fails, that host gets no
+    further challenge for the hotkey in the epoch. A manifest naming someone else's server so costs that server one
+    challenge per epoch from each validator, and no other traffic."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._passed: dict[tuple[str, str], int] = {}  # (endpoint key, url) -> latest epoch it passed
+        self._hosts: dict[tuple[str, str], int] = {}  # (hotkey, host) -> latest epoch an endpoint passed there
+        self._failed: dict[tuple[str, str], int] = {}  # (hotkey, host) -> latest epoch a challenge there failed
+        self._busy: set[tuple[str, str]] = set()  # (hotkey, host) not the hotkey's, with a challenge under way
+
+    def verified(self, key: str, url: str, since_epoch: int) -> bool:
+        """Whether endpoint ``key`` passed at ``url`` in ``since_epoch`` or later."""
+        with self._lock:
+            return self._passed.get((key, url), -1) >= since_epoch
+
+    def own(self, ep: DiscoveredEndpoint, epoch: int) -> bool:
+        """Whether the endpoint's host is one of its hotkey's own (see the class)."""
+        with self._lock:
+            return ep.host == ep.axon or self._hosts.get((ep.hotkey, ep.host), -1) >= epoch - 1
+
+    async def verify(self, endpoints: list[DiscoveredEndpoint], epoch: int, keypair: Keypair,
+                     client: httpx.AsyncClient, *, concurrency: int = IDENTITY_CONCURRENCY) -> None:
+        """Challenge the endpoints that have not passed at their URL in ``epoch`` (see the class)."""
+        slots = asyncio.Semaphore(concurrency)
+        hosts: dict[tuple[str, str], list[DiscoveredEndpoint]] = {}
+        for ep in endpoints:
+            hosts.setdefault((ep.hotkey, ep.host), []).append(ep)
+
+        async def challenge(ep: DiscoveredEndpoint) -> bool:
+            async with slots:
+                ok = await verify_identity(ep, keypair, client)
+            if ok:
+                with self._lock:
+                    self._passed[ep.key, ep.url] = self._hosts[ep.hotkey, ep.host] = epoch
+            return ok
+
+        async def at_host(key: tuple[str, str], group: list[DiscoveredEndpoint]) -> None:
+            if not self.own(group[0], epoch):
+                if not await self._claim(key, epoch):
+                    return
+                try:
+                    for ep in group:
+                        if self.own(ep, epoch):
+                            break
+                        if not self.verified(ep.key, ep.url, epoch) and not await challenge(ep):
+                            with self._lock:
+                                self._failed[key] = epoch
+                            return
+                finally:
+                    with self._lock:
+                        self._busy.discard(key)
+            await asyncio.gather(*(challenge(ep) for ep in group if not self.verified(ep.key, ep.url, epoch)))
+
+        await asyncio.gather(*(at_host(key, group) for key, group in hosts.items()))
+        with self._lock:
+            for table in (self._passed, self._hosts, self._failed):
+                for stale in [k for k, e in table.items() if e < epoch - 1]:
+                    del table[stale]
+
+    async def _claim(self, key: tuple[str, str], epoch: int) -> bool:
+        """Take the host's challenges, after any under way elsewhere (the auditor also discovers in a thread of its
+        own); False if a challenge there failed in ``epoch``."""
+        while True:
+            with self._lock:
+                if self._failed.get(key, -1) >= epoch:
+                    return False
+                if key not in self._busy:
+                    self._busy.add(key)
+                    return True
+            await asyncio.sleep(CLAIM_POLL_S)
