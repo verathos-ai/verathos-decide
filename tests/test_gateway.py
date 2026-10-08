@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import errno
 import json
 import random
 
@@ -224,6 +225,34 @@ def test_a_model_whose_every_miner_fails_is_unavailable_not_busy(tmp_path) -> No
     down = s.many(1)[0]  # every breaker open: none is answering, which is not a capacity limit
     assert down.json()["error"] == {"type": "unavailable", "message": "no miner of kev-4b answers right now"}
     assert down.headers["Retry-After"] == "30"
+
+
+class OutOfFiles(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        try:  # as anyio reports it: every address tried failed, here for want of a descriptor
+            raise OSError("All connection attempts failed") from OSError(errno.EMFILE, "Too many open files")
+        except OSError as exc:
+            raise httpx.ConnectError("All connection attempts failed", request=request) from exc
+
+
+def test_connections_this_host_cannot_make_count_against_no_miner(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    s.client._transport._t["10.0.0.1"] = OutOfFiles()
+    for _ in range(BREAKER_FAILURES + 1):
+        r = asyncio.run(s.post())
+        assert r.status_code == 503 and r.json()["error"]["type"] == "unavailable"
+    (endpoint,) = s.router._pools["kev-4b"].endpoints
+    assert endpoint.breaker.failures == 0 and not any(n.refused for n in s.served._counts.values())
+
+
+def test_a_failed_connection_is_the_gateways_only_for_local_errors() -> None:
+    from verathos.gateway.upstream import local_fault
+
+    refused = httpx.ConnectError("refused")
+    refused.__cause__ = OSError(errno.ECONNREFUSED, "Connection refused")
+    grouped = OSError("All connection attempts failed")
+    grouped.__cause__ = ExceptionGroup("multiple connection attempts failed", [OSError(errno.ENETUNREACH, "x")])
+    assert not local_fault(refused) and local_fault(grouped) and local_fault(httpx.PoolTimeout("pool full"))
 
 
 def test_the_status_says_per_model_what_users_get(tmp_path) -> None:

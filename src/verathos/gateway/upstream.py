@@ -8,12 +8,14 @@ malformed answers are proof on their own.
 A failed attempt says whose fault it is: ``miner`` failures (no connection, an invalid or unsigned response, a refusal
 of this gateway) count against the miner at once; ``unclear`` ones (a timeout, an error status) could be caused by
 the request itself, and count only if another miner then answers the same request; a ``busy`` miner and a request
-the miner ``rejected`` (4xx) count against nobody.
+the miner ``rejected`` (4xx) count against nobody, and neither does a connection the ``gateway`` itself could not
+make (out of descriptors, buffers or connections, no route out: ``LOCAL_ERRNOS``).
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -25,6 +27,25 @@ from verathos.protocol.api import MAX_RESPONSE_BYTES, SystemOneRequest, well_for
 from verathos.protocol.gateway import Route
 from verathos.protocol.receipts import parse_response, signed_exchange
 from verathos.protocol.requests import HDR_NONCE, sign_request
+
+LOCAL_ERRNOS = {errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM, errno.ENETUNREACH, errno.EADDRNOTAVAIL}
+
+
+def local_fault(exc: BaseException) -> bool:
+    """Whether a failed connection is this host's own fault, not the miner's: the pool of connections to miners is
+    full, or an OSError behind the exception (its causes and grouped errors) is one of ``LOCAL_ERRNOS``."""
+    if isinstance(exc, httpx.PoolTimeout):
+        return True
+    stack, seen = [exc], set()
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if isinstance(e, OSError) and e.errno in LOCAL_ERRNOS:
+            return True
+        stack.extend([e.__cause__, e.__context__, *getattr(e, "exceptions", ())])
+    return False
 
 
 @dataclass(frozen=True)
@@ -39,8 +60,8 @@ class Exchange:
 
 
 class UpstreamFailure(Exception):
-    """An attempt at a miner without a usable answer; ``blame`` is miner, unclear, busy or rejected (see the module
-    docstring); ``exchange`` holds signed malformed answers, proof against the miner."""
+    """An attempt at a miner without a usable answer; ``blame`` is miner, unclear, busy, rejected or gateway (see the
+    module docstring); ``exchange`` holds signed malformed answers, proof against the miner."""
 
     def __init__(self, kind: str, blame: str, detail: str = "", *, exchange: Exchange | None = None) -> None:
         super().__init__(f"{kind}: {detail}" if detail else kind)
@@ -80,6 +101,8 @@ class Upstream:
         except TimeoutError:
             raise UpstreamFailure("timeout", "unclear") from None
         except httpx.HTTPError as exc:
+            if local_fault(exc):
+                raise UpstreamFailure("local", "gateway", type(exc).__name__) from None
             raise UpstreamFailure("connect", "miner", type(exc).__name__) from None
         text = raw.decode("utf-8", errors="replace")
         response = parse_response(text)

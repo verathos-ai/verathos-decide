@@ -14,7 +14,6 @@ import asyncio
 import dataclasses
 import logging
 import os
-import resource
 import sys
 import threading
 import time
@@ -32,6 +31,7 @@ from verathos.miner.chain import PermitAuthorizer, build_manifest, publish
 from verathos.miner.config import EndpointConfig, MinerConfig
 from verathos.miner.engine import HttpEngine
 from verathos.miner.status import StatusWatcher
+from verathos.protocol.http import raise_open_file_limit
 from verathos.protocol.manifest import SignedManifest, axon_base
 from verathos.subnet.chain import committed_catalog, current_catalog
 from verathos.throughput.chain import SubtensorChainView
@@ -84,14 +84,6 @@ async def engine_fingerprint(e: EndpointConfig, cat: catalog.Catalog) -> str:
               "max_latency_s": cat.audit_policy().max_latency_s, "hf_revision": model.hf_revision,
               "engine_revision": model.engine.revision}
     return fingerprint(config, info, model.workload)
-
-
-def raise_open_file_limit() -> int:
-    """Raise the soft open-file limit to the hard one (every connection holds a descriptor); returns it."""
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    if soft < hard:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
-    return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
 
 
 class Publisher:

@@ -46,9 +46,12 @@ from verathos.gateway.served import ServedCounter
 from verathos.gateway.upstream import Upstream
 from verathos.gateway.usage import UsageMeter
 from verathos.protocol.gateway import Routes
+from verathos.protocol.http import raise_open_file_limit
 from verathos.throughput.chain import SubtensorChainView
 
 log = logging.getLogger("verathos.gateway")
+RESERVED_FILES = 512  # the database pool, the listeners, the metrics and log files
+MIN_OUTBOUND = 256
 
 
 async def serve(config: GatewayConfig) -> None:
@@ -64,7 +67,15 @@ async def serve(config: GatewayConfig) -> None:
     async def auditor_url() -> str | None:
         return config.auditor_url or await asyncio.to_thread(chain.auditor_url)
 
-    client = httpx.AsyncClient(limits=httpx.Limits(max_connections=None, max_keepalive_connections=4096),
+    # Every connection holds a descriptor: the users' requests in flight, and at most the rest to miners and auditor.
+    files = raise_open_file_limit()
+    outbound = files - config.max_in_flight - RESERVED_FILES
+    if outbound < MIN_OUTBOUND:
+        log.warning("the open-file limit %d cannot hold max_in_flight %d and connections to the miners: raise it "
+                    "(LimitNOFILE=65536 in the systemd unit) or lower max_in_flight", files, config.max_in_flight)
+    outbound = max(outbound, MIN_OUTBOUND)
+    client = httpx.AsyncClient(limits=httpx.Limits(max_connections=outbound,
+                                                   max_keepalive_connections=min(outbound, 4096)),
                                timeout=httpx.Timeout(30.0, connect=3.0))
     state_dir = config.state_dir.expanduser()
 

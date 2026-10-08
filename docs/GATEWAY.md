@@ -48,7 +48,8 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    decision requests have no side effects. A failure that is the miner's (no connection, a response without a valid
    receipt, a compressed or oversized response, a refusal of the gateway) counts against it at once; one that the
    request itself may cause (a timeout, an error status) counts only if another miner then answers the same request.
-   A miner that answers busy (429, 503) is skipped for one second. A refusal of the request (another 4xx) counts
+   A connection the gateway itself cannot make (out of descriptors or buffers, all its connections to miners in use,
+   no route out) counts against nobody. A miner that answers busy (429, 503) is skipped for one second. A refusal of the request (another 4xx) counts
    against it if another miner then answers the same request; the gateway has checked everything a miner checks, so
    a refusal no other miner shares is also reported as refusing users (without opening its breaker), and the user
    gets 503, not 400. A slow endpoint gets fewer requests on its own: they stay in flight longer. After 3 failures
@@ -155,7 +156,18 @@ credited.
    an older schema).
 7. Run `verathos-gateway --config gateway.json serve` under a supervisor, behind a reverse proxy that terminates
    TLS, as an active and a standby process (below). `GET /ready` answers 200 once the gateway has routes and finds
-   its hotkey among the catalog's gateways.
+   its hotkey among the catalog's gateways. Every request holds a connection from the proxy and one to a miner: at
+   start the gateway raises its soft open-file limit to the hard one, keeps its connections to miners within what
+   `max_in_flight` leaves of it, and warns when that is too little. systemd's default soft limit is 1024, so give the
+   unit a higher one:
+
+   ```ini
+   [Service]
+   User=gateway
+   ExecStart=/opt/verathos/.venv/bin/verathos-gateway --config /etc/verathos/gateway.json serve
+   Restart=always
+   LimitNOFILE=65536
+   ```
 
 ### Restarts without downtime
 

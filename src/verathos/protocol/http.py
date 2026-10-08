@@ -1,9 +1,10 @@
-"""Size- and time-bounded JSON over HTTP, for responses from other neurons."""
+"""Size- and time-bounded JSON over HTTP, for responses from other neurons, and the open-file limit connections need."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import resource
 import time
 from typing import Any
 
@@ -57,3 +58,11 @@ def get_json(url: str, *, limit: int, timeout: float) -> Any:
                 raise ResponseTooLarge(f"response exceeds {limit} bytes")
             chunks.append(chunk)
     return _parse(chunks)
+
+
+def raise_open_file_limit() -> int:
+    """Raise the soft open-file limit to the hard one (every connection holds a descriptor); returns it."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < hard:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
