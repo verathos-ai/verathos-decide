@@ -5,7 +5,7 @@
     GET  /v1/models      the catalog's active models: state limit, price, weights, and whether available now
     GET  /v1/status      per model: operational, degraded or unavailable; endpoints, capacity, latency, success
     GET  /health         the process is up
-    GET  /ready          routes are loaded and the gateway is in the catalog (503 otherwise)
+    GET  /ready          routes are loaded and the gateway is in the catalog (503 otherwise), and how old they are
 
 Every response to ``POST /v1/systemone`` carries ``X-Request-Id`` (the client's, if it sent a valid one). Errors are
 ``{"error": {"type": ..., "message": ...}}``; 429 and 503 carry ``Retry-After`` (for a used-up quota: until the next
@@ -51,6 +51,7 @@ from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.logs import Throttle
 from verathos.gateway.router import Endpoint, Outcome, Router
+from verathos.gateway.routes import stale_after_s
 from verathos.gateway.sampler import Sampler
 from verathos.gateway.served import ServedCounter
 from verathos.gateway.stats import DEGRADED_SUCCESS, ModelStats
@@ -100,10 +101,14 @@ class Gateway:
     stats: ModelStats = field(default_factory=ModelStats)
 
     def routes_state(self) -> dict[str, Any] | None:
-        table = self.routes()
-        return None if table is None else {"epoch": table.epoch, "issued_ms": table.issued_ms,
-                                           "age_s": round(time.time() - table.issued_ms / 1000, 1),
-                                           "endpoints": len(table.routes), "catalog": table.catalog_digest}
+        """The routes in use; stale: older than ``routes.stale_after_s``."""
+        table, cat = self.routes(), self.catalog()
+        if table is None:
+            return None
+        age = time.time() - table.issued_ms / 1000
+        return {"epoch": table.epoch, "issued_ms": table.issued_ms, "age_s": round(age, 1),
+                "stale": cat is not None and age > stale_after_s(cat), "endpoints": len(table.routes),
+                "catalog": table.catalog_digest}
 
     def pending_state(self) -> dict[str, Any]:
         return {"usage_rows": self.meter.pending(), "samples": self.sampler.pending(),
@@ -405,7 +410,8 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         reason = ready_reason()
         if reason:
             return JSONResponse({"ready": False, "reason": reason}, status_code=503)
-        return {"ready": True}
+        routes = g.routes_state()
+        return {"ready": True, "routes": {"age_s": routes["age_s"], "stale": routes["stale"]}}
 
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:

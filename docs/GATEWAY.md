@@ -115,10 +115,12 @@ samples never leave the host or the private network.
 verdicts (the previous epoch's while the current ones wait for a test to settle; qualified, not drifted), of `active`
 models, whose hotkey has no wrong answer proven there or since, and is not on probation at the owner's validator;
 with their credited capacity and test latency. While the verdicts cover no confirmed test (the auditor missed the
-tests or they were void), the credits come from the latest confirmed test the auditor holds, whatever its age. The table is signed by
-the auditor hotkey. The gateway polls it every 30 s, uses only tables signed by the subnet owner's hotkey and newer
-than its own, and keeps the last good one on disk. A new endpoint is routable once its first throughput test is
-credited.
+tests or they were void), the credits come from the latest confirmed test the auditor holds, whatever its age. The
+table is signed by the auditor hotkey. The gateway polls it every 30 s, uses only tables signed by the subnet owner's
+hotkey, newer than its own and issued at most 5 minutes ahead of its clock, and keeps the last good one on disk. A new
+endpoint is routable once its first throughput test is credited. While the auditor serves no newer table the gateway
+keeps using its own; older than 3 epochs, the routes are stale: the log says so every 10 minutes, and `GET /ready`
+(still 200) shows it (`"routes": {"age_s": ..., "stale": true}`).
 
 ## Setup
 

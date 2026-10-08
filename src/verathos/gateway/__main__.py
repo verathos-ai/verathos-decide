@@ -48,7 +48,7 @@ from verathos.gateway.app import (
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.router import Router
-from verathos.gateway.routes import RouteTable
+from verathos.gateway.routes import RouteTable, stale_after_s
 from verathos.gateway.sampler import Sampler
 from verathos.gateway.served import ServedCounter
 from verathos.gateway.upstream import Upstream
@@ -107,6 +107,7 @@ async def serve(config: GatewayConfig) -> None:
                 log.error("this gateway's hotkey %s is not among catalog %s's gateways: miners will refuse it",
                           keypair.ss58_address, cat.digest()[:12])
         router.max_latency_s = cat.audit_policy().max_latency_s
+        routes.stale_s = stale_after_s(cat)
         endpoints = {(r.hotkey, r.endpoint_id, r.model_id) for r in table.routes}
         router.update(table)
         if endpoints != known[0]:

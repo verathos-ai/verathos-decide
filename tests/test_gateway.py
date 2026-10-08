@@ -647,6 +647,26 @@ def test_routes_are_taken_only_from_the_auditor_and_newer(tmp_path) -> None:
     restarted = table()
     asyncio.run(restarted.load())
     assert restarted.table.issued_ms == 5  # from disk
+    import time as time_module
+    now_ms = int(time_module.time() * 1000)
+    served["doc"] = signed(now_ms + 3_600_000)  # the auditor's clock an hour ahead
+    assert not asyncio.run(t.refresh())  # refused, or every correct table would be for an hour
+    served["doc"] = signed(now_ms)
+    assert asyncio.run(t.refresh()) and t.table.issued_ms == now_ms
+
+
+def test_ready_says_when_the_routes_in_use_are_stale(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+
+    async def ready():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=s.app), base_url="http://gw") as c:
+            return (await c.get("/ready")).json()
+    import time as time_module
+
+    assert asyncio.run(ready())["routes"]["stale"]  # issued in 1970: the auditor has served no newer table
+    s.router_table = s.router_table.model_copy(update={"issued_ms": int(time_module.time() * 1000)})
+    fresh = asyncio.run(ready())
+    assert fresh["ready"] and not fresh["routes"]["stale"] and fresh["routes"]["age_s"] < 60
 
 
 def test_the_client_address_is_believed_only_from_trusted_proxies() -> None:
