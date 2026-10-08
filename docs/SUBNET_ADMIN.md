@@ -172,7 +172,9 @@ not alpha is bought with it.
 
 To enable it:
 
-1. Keep the miner share below 1: the pool takes at most `1 - miner_share`.
+1. Keep the miner share below 1: the pool takes at most `1 - miner_share`. Validators of a release without the pool
+   ignore the setting and set their weights without it: enable it once the auditor and the full validators run one
+   with it (light validators set the auditor's weights, pool included, whatever their release).
 2. Publish the buyback coldkey and the excluded keys, and commit a catalog with `usage_pool`. `commit-catalog` prints
    the pool and the current period. The auditor reads the burns from the start of the period it adopts the catalog
    in (from blocks its node still holds); that period's record is the first, paid over the next period.
