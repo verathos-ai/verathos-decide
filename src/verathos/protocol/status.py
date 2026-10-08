@@ -1,12 +1,12 @@
 """Endpoint status as validators serve it (``GET /v1/status/{hotkey}``, ``GET /v1/network`` for every hotkey)
-and miners read it.
+and miners and light validators read it.
 
-The validator that serves them, the subnet owner's (the throughput auditor), signs both documents with its hotkey:
-to the status's own fields it adds ``netuid``, ``auditor`` (its hotkey) and ``issued_ms`` (when it signed), and signs
-the canonical JSON of all of them (``protocol.signing``) into ``signature``. A reader that knows only the status's own
-fields ignores the four. A miner acts on the test results in its status only once the document verifies
-(``unverified``), and its setup chooses models from the network's only once that verifies (signed once per epoch, so
-it may be older).
+The validator that serves them (the subnet owner's, which is the throughput auditor, or a full validator with a
+service) signs both documents with its hotkey: to the status's own fields it adds ``netuid``, ``auditor`` (its hotkey)
+and ``issued_ms`` (when it signed), and signs the canonical JSON of all of them (``protocol.signing``) into
+``signature``. A reader that knows only the status's own fields ignores the four. A miner acts on the test results in
+its status, and a light validator sets the weights in the network's, only once the document verifies (``unverified``).
+A miner's setup chooses models from the network's document once it verifies.
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ STATUS_DOMAIN = "verathos/status/v1"
 NETWORK_DOMAIN = "verathos/network-status/v1"
 STATUS_TESTS = 10  # a hotkey's status lists its results in the auditor's last this many tests (one per epoch at most)
 MAX_STATUS_BYTES = 1 << 20  # a status: up to 64 endpoints, and their results in STATUS_TESTS tests
-STATUS_MAX_AGE_S = 300.0  # a miner acts on a status signed at most this long before or after its own clock
-MAX_NETWORK_BYTES = 32 << 20  # every hotkey's status: up to 256 UIDs of 64 endpoints, without their tests
+STATUS_MAX_AGE_S = 300.0  # a reader acts on a document signed at most this long before or after its own clock
+MAX_NETWORK_BYTES = 32 << 20  # every hotkey's status without its test results: 256 UIDs of up to 64 endpoints
 
 State = Literal["scored", "qualifying", "candidate", "failed", "invalid", "probation", "unanswered", "not_audited",
                 "drifted"]
@@ -84,6 +84,9 @@ class NetworkStatus(BaseModel):
     epoch: int | None = None
     epoch_blocks: int | None = None
     model_shares: dict[str, float] = {}
+    # per UID, exactly the weights the validator set after the epoch (in a dry run, would have set); a UID absent gets
+    # none. None from a validator of an older release.
+    weights: dict[int, float] | None = None
     hotkeys: list[HotkeyStatus] = []
 
 
@@ -96,18 +99,18 @@ def sign_document(document: dict[str, Any], keypair: Keypair, *, netuid: int, do
 
 
 def unverified(document: Any, *, domain: str, auditor: str | None, netuid: int, now_ms: int,
-               max_age_s: float = STATUS_MAX_AGE_S) -> str | None:
-    """Why ``document`` (as received) is not a document ``auditor`` signed under ``domain`` for ``netuid`` within
-    ``max_age_s`` of ``now_ms``; None if it is."""
+               signer: str = "the subnet owner hotkey", max_age_s: float = STATUS_MAX_AGE_S) -> str | None:
+    """Why ``document`` (as received) is not a document ``auditor`` (``signer`` in the reason) signed under ``domain``
+    for ``netuid`` within ``max_age_s`` of ``now_ms``; None if it is."""
     if not isinstance(document, dict) or "signature" not in document:
         return "it is not signed (the auditor runs an older release)"
     if not auditor:
-        return "the subnet owner hotkey is not known yet"
+        return f"{signer} is not known yet"
     if document.get("auditor") != auditor or document.get("netuid") != netuid:
-        return f"it is not signed by the subnet owner hotkey {auditor} for netuid {netuid}"
+        return f"it is not signed by {signer} {auditor} for netuid {netuid}"
     if not signing.verify(auditor, domain, {k: v for k, v in document.items() if k != "signature"},
                           document["signature"]):
-        return "its signature does not verify against the subnet owner hotkey"
+        return f"its signature does not verify against {signer}"
     issued = document.get("issued_ms")
     if not isinstance(issued, int) or isinstance(issued, bool) or abs(now_ms - issued) > max_age_s * 1000:
         return f"it was not signed within {max_age_s:.0f} s of this machine's clock"

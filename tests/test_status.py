@@ -288,34 +288,49 @@ def test_a_miner_acts_only_on_a_status_the_subnet_owner_signed_and_logs_the_othe
     assert old_reader.tests == tests and "signature" not in old_reader.model_dump()
 
 
-def test_network_route_serves_every_hotkey_of_the_last_epoch_signed_once_per_epoch() -> None:
-    owner, board = kp(), StatusBoard()
+def test_network_route_serves_every_hotkey_of_the_last_epoch_and_the_weights_set_signed_every_30_s() -> None:
+    owner, board, clock = kp(), StatusBoard(), [1000.0]
     app = FastAPI()
-    add_network_route(app, board, owner, 405)
+    add_network_route(app, board, owner, 405, clock=lambda: clock[0])
     client = TestClient(app)
     empty = client.get(NETWORK_PATH)
     assert NetworkStatus.model_validate(empty.json()).hotkeys == []  # nothing scored yet
     board.publish({"hkB": HotkeyStatus(hotkey="hkB", uid=7, weight=0.4, epoch=5, epoch_blocks=180,
                                        model_shares={"kev-4b": 1.0}),
                    "hkA": HotkeyStatus(hotkey="hkA", uid=2, weight=0.6, epoch=5, epoch_blocks=180,
-                                       model_shares={"kev-4b": 1.0})})
+                                       model_shares={"kev-4b": 1.0})},
+                  epoch=5, epoch_blocks=180, model_shares={"kev-4b": 1.0}, weights={2: 0.6, 7: 0.4, 9: 1e-9})
     response = client.get(NETWORK_PATH)
     got = NetworkStatus.model_validate(response.json())
     assert (got.epoch, got.model_shares, [h.uid for h in got.hotkeys]) == (5, {"kev-4b": 1.0}, [2, 7])
+    assert got.weights == {2: 0.6, 7: 0.4, 9: 1e-9}  # every UID set, also one without a status
     assert response.headers["cache-control"] == "public, max-age=30"
     now_ms = int(time.time() * 1000)
     assert unverified(response.json(), domain=NETWORK_DOMAIN, auditor=owner.ss58_address, netuid=405,
                       now_ms=now_ms) is None
     assert unverified(response.json(), domain=STATUS_DOMAIN, auditor=owner.ss58_address, netuid=405,
                       now_ms=now_ms) is not None  # never taken for a hotkey's status
-    assert client.get(NETWORK_PATH).content == response.content  # signed once per epoch, not per request
+    assert client.get(NETWORK_PATH).content == response.content  # signed at most every 30 s, not per request
     assert board.network() is board.network()  # built once per epoch
+    time.sleep(0.002)
+    clock[0] += 30.0
+    again = client.get(NETWORK_PATH).json()
+    assert again["issued_ms"] > response.json()["issued_ms"]  # its signature shows it is served now
+    assert {k: v for k, v in again.items() if k not in ("issued_ms", "signature")} == {
+        k: v for k, v in response.json().items() if k not in ("issued_ms", "signature")}
+
+    # Without any endpoint the epoch and the weights are still stated.
+    board.publish({}, epoch=6, epoch_blocks=180, model_shares={"kev-4b": 1.0}, weights={0: 1.0})
+    got = NetworkStatus.model_validate(client.get(NETWORK_PATH).json())
+    assert (got.epoch, got.epoch_blocks, got.weights, got.hotkeys) == (6, 180, {0: 1.0}, [])
 
 
 def test_a_restarted_validator_serves_the_last_epochs_status_until_its_next_epoch(tmp_path) -> None:
     path = tmp_path / "status.json"
-    StatusBoard(path).publish({"hkA": HotkeyStatus(hotkey="hkA", uid=2, weight=1.0, epoch=5, epoch_blocks=180)})
+    StatusBoard(path).publish({"hkA": HotkeyStatus(hotkey="hkA", uid=2, weight=1.0, epoch=5, epoch_blocks=180)},
+                              weights={2: 1.0})
     restarted = StatusBoard(path)
     assert restarted.get("hkA").epoch == 5 and b'"epoch":5' in restarted.network()
+    assert NetworkStatus.model_validate_json(restarted.network()).weights == {2: 1.0}
     path.write_text("not json")
     assert StatusBoard(path).get("hkA") is None  # a damaged file is ignored

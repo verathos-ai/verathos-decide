@@ -414,3 +414,99 @@ def test_install_script_parses_and_documents_its_options() -> None:
     usage = subprocess.run(["bash", str(script), "--help"], capture_output=True, text=True)
     assert usage.returncode == 0 and "--source" in usage.stdout and "uninstall" in usage.stdout
     assert "--worker" in usage.stdout and "--peers" in usage.stdout
+    assert "--light" in usage.stdout and "--full" in usage.stdout
+
+
+def test_a_validator_is_light_unless_full_is_asked_for_or_set_up_before_and_the_owners_is_full(tmp_path) -> None:
+    """--yes keeps the mode configured; a configuration from before modes existed is a full validator's."""
+    from verathos.install.validator import choose_mode, mode_lines, parser
+
+    ui = common.Prompter(assume_yes=True)
+    assert choose_mode(ui, None, {}, owner=False) == "light"  # a new validator
+    assert choose_mode(ui, None, {"references": {"kev-4b": "http://127.0.0.1:8101"}}, owner=False) == "full"
+    assert choose_mode(ui, None, {"mode": "light"}, owner=False) == "light"
+    assert choose_mode(ui, None, {"mode": "full"}, owner=False) == "full"
+    assert choose_mode(ui, "full", {"mode": "light"}, owner=False) == "full"
+    assert choose_mode(ui, "light", {"mode": "full"}, owner=False) == "light"
+    assert choose_mode(ui, None, {"mode": "light"}, owner=True) == "full"  # the auditor
+    with pytest.raises(SystemExit, match="subnet owner's hotkey"):
+        choose_mode(ui, "light", {}, owner=True)
+    assert (parser().parse_args(["--light"]).mode, parser().parse_args(["--full"]).mode) == ("light", "full")
+    assert parser().parse_args([]).mode is None
+    with pytest.raises(SystemExit):
+        parser().parse_args(["--light", "--full"])
+
+    cat = catalog.load()
+    assert "mode light" in mode_lines("light", cat, False)[0] and "no GPU" in mode_lines("light", cat, False)[1]
+    assert "10,000 stake" in mode_lines("full", cat, False)[1] and "auditor" in mode_lines("full", cat, True)[0]
+
+    def configure(existing: dict, mode: str, ports: dict[str, int], managed_before: set[str]) -> dict:
+        config = validator_config(existing, network="finney", netuid=96, wallet_name="v", hotkey_name="default",
+                                  ports=ports, dry_run=False, managed_before=managed_before, home=tmp_path, mode=mode)
+        assert ValidatorConfig.model_validate(config).mode == mode
+        return config
+
+    remote = {"url": "https://ref.example/x", "api_key": "k"}
+    full = configure({"references": {"clef-flash": remote}}, "full", {"kev-4b": 8101}, set())
+    light = configure(full, choose_mode(ui, "light", full, owner=False), {}, {"kev-4b"})
+    assert light["mode"] == "light" and light["references"] == {"clef-flash": remote}  # set up by hand: kept
+    again = configure(light, choose_mode(ui, None, light, owner=False), {}, set())  # bash install.sh validator --yes
+    assert again == light
+    assert configure(again, "full", {"kev-4b": 8101}, set())["references"]["kev-4b"] == "http://127.0.0.1:8101"
+
+
+class ServiceManager(FakeManager):
+    """A service manager that records what the setup installs and removes."""
+
+    name = "systemd"
+
+    def __init__(self, batches: list[list[str]]) -> None:
+        super().__init__(batches, [101])
+        self.applied: list[services.Service] = []
+        self.removed: list[str] = []
+
+    def mark(self, name: str) -> None:
+        pass
+
+    def apply(self, applied: list[services.Service], restart: set[str]) -> set[str]:
+        self.applied += applied
+        return {s.name for s in applied}
+
+    def remove(self, names: list[str]) -> None:
+        self.removed += names
+
+    def status_command(self, names: list[str]) -> str:
+        return "systemctl status " + " ".join(names)
+
+    def restart_command(self, names: list[str]) -> str:
+        return "systemctl restart " + " ".join(names)
+
+
+def test_a_light_setup_runs_the_validator_alone_and_stops_the_references_of_a_full_one(tmp_path, monkeypatch) -> None:
+    from verathos.install.validator import VALIDATOR, init_light
+
+    monkeypatch.setattr(common.time, "sleep", lambda s: None)
+    home, config_path = tmp_path, tmp_path / "validator.json"
+    record = common.Record(role="validator", manager="systemd", config=str(config_path),
+                           services=["verathos-reference-kev-4b", VALIDATOR],
+                           engines={"kev-4b": {"model": "kev-4b", "device": "cpu", "port": 8101}},
+                           paths=[str(tmp_path / "engines" / "kev-x")])
+    existing = {"network": "finney", "netuid": 96, "wallet_name": "v", "hotkey_name": "default", "mode": "full",
+                "references": {"kev-4b": "http://127.0.0.1:8101"}}
+    manager = ServiceManager([["light mode: setting the weights the subnet owner's validator publishes each epoch"]])
+    init_light(common.Prompter(assume_yes=True), manager, record, existing, config_path, home, False,
+               cat=catalog.load(), network="finney", netuid=96, wallet_name="v", hotkey_name="default")
+    config = ValidatorConfig.model_validate(common.read_json(config_path))
+    assert config.mode == "light" and config.references == {}
+    assert manager.removed == ["verathos-reference-kev-4b"]
+    (validator,) = manager.applied
+    assert validator.name == VALIDATOR and validator.after == () and validator.command[-2:] == ["--config",
+                                                                                                str(config_path)]
+    saved = common.Record.load(home, "validator")
+    assert (saved.services, saved.engines, saved.paths) == ([VALIDATOR], {}, record.paths)  # uninstall removes them
+
+    with pytest.raises(SystemExit, match="failed"):  # the owner's hotkey: the validator refuses light mode
+        init_light(common.Prompter(assume_yes=True), ServiceManager([[
+            "SystemExit: this is the subnet owner's hotkey: its validator is the auditor"]]), saved,
+            common.read_json(config_path), config_path, home, False, cat=catalog.load(), network="finney", netuid=96,
+            wallet_name="v", hotkey_name="default")

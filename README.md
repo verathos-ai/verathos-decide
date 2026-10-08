@@ -19,9 +19,15 @@ under `~/.bittensor/wallets/<wallet>/`; the coldkey stays elsewhere):
 # a miner: NVIDIA GPUs, a public IP address and one open TCP port
 curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
 
-# a validator: a hotkey with a validator permit; the reference models run on GPUs or in RAM
+# a light validator: a hotkey with a validator permit, no GPU; it sets the weights the auditor publishes
 curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator
+
+# a full validator: it checks the miners' answers itself on reference models, on GPUs or in RAM
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --full
 ```
+
+Light validators follow the auditor's results; full validators check answers independently
+([Two modes](docs/VALIDATING.md#two-modes)).
 
 The command installs what the machine needs, asks a few questions (each has a default), and runs everything as
 system services. Run it again to update. What it asks, what it installs, how to check, update and uninstall, and
@@ -48,7 +54,7 @@ references where memory is left.
 | | |
 |---|---|
 | [Mining](docs/MINING.md) | hardware, one-command and manual install, engines, configuration, running a miner |
-| [Validating](docs/VALIDATING.md) | one-command and manual install, reference engines, configuration, the auditor |
+| [Validating](docs/VALIDATING.md) | light and full mode, one-command and manual install, reference engines, configuration, the auditor |
 | [Scoring](docs/SCORING.md) | how answers are verified and scored |
 | [Throughput audit](docs/THROUGHPUT_AUDIT.md) | declared capacity, the network-wide tests, verdicts, policy |
 | [Gateway](docs/GATEWAY.md) | user traffic: keys, limits, routing, answer checks, running it |
@@ -62,7 +68,7 @@ src/verathos/
   protocol/    wire types: SystemOne API, signed manifests, receipts, request signing
   catalog/     the model catalog and audit policy committed by the owner
   miner/       miner service: manifest and endpoints behind one public port
-  validator/   discovery, canaries, answer comparison, scoring, weights
+  validator/   discovery, canaries, answer comparison, scoring, weights; light mode
   throughput/  throughput audit: schedule, sessions, request mix, miner measurement, auditor, verdicts
   gateway/     verathos-gateway: user traffic to the proven capacity
   engine/      verathos-engine for model families served from their repository code (Clef)

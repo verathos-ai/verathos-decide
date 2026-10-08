@@ -107,3 +107,6 @@ endpoints is on probation inherits the remaining probation, so renaming an endpo
 A UID's value is the sum of its endpoints' EMAs, normalised over all UIDs and set on mechanism 1 once per epoch.
 Endpoints whose UID now belongs to another hotkey are ignored. If no endpoint has a positive score, the weight goes
 to the subnet owner's UID.
+
+Everything above is what a full validator does. A light validator (`VALIDATING.md`) scores nothing: it sets the
+weights the auditor publishes for the epoch (`GET /v1/network`, signed), exactly as the auditor sets them.

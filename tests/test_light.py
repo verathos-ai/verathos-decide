@@ -1,0 +1,350 @@
+"""Light validators: they set exactly the weights the source validator published, only from a document that
+verifies, and never contact a miner or start a reference engine; the auditor publishes exactly what it sets."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import sys
+import time
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from bittensor_wallet import Keypair
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from verathos import catalog
+from verathos.protocol.status import NETWORK_DOMAIN, NETWORK_PATH, STATUS_MAX_AGE_S, NetworkStatus, sign_document
+from verathos.validator import light
+from verathos.validator.config import ValidatorConfig
+from verathos.validator.scoring import ScoreState
+from verathos.validator.service import add_network_route
+from verathos.validator.status import StatusBoard
+
+CAT = catalog.load()
+BLOCKS = CAT.epoch_blocks
+OFFSET = light.LightValidator.offset(CAT)
+SOURCE_AXON = ("198.51.100.20", 8091)
+WEIGHTS = {3: 0.5123456789012345, 7: 0.3, 12: 0.18765432109876551}
+
+
+def kp() -> Keypair:
+    return Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
+
+
+def neuron(uid: int, ip: str = "0.0.0.0", port: int = 0, permit: bool = True) -> SimpleNamespace:
+    return SimpleNamespace(uid=uid, is_null=False, validator_permit=permit, axon_info=SimpleNamespace(ip=ip, port=port))
+
+
+class Chain:
+    """The chain as a light validator and the weight-setting code see it. A light validator reads no metagraph and
+    no commitments: those are how validators find miners."""
+
+    def __init__(self, owner: str, own: str, block: int) -> None:
+        self.owner, self.block = owner, block
+        self.neurons = {owner: neuron(0, *SOURCE_AXON), own: neuron(5)}
+        self.set: list[dict] = []
+        self.substrate = SimpleNamespace(query=lambda module, item, params: SimpleNamespace(value=7))
+
+    def get_current_block(self) -> int:
+        return self.block
+
+    def get_subnet_owner_hotkey(self, netuid: int) -> str:
+        return self.owner
+
+    def get_neuron_for_pubkey_and_subnet(self, hotkey: str, netuid: int):
+        return self.neurons.get(hotkey)
+
+    def get_mechanism_count(self, netuid: int) -> int:
+        return 2
+
+    def set_weights(self, wallet, netuid, uids, weights, mechid, version_key):
+        self.set.append({"netuid": netuid, "uids": uids, "weights": weights, "mechid": mechid,
+                         "version_key": version_key})
+        return SimpleNamespace(success=True, message="")
+
+    def close(self) -> None:
+        pass
+
+    def metagraph(self, *args, **kwargs):
+        raise AssertionError("a light validator reads no metagraph")
+
+    def get_all_commitments(self, *args, **kwargs):
+        raise AssertionError("a light validator reads no commitments")
+
+
+def config(tmp_path, **changes) -> ValidatorConfig:
+    return ValidatorConfig(**{"netuid": 405, "wallet_name": "v", "hotkey_name": "default", "mode": "light",
+                              "state_dir": tmp_path, **changes})
+
+
+def document(signer: Keypair, epoch: int, *, weights: dict[int, float] | None = WEIGHTS, netuid: int = 405,
+             at: float | None = None, epoch_blocks: int = BLOCKS) -> dict:
+    """A network document as a validator of this release serves it."""
+    body = NetworkStatus(epoch=epoch, epoch_blocks=epoch_blocks, weights=weights).model_dump(mode="json")
+    if weights is None:
+        del body["weights"]  # a validator of an older release
+    return sign_document(body, signer, netuid=netuid, domain=NETWORK_DOMAIN,
+                         now_ms=int((time.time() if at is None else at) * 1000))
+
+
+def validator(tmp_path, chain: Chain, own: Keypair, served: list, *, fetched: list | None = None,
+              **cfg) -> light.LightValidator:
+    """A light validator whose source's axon serves ``served[-1]`` (an exception is raised)."""
+    from verathos.validator import __main__ as validator_main
+
+    settings = config(tmp_path, **cfg)
+
+    def fetch(url: str, **kwargs):
+        (fetched if fetched is not None else []).append(url)
+        if isinstance(served[-1], Exception):
+            raise served[-1]
+        return json.loads(json.dumps(served[-1]))
+
+    wallet = SimpleNamespace(hotkey=own)
+    return light.LightValidator(settings, chain, own.ss58_address, SimpleNamespace(catalog=CAT),
+                                set_weights=lambda w: validator_main.set_weights(settings, chain, wallet, w),
+                                state_path=tmp_path / "light.json", fetch=fetch)
+
+
+def test_a_light_validator_sets_exactly_the_weights_its_source_published(tmp_path, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="verathos.validator")
+    owner, own = kp(), kp()
+    chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET + 5)
+    fetched: list[str] = []
+    served = [document(owner, 99)]  # the source has not scored epoch 100 yet
+    started = validator(tmp_path, chain, own, served, fetched=fetched)
+    assert started.step() == light.POLL_S and chain.set == []  # once epoch 100's are due, 99's are not set
+    assert started.why == "the source has not published the results of epoch 100 yet (its latest are for epoch 99)"
+    (tmp_path / "light.json").write_text(json.dumps({"epoch": 99, "epoch_blocks": BLOCKS}))
+    fetched.clear()
+    v = validator(tmp_path, chain, own, served, fetched=fetched)
+    assert v.step() == light.POLL_S and chain.set == [] and "set already" in v.why
+    served.append(document(owner, 100))
+    chain.block += 3
+    v.step()
+    assert chain.set == [{"netuid": 405, "uids": [3, 7, 12], "weights": [WEIGHTS[3], WEIGHTS[7], WEIGHTS[12]],
+                          "mechid": 1, "version_key": 7}]  # exactly, the version key and mechanism as full ones use
+    assert fetched == [f"http://{SOURCE_AXON[0]}:{SOURCE_AXON[1]}{NETWORK_PATH}"] * 2
+    assert (f"epoch 100: set the weights of the subnet owner's validator {owner.ss58_address}: 3 UIDs, top 3: 0.512, "
+            "7: 0.300, 12: 0.188") in caplog.messages
+    # Done for the epoch: it waits for the next epoch's results, also after a restart.
+    wait = v.step()
+    assert wait == (101 * BLOCKS + OFFSET - chain.block) * light.BLOCK_TIME_S and len(fetched) == 2
+    restarted = validator(tmp_path, chain, own, served, fetched=fetched)
+    restarted.step()
+    assert len(chain.set) == 1 and len(fetched) == 2
+
+    # The previous epoch's results still come in time (the source finished late); never older ones.
+    served.append(document(owner, 101))
+    chain.block = 102 * BLOCKS + 2
+    restarted.step()
+    assert len(chain.set) == 2
+
+
+def test_a_light_validator_refuses_documents_that_do_not_verify() -> None:
+    source, stranger, now = kp(), kp(), time.time()
+
+    def refused(doc: dict, done: int | None = 99 * BLOCKS) -> str:
+        with pytest.raises(light.Refused) as exc:
+            light.check(doc, source=source.ss58_address, netuid=405, epoch=100, epoch_blocks=BLOCKS, done_block=done,
+                        now_ms=int(now * 1000))
+        return str(exc.value)
+
+    tampered = document(source, 100)
+    tampered["weights"]["7"] = 0.9
+    unsigned = NetworkStatus(epoch=100, epoch_blocks=BLOCKS, weights=WEIGHTS).model_dump(mode="json")
+    assert refused(tampered) == "its signature does not verify against the source hotkey"
+    assert refused(document(stranger, 100)).startswith("it is not signed by the source hotkey")
+    assert refused(document(source, 100, netuid=96)) == (f"it is not signed by the source hotkey "
+                                                         f"{source.ss58_address} for netuid 405")
+    assert "within 300 s" in refused(document(source, 100, at=now - STATUS_MAX_AGE_S - 60))  # stale
+    assert "within 300 s" in refused(document(source, 100, at=now + STATUS_MAX_AGE_S + 60))
+    assert refused(document(source, 98), done=None) == ("it is for epoch 98, neither the current epoch 100 nor the "
+                                                        "previous one")  # an old document, replayed
+    assert "epoch 101" in refused(document(source, 101))
+    assert "set already" in refused(document(source, 100), done=100 * BLOCKS)  # never set twice
+    assert "not signed (the auditor runs an older release)" in refused(unsigned)
+    assert refused(document(source, 100, weights=None)) == "it lists no weights (the source runs an older release)"
+    assert "180 blocks" in refused(document(source, 50, epoch_blocks=360))
+    assert "non-negative" in refused(document(source, 100, weights={3: -1.0}))
+    got = light.check(document(source, 99), source=source.ss58_address, netuid=405, epoch=100, epoch_blocks=BLOCKS,
+                      done_block=98 * BLOCKS, now_ms=int(now * 1000))
+    assert got.weights == WEIGHTS and got.epoch == 99
+
+
+def test_without_a_fresh_verified_document_a_light_validator_sets_nothing_and_says_so_once(tmp_path, caplog) -> None:
+    owner, stranger, own = kp(), kp(), kp()
+    chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET)
+    served: list = [httpx.ConnectError("connection refused")]
+    v = validator(tmp_path, chain, own, served)
+    for block in range(100 * BLOCKS + OFFSET, 101 * BLOCKS + OFFSET, 3):
+        chain.block = block
+        assert v.step() == light.POLL_S
+        served.append(document(stranger, 100) if block > 100 * BLOCKS + 150 else served[-1])
+    stale = document(owner, 100, at=time.time() - 3600)
+    served.append(stale)
+    chain.block = 101 * BLOCKS + OFFSET - 1
+    v.step()
+    assert chain.set == [] and not caplog.records
+    chain.block += 1  # the deadline: the point from which the next epoch's results can come
+    v.step()
+    chain.block += 3
+    v.step()
+    assert chain.set == []
+    assert [r.getMessage() for r in caplog.records] == [
+        f"epoch 100: no weights set: no results of the source verified by block {101 * BLOCKS + OFFSET} (it was not "
+        f"signed within {STATUS_MAX_AGE_S:.0f} s of this machine's clock)"]
+
+    served.append(httpx.ConnectError("connection refused"))
+    chain.block = 102 * BLOCKS + OFFSET
+    v.step()
+    assert len(caplog.records) == 2 and caplog.records[-1].getMessage().startswith("epoch 101: no weights set")
+    assert v.why == (f"the source's axon http://{SOURCE_AXON[0]}:{SOURCE_AXON[1]} did not serve it: ConnectError: "
+                     "connection refused")
+
+
+def test_a_source_other_than_the_owner_needs_a_permit_and_an_axon(tmp_path) -> None:
+    owner, other, own = kp(), kp(), kp()
+    chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET)
+    chain.neurons[other.ss58_address] = neuron(9, "198.51.100.30", 8091, permit=False)
+    served = [document(other, 100)]
+    v = validator(tmp_path, chain, own, served, source_hotkey=other.ss58_address)
+    v.step()
+    assert chain.set == [] and v.why == f"the source hotkey {other.ss58_address} holds no validator permit"
+    chain.neurons[other.ss58_address].validator_permit = True
+    v.step()
+    assert len(chain.set) == 1
+    chain.neurons[own.ss58_address].validator_permit = False
+    assert v.permit() == "this hotkey holds no validator permit, which setting weights takes"
+    with pytest.raises(ValueError, match="not a hotkey"):
+        config(tmp_path, source_hotkey="5Fnot-a-hotkey")
+
+
+def test_the_auditor_refuses_light_mode(tmp_path) -> None:
+    owner, own = kp(), kp()
+    chain = Chain(owner.ss58_address, owner.ss58_address, 100 * BLOCKS)
+    with pytest.raises(SystemExit, match="this is the subnet owner's hotkey"):
+        light.run(config(tmp_path), chain, SimpleNamespace(hotkey=owner), SimpleNamespace(catalog=CAT),
+                  set_weights=lambda w: True)
+    with pytest.raises(SystemExit, match="own hotkey"):
+        light.run(config(tmp_path, source_hotkey=own.ss58_address), Chain(owner.ss58_address, own.ss58_address, 0),
+                  SimpleNamespace(hotkey=own), SimpleNamespace(catalog=CAT), set_weights=lambda w: True)
+    # The owner hotkey moves to this validator's: it stops, and its restart refuses light mode.
+    chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET)
+    v = validator(tmp_path, chain, own, [document(owner, 100)])
+    chain.owner = own.ss58_address
+    with pytest.raises(SystemExit, match="this is the subnet owner's hotkey"):
+        v.step()
+    assert chain.set == []
+
+
+class Recorder:
+    """Every HTTP request the process sends; only the source's axon answers."""
+
+    def __init__(self, body: bytes) -> None:
+        self.body, self.urls = body, []
+
+    def sync(self, request: httpx.Request) -> httpx.Response:
+        self.urls.append(str(request.url))
+        if (request.url.host, request.url.port) == SOURCE_AXON:
+            return httpx.Response(200, content=self.body, headers={"content-type": "application/json"})
+        raise httpx.ConnectError("not the source")
+
+    async def asynchronous(self, request: httpx.Request) -> httpx.Response:
+        self.urls.append(str(request.url))
+        raise httpx.ConnectError("a light validator sends nothing asynchronously")
+
+
+def test_a_light_validator_never_contacts_miners_or_loads_references(tmp_path, monkeypatch) -> None:
+    """Started as a service starts it, with references still in its configuration: it fetches the source's
+    document and sets its weights, and nothing else of a full validator runs."""
+    from verathos.validator import __main__ as validator_main
+
+    owner, own = kp(), kp()
+    chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET + 5)
+    recorder = Recorder(json.dumps(document(owner, 100)).encode())
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", recorder.sync)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", recorder.asynchronous)
+    monkeypatch.setattr(validator_main.bt, "Subtensor", lambda network: chain)
+    monkeypatch.setattr(validator_main.bt, "Wallet", lambda name, hotkey: SimpleNamespace(hotkey=own))
+    monkeypatch.setattr(validator_main, "CatalogFollower", lambda *args, **kwargs: SimpleNamespace(
+        catalog=CAT, start=lambda: None))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a light validator runs none of a full validator's checks")
+
+    for name in ("load_secret", "missing_references", "wait_for_references", "references_down", "run_epoch",
+                 "audit_epoch", "discover", "start_service"):
+        monkeypatch.setattr(validator_main, name, forbidden)
+    monkeypatch.setattr(validator_main.Throughput, "start", forbidden)
+    path = tmp_path / "validator.json"
+    path.write_text(json.dumps({"netuid": 405, "wallet_name": "v", "hotkey_name": "default", "mode": "light",
+                                "state_dir": str(tmp_path), "catalog_dir": str(tmp_path / "catalog"),
+                                "references": {"kev-4b": "http://127.0.0.1:8101"}}))
+    monkeypatch.setattr(sys, "argv", ["verathos-validator", "--config", str(path), "--once"])
+    validator_main.main()
+    assert recorder.urls == [f"http://{SOURCE_AXON[0]}:{SOURCE_AXON[1]}{NETWORK_PATH}"]
+    assert [s["uids"] for s in chain.set] == [[3, 7, 12]]
+
+
+def test_the_auditor_publishes_exactly_the_weights_it_sets_and_light_validators_set_the_same(tmp_path) -> None:
+    """Weights of UIDs whose endpoints are gone this epoch (their averages decay) and the fallback to the owner's UID
+    are part of what is set, so they are part of what is published."""
+    from verathos.validator import __main__ as validator_main
+    from verathos.validator.discovery import Identities, ManifestCache
+
+    owner, own = kp(), kp()
+    chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET + 5)
+    chain.metagraph = lambda netuid, lite=True: SimpleNamespace(
+        hotkeys=[owner.ss58_address, "hkA", "hkB"], axons=[SimpleNamespace(ip="0.0.0.0", port=0)] * 3,
+        S=[0.0, 0.0, 0.0], validator_permit=[True, False, False])
+    chain.get_all_commitments = lambda netuid: {}
+
+    async def no_verdicts(client, epoch):
+        return None
+
+    throughput = SimpleNamespace(auditor_hotkey=owner.ss58_address, manifests=ManifestCache(60.0),
+                                 identities=Identities(), holding=lambda: False, verdicts=no_verdicts,
+                                 update_slots=lambda miners, neurons, epoch: None)
+    current = SimpleNamespace(catalog=CAT, for_epoch=lambda st, block: CAT, accepted=lambda: {CAT.digest()})
+    auditor_cfg = SimpleNamespace(netuid=405, mechid=1, references={}, dry_run=False)
+    board = StatusBoard()
+    app = FastAPI()
+    add_network_route(app, board, owner, 405)
+    client = TestClient(app)
+    follower = validator(tmp_path, chain, own, [None])
+    follower.fetch = lambda url, **kwargs: client.get(NETWORK_PATH).json()
+
+    def auditor_epoch(state: ScoreState, epoch: int) -> dict:
+        asyncio.run(validator_main.run_epoch(auditor_cfg, chain, SimpleNamespace(hotkey=owner), b"k" * 32, state,
+                                             epoch, 1, throughput, current, board))
+        return chain.set[-1]
+
+    state = ScoreState(ema={"hkA/gpu0": 0.6, "hkB/gpu0": 0.2}, uid_of={"hkA/gpu0": 1, "hkB/gpu0": 2})
+    published = auditor_epoch(state, 100)
+    network = NetworkStatus.model_validate_json(board.network())
+    assert network.hotkeys == [] and network.epoch == 100  # no endpoint this epoch, yet weights are set
+    assert network.weights == dict(zip(published["uids"], published["weights"]))
+    assert network.weights == pytest.approx({1: 0.75, 2: 0.25})
+    follower.step()
+    assert chain.set[-1] == published
+
+    gone = ScoreState()
+    published = auditor_epoch(gone, 101)
+    assert published["uids"] == [0] and NetworkStatus.model_validate_json(board.network()).weights == {0: 1.0}
+    chain.block = 101 * BLOCKS + OFFSET + 5
+    follower.step()
+    assert chain.set[-1] == published and len(chain.set) == 4
+
+
+def test_a_light_configuration_needs_no_references(tmp_path) -> None:
+    light_config = ValidatorConfig.model_validate({"netuid": 96, "wallet_name": "v", "hotkey_name": "h",
+                                                   "mode": "light"})
+    assert light_config.references == {} and light_config.source_hotkey is None
+    assert ValidatorConfig.model_validate({"netuid": 96, "wallet_name": "v", "hotkey_name": "h"}).mode == "full"
+    with pytest.raises(ValueError):
+        ValidatorConfig.model_validate({"netuid": 96, "wallet_name": "v", "hotkey_name": "h", "mode": "half"})

@@ -1,10 +1,10 @@
 """Where each endpoint stands, as a validator saw it in its last epoch.
 
-Validators that run a service (the subnet owner and the throughput auditor) serve it read-only and signed at
-``GET /v1/status/{hotkey}``, together with the hotkey's results in the auditor's last ``STATUS_TESTS`` throughput
-tests (``protocol.status``), and every hotkey's at ``GET /v1/network`` (for network dashboards; see
-``validator.service``). Miners poll it and log it. It is that validator's own view; every validator scores the same
-way from the same rules.
+Validators that run a service (the subnet owner, which is the throughput auditor, and full validators with a
+``public_host``) serve it read-only and signed at ``GET /v1/status/{hotkey}``, together with the hotkey's results in
+the auditor's last ``STATUS_TESTS`` throughput tests (``protocol.status``), and every hotkey's at ``GET /v1/network``
+with the weights the validator set (for network dashboards and light validators; see ``validator.service``). Miners
+poll it and log it. It is that validator's own view; every validator scores the same way from the same rules.
 """
 
 from __future__ import annotations
@@ -69,23 +69,28 @@ class StatusBoard:
     """The latest epoch's status, replaced as a whole after each epoch (``revision`` counts the replacements). The
     network's document is built once per epoch: it is public, and every request for it would otherwise cost the
     validator's process a full rebuild. With a ``path`` it is also kept on disk, so a restarted validator serves the
-    last epoch's status until its next epoch."""
+    last epoch's status, and the weights it set, until its next epoch."""
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path
         self.revision = 0
         self._by_hotkey: dict[str, HotkeyStatus] = {}
+        saved = NetworkStatus()
         if path is not None and path.exists():
             try:
                 saved = NetworkStatus.model_validate_json(path.read_bytes())
                 self._by_hotkey = {h.hotkey: h for h in saved.hotkeys}
             except (OSError, ValueError) as exc:
                 log.warning("the saved status in %s is not used: %s", path, exc)
-        self._network = _network(self._by_hotkey).model_dump_json().encode()
+        self._network = saved.model_dump_json().encode()
         self._lock = threading.Lock()
 
-    def publish(self, by_hotkey: dict[str, HotkeyStatus]) -> None:
-        network = _network(by_hotkey).model_dump_json().encode()
+    def publish(self, by_hotkey: dict[str, HotkeyStatus], *, epoch: int | None = None, epoch_blocks: int | None = None,
+                model_shares: dict[str, float] | None = None, weights: dict[int, float] | None = None) -> None:
+        """Replace the status with ``by_hotkey``. The network's document also states ``weights`` (per UID, as set)
+        and the epoch, its length and the emission shares (by default the first hotkey's)."""
+        network = _network(by_hotkey, epoch=epoch, epoch_blocks=epoch_blocks, model_shares=model_shares,
+                           weights=weights).model_dump_json().encode()
         with self._lock:
             self._by_hotkey, self._network = by_hotkey, network
             self.revision += 1
@@ -112,8 +117,11 @@ class StatusBoard:
             return self.revision, self._network
 
 
-def _network(by_hotkey: dict[str, HotkeyStatus]) -> NetworkStatus:
+def _network(by_hotkey: dict[str, HotkeyStatus], **given) -> NetworkStatus:
     hotkeys = sorted(by_hotkey.values(), key=lambda h: (h.uid is None, h.uid, h.hotkey))
     first = hotkeys[0] if hotkeys else None
-    return NetworkStatus(epoch=first.epoch if first else None, epoch_blocks=first.epoch_blocks if first else None,
-                         model_shares=first.model_shares if first else {}, hotkeys=hotkeys)
+    fields = {}
+    if first is not None:
+        fields = {"epoch": first.epoch, "epoch_blocks": first.epoch_blocks, "model_shares": first.model_shares}
+    fields.update({k: v for k, v in given.items() if v is not None})
+    return NetworkStatus(**fields, hotkeys=hotkeys)

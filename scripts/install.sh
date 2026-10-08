@@ -2,7 +2,7 @@
 # Install or update a Verathos miner or validator (Ubuntu 22.04 or 24.04), then set it up.
 #
 #   curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
-#   curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator
+#   curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator [--full]
 #   bash ~/verathos/scripts/install.sh uninstall [--purge]
 #
 # Installs the system packages it needs, uv, the code (in ~/verathos) and its Python environment, then runs
@@ -17,6 +17,8 @@
 #   --purge         with uninstall: also delete ~/.verathos (configuration, state, measurements)
 # Every other option goes to `verathos-<role> init`, for example:
 #   --yes --wallet <name> --hotkey <name> --network finney|test|<ws url> --netuid <n>
+#   validator mode: --light (the default, except for the subnet owner's hotkey: sets the auditor's published weights;
+#                   no GPU, no reference engines, no requests to miners) or --full (checks miners on references)
 #   miner: --public-ip <ip> --port <port> --model <id>[,<id>...] --gpus <i,j> --no-publish
 #          --model: one model for every GPU or one per GPU in order, auto: the setup chooses (default: the
 #                   active model that pays best on each GPU, measured from the network)

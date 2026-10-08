@@ -1,11 +1,12 @@
 """Run a validator: ``verathos-validator --config validator.json``.
 
 Per epoch (``epoch_blocks`` from the catalog, independent of the subnet tempo): snapshot chain, discover miners, audit
-every endpoint with the epoch's canaries spread over the first part of the epoch, score, and set weights on the
-configured mechanism (dry run until that mechanism exists).
+every endpoint with the epoch's canaries spread over the first part of the epoch, score, publish the status with the
+weights, and set those weights on the configured mechanism (dry run until that mechanism exists).
 
-Every validator takes part in the throughput audit (see ``validator.throughput``): the auditor runs the tests, the
-others apply its signed verdicts; endpoints score in proportion to the capacity they proved.
+Every full validator takes part in the throughput audit (see ``validator.throughput``): the auditor runs the tests,
+the others apply its signed verdicts; endpoints score in proportion to the capacity they proved. A light validator
+(``mode: light``, ``validator.light``) does none of this: it sets the weights its source validator publishes.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import httpx
 from verathos import catalog
 from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
-from verathos.validator import chain, status
+from verathos.validator import chain, light, status
 from verathos.validator.audit import audit_epoch
 from verathos.validator.config import ReferenceEngine, ValidatorConfig
 from verathos.validator.discovery import DiscoveredEndpoint, Neuron, discover
@@ -249,36 +250,47 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                  key, r.tally.verdict().value, r.answered, r.sent, r.identity_ok, r.tally.mean_abs,
                  credited.get(key, 0.0), proven.user_availability.get(key, 1.0), scores.get(key, 0.0),
                  f" errors={sorted(set(r.errors))}" if r.errors else "")
-    uid_weights = weights(state, hotkey_of_uid)
+    # What the board publishes is exactly what is set: light validators set the same.
+    uid_weights = weights_to_set(weights(state, hotkey_of_uid), hotkey_of_uid, throughput.auditor_hotkey)
     board.publish(status.build(
         epoch=epoch, epoch_blocks=cat.epoch_blocks, endpoints=endpoints, results=results, scores=scores, failed=failed,
         invalid_hotkeys=invalid_hotkeys, credited=credited,
         scored_models={m.model_id for m in cat.models if m.status == "active"}, state=state, model_shares=shares,
         weights=uid_weights, drifted=proven.drifted, user_availability=proven.user_availability,
-        latency_factors=factors))
+        latency_factors=factors), epoch=epoch, epoch_blocks=cat.epoch_blocks, model_shares=shares, weights=uid_weights)
     # The epoch is scored; a failure from here on must not run it again.
     try:
-        set_weights(cfg, st, wallet, uid_weights, hotkey_of_uid)
+        set_weights(cfg, st, wallet, uid_weights)
     except Exception:
         log.exception("setting weights failed this epoch")
 
 
-def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: dict[int, float],
-                hotkey_of_uid: dict[int, str]) -> None:
+def weights_to_set(w: dict[int, float], hotkey_of_uid: dict[int, str], owner_hotkey: str) -> dict[int, float]:
+    """``w``, or, if no miner has a positive score, all weight on the subnet owner's UID (none if it holds no UID)."""
+    if w:
+        return w
+    owner = next((uid for uid, hotkey in hotkey_of_uid.items() if hotkey == owner_hotkey), None)
+    if owner is None:
+        log.warning("no miner has a positive score and the subnet owner hotkey holds no UID; no weights set")
+        return {}
+    return {owner: 1.0}
+
+
+def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: dict[int, float]) -> bool:
+    """Set ``w`` on the configured mechanism, retried once per block up to ``WEIGHT_ATTEMPTS`` times; in a dry run, or
+    before the mechanism exists on chain, only logged. Whether that is done (with nothing to set, it is)."""
     if not w:
-        owner = chain.owner_uid(st, cfg.netuid, hotkey_of_uid)
-        if owner is None:
-            log.warning("no miner has a positive score and the subnet owner hotkey holds no UID; no weights set")
-        w = {owner: 1.0} if owner is not None else {}
+        return True
     if cfg.dry_run or not chain.mechanism_ready(st, cfg.netuid, cfg.mechid):
         log.info("dry run (mechanism %d %s): weights %s", cfg.mechid,
                  "not enabled on chain" if not cfg.dry_run else "configured dry", w)
-        return
+        return True
     for attempt in range(1, WEIGHT_ATTEMPTS + 1):
-        if not w or chain.submit_weights(st, wallet, cfg.netuid, cfg.mechid, w):
-            return
+        if chain.submit_weights(st, wallet, cfg.netuid, cfg.mechid, w):
+            return True
         log.warning("setting weights failed (attempt %d of %d); retrying in one block", attempt, WEIGHT_ATTEMPTS)
         time.sleep(BLOCK_TIME_S)
+    return False
 
 
 def main() -> None:
@@ -297,13 +309,18 @@ def main() -> None:
     cfg = ValidatorConfig.load(args.config)
     state_dir = cfg.state_dir.expanduser()
     state_dir.mkdir(parents=True, exist_ok=True)
-    secret = load_secret(state_dir)
-    state_path = state_dir / "scores.json"
-    state = ScoreState.load(state_path)
     wallet = bt.Wallet(name=cfg.wallet_name, hotkey=cfg.hotkey_name)
     st = bt.Subtensor(network=cfg.network)
     current = CatalogFollower(st, cfg.network, cfg.netuid, catalog.CatalogStore(cfg.catalog_dir), cfg.catalog_mirrors,
                               state_path=cfg.state_dir.expanduser() / "catalog_followed.json")
+    if cfg.mode == "light":  # no references, no miners: the source's verified weights
+        current.start()
+        light.run(cfg, st, wallet, current, set_weights=lambda w: set_weights(cfg, st, wallet, w), once=args.once)
+        st.close()
+        return
+    secret = load_secret(state_dir)
+    state_path = state_dir / "scores.json"
+    state = ScoreState.load(state_path)
     if missing := missing_references(cfg, current.catalog):
         raise SystemExit(f"no reference engine configured for the active models {missing}")
     throughput = Throughput.start(network=cfg.network, netuid=cfg.netuid, mechid=cfg.mechid,
@@ -315,7 +332,7 @@ def main() -> None:
         log.critical("%s. Every miner refuses this validator's requests, and it sets no weights until that changes",
                      why)
     is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)
-    if is_owner or throughput.auditor is not None:
+    if is_owner or throughput.auditor is not None or cfg.public_host:
         if not cfg.public_host:
             raise SystemExit("this validator serves the catalog or the throughput verdicts: set public_host")
         if is_owner:

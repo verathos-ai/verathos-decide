@@ -1,4 +1,4 @@
-"""``verathos-validator init``: set up this machine as a validator.
+"""``verathos-validator init``: set up this machine as a full validator, or a light one (``init_light``, the default).
 
 A float32 reference engine for every active catalog model (and, with ``--candidates``, for every candidate model that
 fits in the memory left), on a GPU where one has room and in RAM otherwise, and the validator, all as system services.
@@ -18,7 +18,7 @@ from pydantic import ValidationError
 from verathos import catalog
 from verathos.install import common, engines, host, plan
 from verathos.install.common import Prompter, info, step, warn
-from verathos.install.services import Service
+from verathos.install.services import Manager, Service
 from verathos.subnet.chain import current_catalog
 from verathos.validator.config import ValidatorConfig
 
@@ -30,10 +30,17 @@ FIRST_EPOCH_S = 60.0
 
 
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="verathos-validator init", description="Set up this machine as a validator: a "
-                                "float32 reference engine per active catalog model, the validator, and system "
-                                "services for them. Run it again to update; the previous answers are the defaults.")
+    p = argparse.ArgumentParser(prog="verathos-validator init", description="Set up this machine as a validator, "
+                                "light (the validator alone) or full (also a float32 reference engine per active "
+                                "catalog model), as system services. Run it again to update; the previous answers are "
+                                "the defaults.")
     common.common_arguments(p)
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--light", dest="mode", action="store_const", const="light", help="Set the weights the subnet "
+                      "owner's validator publishes each epoch, once their signature verifies: no GPU, no reference "
+                      "engines, no requests to miners (the default for a new validator, except the subnet owner's)")
+    mode.add_argument("--full", dest="mode", action="store_const", const="full", help="Check every endpoint's "
+                      "answers on float32 reference engines and score them (the subnet owner's validator always does)")
     p.add_argument("--device", choices=("auto", "cpu", "gpu"), default="auto", help="Where the references run: on "
                    "GPUs while they fit, smallest model first, else in RAM (auto); only in RAM (cpu); only on GPUs "
                    "(gpu)")
@@ -54,15 +61,31 @@ def describe(device: str) -> str:
     return "CPU" if device == "cpu" else f"GPU {device.split(':', 1)[1]}"
 
 
+def choose_mode(ui: Prompter, requested: str | None, existing: dict, owner: bool) -> str:
+    """``light`` or ``full``: as requested, else as configured before (a configuration without a mode is a full
+    validator's), else light. The subnet owner's validator is the auditor and always full."""
+    if owner:
+        if requested == "light":
+            raise SystemExit("this is the subnet owner's hotkey: its validator is the auditor, whose results light "
+                             "validators set, and runs in full mode; drop --light")
+        return "full"
+    if requested:
+        return requested
+    default = existing.get("mode") or ("full" if existing else "light")
+    return ui.choose("Mode (light: set the auditor's results; full: check answers on references)", ["light", "full"],
+                     default)
+
+
 def validator_config(existing: dict, *, network: str, netuid: int, wallet_name: str, hotkey_name: str,
-                     ports: dict[str, int], dry_run: bool, managed_before: set[str], home: Path) -> dict:
+                     ports: dict[str, int], dry_run: bool, managed_before: set[str], home: Path,
+                     mode: str = "full") -> dict:
     """The configuration to write: ``existing`` with this setup's answers and a local reference per model (model ->
-    port). References configured by hand (a remote engine) and other settings are kept."""
+    port; none in light mode). References configured by hand (a remote engine) and other settings are kept."""
     references = {m: v for m, v in existing.get("references", {}).items()
                   if m not in ports and m not in managed_before}
     references.update({m: f"http://127.0.0.1:{p}" for m, p in ports.items()})
     config = {**existing, "network": network, "netuid": netuid, "wallet_name": wallet_name,
-              "hotkey_name": hotkey_name, "references": references, "dry_run": dry_run}
+              "hotkey_name": hotkey_name, "mode": mode, "references": references, "dry_run": dry_run}
     config.setdefault("state_dir", str(home / "validator"))
     config.setdefault("catalog_dir", str(home / "catalog"))
     return config
@@ -93,19 +116,25 @@ def init(argv: list[str]) -> None:
             raise SystemExit(message + "\nthen run this again.")
         warn(message.replace("\n", " "))
     elif not neuron.validator_permit:
-        warn(f"UID {neuron.uid} has no validator permit yet: miners answer only validators with one (it follows "
-             "the stake)")
+        warn(f"UID {neuron.uid} has no validator permit yet: a validator sets weights, and miners answer it, only "
+             "with one (it follows the stake)")
     else:
         info(f"registered on netuid {netuid} as UID {neuron.uid}, with a validator permit")
-    if hotkey == st.get_subnet_owner_hotkey(netuid):
+    owner = hotkey == st.get_subnet_owner_hotkey(netuid)
+    if owner:
         warn("this is the subnet owner's hotkey: its validator also serves the catalog and runs the throughput "
              "audit, which needs public_host, port and the load generator (docs/VALIDATING.md)")
+    mode = choose_mode(ui, args.mode, existing, owner)
     store = catalog.CatalogStore(Path(existing.get("catalog_dir", home / "catalog")))
     try:
         cat = current_catalog(st, netuid, store, existing.get("catalog_mirrors", []))
     except catalog.CatalogUnavailable as exc:
         raise SystemExit(f"the subnet's catalog is not available: {exc}") from None
     info(f"catalog {cat.revision} ({cat.digest()[:12]})")
+    if mode == "light":
+        init_light(ui, manager, record, existing, config_path, home, dry_run, cat=cat, network=network, netuid=netuid,
+                   wallet_name=wallet_name, hotkey_name=hotkey_name)
+        return
 
     step("References")
     served = plan.servable_models(cat)
@@ -146,6 +175,8 @@ def init(argv: list[str]) -> None:
                             lambda p: host.port_free(p, "127.0.0.1"))
 
     step("Plan")
+    for line in mode_lines("full", cat, owner):
+        info(line)
     for m in models:
         need = plan.reference_memory(parameters[m], "cpu" if placement[m] == "cpu" else "gpu")
         info(f"{m}{' (' + plan.CANDIDATE + ')' if m in candidates else ''}: float32 reference on "
@@ -251,6 +282,87 @@ def init(argv: list[str]) -> None:
     info(f"status:  {manager.status_command(record.services)}")
     info(f"logs:    {manager.log_command(VALIDATOR)}")
     info("each epoch logs its miners and endpoints, one line per endpoint checked, and the weights set")
+    info(f"after editing the configuration: {manager.restart_command([VALIDATOR])}")
+    for line in common.script_commands("validator", home):
+        info(line)
+
+
+def mode_lines(mode: str, cat: catalog.Catalog, owner: bool) -> list[str]:
+    """What the plan says about the validator's mode and what it needs."""
+    if mode == "light":
+        return ["mode light: sets the weights the subnet owner's validator publishes each epoch, once their signature "
+                "verifies; it follows the auditor's results, where a full validator (--full) checks answers itself",
+                "needs: a validator permit to set weights; no GPU, no reference engines and no stake beyond the "
+                "permit; it sends nothing to miners"]
+    if owner:
+        return ["mode full: the subnet owner's validator is the auditor; it checks every endpoint's answers on its "
+                "references, runs the throughput tests and publishes the results light validators set",
+                "needs: public_host, port and the load generator (docs/VALIDATING.md), and the references below"]
+    return ["mode full: checks every endpoint's answers on float32 references and scores them (--light sets the subnet "
+            "owner's validator's results instead)",
+            f"needs: a validator permit and {cat.scoring.validator_min_stake:,.0f} stake (the metagraph's S) for "
+            "miners to answer it, and the references below"]
+
+
+def init_light(ui: Prompter, manager: Manager | None, record: common.Record, existing: dict, config_path: Path,
+               home: Path, dry_run: bool, *, cat: catalog.Catalog, network: str, netuid: int, wallet_name: str,
+               hotkey_name: str) -> None:
+    """The light validator: the validator alone, as a service. References a full setup placed before stop."""
+    stale = sorted(record.engines)
+    step("Plan")
+    for line in mode_lines("light", cat, owner=False):
+        info(line)
+    if stale:
+        info(f"the references of {', '.join(stale)} stop (their engines and weights stay until uninstall)")
+    info(f"validator with hotkey {wallet_name}/{hotkey_name}" + (", dry run: no weights set" if dry_run else ""))
+    info(f"configuration {config_path}")
+    if not ui.confirm("Go ahead?"):
+        raise SystemExit("stopped; nothing changed")
+
+    step("Configuration")
+    config = validator_config(existing, network=network, netuid=netuid, wallet_name=wallet_name,
+                              hotkey_name=hotkey_name, ports={}, dry_run=dry_run, managed_before=set(stale),
+                              home=home, mode="light")
+    try:
+        ValidatorConfig.model_validate(config)
+    except ValidationError as exc:
+        raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
+    common.write_json(config_path, config)
+    info(f"wrote {config_path}")
+    validator = Service(name=VALIDATOR, description="Verathos validator (light)",
+                        command=[str(Path(sys.prefix) / "bin" / "verathos-validator"), "--config", str(config_path)],
+                        directory=home, user=common.operator(), environment={"HOME": str(Path.home())})
+    record.config, record.engines = str(config_path), {}
+
+    if manager is None:
+        record.save(home)
+        step("Run (no services installed)")
+        info("start the validator under your supervisor" + (" (the references it ran with are not needed)"
+                                                            if stale else "") + ":")
+        print(f"      cd {shlex.quote(str(validator.directory))} && {shlex.join(validator.command)}")
+        return
+
+    step("Services")
+    if stale:
+        manager.remove([service_name(m) for m in stale])
+        info(f"removed the services of the references of {', '.join(stale)}")
+    manager.mark(VALIDATOR)
+    record.manager, record.services = manager.name, [VALIDATOR]
+    record.save(home)  # before the service exists, so uninstall finds it whatever happens next
+    changed = manager.apply([validator], restart={VALIDATOR})
+    info(f"{manager.name}: {VALIDATOR}" + (" (new or changed)" if changed else ""))
+
+    step("Validator")
+    common.follow(manager, VALIDATOR, done=lambda line: "light mode:" in line,
+                  failed=lambda line: "subnet owner's hotkey" in line or "source_hotkey" in line, timeout_s=STARTUP_S)
+
+    step("Done")
+    info(f"validator: service {VALIDATOR}, light mode" + (" (dry run: no weights set)" if dry_run else ""))
+    info(f"configuration: {config_path}; state: {config['state_dir']}")
+    info(f"status:  {manager.status_command(record.services)}")
+    info(f"logs:    {manager.log_command(VALIDATOR)}")
+    info("each epoch, once the subnet owner's validator has published its results (from about 60% into the epoch), "
+         "logs the weights set: the number of UIDs and the highest weights")
     info(f"after editing the configuration: {manager.restart_command([VALIDATOR])}")
     for line in common.script_commands("validator", home):
         info(line)
