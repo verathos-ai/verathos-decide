@@ -1032,8 +1032,47 @@ def test_a_post_on_a_connection_the_auditor_closed_is_sent_again_at_once(tmp_pat
     assert s.served.pending() == 0
     s.client._transport._t["auditor"] = Dropping(auditor, 1, taken=False)
     asyncio.run(s.sampler.flush())
-    assert s.sampler.pending() == {"picked": 0, "proofs": 0}
+    assert s.sampler.pending() == {"picked": 0, "proofs": 0, "test_picks": 0}
     assert s.auditor.store._query("SELECT COUNT(*) FROM samples")[0][0] == 1
+
+
+def test_one_answer_to_users_per_endpoint_and_test_reaches_the_auditor_once_the_test_ends(tmp_path) -> None:
+    """The gateway follows the public schedule: from the test's start block until its traffic ends it draws one of
+    each endpoint's answers, and posts it with the test's id once the sessions end, again if the post fails."""
+    from tests.test_throughput import FakeChain, block_hash
+    from verathos.gateway.sampler import TestFollower
+    from verathos.throughput.follow import ScheduleFollower
+    from verathos.throughput.policy import AuditPolicy, ScheduledTest, draws_hit, eligible_range
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    clock, policy = Clock(), AuditPolicy()
+    s.sampler.clock = clock
+    first, last = eligible_range(3, policy)
+    selection = next(b for b in range(first, last + 1) if draws_hit(b, block_hash(b), policy))
+    chain = FakeChain(selection)
+    tests = TestFollower(s.sampler, ScheduleFollower(chain, policy), lambda: policy)
+    asyncio.run(tests.step())  # the test is selected: it starts lead_blocks later
+    assert asyncio.run(s.post({**REQUEST, "state": "before the test"})).status_code == 200
+    chain.head_block = selection + policy.lead_blocks
+    asyncio.run(tests.step())
+    (test_id,) = s.sampler._tests
+    clock.now += 1.0
+    for i in range(3):
+        assert asyncio.run(s.post({**REQUEST, "state": f"during the test {i}"})).status_code == 200
+    clock.now += policy.session_s - 2.0
+    asyncio.run(tests.step())  # the sessions have not ended: nothing is posted yet
+    assert s.sampler.pending()["test_picks"] == 1
+    s.auditor.store.add_test(ScheduledTest(3, selection, block_hash(selection).hex(), selection + policy.lead_blocks))
+    auditor = s.client._transport._t["auditor"]
+    s.client._transport._t["auditor"] = Unreachable()
+    clock.now += 2.0
+    asyncio.run(tests.step())  # the post fails: kept
+    assert s.sampler.pending()["test_picks"] == 1
+    s.client._transport._t["auditor"] = auditor
+    asyncio.run(tests.step())
+    assert s.sampler.pending()["test_picks"] == 0
+    (row,) = s.auditor.store._query("SELECT request FROM samples WHERE test_id = ?", (test_id,))
+    assert "during the test" in json.loads(row[0])["state"]
 
 
 def test_served_counts_are_kept_while_the_auditor_cannot_be_found() -> None:
@@ -1107,7 +1146,8 @@ def test_an_admin_request_goes_where_it_is_sent_and_is_never_billed(tmp_path) ->
     body = r.json()
     assert r.status_code == 200 and body["endpoint"] == f"{target_kp.ss58_address}/gpu0" and not body["counted"]
     assert body["attempts"][0]["outcome"] == "answered" and json.loads(body["response"])["receipt"]
-    assert s.served.pending() == 0 and s.sampler.pending() == {"picked": 0, "proofs": 0} and s.meter.pending() == 0
+    assert s.served.pending() == 0 and s.meter.pending() == 0
+    assert s.sampler.pending() == {"picked": 0, "proofs": 0, "test_picks": 0}
     counted = asyncio.run(admin_call(s, "POST", "/admin/v1/systemone",
                                      json_={"request": REQUEST, "target": target, "count": True})).json()
     assert counted["counted"] and s.served.pending() == 1 and s.sampler.pending()["picked"] == 1

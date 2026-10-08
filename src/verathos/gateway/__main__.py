@@ -49,13 +49,15 @@ from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.router import Router
 from verathos.gateway.routes import RouteTable, stale_after_s
-from verathos.gateway.sampler import Sampler
+from verathos.gateway.sampler import Sampler, TestFollower
 from verathos.gateway.served import ServedCounter
 from verathos.gateway.upstream import Upstream
 from verathos.gateway.usage import UsageMeter
 from verathos.protocol.gateway import Routes
 from verathos.protocol.http import raise_open_file_limit
 from verathos.throughput.chain import SubtensorChainView
+from verathos.throughput.follow import ScheduleFollower
+from verathos.throughput.policy import AuditPolicy
 
 log = logging.getLogger("verathos.gateway")
 RESERVED_FILES = 512  # the database pool, the listeners, the metrics and log files
@@ -121,6 +123,8 @@ async def serve(config: GatewayConfig) -> None:
     sampler = Sampler(keypair, client, auditor_url=auditor_url, auditor_hotkey=auditor_hotkey,
                       window_s=config.sample_window_s, rng=random.SystemRandom())
     served = ServedCounter(keypair, client, auditor_url=auditor_url, auditor_hotkey=auditor_hotkey)
+    tests = TestFollower(sampler, ScheduleFollower(chain, AuditPolicy()),
+                         lambda: current[0].audit_policy() if current[0] is not None else None)
     router = Router(share=1 / config.instances, max_latency_s=2.0, observer=served)
     gateway = Gateway(config=config, hotkey=keypair.ss58_address, catalog=lambda: current[0], accounts=accounts,
                       meter=meter, router=router, sampler=sampler, served=served, routes=lambda: routes.table,
@@ -137,7 +141,7 @@ async def serve(config: GatewayConfig) -> None:
         except Exception as exc:
             log.warning("keys not loaded, every key is looked up until they are: %s: %s", type(exc).__name__, exc)
         tasks = [asyncio.create_task(t) for t in (routes.run(), meter.run(), sampler.run(), served.run(),
-                                                     accounts.run(), mark_states_forever(gateway))]
+                                                     accounts.run(), tests.run(), mark_states_forever(gateway))]
         log.info("gateway %s on %s:%d (auditor %s, %d instance(s))", keypair.ss58_address, config.listen_host,
                  config.port, auditor_hotkey, config.instances)
         try:

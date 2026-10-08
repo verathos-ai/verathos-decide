@@ -87,6 +87,12 @@ sends the window's picks to the auditor. The auditor keeps up to 8 per endpoint 
 Signed malformed answers are proof on their own: they always go to the auditor, and are kept for the next window if
 a post fails.
 
+During a throughput test the auditor counts what an endpoint answers users only once it has checked one of those
+answers (`THROUGHPUT_AUDIT.md`): a miner knows when a test runs. So the gateway follows the public test schedule on
+the chain, and from when it sees a test's start block until the test's traffic ends it draws, per endpoint, one of
+the exchanges it sends the endpoint, uniformly as above; once the test's sessions end (`session_s` after the start)
+it posts each pick marked with the test's id, and again on failure for 5 minutes.
+
 The gateway also reports, every 5 s, how many requests each endpoint answered it per second, and their input tokens.
 Miners serve the gateway before the auditor's test traffic; what an endpoint answers the gateway inside a test's
 measured window counts as delivered, so serving users never costs a miner credit (`THROUGHPUT_AUDIT.md`). The input
