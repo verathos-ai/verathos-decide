@@ -12,11 +12,12 @@ includes other gateway processes' written counts), plus what this process counte
 read that overlaps a write is read again, so a count is never in both or neither; reads do not wait for each other.
 
 An answer costs its input tokens times the model's price (USD per million tokens, so micro-USD per token). The cost
-is written with the usage, rounded to whole micro-USD per row, and taken from the account's balance in the same
-transaction. A prepaid account is served while its balance is positive: as read from the database at most
-``BALANCE_TTL_S`` ago (so other processes' charges and new credit apply within that time), minus what this process
-charged since and what its requests in flight may cost at most (``reserve``, settled when they end). A balance can
-therefore end below zero by at most one request's cost per process.
+is written with the usage in whole micro-USD per row, the fraction carried to the row's next write (so answers cost
+what their tokens do, however they fall into writes), and taken from the account's balance in the same transaction.
+A prepaid account is served while its balance is positive: as read from the database at most ``BALANCE_TTL_S`` ago
+(so other processes' charges and new credit apply within that time), minus what this process charged since and what
+its requests in flight may cost at most (``reserve``, settled when they end). A balance can therefore end below zero
+by at most one request's cost per process.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import math
 import secrets
 import time
 from collections.abc import Callable
@@ -80,6 +82,7 @@ class UsageMeter:
         self._balance: dict[int, list] = {}  # prepaid account -> [balance as read or written, when read]
         self._uncharged: dict[int, float] = {}  # account -> cost counted since the last batch
         self._reserved: dict[int, float] = {}  # prepaid account -> the most its requests in flight may cost
+        self._fractions: dict[Key, float] = {}  # row -> the fraction of a micro-USD of cost not written yet
         self._waiting: list[Batch] = []  # batches not written yet, oldest first
         self._reading: dict[int, asyncio.Future[None]] = {}  # account -> its balance read in progress
         self._writes = 0  # writes started
@@ -208,9 +211,18 @@ class UsageMeter:
         self._unwritten, self._uncharged = {}, {}
         if not counts:
             return None
-        # rows in one order in every process: two writing the same rows wait for each other, never deadlock
-        return Batch([{"account_id": a, "key_id": k, "model_id": m, "day": d, "requests": c[0], "failed": c[1],
-                       "input_tokens": c[2], "cost": round(c[3])} for (a, k, m, d), c in sorted(counts.items())])
+        rows = []
+        for key, c in sorted(counts.items()):  # one order in every process: two writing the same rows never deadlock
+            cost = c[3] + self._fractions.pop(key, 0.0)
+            whole = math.floor(cost + 1e-9)  # 350 x 0.04 is 14, not 13 and a fraction of 0.99...
+            if cost - whole > 1e-9:
+                self._fractions[key] = cost - whole
+            account, key_id, model, day = key
+            rows.append({"account_id": account, "key_id": key_id, "model_id": model, "day": day, "requests": c[0],
+                         "failed": c[1], "input_tokens": c[2], "cost": whole})
+        today = dt.datetime.now(dt.UTC).date()
+        self._fractions = {k: f for k, f in self._fractions.items() if k[3] >= today - dt.timedelta(days=1)}
+        return Batch(rows)
 
     async def _write_waiting(self) -> None:
         while self._waiting:

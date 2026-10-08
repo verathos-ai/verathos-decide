@@ -78,6 +78,9 @@ def miner(host: str, gateway: Keypair, engine) -> tuple[Keypair, FastAPI]:
     return keypair, app
 
 
+LONG = {**REQUEST, "state": "the customer asks about an invoice " * 40}  # its answers cost whole micro-USD
+
+
 def route(keypair: Keypair, host: str, credited: float = 20.0) -> Route:
     return Route(hotkey=keypair.ss58_address, endpoint_id="gpu0", model_id="kev-4b", url=f"http://{host}:8091/e/gpu0",
                  credited_rps=credited, latency_ms=300.0)
@@ -679,15 +682,14 @@ def test_an_answer_is_billed_at_least_its_states_length_in_tokens(tmp_path) -> N
             return {**await super().answer(request), "usage": {"input_tokens": 0}}
 
     s = Setup(tmp_path, {"10.0.0.1": Free("kev-4b")})
-    long = {**REQUEST, "state": "the customer asks about an invoice " * 40}
-    r = asyncio.run(s.post(long))
-    assert r.status_code == 200 and r.json()["usage"]["input_tokens"] == len(long["state"]) // 8
+    r = asyncio.run(s.post(LONG))
+    assert r.status_code == 200 and r.json()["usage"]["input_tokens"] == len(LONG["state"]) // 8
     asyncio.run(s.meter.flush())
     (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
-    assert usage["input_tokens"] == len(long["state"]) // 8 and usage["cost"] > 0
+    assert usage["input_tokens"] == len(LONG["state"]) // 8 and usage["cost"] > 0
     honest = Setup(tmp_path / "honest", {"10.0.0.1": MockEngine("kev-4b")})
-    signed = asyncio.run(MockEngine("kev-4b").answer(long))["usage"]["input_tokens"]
-    assert asyncio.run(honest.post(long)).json()["usage"]["input_tokens"] == signed  # an honest count is not raised
+    signed = asyncio.run(MockEngine("kev-4b").answer(LONG))["usage"]["input_tokens"]
+    assert asyncio.run(honest.post(LONG)).json()["usage"]["input_tokens"] == signed  # an honest count is not raised
 
 
 def test_invalid_keys_are_limited_before_the_database(tmp_path) -> None:
@@ -875,12 +877,11 @@ def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
 
     s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
     price = catalog.load().get("kev-4b").price
-    long = {**REQUEST, "state": "the customer asks about an invoice " * 40}  # costs whole micro-USD
 
     def balance() -> int:
         return asyncio.run(s.accounts.account("acme"))["balance"]
 
-    first = asyncio.run(s.post(long))  # not prepaid: served without credit, its usage still costs
+    first = asyncio.run(s.post(LONG))  # not prepaid: served without credit, its usage still costs
     assert first.status_code == 200
     asyncio.run(s.meter.flush())
     cost = round(first.json()["usage"]["input_tokens"] * price)
@@ -896,12 +897,12 @@ def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
     assert not listed["kev-9b"]["available"]  # active in the catalog, listed, but no miner routed
 
     asyncio.run(s.accounts.set_account("acme", prepaid=True))
-    refused = asyncio.run(s.post(long))
+    refused = asyncio.run(s.post(LONG))
     assert refused.status_code == 402 and refused.json()["error"]["type"] == "insufficient_credit"
     entry, created = asyncio.run(s.accounts.add_credit("acme", cost + 1, kind="grant", reference="signup:acme"))
     assert created and entry["amount"] == cost + 1 and balance() == 1
-    assert asyncio.run(s.post(long)).status_code == 200  # new credit applies at once in this process
-    assert asyncio.run(s.post(long)).status_code == 402  # charged, though not written yet
+    assert asyncio.run(s.post(LONG)).status_code == 200  # new credit applies at once in this process
+    assert asyncio.run(s.post(LONG)).status_code == 402  # charged, though not written yet
     asyncio.run(s.meter.flush())
     assert balance() == 1 - cost  # the answer accepted with credit left is charged: below zero by one answer
 
@@ -915,7 +916,7 @@ def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
     with pytest.raises(LookupError):
         asyncio.run(s.accounts.add_credit("nobody", 5, kind="grant", reference="y"))
     asyncio.run(s.accounts.add_credit("acme", 1_000_000, kind="topup", reference="pay-1"))
-    assert asyncio.run(s.post(long)).status_code == 200
+    assert asyncio.run(s.post(LONG)).status_code == 200
     ledger = asyncio.run(s.accounts.credits("acme"))
     assert [(c["kind"], c["reference"]) for c in ledger] == [("topup", "pay-1"), ("grant", "signup:acme")]
 
@@ -923,15 +924,15 @@ def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
 def test_concurrent_requests_cannot_overdraw_a_prepaid_account(tmp_path) -> None:
     """Each request reserves the most it may cost until it ends: a burst cannot pass the credit check together."""
     s = Setup(tmp_path, {"10.0.0.1": Slow("kev-4b", 0.3)}, credited=200.0)
-    most = len(json.dumps(REQUEST)) * catalog.load().get("kev-4b").price
+    most = len(json.dumps(LONG)) * catalog.load().get("kev-4b").price
 
     async def run():
         await s.accounts.set_account("acme", prepaid=True)
         await s.accounts.add_credit("acme", 1, kind="grant", reference="g")
-        codes = [r.status_code for r in await asyncio.gather(*(s.post() for _ in range(30)))]
+        codes = [r.status_code for r in await asyncio.gather(*(s.post(LONG) for _ in range(30)))]
         assert codes.count(200) == 1 and codes.count(402) == 29
         await s.meter.flush()
-        assert -most < (await s.accounts.account("acme"))["balance"] < 1
+        assert -most < (await s.accounts.account("acme"))["balance"] < 0
         assert s.meter._reserved == {}  # every reservation released
         await s.accounts.add_credit("acme", 1_000_000, kind="topup", reference="t")
         assert {r.status_code for r in await asyncio.gather(*(s.post() for _ in range(5)))} == {200}
@@ -1000,6 +1001,16 @@ def test_a_usage_row_the_database_refuses_blocks_no_other_row(tmp_path, caplog) 
     asyncio.run(meter.flush())
     assert [u["requests"] for u in asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))] == [1]
     assert meter.pending() == 0 and "refuses" in caplog.text
+
+
+def test_answers_cost_what_their_tokens_do_however_they_fall_into_writes(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    principal = principal_of(s, s.key)
+    for _ in range(10):  # 41 tokens at 0.04 micro-USD: 1.64 each, each in a write of its own
+        s.meter.record(principal, "kev-4b", answered=True, input_tokens=41, price=0.04)
+        asyncio.run(s.meter.flush())
+    (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
+    assert (usage["input_tokens"], usage["cost"]) == (410, 16)
 
 
 def test_usage_beyond_what_may_wait_is_dropped_and_logged(tmp_path, caplog, monkeypatch) -> None:
@@ -1105,7 +1116,7 @@ def test_the_admin_api_signs_users_up_with_keys_and_credit(tmp_path) -> None:
     for bad in ({**grant, "amount": "5"}, {**grant, "amount": -5, "reference": "n"}, {**grant, "kind": "gift"},
                 {"amount": 5, "kind": "grant"}):
         assert call("POST", "/admin/v1/accounts/u_42/credits", bad).status_code == 400
-    answered = asyncio.run(s.post(key=key))
+    answered = asyncio.run(s.post(LONG, key=key))
     assert answered.status_code == 200
     asyncio.run(s.meter.flush())
     cost = round(answered.json()["usage"]["input_tokens"] * catalog.load().get("kev-4b").price)

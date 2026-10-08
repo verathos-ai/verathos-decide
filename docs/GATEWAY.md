@@ -279,8 +279,8 @@ verathos-gateway credits list --account acme
 ### Credit
 
 An answer costs its input tokens times the model's catalog `price` (USD per million input tokens). The cost is
-written with the usage every 5 s, rounded to whole micro-USD per account, key, model and day, and taken from the
-account's balance in the same transaction. Every account has a balance: the credit recorded minus the cost of its
+written with the usage every 5 s, in whole micro-USD per account, key, model and day (fractions are carried to the
+next write, so answers cost what their tokens do), and taken from the account's balance in the same transaction. Every account has a balance: the credit recorded minus the cost of its
 usage. A prepaid account (`--prepaid yes`) is served only while its balance is positive; others are served
 regardless (their balance just goes negative).
 
