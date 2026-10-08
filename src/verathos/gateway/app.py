@@ -238,6 +238,7 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
     tried: set[str] = set()
     unclear: list[Endpoint] = []
     rejected: list[Endpoint] = []
+    excused: list[Endpoint] = []
     result = "busy"
     for attempt in range(g.config.max_attempts):
         remaining = deadline - g.clock()
@@ -271,6 +272,7 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
             elif failure.blame == "busy":
                 outcome = Outcome.BUSY
             elif failure.blame == "gateway":  # this host's own fault: no miner is told off for it
+                excused.append(endpoint)
                 result = "failed"
             elif failure.blame == "rejected":
                 unclear.append(endpoint)
@@ -294,8 +296,12 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
                 attempts.append(note)
         for other in unclear:
             g.router.penalize(other, observe=counted)
+        for other in excused:
+            g.router.settled(other)
         metrics.UPSTREAM_SECONDS.labels(model_id).observe(seconds)
         return dataclasses.replace(exchange, seconds=seconds)
+    for other in unclear + excused:
+        g.router.settled(other)
     if len(rejected) == 1:
         g.router.refused(rejected[0], observe=counted)
     return result

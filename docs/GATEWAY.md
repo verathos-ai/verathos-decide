@@ -54,7 +54,8 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    a refusal no other miner shares is also reported as refusing users (without opening its breaker), and the user
    gets 503, not 400. A slow endpoint gets fewer requests on its own: they stay in flight longer. After 3 failures
    in a row an endpoint's circuit breaker opens for 5 s; one probe request then decides, and each failed probe
-   doubles the time (up to 120 s).
+   doubles the time (up to 120 s). A probe that times out stays the one probe until its request is settled: it
+   fails if another miner answers the request.
 7. **Response.** The answers, the input tokens the miner signed in its receipt (at most one per byte of the
    request, at least one per 8 characters of the state; the auditor checks sampled counts against its reference,
    too many or too few being a wrong answer), the receipt itself and the request id. Usage is counted per account,

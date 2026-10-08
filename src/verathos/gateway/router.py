@@ -215,7 +215,8 @@ class Router:
 
     def finished(self, endpoint: Endpoint, outcome: Outcome | None, seconds: float | None = None, *,
                  observe: bool = True) -> None:
-        """One attempt is over after ``seconds``; ``outcome`` None: it counts neither way (yet, see ``penalize``)."""
+        """One attempt is over after ``seconds``; ``outcome`` None: it counts neither way yet, until ``penalize`` or
+        ``settled`` (a probe stays the breaker's one probe until then, so a failed one doubles the open time)."""
         endpoint.in_flight -= 1
         slow = seconds is not None and seconds >= SLOW_FACTOR * self.max_latency_s
         if outcome is Outcome.ANSWERED or slow:  # a timeout at the attempt's limit is slow too
@@ -224,10 +225,9 @@ class Router:
             self._breaker(endpoint, endpoint.breaker.succeeded)
         elif outcome is Outcome.FAILED:
             self._breaker(endpoint, lambda: endpoint.breaker.failed(self.clock()))
-        else:
+        elif outcome is Outcome.BUSY:
             endpoint.breaker.probing = False
-            if outcome is Outcome.BUSY:
-                endpoint.busy_until = self.clock() + BUSY_S
+            endpoint.busy_until = self.clock() + BUSY_S
         if outcome in (Outcome.BUSY, Outcome.FAILED) and observe and self.observer is not None:
             self.observer.refused(endpoint.route)
 
@@ -235,6 +235,10 @@ class Router:
         """Count a failure whose cause was unclear, once another miner has answered the same request."""
         self._breaker(endpoint, lambda: endpoint.breaker.failed(self.clock()))
         self.refused(endpoint, observe=observe)
+
+    def settled(self, endpoint: Endpoint) -> None:
+        """An attempt that ended with no outcome counts neither way after all (no other miner answered)."""
+        endpoint.breaker.probing = False
 
     def refused(self, endpoint: Endpoint, *, observe: bool = True) -> None:
         """Report that the endpoint refused a user request, without a breaker failure."""

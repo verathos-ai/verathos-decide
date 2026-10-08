@@ -476,6 +476,32 @@ def test_the_router_spreads_by_capacity_and_respects_caps_and_breakers() -> None
     assert router._pools["kev-4b"].endpoints == [b]  # kept with its state
 
 
+def test_a_probe_that_times_out_doubles_the_open_time_once_another_miner_answers() -> None:
+    clock = Clock()
+    router = Router(share=1.0, max_latency_s=2.0, rng=random.Random(3), clock=clock)
+    router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=1, catalog_digest="0" * 64,
+                         routes=[route(kp(), "b", 30.0), route(kp(), "s", 10.0)]))
+    (b, s) = router._pools["kev-4b"].endpoints
+    for _ in range(BREAKER_FAILURES):
+        router.started(b)
+        router.finished(b, Outcome.FAILED)
+    clock.now += OPEN_S
+    probe = next(e for e in (router.pick("kev-4b") for _ in range(100)) if e is b)
+    router.started(probe)
+    router.finished(probe, None, 4.0)  # timed out: unclear until the request is settled
+    assert all(router.pick("kev-4b") is s for _ in range(50))  # still the one probe
+    router.penalize(probe)  # another miner answered the same request
+    assert b.breaker.open_s == 2 * OPEN_S
+    clock.now += OPEN_S
+    assert all(router.pick("kev-4b") is s for _ in range(50))  # open for the doubled time
+    clock.now += OPEN_S
+    probe = next(e for e in (router.pick("kev-4b") for _ in range(100)) if e is b)
+    router.started(probe)
+    router.finished(probe, None, 4.0)
+    router.settled(probe)  # no miner answered it: neither way
+    assert b.breaker.open_s == 2 * OPEN_S and not b.breaker.probing
+
+
 class Observer:
     def __init__(self) -> None:
         self.offers: dict[str, int] = {}
