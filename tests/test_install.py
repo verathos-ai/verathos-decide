@@ -414,7 +414,7 @@ def test_install_script_parses_and_documents_its_options() -> None:
     usage = subprocess.run(["bash", str(script), "--help"], capture_output=True, text=True)
     assert usage.returncode == 0 and "--source" in usage.stdout and "uninstall" in usage.stdout
     assert "--worker" in usage.stdout and "--peers" in usage.stdout
-    assert "--light" in usage.stdout and "--full" in usage.stdout
+    assert "--light" in usage.stdout and "--full" in usage.stdout and "--references" in usage.stdout
 
 
 def test_a_validator_is_light_unless_full_is_asked_for_or_set_up_before_and_the_owners_is_full(tmp_path) -> None:
@@ -510,3 +510,147 @@ def test_a_light_setup_runs_the_validator_alone_and_stops_the_references_of_a_fu
             "SystemExit: this is the subnet owner's hotkey: its validator is the auditor"]]), saved,
             common.read_json(config_path), config_path, home, False, cat=catalog.load(), network="finney", netuid=96,
             wallet_name="v", hotkey_name="default")
+
+
+def test_references_run_one_at_a_time_when_the_active_ones_do_not_all_fit() -> None:
+    """The setup keeps them resident while the active models' references all fit in the free memory, else runs them
+    one at a time, where each alone needs to fit; --references forces either, and one at a time stays once set up."""
+    from verathos.install.validator import place, reference_line
+
+    def decide(ram_gib: float, gpu_gib: float | None = None, references: str | None = None, existing=None,
+               record=None, owner: bool = False, device: str = "auto"):
+        args = argparse.Namespace(device=device, references=references)
+        gpus = {} if gpu_gib is None else {0: int(gpu_gib * GiB)}
+        return place(KEV, gpus, int(ram_gib * GiB), args, existing or {}, record or common.Record(role="validator"),
+                     owner, [])
+
+    mode, why, placement = decide(128)
+    assert (mode, placement) == ("resident", {"kev-4b": "cpu", "kev-9b": "cpu"}) and "fit" in why
+    assert reference_line(mode, placement, KEV) == "all references resident (RAM about 63 GiB)"
+    mode, why, placement = decide(50)
+    assert (mode, placement) == ("sequential", {"kev-4b": "cpu", "kev-9b": "cpu"})
+    assert why == "the active models' references do not all fit in the free memory at once"
+    assert reference_line(mode, placement, KEV) == "references one at a time (RAM for the largest: about 42 GiB)"
+    with pytest.raises(plan.PlanError, match="kev-9b reference needs about 42 GiB of RAM, even one at a time"):
+        decide(30, device="cpu")
+    # a GPU that holds each alone, not both: one at a time on the GPU
+    mode, _, placement = decide(30, gpu_gib=50)
+    assert (mode, placement) == ("sequential", {"kev-4b": "cuda:0", "kev-9b": "cuda:0"})
+    assert reference_line(mode, placement, KEV) == "references one at a time (GPU 0 for the largest: about 48 GiB)"
+    # forced, kept, and the auditor's
+    assert decide(128, references="sequential")[:2] == ("sequential", "as --references sequential asks")
+    mode, why, _ = decide(128, existing={"reference_mode": "sequential"})
+    assert mode == "sequential" and "--references resident runs them all at once, which fits now" in why
+    assert decide(128, existing={"reference_mode": "sequential"}, references="resident")[0] == "resident"
+    with pytest.raises(plan.PlanError, match="kev-9b reference needs"):
+        decide(50, references="resident")
+    assert decide(50, existing={"reference_mode": "resident"})[0] == "sequential"  # no longer fits
+    assert decide(128, owner=True)[0] == "resident"
+    with pytest.raises(SystemExit, match="auditor .* stay resident"):
+        decide(50, owner=True, references="sequential")
+    # resident references set up before hold their memory: they stay resident, and one at a time it is theirs again
+    before = common.Record(role="validator", services=["verathos-reference-kev-4b", "verathos-reference-kev-9b",
+                                                       "verathos-validator"],
+                           engines={"kev-4b": {"device": "cpu", "port": 8101},
+                                    "kev-9b": {"device": "cpu", "port": 8102}})
+    assert decide(4, record=before)[:3:2] == ("resident", {"kev-4b": "cpu", "kev-9b": "cpu"})
+    assert decide(4, record=before, references="sequential")[:3:2] == ("sequential", {"kev-4b": "cpu",
+                                                                                      "kev-9b": "cpu"})
+    # one at a time, a candidate that fits alone is checked too; one that fits nowhere is left out
+    parameters = {**KEV, "clef-flash": CLEF}
+    assert plan.place_one_at_a_time(parameters, {}, 45 * GiB, "auto", {}, optional={"clef-flash"}) == {
+        "kev-4b": "cpu", "kev-9b": "cpu", "clef-flash": "cpu"}
+    assert plan.place_one_at_a_time({"kev-4b": KEV["kev-4b"], "clef-flash": CLEF}, {}, 30 * GiB, "auto", {},
+                                    optional={"clef-flash"}) == {"kev-4b": "cpu"}
+
+
+def test_the_configuration_of_references_one_at_a_time_holds_how_to_start_them(tmp_path) -> None:
+    launch = {"kev-4b": {"command": ["/e/.venv-reference/bin/python", "-m", "kev.serve", "--port", "8101"],
+                         "directory": "/e", "environment": {"KEV_DTYPE": "fp32", "CUDA_VISIBLE_DEVICES": ""}}}
+    config = validator_config({}, network="finney", netuid=96, wallet_name="v", hotkey_name="default",
+                              ports={"kev-4b": 8101}, dry_run=False, managed_before=set(), home=tmp_path,
+                              reference_mode="sequential", launch=launch)
+    assert config["reference_mode"] == "sequential"
+    assert config["references"] == {"kev-4b": {"url": "http://127.0.0.1:8101", **launch["kev-4b"]}}
+    parsed = ValidatorConfig.model_validate(config)
+    assert parsed.reference_mode == "sequential" and parsed.references["kev-4b"].command[-1] == "8101"
+    resident = validator_config(config, network="finney", netuid=96, wallet_name="v", hotkey_name="default",
+                                ports={"kev-4b": 8101}, dry_run=False, managed_before={"kev-4b"}, home=tmp_path,
+                                reference_mode="resident")
+    assert resident["references"] == {"kev-4b": "http://127.0.0.1:8101"} and resident["reference_mode"] == "resident"
+
+
+def test_a_full_setup_runs_the_references_one_at_a_time_or_as_services_by_the_memory_it_finds(
+        tmp_path, monkeypatch, capsys) -> None:
+    """With too little memory for both active references at once, no reference services: the validator starts each
+    from its configuration. With enough, a service each, as before; a later run with --references sequential removes
+    them."""
+    from types import SimpleNamespace
+
+    from verathos.install import host
+    from verathos.install import validator as setup
+
+    class Manager(ServiceManager):
+        def __init__(self) -> None:
+            super().__init__([["throughput tests are run by 5Owner; applying its verdicts"],
+                              ["epoch 7: 3 miners, 3 open endpoints"]])
+            self.stopped: list[str] = []
+
+        def stop(self, names: list[str]) -> None:
+            self.stopped += names
+
+        def log_command(self, name: str) -> str:
+            return f"journalctl -u {name} -f"
+
+    chain = SimpleNamespace(
+        get_neuron_for_pubkey_and_subnet=lambda hotkey, netuid: SimpleNamespace(is_null=False, uid=5,
+                                                                                validator_permit=True),
+        get_subnet_owner_hotkey=lambda netuid: "5Owner")
+    managers: list[Manager] = []
+    monkeypatch.setattr(common.time, "sleep", lambda s: None)
+    monkeypatch.setattr(common, "manager_for", lambda args, record: managers[-1])
+    monkeypatch.setattr(common, "load_hotkey", lambda w, h: SimpleNamespace(hotkey=SimpleNamespace(
+        ss58_address="5Validator")))
+    monkeypatch.setattr(common, "connect", lambda network: chain)
+    monkeypatch.setattr(common, "wait_engines", lambda manager, ports, timeout_s: None)
+    monkeypatch.setattr(setup, "current_catalog", lambda *args: catalog.load())
+    monkeypatch.setattr(host, "wallets", lambda: [])
+    monkeypatch.setattr(host, "gpus", lambda: [])
+    monkeypatch.setattr(host, "port_free", lambda port, address="0.0.0.0": True)
+    monkeypatch.setattr(engines, "parameters", lambda m: {**KEV, "clef-flash": CLEF}[m.model_id])
+    monkeypatch.setattr(engines.KevEngine, "install", lambda self, purpose: None)
+    monkeypatch.setattr(engines, "download", lambda python, m, hf_home: None)
+    argv = ["--full", "--yes", "--wallet", "v", "--hotkey", "default", "--home", str(tmp_path)]
+    config_path = tmp_path / "validator.json"
+
+    def run(free_gib: float, *extra: str) -> tuple[Manager, dict, str]:
+        managers.append(Manager())
+        monkeypatch.setattr(host, "memory_available", lambda: (int(64 * GiB), int(free_gib * GiB)))
+        setup.init([*argv, *extra])
+        return managers[-1], common.read_json(config_path), capsys.readouterr().out
+
+    manager, config, out = run(50)
+    assert "references one at a time (RAM for the largest: about 42 GiB): the active models' references do not " \
+           "all fit in the free memory at once" in out
+    assert "kev-9b: float32 reference on CPU (about 42 GiB), 127.0.0.1:8102, started by the validator" in out
+    assert config["reference_mode"] == "sequential"
+    kev9 = ValidatorConfig.model_validate(config).references["kev-9b"]
+    assert kev9.url == "http://127.0.0.1:8102" and kev9.command[1:4] == ["-m", "kev.serve", "--run"]
+    assert kev9.environment["KEV_DTYPE"] == "fp32" and kev9.environment["HF_HUB_OFFLINE"] == "1"
+    (validator,) = manager.applied
+    assert validator.name == setup.VALIDATOR and validator.after == ()
+    assert common.Record.load(tmp_path, "validator").services == [setup.VALIDATOR]
+
+    manager, config, out = run(50)  # an update keeps it, whatever the memory then
+    assert config["reference_mode"] == "sequential" and [s.name for s in manager.applied] == [setup.VALIDATOR]
+
+    manager, config, out = run(100, "--references", "resident")
+    assert "all references resident (RAM about 63 GiB): as --references resident asks" in out
+    assert config["reference_mode"] == "resident" and config["references"]["kev-4b"] == "http://127.0.0.1:8101"
+    assert [s.name for s in manager.applied] == ["verathos-reference-kev-4b", "verathos-reference-kev-9b",
+                                                 setup.VALIDATOR]
+    assert manager.stopped == [setup.VALIDATOR]  # its own reference ends before the services take the memory
+
+    manager, config, out = run(10, "--references", "sequential")
+    assert manager.removed == ["verathos-reference-kev-4b", "verathos-reference-kev-9b"]
+    assert config["reference_mode"] == "sequential" and [s.name for s in manager.applied] == [setup.VALIDATOR]

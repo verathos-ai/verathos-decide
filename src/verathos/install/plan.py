@@ -1,5 +1,5 @@
 """The setup's decisions, free of side effects: which models a GPU can serve and which one it serves, where each
-reference engine runs and which ports the engines take."""
+reference engine runs (all resident, or one at a time) and which ports the engines take."""
 
 from __future__ import annotations
 
@@ -339,6 +339,51 @@ def place_references(parameters: dict[str, int], gpu_free: dict[int, int], ram_f
         raise PlanError(f"the {model} reference needs about {needs}; not enough is free (RAM {ram / GiB:.0f} GiB"
                         + "".join(f", GPU {i} {f / GiB:.0f} GiB" for i, f in sorted(free.items())) + ")")
     return placement
+
+
+def place_one_at_a_time(parameters: dict[str, int], gpu_free: dict[int, int], ram_free: int, device: str,
+                        keep: dict[str, str], optional: Collection[str] = ()) -> dict[str, str]:
+    """Where each reference runs when the validator runs them one at a time (``reference_mode`` sequential): each
+    alone in the free memory, so the memory needs only the largest. A placement an earlier setup chose stays where
+    ``device`` allows it; the others go on the GPU with the most free memory if it holds them (``device`` "auto" or
+    "gpu"), else in RAM ("auto" or "cpu"). The ``optional`` models (candidates) that fit nowhere are left out; another
+    raises PlanError."""
+    if device not in ("auto", "cpu", "gpu"):
+        raise PlanError(f"unknown device {device!r}")
+    placement: dict[str, str] = {}
+    for model in sorted(parameters, key=lambda m: (m in optional, parameters[m], m)):
+        where = keep.get(model, "")
+        on_gpu = where.startswith("cuda:") and int(where.split(":", 1)[1]) in gpu_free
+        if (where == "cpu" and device != "gpu") or (on_gpu and device != "cpu"):
+            placement[model] = where
+            continue
+        gpu_need, cpu_need = reference_memory(parameters[model], "gpu"), reference_memory(parameters[model], "cpu")
+        if device != "cpu" and gpu_free:
+            index = max(gpu_free, key=lambda i: (gpu_free[i], -i))
+            if gpu_free[index] >= gpu_need:
+                placement[model] = f"cuda:{index}"
+                continue
+        if device != "gpu" and ram_free >= cpu_need:
+            placement[model] = "cpu"
+            continue
+        if model in optional:
+            continue
+        needs = {"auto": f"{gpu_need / GiB:.0f} GiB on a GPU or {cpu_need / GiB:.0f} GiB of RAM",
+                 "cpu": f"{cpu_need / GiB:.0f} GiB of RAM", "gpu": f"{gpu_need / GiB:.0f} GiB on a GPU"}[device]
+        raise PlanError(f"the {model} reference needs about {needs}, even one at a time; not enough is free (RAM "
+                        f"{ram_free / GiB:.0f} GiB" + "".join(f", GPU {i} {f / GiB:.0f} GiB"
+                                                           for i, f in sorted(gpu_free.items())) + ")")
+    return placement
+
+
+def reference_needs(placement: dict[str, str], parameters: dict[str, int]) -> dict[str, list[tuple[str, int]]]:
+    """Per place a reference runs ("cpu" or "cuda:<index>"), its models and the memory each needs there, largest
+    first."""
+    out: dict[str, list[tuple[str, int]]] = {}
+    for model, where in placement.items():
+        need = reference_memory(parameters[model], "cpu" if where == "cpu" else "gpu")
+        out.setdefault(where, []).append((model, need))
+    return {where: sorted(models, key=lambda item: (-item[1], item[0])) for where, models in sorted(out.items())}
 
 
 def pick_ports(keys: list[str], previous: dict[str, int], start: int, is_free: Callable[[int], bool]) -> dict[str, int]:
