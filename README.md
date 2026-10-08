@@ -46,8 +46,9 @@ Models of the shipped catalog (the installers read the catalog the subnet owner 
 GPU: by default the active model that pays best on it now, from each model's share of the emission and the capacity
 serving it on the network ([Models](docs/MINING.md#models)), and its plan lists the others that fit; `--model` names
 one model for every GPU, or one per GPU in order (`--model kev-4b,clef-flash`). A validator runs each active model's
-reference on a GPU while one has room, smallest first, and in RAM otherwise; `--candidates` adds the candidates'
-references where memory is left.
+reference on a GPU while one has room, smallest first, and in RAM otherwise, all resident while they fit and else one
+at a time, which needs memory for the largest only; `--candidates` adds the candidates' references where memory is
+left.
 
 ## Documentation
 

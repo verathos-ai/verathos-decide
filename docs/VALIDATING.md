@@ -9,7 +9,7 @@ A validator sets weights on mechanism 1 once per epoch. It runs in one of two mo
 |---|---|---|
 | What it does | sets the weights the subnet owner's validator (the auditor) publishes each epoch, once their signature verifies | discovers miners, sends every endpoint canary requests, compares the answers with its own float32 references, applies the auditor's signed throughput verdicts, scores, sets weights |
 | Requests to miners | none | identity challenges and canaries to every endpoint |
-| Hardware | a small Linux machine, no GPU | a float32 reference engine per active model, in RAM or on GPUs (Kev-4B and Kev-9B: about 63 GiB of RAM) |
+| Hardware | a small Linux machine, no GPU | a float32 reference engine per active model, in RAM or on GPUs: all resident (Kev-4B and Kev-9B: about 63 GiB of RAM) or one at a time (about 42 GiB, for the largest) |
 | Stake | a validator permit | a validator permit and the catalog's `validator_min_stake` (10,000), or miners refuse it |
 | Download | the code | the code, the engines and the model weights (tens of GB) |
 
@@ -43,9 +43,10 @@ A full validator also needs:
 - One reference engine per active catalog model, and optionally per candidate model to check its endpoints too. The
   reference is the model run in fp32; CPU is enough because each canary is computed once per epoch and reused for every
   endpoint, so the reference work does not grow with the number of miners: 16 canaries per model and epoch
-  (`canary_pool_size`). They are computed within 30% of the canaries' time, about 6.5 minutes per epoch, the models side
-  by side (a candidate's reference on the same CPU shares it with the active ones); a slower reference computes fewer of
-  them (each endpoint then gets fewer canaries) and never delays the epoch. Measured on a rented server CPU: Kev-4B
+  (`canary_pool_size`). They are computed within 30% of the canaries' time, about 6.5 minutes per epoch: resident
+  references side by side (a candidate's reference on the same CPU shares it with the active ones), or one at a time
+  ([References: resident or one at a time](#references-resident-or-one-at-a-time)); a slower reference computes fewer
+  of them (each endpoint then gets fewer canaries) and never delays the epoch. Measured on a rented server CPU: Kev-4B
   3.4 s and Kev-9B 6.6 s per request; on 12 cores shared with other work Kev-9B took 16-29 s, which still computes 16
   canaries alone and 8 next to Kev-4B. The fp32 weights alone take about 16 GB and 36 GB of RAM. A GPU in fp32 is
   faster. Rechecking the auditor's evidence on the references takes at most a tenth of the epoch; what is not rechecked
@@ -59,6 +60,78 @@ A full validator also needs:
   second, in a random order (`THROUGHPUT_AUDIT.md`).
 - A public IP of its own: behind most NATs a machine cannot reach other machines that share its public IP through
   that IP, so a validator next to miners on one NAT cannot send them canaries.
+
+## References: resident or one at a time
+
+A full validator runs its references in one of two ways (`reference_mode` in `validator.json`; `--references` for the
+installer, which chooses by the memory it finds):
+
+- **resident** (`resident`): every reference runs all the time, each a service; the memory holds them all. Each epoch
+  they compute their canaries side by side, and every model is checked every epoch.
+- **one at a time** (`sequential`): each epoch the validator starts a model's reference itself (from the weights the
+  installer downloaded), computes that model's canaries, stops it, then starts the next model's. The memory needs only
+  the largest reference. Starts and stops count in the same reference time as resident references compute in (30% of
+  the canaries' time, about 6.5 minutes of a 180-block epoch), so the canaries keep their time and spread.
+
+| References | RAM (or memory on one GPU) | with the candidate Clef-flash |
+|---|---|---|
+| resident: Kev-4B and Kev-9B | about 63 GiB (75 GiB) | about 103 GiB (121 GiB) |
+| one at a time | about 42 GiB (48 GiB), for Kev-9B | about 42 GiB (48 GiB) |
+
+These are the free memory the installer asks for; the machine also holds the system and the validator itself. The
+installer keeps the references resident while the active models' all fit in the free memory, and runs them one at a
+time otherwise, or when asked to with `--references sequential`. The subnet owner's validator (the auditor) checks
+test answers at any time and every model each epoch: its references are always resident.
+
+The validator learns how long each model's reference takes to start, to compute a canary and to stop
+(`state_dir/references.json`, the largest of each model's last 5 measurements) and plans each epoch with them. A model
+needs its start, `canaries_per_endpoint` (10) canaries and its stop; on the server CPU above, 34 s of canaries for
+Kev-4B and 66 s for Kev-9B, plus the time to load each model's weights. A model that fits computes its whole pool of
+16 canaries while the time the models after it need remains.
+
+**Coverage.** When the reference time does not hold every model, the validator checks those that fit, in an order it
+draws each epoch from its canary secret, so miners cannot tell which models it checks. With `k` models to check, a
+model that has not run for `k` epochs in a row is overdue: overdue models come first, the longest overdue first; the
+others follow in a random order in which a model weighs one plus the epochs it has waited, so a model skipped gets
+priority the next time. Models are taken in that order while their time fits in what the ones before leave; the first
+model, when overdue, runs even if its time alone exceeds the reference time, and computes the canaries it can. The
+longest overdue model runs every epoch, so every model is checked at least once every `2k` epochs (4 epochs for two
+models, 6 for three), whatever its time, and more often when several fit in an epoch. Canaries for the models not
+checked are not sent, and their endpoints get no identity challenge from this validator that epoch (unless the model
+was planned to run and the time ran out).
+
+**Results of the models not checked.** For each model it does not check in an epoch (not drawn, or its reference did not
+start or answer in time), the validator takes the results the source publishes: the auditor's, or those of
+`source_hotkey`. It reads the source's `GET /v1/network` for the epoch as light validators do (signed by the source
+hotkey for this netuid within 5 minutes of its clock, for the catalog's epoch length and this epoch), until 2 minutes
+before the epoch ends. Each endpoint of such a model that the source lists enters this validator's scoring by the state
+the source gave it:
+
+| Source's state | In this validator's scoring |
+|---|---|
+| `failed` | failed: score zero, and every endpoint of its hotkey starts probation with its average reset, as for this validator's own failures |
+| `probation` | score zero for the epoch |
+| `not_audited`, `invalid` | its average is held (an `invalid` hotkey's proven wrong answers come with the auditor's verdicts, as for every model) |
+| any other | the score the source gave it: its share of its model's emission in the epoch |
+
+That score enters the endpoint's average, probation and the weights exactly as one the validator computes, and the
+validator sets one weight vector from both: checking every model, it scores as with resident references; checking
+none, it sets the source's weights, exactly so once its averages hold the source's results alone (an average moves
+`ema_alpha`, 0.2, of the way each epoch). Without a document that verifies by then, the endpoints of the models not
+checked keep their averages, as endpoints without reference answers (at most 3 epochs in a row). An endpoint of such a
+model that the source does not list keeps its average too.
+
+Each epoch logs one line with the models checked and those taken from the source, with why each was not checked, as a
+warning when one was not:
+
+```
+epoch 45406: references one at a time: checked kev-4b, clef-flash; taken from the subnet owner's validator 5D...: kev-9b (not drawn)
+```
+
+and, without the source's results,
+`...; not checked, their averages kept (no results of the source: <why>): kev-9b (not drawn)`. Each reference's output
+is in `state_dir/references/<model>.log` (its latest start). A reference started for a proven wrong answer to recheck
+runs only if its start fits in the recheck's time; else the auditor's word stands, as when a reference is down.
 
 ## Quick start (one command)
 
@@ -88,6 +161,7 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--wallet`, `--hotkey` | the wallet and hotkey |
 | `--light`, `--full` | the mode; without either, the one set up before (a validator set up before modes existed is full), else light; the subnet owner's hotkey is always full. The options for references below are for full validators |
 | `--device` | where the references run: `auto` (on GPUs while they fit, smallest model first, the rest in RAM), `cpu` or `gpu` |
+| `--references` | `resident` (every reference a service) or `sequential` (one at a time, started by the validator); default: as set up before, else resident while the active models' references all fit in the free memory ([References](#references-resident-or-one-at-a-time)) |
 | `--candidates` | also run references for the catalog's candidate models, in the memory the active ones leave; a later run keeps them, `--no-candidates` removes them |
 | `--dry-run` | compute weights without setting them; `--no-dry-run` sets them again |
 | `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
@@ -99,8 +173,11 @@ What it does (a full validator; light, see below):
 3. checks the hotkey, its registration and validator permit, and reads the catalog the subnet owner commits;
 4. places a float32 reference engine for every `active` model in the free memory, smallest first: on the GPU with
    the most free memory while one has room, otherwise in RAM. With `--candidates` it then places the `candidate`
-   models (checked, scored zero) in what is left, and leaves out one that does not fit; the plan names every model's
-   place and memory;
+   models (checked, scored zero) in what is left, and leaves out one that does not fit. When the active models'
+   references do not all fit at once, it runs them one at a time, each placed alone in the free memory
+   ([References](#references-resident-or-one-at-a-time)). The plan says which, with the memory (`all references
+   resident (RAM about 63 GiB)` or `references one at a time (RAM for the largest: about 42 GiB)`), and names every
+   model's place and memory;
 
    | Model | Status | float32 reference in RAM | on a GPU |
    |---|---|---|---|
@@ -112,10 +189,12 @@ What it does (a full validator; light, see below):
    `engine.revision` for Kev models, `verathos-engine` from this code for Clef models, which runs the model
    repository's own inference code; then downloads the weights at `hf_revision` and the base model at
    `base_revision`; the references run offline from that copy;
-6. writes `~/.verathos/validator.json` ([3. Configure](#3-configure)) with the `references` and `state_dir`
-   (`~/.verathos/validator`: the canary secret, the score history and the last status; keep it);
+6. writes `~/.verathos/validator.json` ([3. Configure](#3-configure)) with the `references` (one at a time: with the
+   command that serves each), `reference_mode` and `state_dir` (`~/.verathos/validator`: the canary secret, the score
+   history and the last status; keep it);
 7. starts the references (`verathos-reference-kev-4b`, ...) on `127.0.0.1` and the validator
-   (`verathos-validator`) as services, waits for the references to load, and shows the validator's start.
+   (`verathos-validator`) as services, waits for the references to load, and shows the validator's start. One at a
+   time, only the validator is a service: it starts each reference itself when it checks the model, on the same port.
 
 Code, engines, weights and services live where they do for miners (`MINING.md`).
 
@@ -151,9 +230,9 @@ A validator restarted in an epoch it already scored (or, light, whose weights it
 
 | | systemd | supervisord (containers) |
 |---|---|---|
-| status | `systemctl status verathos-validator` (full: and `verathos-reference-kev-4b verathos-reference-kev-9b`) | `supervisorctl status` |
+| status | `systemctl status verathos-validator` (full, resident: and `verathos-reference-kev-4b verathos-reference-kev-9b`) | `supervisorctl status` |
 | validator log | `journalctl -u verathos-validator -f` | `tail -f /var/log/verathos/verathos-validator.log` |
-| reference log | `journalctl -u verathos-reference-kev-4b -f` | `tail -f /var/log/verathos/verathos-reference-kev-4b.log` |
+| reference log | `journalctl -u verathos-reference-kev-4b -f`; one at a time: `~/.verathos/validator/references/kev-4b.log` | `tail -f /var/log/verathos/verathos-reference-kev-4b.log`; one at a time: as with systemd |
 | restart after editing `validator.json` | `systemctl restart verathos-validator` | `supervisorctl restart verathos-validator` |
 
 ### Update
@@ -166,7 +245,9 @@ updates the code, and the engines and weights when the catalog pins new revision
 catalog activates a model. References keep running unless their revision or settings changed (or, for
 `verathos-engine`, its code); the validator restarts.
 
-It keeps the mode. A light validator has only its code to update.
+It keeps the mode, and references one at a time stay so (`--references resident` makes them resident again). Resident
+references that no longer fit in the memory, as when the catalog activates another model, run one at a time from then
+on. A light validator has only its code to update.
 
 ### Uninstall
 
@@ -188,6 +269,9 @@ stops and removes the services, the code, the engines and the weights. The confi
 | `the kev-9b reference needs about 42 GiB ...; not enough is free` | free memory or add some; `--device` chooses between GPU and RAM |
 | `clef-flash (candidate ...): no reference, not enough memory left` | a candidate's reference is optional: free memory and run the command again, or leave it to other validators |
 | `... of 16 canaries without a reference answer this epoch` | the reference's log: it is down, or too slow to compute the canaries within the epoch's reference time ([Requirements](#requirements)) |
+| `references one at a time: checked ...; taken from ...` | the reference time held only the models checked; every model is checked at least once every `2k` epochs ([Coverage](#references-resident-or-one-at-a-time)). Resident references (more memory) or a faster machine check more each epoch |
+| `the kev-9b reference did not start: ...` | its log, `~/.verathos/validator/references/kev-9b.log`; `another process holds its port`: a reference service of a resident setup still runs, run the installer again |
+| `the kev-9b reference needs about 42 GiB of RAM, even one at a time` | the largest reference needs that much free memory: free or add some, or `--device` for a GPU |
 | `no reference engine configured for the active models` | the catalog activated a model: run the command again |
 | `the subnet's catalog is not available` | the subnet owner's axon serves it; add a mirror to `catalog_mirrors` in `validator.json` |
 | `this is the subnet owner's hotkey` | the owner's validator also serves the catalog and runs the throughput audit: set `public_host` and `port`, and build the load generator ([1. Install](#1-install)) |
@@ -235,6 +319,17 @@ reference needs about 41 GiB of RAM (47 GiB on a GPU).
 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8103 --device cpu --dtype float32
 ```
 
+References one at a time are not started by hand: give each its command in `references` and set `reference_mode` to
+`sequential` ([3. Configure](#3-configure)); the validator runs the command from `directory` with `environment` over
+its own, and the engine must serve on the URL's port on `127.0.0.1`:
+
+```json
+"reference_mode": "sequential",
+"references": {"kev-4b": {"url": "http://127.0.0.1:8101", "directory": "/path/to/kev",
+                          "command": [".venv/bin/python", "-m", "kev.serve", "--run", "jaredpalmer/kev-4b@<hf_revision>", "--port", "8101"],
+                          "environment": {"CUDA_VISIBLE_DEVICES": "", "KEV_DTYPE": "fp32", "HF_HUB_OFFLINE": "1"}}}
+```
+
 Each epoch (and the auditor before each test and round of checks) asks every reference and screen what it serves
 (`GET /v1/models`): one that names other weights than the catalog's `hf_revision` is not used, and its model's
 endpoints are not audited. `verathos-engine` names its revision, and so does the Kev server run as
@@ -273,11 +368,12 @@ of a full validator:
 | Field | Default | Meaning |
 |---|---|---|
 | `mode` | `full` | `light` or `full` ([Two modes](#two-modes)); the subnet owner's validator does not start in light mode |
-| `source_hotkey` | the subnet owner's | light: the validator whose published weights to set; another validator must hold a validator permit and serve its results (a full validator with `public_host`) |
+| `source_hotkey` | the subnet owner's | light: the validator whose published weights to set; full with references one at a time: the validator whose results the models not checked take. Another validator must hold a validator permit and serve its results (a full validator with `public_host`) |
 | `mechid` | 1 | mechanism the weights are set on |
-| `references` | {} | full: model id -> the model's fp32 reference engine: a URL, or `{"url", "api_key"}` for a remote engine behind https (the Kev server takes its key from `KEV_API_KEY`). Every `active` model needs one: the validator does not start without, and stops when a new catalog activates a model it has none for; `candidate` models without one are not audited by this validator. Light validators ignore it |
+| `references` | {} | full: model id -> the model's fp32 reference engine: a URL, or `{"url", "api_key"}` for a remote engine behind https (the Kev server takes its key from `KEV_API_KEY`), or for references one at a time `{"url", "command", "directory", "environment"}`: the command that serves it at the URL on `127.0.0.1`, which the validator runs when it checks the model (the installer writes them; a reference without a command is taken as running). Every `active` model needs one: the validator does not start without, and stops when a new catalog activates a model it has none for; `candidate` models without one are not audited by this validator. Light validators ignore it |
+| `reference_mode` | `resident` | full: `resident` or `sequential` (one at a time, [References](#references-resident-or-one-at-a-time)); the subnet owner's validator does not start one at a time |
 | `audit_screens` | {} | auditor only: model id -> a bf16 engine (same forms) that screens the sampled test answers; an answer it flags counts as wrong only once the fp32 reference confirms it |
-| `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database; light: the last epoch whose weights it set |
+| `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database; references one at a time: their times (`references.json`) and logs (`references/`); light: the last epoch whose weights it set |
 | `dry_run` | false | compute weights without setting them (light: log the weights it would set) |
 | `public_host`, `port` | -, 8091 | public IP and port of the validator's service; needed by the subnet owner and the auditor. A full validator that sets them serves its status and the weights it sets there, for light validators that name it in `source_hotkey` |
 | `catalog_mirrors` | [] | extra catalog sources, URL templates with `{digest}`, tried after the owner's axon |
@@ -324,13 +420,15 @@ Per epoch a full validator:
    still names it, so the endpoints on the miner's other machines keep their checks;
 3. challenges each endpoint at its URL to sign a nonce with the listing hotkey, while it computes the references;
    a host that is not the hotkey's gets no more than one challenge per epoch;
-4. derives the epoch's canaries from its secret, computes the references (within 30% of the canaries' time), sends
-   each endpoint that passed its challenge its subset of the canaries computed, spread over the rest of the first
+4. derives the epoch's canaries from its secret, computes the references (within 30% of the canaries' time; one at
+   a time, those of the models that fit, [References](#references-resident-or-one-at-a-time)), sends each endpoint
+   that passed its challenge its subset of the canaries computed, spread over the rest of the first
    `canary_spread_fraction` of the epoch (holding them while a throughput test runs), and checks every signed
    receipt;
 5. reads the auditor's verdicts for the epoch: each endpoint's proven capacity, what users got from it (readiness
    and latency), each model's user demand, and any proven wrong answers;
-6. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
+6. one at a time: takes the source's results for the models it did not check;
+7. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
    probation, and sets weights on `mechid` (retried once per block, up to 10 times).
 
 Nothing a miner returns can stop the epoch: replies are size- and time-bounded and every malformed reply is

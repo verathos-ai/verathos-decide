@@ -25,7 +25,10 @@ answers the subnet's gateway receives (`GATEWAY.md`).
 The reference engine answers each canary once; every endpoint of that model receives its own random subset of
 `canaries_per_endpoint` (10) canaries, spread over the first `canary_spread_fraction` (0.6) of the epoch. Canaries
 wait while a throughput test runs (`THROUGHPUT_AUDIT.md`). If the reference engine cannot answer, the model's
-endpoints are not audited that epoch and keep their score, for at most 3 epochs in a row.
+endpoints are not audited that epoch and keep their score, for at most 3 epochs in a row. A validator running its
+references one at a time checks the models whose references fit in the epoch's reference time, drawn from its secret
+so that each of `k` models is checked at least once every `2k` epochs, and takes the others' results from its source
+(`VALIDATING.md`).
 
 Every request is signed by the validator and bound to the miner and a nonce. Every answer comes with a receipt
 signed by the miner hotkey that binds the request, the answers, the endpoint, the model, the caller, the nonce, the
@@ -108,5 +111,9 @@ A UID's value is the sum of its endpoints' EMAs, normalised over all UIDs and se
 Endpoints whose UID now belongs to another hotkey are ignored. If no endpoint has a positive score, the weight goes
 to the subnet owner's UID.
 
-Everything above is what a full validator does. A light validator (`VALIDATING.md`) scores nothing: it sets the
-weights the auditor publishes for the epoch (`GET /v1/network`, signed), exactly as the auditor sets them.
+Everything above is what a full validator does. A full validator running its references one at a time scores the
+endpoints of the models it does not check in an epoch with the source's published results for them: the score the
+source gave an endpoint enters its average as one it computed (zero on the source's probation, a failure as its own
+failure, held where the source could not check it), so its weights are one vector from both. A light validator
+(`VALIDATING.md`) scores nothing: it sets the weights the auditor publishes for the epoch (`GET /v1/network`, signed),
+exactly as the auditor sets them.
