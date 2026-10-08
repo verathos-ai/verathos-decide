@@ -72,6 +72,12 @@ usage_daily = Table(
     Column("cost", BigInteger, nullable=False, server_default="0"),  # micro-USD charged
 )
 
+usage_flushes = Table(  # the usage batches written, so a batch written again is not counted twice
+    "usage_flushes", metadata,
+    Column("id", String(32), primary_key=True),
+    Column("written_at", DateTime(timezone=True), nullable=False, index=True),
+)
+
 credits = Table(
     "credits", metadata,
     Column("id", ID, primary_key=True, autoincrement=True),

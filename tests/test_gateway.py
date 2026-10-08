@@ -4,6 +4,7 @@ retries, breakers, receipts, usage, and sampled answers proving a wrong one."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import random
@@ -934,6 +935,127 @@ def test_concurrent_requests_cannot_overdraw_a_prepaid_account(tmp_path) -> None
         assert s.meter._reserved == {}  # every reservation released
         await s.accounts.add_credit("acme", 1_000_000, kind="topup", reference="t")
         assert {r.status_code for r in await asyncio.gather(*(s.post() for _ in range(5)))} == {200}
+    asyncio.run(run())
+
+
+class Hooked:
+    """The meter's database engine, with waits and faults put in front of its transactions and connections."""
+
+    def __init__(self, engine) -> None:
+        self.engine, self.before_begin, self.before_connect, self.lose_next_commit = engine, None, None, False
+
+    def __getattr__(self, name: str):
+        return getattr(self.engine, name)
+
+    @contextlib.asynccontextmanager
+    async def begin(self):
+        if self.before_begin is not None:
+            await self.before_begin()
+        async with self.engine.begin() as conn:
+            yield conn
+        if self.lose_next_commit:
+            self.lose_next_commit = False
+            raise ConnectionResetError("the commit's confirmation was lost")
+
+    @contextlib.asynccontextmanager
+    async def connect(self):
+        if self.before_connect is not None:
+            await self.before_connect()
+        async with self.engine.connect() as conn:
+            yield conn
+
+
+def principal_of(s: Setup, key: str):
+    return asyncio.run(s.accounts.authenticate(key))
+
+
+def test_a_usage_write_whose_confirmation_is_lost_is_not_counted_twice(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    s.meter.engine = Hooked(s.engine)
+    assert asyncio.run(s.post()).status_code == 200
+    s.meter.engine.lose_next_commit = True
+    with pytest.raises(ConnectionResetError):
+        asyncio.run(s.meter.flush())
+    asyncio.run(s.meter.flush())
+    (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
+    assert usage["requests"] == 1 and s.meter.pending() == 0
+
+
+def test_a_usage_row_the_database_refuses_blocks_no_other_row(tmp_path, caplog) -> None:
+    from sqlalchemy import event, text
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    engine = db.create_engine(s.config.database_url)
+    event.listen(engine.sync_engine, "connect", lambda conn, _: conn.execute("PRAGMA foreign_keys=ON"))
+    meter = UsageMeter(engine)
+    asyncio.run(s.accounts.create_account("other", rate_rps=1.0, burst=1))
+    kept, gone = principal_of(s, s.key), principal_of(s, asyncio.run(s.accounts.create_key("other", "k")))
+    for principal in (kept, gone):
+        meter.record(principal, "kev-4b", answered=True, input_tokens=10, price=0.04)
+
+    async def delete_key():  # by hand: its usage can no longer be written
+        async with engine.begin() as conn:
+            await conn.execute(text("DELETE FROM api_keys WHERE id = :id"), {"id": gone.key_id})
+    asyncio.run(delete_key())
+    asyncio.run(meter.flush())
+    assert [u["requests"] for u in asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))] == [1]
+    assert meter.pending() == 0 and "refuses" in caplog.text
+
+
+def test_usage_beyond_what_may_wait_is_dropped_and_logged(tmp_path, caplog, monkeypatch) -> None:
+    from verathos.gateway import usage
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    monkeypatch.setattr(usage, "MAX_PENDING", 1)
+    principal = principal_of(s, s.key)
+    for model in ("kev-4b", "kev-9b"):
+        s.meter.record(principal, model, answered=True, input_tokens=10, price=0.04)
+    assert s.meter.pending() == 1
+    asyncio.run(s.meter.flush())
+    assert "1 usage counts dropped" in caplog.text
+
+
+def test_charges_being_written_still_count_against_the_credit(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    asyncio.run(s.accounts.set_account("acme", prepaid=True))
+    asyncio.run(s.accounts.add_credit("acme", 2, kind="grant", reference="g"))
+    principal = principal_of(s, s.key)
+    s.meter.engine = Hooked(s.engine)
+
+    async def run():
+        s.meter.record(principal, "kev-4b", answered=True, input_tokens=1000, price=0.04)  # 40 of the 2 micro-USD
+        assert not await s.meter.has_credit(principal)
+        written = asyncio.Event()
+        s.meter.engine.before_begin = written.wait
+        flush = asyncio.create_task(s.meter.flush())
+        await asyncio.sleep(0.05)  # the write has taken the counts and waits for the database
+        assert not await s.meter.has_credit(principal)
+        written.set()
+        await flush
+        assert not await s.meter.has_credit(principal)
+    asyncio.run(run())
+    assert asyncio.run(s.accounts.account("acme"))["balance"] == 2 - 40
+
+
+def test_balance_reads_do_not_wait_for_each_other(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    s.meter.engine = Hooked(s.engine)
+    asyncio.run(s.accounts.create_account("other", rate_rps=1.0, burst=1))
+    first, other = (asyncio.run(s.accounts.account(name))["id"] for name in ("acme", "other"))
+
+    async def run():
+        stalled, calls = asyncio.Event(), []
+
+        async def stall_the_first():
+            calls.append(1)
+            if len(calls) == 1:
+                await stalled.wait()
+        s.meter.engine.before_connect = stall_the_first
+        slow = asyncio.create_task(s.meter.read_balance(first))
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(s.meter.read_balance(other), 1.0)
+        stalled.set()
+        await slow
     asyncio.run(run())
 
 
