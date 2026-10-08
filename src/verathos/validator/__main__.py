@@ -29,7 +29,7 @@ from verathos.throughput.feed import Credit, Verdicts
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator import chain, status
 from verathos.validator.audit import audit_epoch
-from verathos.validator.config import ValidatorConfig
+from verathos.validator.config import ReferenceEngine, ValidatorConfig
 from verathos.validator.discovery import DiscoveredEndpoint, discover
 from verathos.validator.follow import CatalogFollower
 from verathos.validator.scoring import (
@@ -48,6 +48,7 @@ from verathos.validator.throughput import Throughput
 
 log = logging.getLogger("verathos.validator")
 WEIGHT_ATTEMPTS = 10
+REFERENCE_WAIT_S = 900.0  # the most the first epoch waits for reference engines still loading their models
 EVIDENCE_SHARE = 0.1  # of the epoch, the most rechecking the auditor's evidence may take
 
 
@@ -108,6 +109,35 @@ def credited_capacity(endpoints: list[DiscoveredEndpoint], verdicts: Verdicts | 
 
 def missing_references(cfg: ValidatorConfig, cat: catalog.Catalog) -> list[str]:
     return [m.model_id for m in cat.models if m.status == "active" and m.model_id not in cfg.references]
+
+
+async def references_down(references: dict[str, ReferenceEngine]) -> list[str]:
+    """The models whose reference engine does not answer HTTP yet (any reply counts: the engine is up)."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        async def down(model: str, reference: ReferenceEngine) -> str | None:
+            try:
+                await client.get(reference.url.rstrip("/") + "/v1/models")
+            except httpx.HTTPError:
+                return model
+            return None
+
+        return sorted(m for m in await asyncio.gather(*(down(m, r) for m, r in references.items())) if m)
+
+
+def wait_for_references(references: dict[str, ReferenceEngine], timeout_s: float = REFERENCE_WAIT_S,
+                        poll_s: float = 5.0) -> None:
+    """Wait until every reference engine is up, at most ``timeout_s``: engines restarted with the validator load
+    their models meanwhile, and an epoch started before would compute no canary."""
+    deadline, logged = time.monotonic() + timeout_s, None
+    while down := asyncio.run(references_down(references)):
+        if time.monotonic() >= deadline:
+            log.warning("reference engines still down after %.0f s: %s; starting without them", timeout_s,
+                        ", ".join(down))
+            return
+        if down != logged:
+            log.info("waiting for the reference engines of %s", ", ".join(down))
+            logged = down
+        time.sleep(poll_s)
 
 
 async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, secret: bytes, state: ScoreState,
@@ -249,6 +279,7 @@ def main() -> None:
     current.on_change.append(adopt)
     current.start()
     throughput.start_slot_refresh(cfg.network, current.accepted)
+    wait_for_references(cfg.references)
 
     done = state.last_epoch
     while True:

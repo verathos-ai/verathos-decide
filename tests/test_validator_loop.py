@@ -542,3 +542,44 @@ def test_each_model_pool_is_split_by_its_own_endpoints() -> None:
     scores, _ = epoch_scores(results, shares={"kev-4b": 0.4, "kev-9b": 0.6},
                              credited={"a/gpu0": 30.0, "b/gpu0": 10.0, "c/gpu0": 5.0}, latency_ms={}, state=state)
     assert scores == {"a/gpu0": pytest.approx(0.3), "b/gpu0": pytest.approx(0.1), "c/gpu0": pytest.approx(0.6)}
+
+
+def test_the_validator_starts_once_its_reference_engines_are_up(monkeypatch) -> None:
+    """References restarted with the validator load their models first; an epoch started before them would compute
+    no canary. Any HTTP reply counts as up; one that stays down delays the start by the wait's limit only."""
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from verathos.validator import __main__ as validator_main
+    from verathos.validator.config import ReferenceEngine
+
+    server = HTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)  # replies 501 to everything: up
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        closed = s.getsockname()[1]
+    references = {"kev-4b": ReferenceEngine(url=f"http://127.0.0.1:{server.server_port}"),
+                  "kev-9b": ReferenceEngine(url=f"http://127.0.0.1:{closed}")}
+    try:
+        assert asyncio.run(validator_main.references_down(references)) == ["kev-9b"]
+    finally:
+        server.shutdown()
+
+    checks = iter([["kev-4b", "kev-9b"], ["kev-9b"], []])
+    calls = []
+
+    async def loading(refs):
+        calls.append(refs)
+        return next(checks)
+
+    monkeypatch.setattr(validator_main, "references_down", loading)
+    monkeypatch.setattr(validator_main.time, "sleep", lambda s: None)
+    validator_main.wait_for_references(references)
+    assert len(calls) == 3
+
+    async def never_up(refs):
+        return ["kev-9b"]
+
+    monkeypatch.setattr(validator_main, "references_down", never_up)
+    validator_main.wait_for_references(references, timeout_s=0.0)  # gives up and starts
