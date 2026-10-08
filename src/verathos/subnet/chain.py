@@ -5,12 +5,22 @@ from __future__ import annotations
 import logging
 
 import bittensor as bt
+from async_substrate_interface.errors import ConnectionClosed, InvalidHandshake, SubstrateRequestException
 
 from verathos import catalog
 from verathos.catalog import Catalog, CatalogStore
 from verathos.protocol.manifest import axon_base
 
 log = logging.getLogger(__name__)
+# Failures of the connection to the chain's node (a closed websocket, a keepalive timeout, no route) and errors its RPC
+# returns: a later attempt, on a new connection, may succeed. Loops log them in one line (``one_line``); anything else
+# is a programming error and keeps its traceback.
+CHAIN_ERRORS = (OSError, ConnectionClosed, InvalidHandshake, SubstrateRequestException)
+
+
+def one_line(exc: BaseException) -> str:
+    """An exception as its type and message."""
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
 def serve_axon(subtensor: bt.Subtensor, wallet: bt.Wallet, netuid: int, host: str, port: int) -> int:

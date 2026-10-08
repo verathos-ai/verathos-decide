@@ -47,7 +47,7 @@ from verathos.protocol.manifest import (
     is_public,
 )
 from verathos.protocol.status import ThroughputOutcome
-from verathos.subnet.chain import committed_catalog, current_catalog
+from verathos.subnet.chain import CHAIN_ERRORS, committed_catalog, current_catalog, one_line
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.measure import (
     Measurement,
@@ -374,9 +374,11 @@ class Publisher:
                 self.publish(st)
                 log.info("manifest published")
             return st
+        except (*CHAIN_ERRORS, catalog.CatalogUnavailable) as exc:
+            log.warning("catalog follow failed (%s); retrying", one_line(exc))
         except Exception:
             log.exception("catalog follow failed; retrying")
-            return None
+        return None
 
 
 def permits(config: MinerConfig, publisher: Publisher) -> PermitAuthorizer:

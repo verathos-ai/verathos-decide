@@ -19,7 +19,7 @@ from verathos.protocol.manifest import (
     SignedManifest,
     commitment_value,
 )
-from verathos.subnet.chain import serve_axon
+from verathos.subnet.chain import CHAIN_ERRORS, one_line, serve_axon
 from verathos.throughput.policy import BLOCK_TIME_S
 
 log = logging.getLogger(__name__)
@@ -93,10 +93,16 @@ class PermitAuthorizer:
     def _loop(self) -> None:
         while True:
             time.sleep(self._refresh_s)
-            try:
-                self.refresh()
-            except Exception:
-                log.exception("permit refresh failed; keeping the previous set")
+            self.try_refresh()
+
+    def try_refresh(self) -> None:
+        """``refresh``; if it fails, the previous set stays."""
+        try:
+            self.refresh()
+        except CHAIN_ERRORS as exc:
+            log.warning("permit refresh failed (%s); keeping the previous set", one_line(exc))
+        except Exception:
+            log.exception("permit refresh failed; keeping the previous set")
 
     def __call__(self, hotkey: str) -> bool:
         stake = self._stake.get(hotkey)
