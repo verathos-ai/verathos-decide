@@ -75,7 +75,7 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
    declared capacity and a model that is not retired. Each is tested at its declared rate, but at most
    `rate_growth` (2) times what it delivered in its last counted test, or `retest_growth` (1.1) times while one of
    its last `regrow_after` (3) counted tests fell short (at least `min_test_share` (1/8) of the model's
-   `first_test_rps`), and at most `first_test_rps` before its first. A test probes far beyond what an endpoint has
+   `first_test_rps`), and at most `first_test_rps` before its first test of the model it serves now. A test probes far beyond what an endpoint has
    shown it serves only while it keeps up: one that declares more than it serves is tested at about what it
    serves, so the users it also serves during the test are not held up, and its credit stays below that. Counted in first tests' worth (rate /
    the model's `first_test_rps`), a hotkey's endpoints together get at most `rate_growth` times what all its

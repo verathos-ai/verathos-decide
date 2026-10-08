@@ -5,11 +5,11 @@ Per test:
 1. At the selection block the auditor fixes the targets: every listed open endpoint with a declared capacity, each at
    its declared rate, but at most ``rate_growth`` times what it delivered in its last test, or ``retest_growth``
    times while one of its last ``regrow_after`` tests fell short (at most the model's ``first_test_rps`` before its
-   first, and never less than ``min_test_share`` of that): a test probes beyond what an endpoint has shown it
-   serves only while it keeps up, so users of an endpoint that cannot are not held up. A hotkey's endpoints
-   together get at most ``rate_growth`` times what the hotkey delivered last, measured in first tests' worth, and at
-   least one first test's worth. Neither an endpoint nor a hotkey can make the auditor send much more than it has
-   shown it serves.
+   first of the model it serves now, and never less than ``min_test_share`` of that): a test probes beyond what an
+   endpoint has shown it serves only while it keeps up, so users of an endpoint that cannot are not held up. A
+   hotkey's endpoints together get at most ``rate_growth`` times what the hotkey delivered last, measured in first
+   tests' worth, and at least one first test's worth. Neither an endpoint nor a hotkey can make the auditor send much
+   more than it has shown it serves.
 2. When the start block appears, the load generator drives all targets at once: a warmup drawn from
    [``warmup_s``, 2 x ``warmup_s``], then the measured window of ``test_s``. Endpoints sharing hardware, or a pool
    behind several endpoints, must deliver the sum of their rates at the same time.
@@ -899,7 +899,9 @@ class Auditor:
         for hotkey, slots in by_hotkey.items():
             rates = []
             for slot, model in slots:
-                _, delivered_last, fell_short = last.get(slot.key, (None, None, False))
+                model_last, delivered_last, fell_short = last.get(slot.key, (None, None, False))
+                if model_last != slot.model_id:  # what it delivered of another model says nothing of this one
+                    delivered_last, fell_short = None, False
                 rates.append(planned_rate(slot, model.first_test_rps, delivered_last, policy, fell_short))
             # The hotkey's budget in first tests' worth, from what all its endpoints (renamed ones too) delivered.
             delivered = sum(rps / cat.get(m).first_test_rps for key, (m, rps, _) in last.items()

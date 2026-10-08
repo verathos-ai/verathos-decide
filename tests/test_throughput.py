@@ -564,6 +564,21 @@ def test_a_hotkey_cannot_reset_its_test_rate_by_renaming_endpoints(tmp_path) -> 
     assert sum(t.tested_rps for t in auditor.targets(auditor.policy)) == pytest.approx(50.0, abs=0.1)
 
 
+def test_an_endpoint_that_switches_model_starts_from_the_new_models_first_test(tmp_path) -> None:
+    """What an endpoint delivered of a small model says nothing of a larger one: it is probed at the new model's
+    first_test_rps, not at twice its old rate (scaled by its hotkey's budget, which counts the old result)."""
+    from verathos.throughput.auditor import Result, Target
+
+    auditor = _auditor(tmp_path)
+    small = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 100.0)
+    test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+    auditor.store.add_test(test)
+    auditor.store.add_results(test.test_id, [Result(Target(small, 50.0), "passed", "", 40.0, 40.0)])
+    auditor.update_slots([dataclasses.replace(small, model_id="kev-9b")])
+    (target,) = auditor.targets(auditor.policy)
+    assert target.tested_rps == catalog.load().get("kev-9b").first_test_rps
+
+
 def test_answers_drifting_across_tests_lose_their_credit(tmp_path) -> None:
     from verathos.throughput.auditor import Result, Target
 
