@@ -8,13 +8,18 @@ validator's own view; every validator scores the same way from the same rules.
 
 from __future__ import annotations
 
+import logging
+import os
 import threading
 from collections.abc import Collection, Mapping
+from pathlib import Path
 
 from verathos.protocol.status import EndpointStatus, HotkeyStatus, NetworkStatus
 from verathos.validator.audit import EndpointResult
 from verathos.validator.discovery import DiscoveredEndpoint
 from verathos.validator.scoring import ScoreState, windowed_verdict
+
+log = logging.getLogger(__name__)
 
 
 def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint], results: dict[str, EndpointResult],
@@ -61,17 +66,32 @@ def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint],
 
 class StatusBoard:
     """The latest epoch's status, replaced as a whole after each epoch. The network's document is built once per
-    epoch: it is public, and every request for it would otherwise cost the validator's process a full rebuild."""
+    epoch: it is public, and every request for it would otherwise cost the validator's process a full rebuild. With a
+    ``path`` it is also kept on disk, so a restarted validator serves the last epoch's status until its next epoch."""
 
-    def __init__(self) -> None:
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path
         self._by_hotkey: dict[str, HotkeyStatus] = {}
-        self._network = _network({}).model_dump_json().encode()
+        if path is not None and path.exists():
+            try:
+                saved = NetworkStatus.model_validate_json(path.read_bytes())
+                self._by_hotkey = {h.hotkey: h for h in saved.hotkeys}
+            except (OSError, ValueError) as exc:
+                log.warning("the saved status in %s is not used: %s", path, exc)
+        self._network = _network(self._by_hotkey).model_dump_json().encode()
         self._lock = threading.Lock()
 
     def publish(self, by_hotkey: dict[str, HotkeyStatus]) -> None:
         network = _network(by_hotkey).model_dump_json().encode()
         with self._lock:
             self._by_hotkey, self._network = by_hotkey, network
+        if self.path is not None:
+            try:
+                partial = self.path.with_suffix(".partial")
+                partial.write_bytes(network)
+                os.replace(partial, self.path)
+            except OSError as exc:
+                log.warning("the status could not be saved to %s: %s", self.path, exc)
 
     def get(self, hotkey: str) -> HotkeyStatus | None:
         with self._lock:

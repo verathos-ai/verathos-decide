@@ -288,7 +288,7 @@ def main() -> None:
                                   current=lambda: current.catalog, st=st, wallet=wallet, references=cfg.references,
                                   screens=cfg.audit_screens,
                                   state_dir=state_dir)
-    board = StatusBoard()
+    board = StatusBoard(state_dir / "status.json")
     is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)
     if is_owner or throughput.auditor is not None:
         if not cfg.public_host:

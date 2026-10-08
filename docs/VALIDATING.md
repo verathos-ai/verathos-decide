@@ -73,7 +73,7 @@ What it does:
    downloads the weights at `hf_revision` and the base model at `base_revision`; the references run offline from
    that copy;
 6. writes `~/.verathos/validator.json` ([3. Configure](#3-configure)) with the `references` and `state_dir`
-   (`~/.verathos/validator`: the canary secret and the score history; keep it);
+   (`~/.verathos/validator`: the canary secret, the score history and the last status; keep it);
 7. starts the references (`verathos-reference-kev-4b`, ...) on `127.0.0.1` and the validator
    (`verathos-validator`) as services, waits for the references to load, and shows the validator's start.
 

@@ -151,3 +151,14 @@ def test_network_route_serves_every_hotkey_of_the_last_epoch() -> None:
     assert (got.epoch, got.model_shares, [h.uid for h in got.hotkeys]) == (5, {"kev-4b": 1.0}, [2, 7])
     assert response.headers["cache-control"] == "public, max-age=30"
     assert board.network() is board.network()  # built once per epoch, not per request
+
+
+def test_a_restarted_validator_serves_the_last_epochs_status_until_its_next_epoch(tmp_path) -> None:
+    from verathos.validator.status import StatusBoard
+
+    path = tmp_path / "status.json"
+    StatusBoard(path).publish({"hkA": HotkeyStatus(hotkey="hkA", uid=2, weight=1.0, epoch=5, epoch_blocks=180)})
+    restarted = StatusBoard(path)
+    assert restarted.get("hkA").epoch == 5 and b'"epoch":5' in restarted.network()
+    path.write_text("not json")
+    assert StatusBoard(path).get("hkA") is None  # a damaged file is ignored
