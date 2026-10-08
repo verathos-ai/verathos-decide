@@ -50,13 +50,13 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    receipt, a compressed or oversized response, a refusal of the gateway) counts against it at once; one that the
    request itself may cause (a timeout, an error status) counts only if another miner then answers the same request.
    A connection the gateway itself cannot make (out of descriptors or buffers, all its connections to miners in use,
-   no route out) counts against nobody. A miner that answers busy (429, 503) is skipped for one second. A refusal of the request (another 4xx) counts
-   against it if another miner then answers the same request; the gateway has checked everything a miner checks, so
-   a refusal no other miner shares is also reported as refusing users (without opening its breaker), and the user
-   gets 503, not 400. A slow endpoint gets fewer requests on its own: they stay in flight longer. After 3 failures
-   in a row an endpoint's circuit breaker opens for 5 s; one probe request then decides, and each failed probe
-   doubles the time (up to 120 s). A probe that times out stays the one probe until its request is settled: it
-   fails if another miner answers the request.
+   no route out) counts against nobody. A miner that answers busy (429, 503) is skipped for one second. A refusal of
+   the request (another 4xx) counts against it if another miner then answers the same request; the gateway has
+   checked everything a miner checks, so a refusal no other miner shares is also reported as refusing users (without
+   opening its breaker), and the user gets 503, not 400. A slow endpoint gets fewer requests on its own: they stay in
+   flight longer. After 3 failures in a row an endpoint's circuit breaker opens for 5 s; one probe request then
+   decides, and each failed probe doubles the time (up to 120 s). A probe that times out stays the one probe until
+   its request is settled: it fails if another miner answers the request.
 7. **Response.** The answers, the input tokens the miner signed in its receipt (at most one per byte of the
    request, at least one per 8 characters of the state; the auditor checks sampled counts against its reference,
    too many or too few being a wrong answer), the receipt itself and the request id. Usage is counted per account,
@@ -314,9 +314,9 @@ verathos-gateway credits list --account acme
 
 An answer costs its input tokens times the model's catalog `price` (USD per million input tokens). The cost is
 written with the usage every 5 s, in whole micro-USD per account, key, model and day (fractions are carried to the
-next write, so answers cost what their tokens do), and taken from the account's balance in the same transaction. Every account has a balance: the credit recorded minus the cost of its
-usage. A prepaid account (`--prepaid yes`) is served only while its balance is positive; others are served
-regardless (their balance just goes negative).
+next write, so answers cost what their tokens do), and taken from the account's balance in the same transaction.
+Every account has a balance: the credit recorded minus the cost of its usage. A prepaid account (`--prepaid yes`) is
+served only while its balance is positive; others are served regardless (their balance just goes negative).
 
 Credit is a ledger. Each entry has a `kind` (`grant`: free credit, `topup`: a payment, `adjust`: an operator's
 correction, the only kind that may be negative) and a `reference` naming the payment or grant it records. A

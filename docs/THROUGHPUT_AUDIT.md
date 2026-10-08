@@ -161,12 +161,12 @@ endpoints it tests, those whose receipt binds the request and the answers and na
 endpoint and epoch; signed malformed answers always), and recomputes a random `gateway_checks_per_epoch` of them per
 endpoint and epoch, between tests (screen and fp32 reference as above). A wrong answer is evidence like one in a
 test; so is a receipt signing more or fewer input tokens than the reference counts (beyond 2% and 2 tokens), here
-and in tests, since users' input tokens are what they are billed and set the models' emission shares. The differences form a drift tally of their own
-over the last `drift_window_tests` epochs: an endpoint whose answers to users drift beyond the model's `mean_abs`
-loses its credit, however correct its test answers are. A
-gateway answer counts in the epoch its check finished, so an epoch's verdicts depend only on checks finished before
-it began. A sampled user request in the form of the test's requests or of a canary is logged as relayed: some miner
-forwards what it is sent to the gateway (`throughput.workload.in_mix_form`, `validator.canaries.canary_like`).
+and in tests, since users' input tokens are what they are billed and set the models' emission shares. The
+differences form a drift tally of their own over the last `drift_window_tests` epochs: an endpoint whose answers to
+users drift beyond the model's `mean_abs` loses its credit, however correct its test answers are. A gateway answer
+counts in the epoch its check finished, so an epoch's verdicts depend only on checks finished before it began. A
+sampled user request in the form of the test's requests or of a canary is logged as relayed: some miner forwards
+what it is sent to the gateway (`throughput.workload.in_mix_form`, `validator.canaries.canary_like`).
 
 The gateway also reports, per endpoint and by the second each request was sent, how many user requests it sent the
 endpoint and how many of them it answered (a report is taken once, even if the gateway posts it again). Miners
