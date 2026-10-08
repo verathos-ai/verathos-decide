@@ -54,7 +54,7 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--model` | one model for every GPU, or one per GPU in order (`kev-4b,kev-9b`) |
 | `--gpus` | the GPUs to serve on (`0,1`; default all) |
 | `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
-| `--no-publish` | try the machine before registering: the miner serves and measures, but writes nothing on chain |
+| `--no-publish` | try the machine before registering: the miner serves and measures, but writes nothing on chain; once the hotkey is registered, run the command again without it |
 | `--no-service` | set everything up, and print the commands to run instead of installing services |
 | `--source`, `--ref`, `--dir` | the code from another git URL, git bundle or tarball; a branch, tag or commit; another directory than `~/verathos` |
 

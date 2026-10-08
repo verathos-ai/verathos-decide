@@ -12,6 +12,8 @@ import shlex
 import sys
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from verathos import catalog
 from verathos.install import common, engines, host, plan
 from verathos.install.common import Prompter, info, step, warn
@@ -197,7 +199,10 @@ def init(argv: list[str]) -> None:
                           hotkey_name=hotkey_name, public_ip=public_ip, port=port,
                           endpoints={eid: (chosen[gpu], engine_ports[eid]) for gpu, eid in endpoint_ids.items()},
                           managed_before=set(record.engines), home=home)
-    MinerConfig.model_validate(config)
+    try:
+        MinerConfig.model_validate(config)
+    except ValidationError as exc:
+        raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
     common.write_json(config_path, config)
     info(f"wrote {config_path}")
 
