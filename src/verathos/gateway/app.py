@@ -35,7 +35,7 @@ import math
 import re
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,6 +48,7 @@ from verathos.gateway import metrics
 from verathos.gateway.accounts import Accounts, Principal, well_formed_key
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
+from verathos.gateway.logs import Throttle
 from verathos.gateway.router import Endpoint, Outcome, Router
 from verathos.gateway.sampler import Sampler
 from verathos.gateway.served import ServedCounter
@@ -65,7 +66,10 @@ STATE_CHARS_PER_TOKEN = 4  # as the miners count it
 STATE_CHARS_PER_BILLED_TOKEN = 8
 FAILED_KEY_RATE, FAILED_KEY_BURST = 2.0, 20  # invalid keys per client address (IPv6: per /64)
 ANSWER_ENVELOPE_BYTES = 4096  # the receipt, the usage and the response's own fields
+ACCOUNTS_WAIT_S = 5.0  # a request's key or credit check, at most; the miners' deadline starts after them
+FINAL_WRITE_S = 10.0  # each write at shutdown, at most
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_throttled = Throttle()
 
 
 @dataclass
@@ -161,6 +165,10 @@ class Rejected(Exception):
                  model: str = "-") -> None:
         super().__init__(message)
         self.status, self.kind, self.message, self.retry_after, self.model = status, kind, message, retry_after, model
+
+
+class Unchecked(Exception):
+    """The accounts could not be checked: the database failed or was too slow."""
 
 
 @dataclass(frozen=True)
@@ -289,6 +297,19 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
     return result
 
 
+async def final_writes(g: Gateway) -> None:
+    """At shutdown: usage, samples and served counts written, each within ``FINAL_WRITE_S``; what cannot be is logged
+    as lost."""
+    for what, write in (("usage", g.meter.flush), ("samples", g.sampler.flush),
+                        ("served counts", lambda: g.served.report(final=True))):
+        try:
+            async with asyncio.timeout(FINAL_WRITE_S):
+                await write()
+        except Exception as exc:
+            log.error("the final write of %s failed (%s: %s); not written: %s", what, type(exc).__name__, exc,
+                      g.pending_state())
+
+
 def model_state(g: Gateway, model_id: str) -> str:
     """unavailable: no routable endpoint, or every one failing; degraded: under DEGRADED_SUCCESS of the last 15
     minutes' requests answered, or more than half the endpoints failing; else operational."""
@@ -404,9 +425,8 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         if g.limiter.wait(address, FAILED_KEY_RATE, FAILED_KEY_BURST, started):
             return reject(429, "rate_limited", "too many requests with invalid keys", request_id, 1)
         try:
-            principal = await g.accounts.authenticate(key) if well_formed_key(key) else None
-        except Exception:
-            log.exception("key lookup failed")
+            principal = await bounded("key lookup", g.accounts.authenticate(key)) if well_formed_key(key) else None
+        except Unchecked:
             return reject(503, "unavailable", "accounts cannot be checked right now", request_id, 5)
         if principal is None:
             g.limiter.check(address, FAILED_KEY_RATE, FAILED_KEY_BURST, started)
@@ -417,9 +437,8 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         if not g.meter.within_quota(principal):
             return reject(429, "quota_exceeded", "the account's monthly quota is used up", request_id)
         try:
-            funded = await g.meter.has_credit(principal)
-        except Exception:
-            log.exception("balance lookup failed")
+            funded = await bounded("balance lookup", g.meter.has_credit(principal))
+        except Unchecked:
             return reject(503, "unavailable", "accounts cannot be checked right now", request_id, 5)
         if not funded:
             return reject(402, "insufficient_credit", "the account's credit is used up", request_id)
@@ -434,9 +453,8 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
             return reject(r.status, r.kind, r.message, request_id, r.retry_after, model=r.model)
         most = len(checked.body) * checked.price  # the most the answer may cost: one token per byte of the request
         try:
-            funded = await g.meter.reserve(principal, most)
-        except Exception:
-            log.exception("balance lookup failed")
+            funded = await bounded("balance lookup", g.meter.reserve(principal, most))
+        except Unchecked:
             return reject(503, "unavailable", "accounts cannot be checked right now", request_id, 5)
         if not funded:
             return reject(402, "insufficient_credit", "the account's credit is used up", request_id)
@@ -445,9 +463,22 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         finally:
             g.meter.release(principal, most)
 
+    async def bounded(what: str, check: Awaitable[Any]) -> Any:
+        """An account check within ``ACCOUNTS_WAIT_S``; raises Unchecked if the database fails or is slower."""
+        try:
+            async with asyncio.timeout(ACCOUNTS_WAIT_S):
+                return await check
+        except TimeoutError:
+            if times := _throttled(f"{what} slow"):
+                log.warning("%s took more than %.0f s (%d times)", what, ACCOUNTS_WAIT_S, times)
+        except Exception:
+            if times := _throttled(f"{what} failed"):
+                log.exception("%s failed (%d times)", what, times)
+        raise Unchecked
+
     async def answer(principal: Principal, checked: Checked, started: float, request_id: str):
         model = checked.parsed.model
-        outcome = await forward(g, checked, started)
+        outcome = await forward(g, checked, g.clock())  # the miners' deadline starts now, after the gateway's checks
         metrics.REQUEST_SECONDS.labels(model).observe(g.clock() - started)
         if isinstance(outcome, Exchange):
             # rendered before anything is recorded: an answer that cannot be delivered is neither billed nor counted

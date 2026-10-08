@@ -87,19 +87,17 @@ class Accounts:
             return known[1]
         if self._unknown.get(h, 0.0) > now:
             return None
-        pending = self._loading.get(h)
-        if pending is not None:
-            return await asyncio.shield(pending)
-        future = asyncio.get_running_loop().create_future()
-        self._loading[h] = future
-        try:
-            principal = await self._load(h)
-        except Exception as exc:
-            future.set_exception(exc)
-            future.exception()  # retrieved: the waiters get it raised
-            raise
-        finally:
-            del self._loading[h]
+        loading = self._loading.get(h)
+        if loading is None:  # a task of its own: a waiter giving up (its deadline) stops no one else's lookup
+            loading = self._loading[h] = asyncio.ensure_future(self._load(h))
+            loading.add_done_callback(lambda done: self._loaded(h, done))
+        return await asyncio.shield(loading)
+
+    def _loaded(self, h: str, done: asyncio.Future[Principal | None]) -> None:
+        del self._loading[h]
+        if done.cancelled() or done.exception() is not None:  # retrieved: the waiters get it raised
+            return
+        principal, now = done.result(), self.clock()
         if principal is None:
             if len(self._unknown) >= MAX_CACHED:
                 self._unknown = {k: t for k, t in self._unknown.items() if t > now}
@@ -110,8 +108,6 @@ class Accounts:
             if len(self._known) >= MAX_CACHED:
                 self._known = {k: v for k, v in self._known.items() if v[0] > now}
             self._known[h] = (now + self.ttl_s, principal)
-        future.set_result(principal)
-        return principal
 
     async def _load(self, h: str) -> Principal | None:
         now = dt.datetime.now(dt.UTC)

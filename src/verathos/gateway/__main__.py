@@ -36,7 +36,7 @@ from verathos import catalog as catalog_module
 from verathos.gateway import db
 from verathos.gateway.accounts import Accounts
 from verathos.gateway.admin import ByPort, admin_app, read_token
-from verathos.gateway.app import Gateway, create_app, mark_states_forever
+from verathos.gateway.app import ACCOUNTS_WAIT_S, Gateway, create_app, final_writes, mark_states_forever
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.router import Router
@@ -119,11 +119,7 @@ async def serve(config: GatewayConfig) -> None:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            for final in (meter.flush(), sampler.flush(), served.report(final=True)):
-                try:
-                    await final
-                except Exception:
-                    log.exception("final write failed")
+            await final_writes(gateway)
             await client.aclose()
             await engine.dispose()
 
@@ -136,9 +132,11 @@ async def serve(config: GatewayConfig) -> None:
         app = ByPort(app, config.admin_port, admin_app(gateway, token=read_token(config.admin_token_file)))
         sockets.append(listen(config.admin_host, config.admin_port))
         log.info("admin API on %s:%d", config.admin_host, config.admin_port)
-    # On SIGTERM: stop accepting (the reverse proxy turns to the standby), finish what is in flight, write usage.
+    # On SIGTERM: stop accepting (the reverse proxy turns to the standby), finish what is in flight (its account
+    # checks and its miners' deadline), write usage.
+    in_flight_s = 3 * ACCOUNTS_WAIT_S + config.request_timeout_s
     server = uvicorn.Server(uvicorn.Config(app, log_level="warning", access_log=False, server_header=False,
-                                           timeout_graceful_shutdown=config.request_timeout_s + 2))
+                                           timeout_graceful_shutdown=in_flight_s + 2))
     await server.serve(sockets=sockets)
 
 

@@ -26,7 +26,9 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    key or a changed limit applies within a minute. An address (IPv6: a /64) sending invalid keys is limited to 2 per
    second (bursts of 20) before any lookup.
 2. **Limits.** The account's rate (requests/s and burst, GCRA), applied to each of its keys, and its monthly quota
-   (UTC calendar month) for the account.
+   (UTC calendar month) for the account. A key or credit check that needs the database waits for it at most 5 s
+   (then 503), and every database statement is bounded (10 s, 5 s waiting for a lock), so a stalled database
+   refuses requests instead of holding them; the miners' deadline (`request_timeout_s`) starts after these checks.
 3. **Request.** Strict JSON (no NaN or infinities): a SystemOne request (`protocol/api.py`) for a model the catalog
    lists as `active` and the routes serve, with a state within the model's `max_state_tokens` (4 characters per
    token, as miners count), and questions whose answers fit a response (64 KiB). Requests no miner could answer are
@@ -139,7 +141,7 @@ credited.
    | `auditor_url` | owner's axon | the owner validator's service |
    | `instances` | 1 | gateway processes sharing the miners' capacity |
    | `trusted_proxies` | localhost | networks whose `X-Forwarded-For` is believed |
-   | `request_timeout_s`, `attempt_timeout_s`, `max_attempts` | 10, 4, 3 | deadline per request, per attempt, attempts |
+   | `request_timeout_s`, `attempt_timeout_s`, `max_attempts` | 10, 4, 3 | the miners' deadline per request, per attempt, attempts |
    | `max_in_flight` | 4096 | requests in flight per process; more get 503 |
    | `max_body_bytes` | 1 MiB | |
    | `sample_window_s` | 600 | one exchange per endpoint and window goes to the auditor |
@@ -184,10 +186,11 @@ systemctl restart verathos-gateway;         until curl -sf http://127.0.0.1:8080
 ```
 
 On SIGTERM a process stops accepting connections, so the proxy sends new requests to the other one; it finishes
-the requests in flight (at most `request_timeout_s`), writes usage, samples and served counts, and exits. A request
-whose process fails before answering goes to the other process once. A process is ready as soon as it has started:
-it serves the routes it kept on disk while it fetches new ones. A restart of the auditor does not reach users: the
-gateways keep their routes until it serves new ones. A key's rate limit starts afresh on the other process.
+the requests in flight (their checks and `request_timeout_s`), writes usage, samples and served counts (10 s each
+at most; what cannot be written is logged), and exits. A request whose process fails before answering goes to the
+other process once. A process is ready as soon as it has started: it serves the routes it kept on disk while it
+fetches new ones. A restart of the auditor does not reach users: the gateways keep their routes until it serves new
+ones. A key's rate limit starts afresh on the other process.
 
 ### More than one process
 

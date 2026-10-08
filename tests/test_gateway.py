@@ -1070,6 +1070,75 @@ def test_balance_reads_do_not_wait_for_each_other(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_a_stalled_database_answers_users_503_in_bounded_time(tmp_path, monkeypatch) -> None:
+    from verathos.gateway import app as app_module
+
+    monkeypatch.setattr(app_module, "ACCOUNTS_WAIT_S", 0.2)
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+
+    async def stalled(*_):
+        await asyncio.Event().wait()
+
+    load = s.accounts._load
+    s.accounts._load = stalled
+    r = asyncio.run(asyncio.wait_for(s.post(), 3.0))
+    assert r.status_code == 503 and r.json()["error"]["message"] == "accounts cannot be checked right now"
+    s.accounts._load = load
+    asyncio.run(s.accounts.set_account("acme", prepaid=True))
+    s.meter.read_balance = stalled
+    r = asyncio.run(asyncio.wait_for(s.post(), 3.0))
+    assert r.status_code == 503 and r.json()["error"]["type"] == "unavailable"
+
+
+def test_a_key_lookup_continues_for_others_when_one_waiter_gives_up(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    load = s.accounts._load
+
+    async def slow(h):
+        await asyncio.sleep(0.2)
+        return await load(h)
+    s.accounts._load = slow
+
+    async def run():
+        impatient = asyncio.create_task(asyncio.wait_for(s.accounts.authenticate(s.key), 0.05))
+        patient = asyncio.create_task(s.accounts.authenticate(s.key))
+        with pytest.raises(TimeoutError):
+            await impatient
+        return await asyncio.wait_for(patient, 2.0)
+    assert asyncio.run(run()).account == "acme"
+
+
+def test_writes_at_shutdown_are_bounded(tmp_path, caplog, monkeypatch) -> None:
+    from verathos.gateway import app as app_module
+
+    monkeypatch.setattr(app_module, "FINAL_WRITE_S", 0.2)
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    assert asyncio.run(s.post()).status_code == 200
+    s.meter.engine = Hooked(s.engine)
+    s.meter.engine.before_begin = asyncio.Event().wait  # the database stalls
+    asyncio.run(asyncio.wait_for(app_module.final_writes(s.gateway), 3.0))
+    assert "final write of usage failed" in caplog.text and "'usage_rows': 1" in caplog.text
+
+
+def test_repeated_log_lines_are_throttled_with_their_count() -> None:
+    from verathos.gateway.logs import Throttle
+
+    clock = Clock()
+    throttle = Throttle(every_s=60.0, clock=clock)
+    assert [throttle("slow"), throttle("slow"), throttle("slow"), throttle("other")] == [1, 0, 0, 1]
+    clock.now += 60.0
+    assert throttle("slow") == 3  # this time and the two not logged
+
+
+def test_database_statements_are_bounded_on_postgresql(monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setattr(db, "create_async_engine", lambda url, **options: captured.update(options))
+    db.create_engine("postgresql+asyncpg://gateway@127.0.0.1/gateway")
+    settings = captured["connect_args"]["server_settings"]
+    assert captured["connect_args"]["command_timeout"] > 0 and captured["pool_timeout"] > 0
+    assert int(settings["statement_timeout"]) > 0 and int(settings["lock_timeout"]) > 0
+
+
 def test_another_process_charges_and_credit_apply_within_the_balance_ttl(tmp_path) -> None:
     s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
     clock = Clock()

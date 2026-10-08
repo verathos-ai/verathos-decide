@@ -31,6 +31,8 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 MIGRATIONS = Path(__file__).parent / "migrations"
+STATEMENT_TIMEOUT_MS, LOCK_TIMEOUT_MS = 10_000, 5_000
+COMMAND_TIMEOUT_S, POOL_TIMEOUT_S = 15.0, 10.0
 ID = BigInteger().with_variant(Integer, "sqlite")  # SQLite autoincrements only INTEGER keys
 
 metadata = MetaData()
@@ -91,8 +93,15 @@ credits = Table(
 
 
 def create_engine(url: str) -> AsyncEngine:
+    """On PostgreSQL every statement is bounded: the server cancels one after ``STATEMENT_TIMEOUT_MS`` or one waiting
+    ``LOCK_TIMEOUT_MS`` for a lock (a transaction left open by hand), the client gives up after ``COMMAND_TIMEOUT_S``
+    (an unreachable server), and a connection is waited for at most ``POOL_TIMEOUT_S``."""
     if url.startswith("postgresql"):
-        return create_async_engine(url, pool_size=10, max_overflow=10, pool_pre_ping=True, pool_recycle=1800)
+        return create_async_engine(
+            url, pool_size=10, max_overflow=10, pool_pre_ping=True, pool_recycle=1800, pool_timeout=POOL_TIMEOUT_S,
+            connect_args={"command_timeout": COMMAND_TIMEOUT_S,
+                          "server_settings": {"statement_timeout": str(STATEMENT_TIMEOUT_MS),
+                                              "lock_timeout": str(LOCK_TIMEOUT_MS)}})
     return create_async_engine(url)
 
 
