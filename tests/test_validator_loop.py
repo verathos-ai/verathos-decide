@@ -189,6 +189,21 @@ def test_a_bound_canary_receipt_proves_control_and_a_canary_counts_only_within_t
     assert slow.errors == ["request failed: TimeoutError"] * 2
 
 
+def test_a_validator_notices_when_the_subnet_owner_hotkey_moves() -> None:
+    """Its role (auditor or follower) and the auditor it trusts are set at its start: a new owner hotkey means a
+    restart."""
+    from types import SimpleNamespace
+
+    from verathos.validator.__main__ import auditor_moved
+
+    def chain(owner):
+        return SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: owner)
+
+    assert auditor_moved(chain("new"), 405, "old") == "new"
+    assert auditor_moved(chain("old"), 405, "old") is None
+    assert auditor_moved(chain(None), 405, "old") is None  # the chain did not say
+
+
 def test_weights_ignore_reassigned_uids() -> None:
     state = ScoreState(ema={"hkA/gpu0": 0.5, "hkB/gpu0": 0.5}, uid_of={"hkA/gpu0": 1, "hkB/gpu0": 2})
     assert weights(state, {1: "hkA", 2: "someone-else"}) == {1: pytest.approx(1.0)}

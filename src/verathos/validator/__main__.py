@@ -120,6 +120,12 @@ def epoch_shares(verdicts: Verdicts | None, cat: catalog.Catalog) -> dict[str, f
     return model_shares(verdicts.demand if verdicts is not None else {}, cat)
 
 
+def auditor_moved(st: bt.Subtensor, netuid: int, auditor_hotkey: str) -> str | None:
+    """The subnet owner's hotkey, if it is no longer ``auditor_hotkey`` (the auditor this validator is or follows)."""
+    owner = st.get_subnet_owner_hotkey(netuid)
+    return owner if owner and owner != auditor_hotkey else None
+
+
 def missing_references(cfg: ValidatorConfig, cat: catalog.Catalog) -> list[str]:
     return [m.model_id for m in cat.models if m.status == "active" and m.model_id not in cfg.references]
 
@@ -322,6 +328,10 @@ def main() -> None:
             epoch = block // epoch_blocks
             next_start = (epoch + 1) * epoch_blocks
             if epoch != done:
+                if moved := auditor_moved(st, cfg.netuid, throughput.auditor_hotkey):
+                    # the roles are set at the start: the supervisor's restart takes up the new auditor
+                    log.critical("the subnet owner hotkey is now %s, the auditor; restarting", moved)
+                    os._exit(1)
                 blocks_left = max(next_start - block, 1)
                 trial = copy.deepcopy(state)  # an epoch that fails part way leaves no trace for its retry
                 asyncio.run(run_epoch(cfg, st, wallet, secret, trial, epoch, 1 if args.once else blocks_left,

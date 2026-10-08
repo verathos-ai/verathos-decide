@@ -495,6 +495,25 @@ def test_a_screen_flag_counts_only_once_the_fp32_reference_confirms_it() -> None
     asyncio.run(run())
 
 
+def test_a_reference_that_counts_no_input_tokens_is_reported_once(caplog) -> None:
+    """Without the reference's count, the input tokens miners sign (they set the demand) cannot be checked."""
+    request = make_request("kev-4b", KEV.workload, random.Random(6))
+
+    class Uncounted(MockEngine):
+        async def answer(self, request):
+            return {**await super().answer(request), "usage": None}
+
+    async def run():
+        answers = (await MockEngine("kev-4b").answer(request))["answers"]
+        recomputes = Checks({"uncounted": Uncounted("kev-4b")}, {}).for_test()
+        for _ in range(2):
+            await recomputes.check("uncounted", request, answers, KEV.tolerance, recompute_answers=True, claimed=10**6)
+
+    with caplog.at_level("WARNING", logger="verathos.throughput.auditor"):
+        asyncio.run(run())
+    assert caplog.text.count("uncounted reference reports no usage.input_tokens") == 1
+
+
 def test_reference_engines_take_a_url_or_a_keyed_tls_endpoint() -> None:
     from verathos.validator.config import ValidatorConfig
 

@@ -215,8 +215,9 @@ the same ones.
 .venv/bin/verathos-validator --config validator.json
 ```
 
-Run it under a supervisor (systemd, pm2) that restarts it. At start it waits until its reference engines answer
-(at most 15 minutes), so references restarted with it can load their models before an epoch needs them.
+Run it under a supervisor (systemd, pm2) that restarts it: the validator also exits by itself when the subnet owner
+hotkey changes, to start again under the new auditor. At start it waits until its reference engines answer (at most
+15 minutes), so references restarted with it can load their models before an epoch needs them.
 
 Per epoch (`epoch_blocks` from the catalog, default 180 blocks) the validator:
 1. uses the catalog the subnet owner commits (shipped copy, local store, owner's axon, mirrors; any copy is
@@ -256,9 +257,11 @@ capacities, up to the model's `first_test_rps`, and fetches nothing.
 
 Validators that run a service (the subnet owner's and the auditor's) also serve each hotkey's status for its miners
 at `GET /v1/status/<hotkey>`: the UID and its share of the weights set, per endpoint the state in the last epoch
-(scored, qualifying, candidate, failed, invalid, probation), its checks, declared and proven capacity and scores, and
-the auditor's recent test results for the hotkey. `GET /v1/network` serves every hotkey's status of the last epoch at
-once (without the test results), for network dashboards.
+(scored, qualifying, candidate, drifted, failed, invalid, probation), its checks, declared and proven capacity, how
+ready users found it, its latency factor and scores, and the auditor's recent test results for the hotkey.
+`GET /v1/network` serves every hotkey's status of the last epoch at once (without the test results, built once per
+epoch), for network dashboards. These routes are public and share the auditor's process and uplink: on the auditor,
+put a rate-limiting reverse proxy in front of them.
 
 If the validator's hotkey is the auditor, it also:
 - serves the verdicts on `port` and points its axon at `public_host:port`, where miners and validators find it;

@@ -150,3 +150,4 @@ def test_network_route_serves_every_hotkey_of_the_last_epoch() -> None:
     got = NetworkStatus.model_validate(response.json())
     assert (got.epoch, got.model_shares, [h.uid for h in got.hotkeys]) == (5, {"kev-4b": 1.0}, [2, 7])
     assert response.headers["cache-control"] == "public, max-age=30"
+    assert board.network() is board.network()  # built once per epoch, not per request

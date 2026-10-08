@@ -101,6 +101,7 @@ REFERENCE_CONCURRENCY = 4
 REFERENCE_TIMEOUT_S = 30.0
 RECOMPUTE_BUDGET_S = 900.0  # after this, a test's remaining recomputes are skipped
 BREAKER_FAILURES = 3  # an engine failing this often in a row is not asked again in the test
+_UNCOUNTED: set[str] = set()  # models whose reference reported no input tokens (logged once each)
 ROUTES_TTL_S = 30.0
 KEPT_PER_ENDPOINT = 8  # gateway samples kept per endpoint and epoch, of which gateway_checks_per_epoch are checked
 MAX_CHECK_ATTEMPTS = 3
@@ -255,6 +256,10 @@ class Recomputes:
                 log.warning("a %s recompute failed, the answer is unchecked: %s", model_id, exc)
                 return None
             self._failures[id(engine)] = 0
+            if comparison.reference_input_tokens is None and model_id not in _UNCOUNTED:
+                _UNCOUNTED.add(model_id)
+                log.warning("the %s reference reports no usage.input_tokens: the input tokens miners sign for it, "
+                            "which set its demand, are not checked", model_id)
             return comparison
         finally:
             self._slots.release()

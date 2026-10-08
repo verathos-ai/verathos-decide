@@ -20,7 +20,7 @@ from collections.abc import Callable, Collection
 import bittensor as bt
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
 
 from verathos.catalog import CATALOG_PATH, CatalogStore
@@ -64,7 +64,8 @@ def add_status_route(app: FastAPI, board: StatusBoard, auditor: Auditor | None) 
 def add_network_route(app: FastAPI, board: StatusBoard) -> None:
     @app.get(NETWORK_PATH)
     def get_network():
-        return JSONResponse(board.network().model_dump(), headers={"Cache-Control": "public, max-age=30"})
+        return Response(board.network(), media_type="application/json",
+                        headers={"Cache-Control": "public, max-age=30"})
 
 
 def add_verdicts_route(app: FastAPI, auditor: Auditor) -> None:

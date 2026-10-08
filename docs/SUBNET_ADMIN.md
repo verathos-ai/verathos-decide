@@ -42,8 +42,12 @@ endpoints together; later tests grow from what was delivered.
 the per-caller limit, and the auditor checks a sample of their answers. Rotating a gateway hotkey is a catalog
 commit.
 
-The auditor is the validator of the subnet owner hotkey. After changing the subnet owner hotkey on chain, restart
-every validator so it applies the new auditor's verdicts (miners follow within a minute).
+The auditor is the validator of the subnet owner hotkey. After the subnet owner hotkey changes on chain, every
+validator exits at the start of its next epoch so that its supervisor restarts it under the new auditor (the new
+owner's validator then runs the tests); miners follow within a minute.
+
+Activate a model only once its reference engine reports `usage.input_tokens` (the auditor logs a warning for one that
+does not): the input tokens miners sign set the model's demand, and only the reference's count checks them.
 
 Model status: `active` models are scored; `candidate` models can be served and are checked but weighted zero, which
 lets a new model run on the network before it is scored; `retired` models are skipped, and miners withdraw endpoints
