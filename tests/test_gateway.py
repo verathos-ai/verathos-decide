@@ -815,6 +815,20 @@ def test_the_auditor_overwrites_what_it_scrubs(tmp_path) -> None:
     assert Store(tmp_path / "a.sqlite", epoch_blocks=180)._query("PRAGMA secure_delete") == [(1,)]
 
 
+def test_test_requests_and_canaries_cannot_be_relayed_through_the_gateway(tmp_path) -> None:
+    from verathos.throughput.workload import make_request
+    from verathos.validator.canaries import canary_pool
+
+    s = Setup(tmp_path, {"10.0.0.1": Counting("kev-4b")})
+    Counting.calls = 0
+    test_request = make_request("kev-4b", catalog.load().get("kev-4b").workload, random.Random(1))
+    (canary,) = canary_pool(b"secret", 3, "kev-4b", 1)
+    for relayed in (test_request, canary):
+        r = asyncio.run(s.post(relayed))
+        assert r.status_code == 400 and "test requests or canaries" in r.json()["error"]["message"]
+    assert Counting.calls == 0 and asyncio.run(s.post()).status_code == 200
+
+
 def test_a_request_that_breaks_every_miner_opens_no_breaker(tmp_path) -> None:
     s = Setup(tmp_path, {f"10.0.0.{i}": Counting("kev-4b") for i in (1, 2, 3)})
     poison = {**REQUEST, "state": "POISON"}

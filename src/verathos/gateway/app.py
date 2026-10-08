@@ -69,6 +69,8 @@ from verathos.protocol.api import (
 )
 from verathos.protocol.canonical import digest
 from verathos.protocol.gateway import Routes
+from verathos.throughput.workload import in_mix_form
+from verathos.validator.canaries import canary_like
 
 log = logging.getLogger(__name__)
 # An answer is billed at least one token per this many characters of the state, whatever the miner signs; these
@@ -214,7 +216,9 @@ def validation_message(exc: ValidationError) -> str:
 
 def check_request(g: Gateway, body: bytes) -> Checked:
     """A body the gateway can forward: strict JSON, a SystemOne request for an active model miners serve now, within
-    the model's limit (``prompt_chars``) and with answers that fit a response. Raises Rejected."""
+    the model's limit (``prompt_chars``) and with answers that fit a response, whose state is not one of the subnet's
+    test requests or canaries (a miner relaying them through the gateway would have its answers counted as users').
+    Raises Rejected."""
     try:
         raw = json.loads(body, parse_constant=_no_constants)
         parsed = SystemOneRequest.model_validate(raw)
@@ -224,6 +228,8 @@ def check_request(g: Gateway, body: bytes) -> Checked:
         raise Rejected(400, "invalid_request", f"not a SystemOne request: {validation_message(exc)}") from None
     except (ValueError, TypeError, RecursionError) as exc:
         raise Rejected(400, "invalid_request", f"not a SystemOne request: {exc}"[:500]) from None
+    if in_mix_form(parsed.state) or canary_like(parsed.state):  # relayed, so that the gateway's answers count
+        raise Rejected(400, "invalid_request", "the state has the form of the subnet's test requests or canaries")
     cat = g.catalog()
     if cat is None:
         raise Rejected(503, "unavailable", "the gateway has no catalog yet", 5)
