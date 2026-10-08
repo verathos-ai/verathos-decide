@@ -204,7 +204,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     log.info("  emission shares: %s", ", ".join(f"{m} {s:.1%}" for m, s in sorted(shares.items())))
     scores, failed = epoch_scores(results, shares=shares, credited=credited, latency_ms=proven.latency_ms, state=state,
                                   failed_hotkeys=invalid_hotkeys, user_latency_ms=proven.user_latency_ms,
-                                  user_availability=proven.user_availability)
+                                  user_availability=proven.user_availability, max_latency_s=policy.max_latency_s)
     held = {e.key for e in endpoints} - set(results)
     if held:
         log.info("  %d endpoints not audited this epoch (no usable reference answers); scores held", len(held))

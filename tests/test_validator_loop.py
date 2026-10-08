@@ -285,6 +285,32 @@ def test_what_users_got_from_an_endpoint_counts_once_there_is_enough_of_it() -> 
     assert scores == {k: pytest.approx(w / sum(weights_.values())) for k, w in weights_.items()}
 
 
+def test_answering_users_near_twice_the_latency_bound_earns_next_to_nothing() -> None:
+    """An endpoint answering users just under the gateway's slow bound (twice max_latency_s) keeps all its draws
+    ready on half its GPU; its latency factor falls linearly from the bound to zero at twice it, not to a 0.7 floor."""
+    import math
+
+    from verathos.validator.audit import EndpointResult
+    from verathos.validator.discovery import DiscoveredEndpoint
+
+    def result(endpoint_id: str) -> EndpointResult:
+        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}",
+                                model_id="kev-4b", capacity_rps=20.0))
+        return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4)
+
+    results = {k: result(k.split("/")[1]) for k in ("hkA/quick", "hkA/bound", "hkA/dawdler")}
+    state = ScoreState()
+    record_window(state, results, 3)
+    users = {"hkA/quick": 1000.0, "hkA/bound": 2000.0, "hkA/dawdler": 3900.0}
+    scores, _ = epoch_scores(results, shares={"kev-4b": 1.0}, credited=dict.fromkeys(results, 20.0),
+                             latency_ms=dict.fromkeys(results, 400.0), state=state, user_latency_ms=users,
+                             max_latency_s=2.0)
+    # median 2000 ms: the quick one at the 1.3 cap, the dawdler sqrt(2000 / 3900) and then 5% of that
+    factors = {"hkA/quick": 1.3, "hkA/bound": 1.0, "hkA/dawdler": math.sqrt(2000 / 3900) * (2 - 3.9 / 2)}
+    assert scores == {k: pytest.approx(f / sum(factors.values())) for k, f in factors.items()}
+    assert scores["hkA/dawdler"] < 0.02
+
+
 def test_a_model_whose_endpoints_all_refuse_users_scores_zero_and_stops_nothing() -> None:
     from verathos.validator.audit import EndpointResult
     from verathos.validator.discovery import DiscoveredEndpoint

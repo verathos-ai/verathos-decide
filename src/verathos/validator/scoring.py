@@ -13,15 +13,14 @@ Per endpoint and epoch:
   proportion to proven capacity (requests/s) x availability (answered / sent) x availability to users x latency
   factor. Availability to users is the share of the times the gateways considered the endpoint for a user request
   that it was ready (not busy, failing, or answering slower than twice the latency bound), less the requests it
-  refused, once it was considered ``user_refusals_min_offers`` times: capacity shown in tests but kept from users
-  does not count, and neither does keeping users waiting. The latency
-  factor compares the endpoint's median latency with the median over the scored endpoints serving the same model,
-  each weighted by its proven capacity (so splitting capacity over more endpoints does not move it), capped to
-  [0.7, 1.3]: the latency of its answers to
-  users once its hotkey's endpoints serving the model gave ``user_latency_min_answers`` of them, compared among
-  endpoints measured the same way, else its latency in its throughput test, compared among those, and then at most 1
-  while users measure others of the model. Every validator reads the same figures from the auditor's
-  verdicts. Candidate models score zero.
+  refused, with ``user_offers_prior`` ready offers to start from: capacity shown in tests but kept from users does
+  not count, and neither does keeping users waiting. The latency factor compares the endpoint's median latency with
+  the median over the scored endpoints serving the same model, each weighted by its proven capacity (so splitting
+  capacity over more endpoints does not move it), capped to [0.7, 1.3]: the latency of its answers to users once its
+  hotkey's endpoints serving the model gave ``user_latency_min_answers`` of them, compared among endpoints measured
+  the same way, and falling linearly from the latency bound to 0 at twice it; else its latency in its throughput
+  test, compared among those, and then at most 1 while users measure others of the model. Every validator reads the
+  same figures from the auditor's verdicts. Candidate models score zero.
 An endpoint that could not be audited (no usable reference answers) keeps its average for at most ``MAX_HELD_EPOCHS``
 epochs in a row. Per UID: the sum of its endpoints' EMAs. Weights: UID values normalised to 1.
 """
@@ -35,6 +34,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from verathos.catalog import Catalog
+from verathos.throughput.policy import AuditPolicy
 from verathos.validator.audit import EndpointResult
 from verathos.validator.compare import Verdict
 
@@ -164,7 +164,8 @@ def _with_floor(shares: dict[str, float], floor: float) -> dict[str, float]:
 def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, float], credited: dict[str, float],
                  latency_ms: dict[str, float], state: ScoreState, failed_hotkeys: Collection[str] = (),
                  user_latency_ms: Mapping[str, float] | None = None,
-                 user_availability: Mapping[str, float] | None = None) -> tuple[dict[str, float], set[str]]:
+                 user_availability: Mapping[str, float] | None = None,
+                 max_latency_s: float = AuditPolicy.max_latency_s) -> tuple[dict[str, float], set[str]]:
     """-> (score per endpoint key, keys that failed verification this epoch). Call after ``record_window``.
 
     ``shares`` holds each model's share of the emission (``model_shares``; missing: none); ``credited`` each
@@ -172,7 +173,8 @@ def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, flo
     test (missing: no latency factor); ``failed_hotkeys`` the hotkeys with a wrong answer proven by the throughput
     auditor; ``user_latency_ms`` the median latency of its answers to users, where there were enough (it takes the
     place of the test's); ``user_availability`` the share of the times it was considered for users that it was
-    ready (missing: 1).
+    ready (missing: 1); ``max_latency_s`` the latency capacity is declared at: answers to users slower than it take
+    the latency factor down linearly, to 0 at twice it.
     """
     user_latency_ms, user_availability = user_latency_ms or {}, user_availability or {}
     scores: dict[str, float] = {}
@@ -208,6 +210,8 @@ def epoch_scores(results: dict[str, EndpointResult], *, shares: Mapping[str, flo
             factor = min(max(math.sqrt(median[(model, source)] / own), LATENCY_CAP[0]), LATENCY_CAP[1])
             if source == "test" and model in by_users:
                 factor = min(factor, 1.0)  # staying out of users' sight earns no bonus
+            if source == "users":  # answering users just under the gateway's slow bound pays nothing
+                factor *= min(max(2.0 - own / 1000 / max_latency_s, 0.0), 1.0)
         availability = (r.answered / r.sent) * min(max(user_availability.get(key, 1.0), 0.0), 1.0)
         weight[key] = credited[key] * availability * factor
     model_total: dict[str, float] = {}

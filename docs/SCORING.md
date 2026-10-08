@@ -67,7 +67,9 @@ Per endpoint and epoch:
   offers move it little: capacity shown in tests but kept from users does not count, and neither does keeping users
   waiting. The latency factor is `sqrt(median / own latency)`, capped to [0.7, 1.3]. An endpoint's latency is the
   median latency of its hotkey's answers to the model's users once they gave `user_latency_min_answers` (50) in the
-  epoch before, compared with the median over the model's scored endpoints measured the same way; else its median
+  epoch before, compared with the median over the model's scored endpoints measured the same way, and the factor is
+  then scaled by `2 - latency / max_latency_s` between `max_latency_s` and twice it (0 beyond): answering users just
+  under the gateway's slow bound, which keeps an endpoint ready on part of its GPU, earns next to nothing; else its median
   latency in its throughput test, compared with those measured so, and then at most 1 while users measure others of
   the model. Tests are known shortly ahead and their requests are recognisable, so what users get is measured on
   users, per hotkey and model, so splitting capacity over endpoints hides none of it. Every validator reads the same
