@@ -1,11 +1,14 @@
-"""Usage per account, key, model and UTC day: counted in memory, written every ``flush_s`` in one transaction.
+"""Usage per account, key, model and UTC day: counted in memory, written every ``flush_s`` in one transaction, together
+with the answered requests and input tokens per model and UTC hour of all accounts (``usage_hourly``: the network's
+totals).
 
 What was counted since the last write is taken as a batch with an id of its own, written in one transaction that also
 records the id (``usage_flushes``). A batch whose write failed waits and is written again as it is, before anything
 counted since: if its first write did reach the database (its confirmation was lost, or it was cancelled at shutdown),
 the id shows it and it is not counted twice. A batch with rows the database refuses (a key or account deleted by hand)
-is written row by row, and a row refused on its own is dropped with an error in the log. Counts and batches waiting
-are bounded by ``MAX_PENDING`` rows; counts beyond are dropped and logged. Nothing is written per request.
+is written row by row (its hours apart), and a row refused on its own is dropped with an error in the log. Counts and
+batches waiting are bounded by ``MAX_PENDING`` rows; counts beyond are dropped and logged. Nothing is written per
+request.
 
 For monthly quotas the meter also keeps each account's answered requests this month: as read from the database (which
 includes other gateway processes' written counts), plus what this process counted since, waiting or being written. A
@@ -39,7 +42,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from verathos.gateway import metrics
-from verathos.gateway.db import accounts, usage_daily, usage_flushes
+from verathos.gateway.db import accounts, usage_daily, usage_flushes, usage_hourly
 
 if TYPE_CHECKING:
     from verathos.gateway.accounts import Principal
@@ -51,6 +54,7 @@ BALANCE_TTL_S = 5.0
 READ_RETRY_S = 0.01  # a read waits this long for a write in progress, then tries again
 FLUSH_IDS_KEPT = dt.timedelta(days=7)  # batch ids older than this are deleted; a batch is retried within minutes
 Key = tuple[int, int, str, dt.date]  # account, key, model, day
+Hour = tuple[str, dt.datetime]  # model, the hour's start
 
 
 def month_start(day: dt.date) -> dt.date:
@@ -59,9 +63,10 @@ def month_start(day: dt.date) -> dt.date:
 
 @dataclass
 class Batch:
-    """Usage rows written together (cost in whole micro-USD), with what they add per account."""
+    """Usage rows written together (cost in whole micro-USD) with the hours' totals, and what they add per account."""
 
     rows: list[dict[str, Any]]
+    hours: list[dict[str, Any]] = field(default_factory=list)
     id: str = field(default_factory=lambda: secrets.token_hex(16))
     answered: dict[int, int] = field(default_factory=dict)
     charged: dict[int, int] = field(default_factory=dict)
@@ -77,6 +82,7 @@ class UsageMeter:
                  clock: Callable[[], float] = time.monotonic) -> None:
         self.engine, self.flush_s, self.balance_ttl_s, self.clock = engine, flush_s, balance_ttl_s, clock
         self._counts: dict[Key, list] = {}  # -> [requests, failed, input tokens, cost in micro-USD]
+        self._hours: dict[Hour, list] = {}  # -> [answered, input tokens], all accounts
         self._month: dict[int, list] = {}  # account -> [month start, answered as read or written]
         self._unwritten: dict[int, int] = {}  # account -> answered, counted since the last batch
         self._balance: dict[int, list] = {}  # prepaid account -> [balance as read or written, when read]
@@ -93,7 +99,8 @@ class UsageMeter:
     def record(self, principal: Principal, model_id: str, *, answered: bool, input_tokens: int = 0,
                price: float = 0.0) -> None:
         """``price``: the model's, in USD per million input tokens."""
-        key = (principal.account_id, principal.key_id, model_id, dt.datetime.now(dt.UTC).date())
+        now = dt.datetime.now(dt.UTC)
+        key = (principal.account_id, principal.key_id, model_id, now.date())
         counts = self._counts.get(key)
         if counts is None:
             if self.pending() >= MAX_PENDING:
@@ -103,6 +110,9 @@ class UsageMeter:
         counts[0 if answered else 1] += 1
         counts[2] += input_tokens
         if answered:
+            hour = self._hours.setdefault((model_id, now.replace(minute=0, second=0, microsecond=0)), [0, 0])
+            hour[0] += 1
+            hour[1] += input_tokens
             cost = input_tokens * price
             counts[3] += cost
             self._unwritten[principal.account_id] = self._unwritten.get(principal.account_id, 0) + 1
@@ -208,6 +218,7 @@ class UsageMeter:
             log.error("%d usage counts dropped: %d rows wait to be written already", self._dropped, self.pending())
             self._dropped = 0
         counts, self._counts = self._counts, {}
+        hours, self._hours = self._hours, {}
         self._unwritten, self._uncharged = {}, {}
         if not counts:
             return None
@@ -222,7 +233,8 @@ class UsageMeter:
                          "failed": c[1], "input_tokens": c[2], "cost": whole})
         today = dt.datetime.now(dt.UTC).date()
         self._fractions = {k: f for k, f in self._fractions.items() if k[3] >= today - dt.timedelta(days=1)}
-        return Batch(rows)
+        return Batch(rows, [{"model_id": model, "hour": hour, "requests": n[0], "input_tokens": n[1]}
+                            for (model, hour), n in sorted(hours.items())])
 
     async def _write_waiting(self) -> None:
         while self._waiting:
@@ -232,10 +244,11 @@ class UsageMeter:
             try:
                 await self._commit(batch)
             except IntegrityError:
-                if len(batch.rows) > 1:  # written row by row, so only the refused rows are lost
-                    self._waiting[:1] = [Batch([row]) for row in batch.rows]
+                if len(batch.rows) + bool(batch.hours) > 1:  # written row by row, so only the refused rows are lost
+                    hours = [Batch([], batch.hours)] if batch.hours else []
+                    self._waiting[:1] = hours + [Batch([row]) for row in batch.rows]
                 else:
-                    log.error("a usage row the database refuses is dropped: %s", batch.rows[0])
+                    log.error("a usage row the database refuses is dropped: %s", (batch.rows or batch.hours)[0])
                     self._waiting.pop(0)
                 continue
             except BaseException:
@@ -255,17 +268,22 @@ class UsageMeter:
 
     async def _commit(self, batch: Batch) -> None:
         insert = pg_insert if self.engine.dialect.name == "postgresql" else sqlite_insert
-        statement = insert(usage_daily)
-        statement = statement.on_conflict_do_update(
-            index_elements=["account_id", "key_id", "model_id", "day"],
-            set_={c: getattr(usage_daily.c, c) + getattr(statement.excluded, c)
-                  for c in ("requests", "failed", "input_tokens", "cost")})
+
+        def adding(table, keys: list[str], counts: tuple[str, ...]):
+            statement = insert(table)
+            return statement.on_conflict_do_update(
+                index_elements=keys, set_={c: getattr(table.c, c) + getattr(statement.excluded, c) for c in counts})
         now = dt.datetime.now(dt.UTC)
         async with self.engine.begin() as conn:
             if (await conn.execute(select(usage_flushes.c.id).where(usage_flushes.c.id == batch.id))).first():
                 return  # written already: its first write's confirmation was lost
             await conn.execute(insert(usage_flushes).values(id=batch.id, written_at=now))
-            await conn.execute(statement, batch.rows)
+            if batch.rows:
+                await conn.execute(adding(usage_daily, ["account_id", "key_id", "model_id", "day"],
+                                          ("requests", "failed", "input_tokens", "cost")), batch.rows)
+            if batch.hours:
+                await conn.execute(adding(usage_hourly, ["model_id", "hour"], ("requests", "input_tokens")),
+                                   batch.hours)
             for account, cost in sorted(batch.charged.items()):  # one order in every process: no deadlocks
                 if cost:
                     await conn.execute(update(accounts).where(accounts.c.id == account)

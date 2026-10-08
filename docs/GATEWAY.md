@@ -62,7 +62,8 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
 7. **Response.** The answers, the input tokens the miner signed in its receipt (at most one per byte of the
    request, at least one per 8 characters of the state; the auditor checks sampled counts against its reference,
    too many or too few being a wrong answer), the receipt itself and the request id. Usage is counted per account,
-   key, model and day, and written every 5 s.
+   key, model and day, and written every 5 s, with every account's answered requests and input tokens per model and
+   hour (the network's totals).
 8. **Report.** Every 5 s the gateway tells the auditor, per endpoint and second, the user requests it sent it and
    those it answered (with input tokens and durations), how often it considered it for a request (drew it), and how
    often it was not ready then (busy, behind an open breaker, or its latest answer or timed-out attempt took at least
@@ -366,12 +367,12 @@ The gateway refuses to start with a shorter token or a file others can read. Eve
 with the caller's address, and every credit with the token and address that recorded it.
 
 The service that signs users up (the web app) gets a token of its own, `accounts_token_file` (made the same way, and
-not the admin token), whose scope is narrower: only the accounts named with `accounts_prefix` (`u_`), which it
-creates prepaid; their keys, usage and ledger; changes other than `prepaid`; and credit of kind `grant` or `topup`,
-at most `accounts_max_credit` per entry and `accounts_max_credit_per_hour` within an hour (per process; recording an
-entry again under its reference takes no more). Anything else, including requests, state and routes, answers 403, and
-reaching a cap is logged as an error. A leaked web app token can then neither give an account unlimited service nor
-mint more than the hourly cap.
+not the admin token), whose scope is narrower: only the accounts named with `accounts_prefix` (`u_`), which it creates
+prepaid; their keys, usage and ledger; changes other than `prepaid`; credit of kind `grant` or `topup`, at most
+`accounts_max_credit` per entry and `accounts_max_credit_per_hour` within an hour (per process; recording an entry
+again under its reference takes no more); and the network's usage totals. Anything else, including requests, state and
+routes, answers 403, and reaching a cap is logged as an error. A leaked web app token can then neither give an account
+unlimited service nor mint more than the hourly cap.
 
 | Call | Returns |
 |---|---|
@@ -387,10 +388,35 @@ mint more than the hourly cap.
 | `GET /admin/v1/accounts/{name}/usage?since=YYYY-MM-DD` | per day and model: answered and failed requests, input tokens, cost (micro-USD); default since the first of the month |
 | `POST /admin/v1/accounts/{name}/credits` | `{"amount" (micro-USD), "kind", "reference", "note"}` -> 201 with the entry and the new balance; 200 if `reference` already records this entry; 409 if it records another |
 | `GET /admin/v1/accounts/{name}/credits?limit=100` | the balance and the ledger, newest first |
+| `GET /admin/v1/usage/totals` | the network's totals, below |
 
 Each gateway process serves the admin API on its own `admin_port`; with an active and a standby process, a client
 of the account calls tries the other one when one does not answer (a restart). Every write is in the shared
 database, so either process gives the same answers.
+
+`GET /admin/v1/usage/totals` sums every account's usage as written (every 5 s), all time and in the last 24 hours
+(the current UTC hour and the 23 before it) and 30 days (today and the 29 UTC days before), in all and per model;
+amounts in micro-USD:
+
+```json
+{"as_of": "2026-10-08T17:42:10+00:00",
+ "since": {"last_24h": "2026-10-07T18:00:00+00:00", "last_30d": "2026-09-09T00:00:00+00:00"},
+ "requests": {"all_time": 1204311, "last_24h": 48211, "last_30d": 903554},
+ "input_tokens": {"all_time": 291004533, "last_24h": 11320444, "last_30d": 218700120},
+ "models": {"kev-4b": {"requests": {"all_time": 980112, "last_24h": 40012, "last_30d": 731020},
+                       "input_tokens": {"all_time": 233100422, "last_24h": 9310022, "last_30d": 175300111}}},
+ "paid_usage_micros": {"all_time": 9120000, "last_30d": 6400000},
+ "topups_micros": {"all_time": 25000000, "last_30d": 15000000},
+ "paying_accounts": {"all_time": 31, "last_30d": 12}}
+```
+
+- `requests`, `input_tokens`: answered requests and their input tokens, of every account (paid, free, the demo,
+  internal); admin requests are not usage. Usage from before the hourly totals counts at its day's first hour.
+- `paid_usage_micros`: usage paid with bought credit: per account, its usage cost beyond its free credit (grants,
+  counted as spent first), up to its top-ups; in the last 30 days, what that grew by. Grants, adjustments and the
+  usage they pay are never counted.
+- `topups_micros`, `paying_accounts`: the top-ups recorded and the accounts with at least one, all time and in the
+  last 30 days.
 
 ```bash
 curl -s http://127.0.0.1:8090/admin/v1/systemone -H "Authorization: Bearer $(cat ~/.verathos/gateway/admin.token)" \

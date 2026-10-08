@@ -74,6 +74,14 @@ usage_daily = Table(
     Column("cost", BigInteger, nullable=False, server_default="0"),  # micro-USD charged
 )
 
+usage_hourly = Table(  # every account's answered requests together, per model and hour: the network's totals
+    "usage_hourly", metadata,
+    Column("model_id", String(128), primary_key=True),
+    Column("hour", DateTime(timezone=True), primary_key=True),  # its start, UTC
+    Column("requests", BigInteger, nullable=False),
+    Column("input_tokens", BigInteger, nullable=False),
+)
+
 usage_flushes = Table(  # the usage batches written, so a batch written again is not counted twice
     "usage_flushes", metadata,
     Column("id", String(32), primary_key=True),

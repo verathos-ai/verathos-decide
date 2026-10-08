@@ -8,7 +8,8 @@ Two tokens, two scopes. The admin token (``admin_token_file``) reaches everythin
 (``accounts_token_file``), for the web app that signs users up, reaches only the accounts named with
 ``accounts_prefix``, which it creates prepaid: their keys, usage and ledger, changes other than ``prepaid``, and
 credit of kind grant or top-up within ``accounts_max_credit`` per entry and ``accounts_max_credit_per_hour`` (per
-process; reaching a cap is logged as an error). Requests, state and routes are the admin token's only.
+process; reaching a cap is logged as an error); and the network's usage totals. Requests, state and routes are the
+admin token's only.
 
     GET  /admin/v1/state       routes, catalog, and what is waiting to be written (usage) or sent (samples, counts)
     GET  /admin/v1/routes      every routable endpoint as the router sees it: capacity, cap, in flight, breaker
@@ -32,6 +33,9 @@ Accounts, for the service that signs users up (amounts in micro-USD; ``name``: `
                                                     entry already recorded under ``reference``; 409 if it records
                                                     another one
     GET    /admin/v1/accounts/{name}/credits?limit= the ledger, newest first, and the balance
+    GET    /admin/v1/usage/totals                   every account's answered requests and input tokens (all time, 24
+                                                    hours, 30 days; per model), paid usage, top-ups and the accounts
+                                                    that topped up (``Accounts.totals``)
 """
 
 from __future__ import annotations
@@ -170,8 +174,9 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
     credited: collections.deque[tuple[float, int]] = collections.deque()  # the account service's credit, last hour
 
     def reaches(request: Request) -> bool:
-        """Whether the caller's scope reaches this call: the account service only its own accounts' routes."""
-        if request.state.scope == "admin":
+        """Whether the caller's scope reaches this call: the account service only its own accounts' routes and the
+        totals."""
+        if request.state.scope == "admin" or request.url.path == "/admin/v1/usage/totals":
             return True
         parts = request.url.path.split("/")  # "", "admin", "v1", "accounts", name, ...
         return parts[1:4] == ["admin", "v1", "accounts"] and (
@@ -358,6 +363,10 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
         account = await accounts.account(name)
         return JSONResponse(jsonable_encoder({"credit": entry, "created": created, "balance": account["balance"]}),
                             status_code=201 if created else 200)
+
+    @app.get("/admin/v1/usage/totals")
+    async def totals():
+        return await accounts.totals()
 
     @app.get("/admin/v1/accounts/{name}/credits")
     async def ledger(name: str, limit: int = 100):

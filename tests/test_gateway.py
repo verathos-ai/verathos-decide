@@ -1417,6 +1417,7 @@ def test_a_usage_write_whose_confirmation_is_lost_is_not_counted_twice(tmp_path)
     asyncio.run(s.meter.flush())
     (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
     assert usage["requests"] == 1 and s.meter.pending() == 0
+    assert asyncio.run(s.accounts.totals())["requests"] == {"all_time": 1, "last_24h": 1, "last_30d": 1}
 
 
 def test_a_usage_row_the_database_refuses_blocks_no_other_row(tmp_path, caplog) -> None:
@@ -1438,6 +1439,7 @@ def test_a_usage_row_the_database_refuses_blocks_no_other_row(tmp_path, caplog) 
     asyncio.run(meter.flush())
     assert [u["requests"] for u in asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))] == [1]
     assert meter.pending() == 0 and "refuses" in caplog.text
+    assert asyncio.run(s.accounts.totals())["input_tokens"]["all_time"] == 20  # both were answered
 
 
 def test_answers_cost_what_their_tokens_do_however_they_fall_into_writes(tmp_path) -> None:
@@ -1691,6 +1693,91 @@ def test_the_account_services_token_reaches_only_its_prepaid_accounts_within_the
                for r in caplog.records)
     assert call("POST", "/admin/v1/accounts/u_7/credits", topup, token=ADMIN_TOKEN).status_code == 201
     assert call("GET", "/admin/v1/accounts/u_7/credits").json()["balance"] == 1_600_000
+
+
+def test_the_networks_totals_count_every_answer_and_as_paid_only_what_bought_credit_paid(tmp_path) -> None:
+    from sqlalchemy import insert, select, update
+
+    from verathos.gateway.db import api_keys, credits, usage_daily, usage_hourly
+
+    s = admin_setup(tmp_path)
+    answered = [r.json()["usage"]["input_tokens"] for r in s.many(3)]  # the not prepaid account acme
+    asyncio.run(s.meter.flush())
+    now = dt.datetime.now(dt.UTC)
+    hour, today = now.replace(minute=0, second=0, microsecond=0), now.date()
+
+    async def history():
+        async with s.engine.begin() as conn:
+            await conn.execute(insert(usage_hourly), [
+                {"model_id": "kev-9b", "hour": hour - dt.timedelta(hours=30), "requests": 10, "input_tokens": 1000},
+                {"model_id": "kev-4b", "hour": hour - dt.timedelta(days=40), "requests": 100, "input_tokens": 9000}])
+
+    async def account(name: str, entries: list[tuple[str, int, int]], usage: list[tuple[int, int]]) -> None:
+        """Credit entries (kind, micro-USD, days ago) and usage (micro-USD, days ago) of a new account."""
+        account_id = await s.accounts.create_account(name, rate_rps=1.0, burst=1, prepaid=True)
+        await s.accounts.create_key(name, "k")
+        async with s.engine.begin() as conn:
+            key_id = (await conn.execute(select(api_keys.c.id).where(api_keys.c.account_id == account_id))).scalar()
+            for kind, amount, days in entries:
+                await conn.execute(insert(credits).values(account_id=account_id, amount=amount, kind=kind,
+                                                          reference=f"{name}:{kind}:{days}"))
+                await conn.execute(update(credits).where(credits.c.reference == f"{name}:{kind}:{days}").values(
+                    created_at=now - dt.timedelta(days=days)))
+            await conn.execute(insert(usage_daily), [
+                {"account_id": account_id, "key_id": key_id, "model_id": "kev-4b",
+                 "day": today - dt.timedelta(days=days), "requests": 1, "failed": 0, "input_tokens": 1, "cost": cost}
+                for cost, days in usage])
+
+    asyncio.run(history())
+    # paid 1.5 USD (beyond the 1 USD grant) before the last 30 days and 1.5 USD in them
+    asyncio.run(account("u_old", [("grant", 1_000_000, 60), ("topup", 5_000_000, 40)],
+                        [(500_000, 50), (2_000_000, 35), (1_500_000, 0)]))
+    # topped up today, still spending its grant
+    asyncio.run(account("u_new", [("grant", 1_000_000, 0), ("topup", 2_000_000, 0)], [(400_000, 0)]))
+    asyncio.run(account("u_free", [("grant", 1_000_000, 3)], [(900_000, 1)]))  # free credit only
+    assert asyncio.run(admin_call(s, "POST", "/admin/v1/usage/totals")).status_code == 405
+    totals = asyncio.run(admin_call(s, "GET", "/admin/v1/usage/totals", token=ACCOUNTS_TOKEN)).json()
+    assert totals["requests"] == {"all_time": 113, "last_24h": 3, "last_30d": 13}
+    assert totals["input_tokens"] == {"all_time": sum(answered) + 10_000, "last_24h": sum(answered),
+                                      "last_30d": sum(answered) + 1000}
+    assert totals["models"]["kev-9b"]["requests"] == {"all_time": 10, "last_24h": 0, "last_30d": 10}
+    assert totals["paid_usage_micros"] == {"all_time": 3_000_000, "last_30d": 1_500_000}
+    assert totals["topups_micros"] == {"all_time": 7_000_000, "last_30d": 2_000_000}
+    assert totals["paying_accounts"] == {"all_time": 2, "last_30d": 1}
+    assert totals["since"]["last_24h"] == (hour - dt.timedelta(hours=23)).isoformat()
+
+
+def test_usage_written_before_the_hourly_totals_enters_them_at_its_days_first_hour(tmp_path) -> None:
+    from alembic import command
+    from sqlalchemy import text
+
+    url = f"sqlite+aiosqlite:///{tmp_path}/old.db"
+    command.upgrade(db.alembic_config(url), "0003")
+
+    async def old_usage():
+        engine = db.create_engine(url)
+        async with engine.begin() as conn:
+            await conn.execute(text("INSERT INTO accounts (name, rate_rps, burst) VALUES ('old', 1, 1)"))
+            await conn.execute(text("INSERT INTO api_keys (account_id, key_hash, prefix, name) VALUES "
+                                    "(1, 'h1', 'vd_1', 'a'), (1, 'h2', 'vd_2', 'b')"))
+            await conn.execute(text(
+                "INSERT INTO usage_daily (account_id, key_id, model_id, day, requests, failed, input_tokens, cost) "
+                "VALUES (1, 1, 'kev-4b', '2026-09-01', 5, 1, 500, 20), (1, 2, 'kev-4b', '2026-09-01', 2, 0, 80, 3), "
+                "(1, 1, 'kev-9b', '2026-09-02', 1, 0, 40, 4)"))
+        await engine.dispose()
+
+    asyncio.run(old_usage())
+    db.upgrade(url)
+    engine = db.create_engine(url)
+    totals = asyncio.run(Accounts(engine).totals(dt.datetime(2026, 9, 3, 12, tzinfo=dt.UTC)))
+    assert totals["models"] == {
+        "kev-4b": {"requests": {"all_time": 7, "last_24h": 0, "last_30d": 7},
+                   "input_tokens": {"all_time": 580, "last_24h": 0, "last_30d": 580}},
+        "kev-9b": {"requests": {"all_time": 1, "last_24h": 0, "last_30d": 1},
+                   "input_tokens": {"all_time": 40, "last_24h": 0, "last_30d": 40}}}
+    assert asyncio.run(Accounts(engine).totals(dt.datetime(2026, 9, 2, 20, tzinfo=dt.UTC)))["requests"][
+        "last_24h"] == 1  # 2026-09-02 at 00:00
+    asyncio.run(engine.dispose())
 
 
 def test_a_database_from_before_credit_is_upgraded_in_place(tmp_path) -> None:

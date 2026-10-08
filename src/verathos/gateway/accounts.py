@@ -18,6 +18,10 @@ Usage is paid (``Principal.paid``) when the account is prepaid and has topped up
 paid from credit someone bought. The ledger does not tell which entry a request spends, so an account that only ever
 had free credit (a grant: a sign-up, the demo) is unpaid, and one that topped up is paid from then on, grants
 included. Only paid usage moves the models' emission shares (``ServedCount.paid_input_tokens``).
+
+The network's totals (``totals``) count every account's answered requests. Their paid usage is stricter, money that
+came in: each account's usage cost beyond its free credit (counted as spent first), up to what it bought
+(``paid_cost``).
 """
 
 from __future__ import annotations
@@ -33,11 +37,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import exists, func, insert, select, update
+from sqlalchemy import case, exists, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from verathos.gateway.db import accounts, api_keys, credits, usage_daily
+from verathos.gateway.db import accounts, api_keys, credits, usage_daily, usage_hourly
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.usage import UsageMeter
 
@@ -80,6 +84,11 @@ def key_hash(key: str) -> str:
 
 def well_formed_key(key: str | None) -> bool:
     return key is not None and _KEY.fullmatch(key) is not None
+
+
+def paid_cost(cost: int, grants: int, topups: int) -> int:
+    """The part of an account's usage cost paid with bought credit: beyond its grants, up to its top-ups."""
+    return max(0, min(topups, cost - grants))
 
 
 class Accounts:
@@ -234,6 +243,57 @@ class Accounts:
         async with self.engine.connect() as conn:
             return [dict(r._mapping) for r in await conn.execute(query)]
 
+
+    async def totals(self, now: dt.datetime | None = None) -> dict[str, Any]:
+        """The network's totals: answered requests and input tokens of every account, in all and per model, all time,
+        in the last 24 hours (the current UTC hour and the 23 before) and the last 30 days (today and the 29 UTC days
+        before); paid usage, top-ups and the accounts that topped up, all time and in the last 30 days. In micro-USD;
+        adjustments are left out."""
+        now = now or dt.datetime.now(dt.UTC)
+        day = now.replace(minute=0, second=0, microsecond=0) - dt.timedelta(hours=23)
+        month = dt.datetime.combine(now.date() - dt.timedelta(days=29), dt.time(), dt.UTC)
+
+        def since(start: Any, when: Any, column: Any) -> Any:
+            return func.sum(case((when >= start, column), else_=0))
+        hourly = usage_hourly.c
+        answered = select(hourly.model_id, *(column for c in (hourly.requests, hourly.input_tokens) for column in (
+            func.sum(c), since(day, hourly.hour, c), since(month, hourly.hour, c)))).group_by(hourly.model_id)
+        topped = select(credits.c.account_id).where(credits.c.kind == "topup")
+        cost = (select(usage_daily.c.account_id, func.sum(usage_daily.c.cost),
+                       since(month.date(), usage_daily.c.day, usage_daily.c.cost))
+                .where(usage_daily.c.account_id.in_(topped)).group_by(usage_daily.c.account_id))
+        credit = (select(credits.c.account_id, credits.c.kind, func.sum(credits.c.amount),
+                         since(month, credits.c.created_at, credits.c.amount))
+                  .where(credits.c.account_id.in_(topped), credits.c.kind.in_(("grant", "topup")))
+                  .group_by(credits.c.account_id, credits.c.kind))
+        async with self.engine.connect() as conn:
+            per_model = {model: [int(n or 0) for n in counts] for model, *counts in await conn.execute(answered)}
+            costs = {a: (int(c or 0), int(c or 0) - int(recent or 0)) for a, c, recent in await conn.execute(cost)}
+            ledger: dict[tuple[int, str], tuple[int, int]] = {
+                (a, kind): (int(total or 0), int(total or 0) - int(recent or 0))
+                for a, kind, total, recent in await conn.execute(credit)}
+
+        def windows(counts: list[int]) -> dict[str, int]:
+            return dict(zip(("all_time", "last_24h", "last_30d"), counts))
+        models = {m: {"requests": windows(c[:3]), "input_tokens": windows(c[3:])} for m, c in sorted(per_model.items())}
+        money = {"paid_usage_micros": [0, 0], "topups_micros": [0, 0], "paying_accounts": [0, 0]}  # all, 30 days
+        for account in {a for a, kind in ledger if kind == "topup"}:
+            cost_all, cost_before = costs.get(account, (0, 0))
+            grants, grants_before = ledger.get((account, "grant"), (0, 0))
+            bought, bought_before = ledger[(account, "topup")]
+            paid = paid_cost(cost_all, grants, bought)
+            for what, all_time, recent in (
+                    ("paid_usage_micros", paid, max(0, paid - paid_cost(cost_before, grants_before, bought_before))),
+                    ("topups_micros", bought, bought - bought_before),
+                    ("paying_accounts", 1, int(bought > bought_before))):
+                money[what][0] += all_time
+                money[what][1] += recent
+        return {"as_of": now.isoformat(timespec="seconds"),
+                "since": {"last_24h": day.isoformat(), "last_30d": month.isoformat()},
+                **{what: {w: sum(m[what][w] for m in models.values()) for w in ("all_time", "last_24h", "last_30d")}
+                   for what in ("requests", "input_tokens")},
+                "models": models,
+                **{what: {"all_time": pair[0], "last_30d": pair[1]} for what, pair in money.items()}}
 
     async def add_credit(self, account: str, amount: int, *, kind: str, reference: str,
                          note: str | None = None) -> tuple[dict[str, Any], bool]:
