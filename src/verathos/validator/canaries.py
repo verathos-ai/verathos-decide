@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import random
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -95,6 +96,33 @@ def canary_pool(secret: bytes, epoch: int, model_id: str, size: int) -> list[dic
         qids = rng.sample(sorted(domain["questions"]), k=rng.randint(2, len(domain["questions"])))
         pool.append({"model": model_id, "state": state, "questions": {q: domain["questions"][q] for q in qids}})
     return pool
+
+
+def _canary_states() -> re.Pattern[str]:
+    def alternatives(options: list[str]) -> str:
+        return "(?:" + "|".join(options) + ")"
+
+    def issue(template: str) -> str:
+        parts = re.split(r"\{(\w+)\}", template)  # text, key, text, ...
+        return "".join(re.escape(p) if i % 2 == 0 else alternatives([re.escape(v) for v in FILL[p]])
+                       for i, p in enumerate(parts))
+
+    domains = []
+    for d in DOMAINS.values():
+        issues = alternatives([issue(t) for t in d["issues"]])
+        tones = alternatives([re.escape(t) for t in d["tones"] if t])
+        domains.append(rf"{alternatives([re.escape(o) for o in d['openers']])} {issues}\. Also, {issues}\."
+                       rf"(?: {tones})? Ref \d{{6}}\.")
+    return re.compile(alternatives(domains))
+
+
+_CANARY_STATE = _canary_states()
+
+
+def canary_like(state: Any) -> bool:
+    """Whether a state has the form of a canary's. Users do not write such states, so one reaching a miner as a
+    user's is a canary relayed."""
+    return isinstance(state, str) and _CANARY_STATE.fullmatch(state) is not None
 
 
 def max_request_bytes(model_id: str) -> int:

@@ -373,6 +373,65 @@ def test_a_test_is_judged_against_what_the_endpoint_was_asked(tmp_path) -> None:
     assert refused.outcome == "partial" and refused.credited_rps < 15
 
 
+def test_users_above_their_usual_rate_displace_test_requests_at_no_cost(tmp_path) -> None:
+    """A burst of users during a test (a customer, or test traffic relayed through the gateway) takes the place of
+    test requests one for one, as miners serve users first: an endpoint that answers them all and the test's rest up
+    to the tested rate passes. Refusing users still counts against it."""
+    import time as time_module
+
+    from tests.test_throughput import _result
+    from verathos.protocol.gateway import ServedCount
+
+    auditor = _auditor(tmp_path)
+    slots = {n: Slot("hk", n, f"http://x/e/{n}", "kev-4b", 20.0) for n in ("busy", "refuser")}
+    auditor.update_slots(list(slots.values()))
+    start = int(time_module.time()) - 30
+    window = (start + 0.5, start + 16.5)  # test_s 16; users usually send 6/s, so the test sent 14/s
+    counts = [ServedCount(hotkey="hk", endpoint_id=n, second=start - 80 + i, attempts=6, answered=6)
+              for n in slots for i in range(60)]
+    counts += [ServedCount(hotkey="hk", endpoint_id=n, second=start + i, attempts=16, answered=16 if n == "busy" else 8)
+               for n in slots for i in range(17)]
+    assert auditor.accept_served(counts) == len(counts)
+    test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
+    scale = auditor.user_scales(window)["kev-4b"]
+
+    def evaluate(name: str, completed_per_s: int):
+        r = _result(slots[name].key, sent=14 * 16, completed=completed_per_s * 16)
+        return asyncio.run(auditor.evaluate(test, Target(slots[name], 20.0), r, Checks({}, {}).for_test(),
+                                            auditor.policy, window, scale))
+
+    busy = evaluate("busy", 5)  # 21/s in all: 16 to users, 5 of the test's
+    assert busy.outcome == "passed" and busy.credited_rps == pytest.approx(20.0)
+    refuser = evaluate("refuser", 12)  # 20/s in all, but 8 users/s refused while it served the test
+    assert refuser.outcome == "partial" and refuser.credited_rps < 12
+
+
+def test_test_traffic_and_canaries_relayed_through_the_gateway_are_recognised(tmp_path, caplog) -> None:
+    import random
+
+    from verathos.throughput.workload import in_mix_form, make_request
+    from verathos.validator.canaries import canary_like, canary_pool
+
+    mix = [make_request("kev-4b", KEV.workload, random.Random(i))["state"] for i in range(20)]
+    canaries = [c["state"] for e in range(20) for c in canary_pool(b"k" * 32, e, "kev-4b", 16)]
+    users = [REQUEST["state"], "Ticket 0123456789abcdef. please refund my order.", "Hi team, a question.", ""]
+    assert all(map(in_mix_form, mix)) and not any(map(in_mix_form, canaries + users))
+    assert all(map(canary_like, canaries)) and not any(map(canary_like, mix + users))
+
+    gateway, miner_kp = kp(), kp()
+    honest = miner(miner_kp, MockEngine("kev-4b"), gateway)
+    relayed = make_request("kev-4b", KEV.workload, random.Random(1))
+    response = asyncio.run(exchange(honest, gateway, miner_kp, relayed))
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "http://x/e/gpu0", "kev-4b", 40.0)])
+    sample = GatewaySample(hotkey=miner_kp.ss58_address, endpoint_id="gpu0", model_id="kev-4b", request=relayed,
+                           response=response.text)
+    with caplog.at_level("WARNING", logger="verathos.throughput.auditor"):
+        assert auditor.accept_samples(gateway.ss58_address, [sample]) == 1
+    assert "relays what it is sent through the gateway" in caplog.text
+
+
 def test_a_discovery_that_finds_no_miner_keeps_the_endpoints_known(tmp_path) -> None:
     from verathos.validator.discovery import Neuron
     from verathos.validator.throughput import Throughput

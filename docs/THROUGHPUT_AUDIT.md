@@ -105,8 +105,9 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
    its last `drift_window_tests` tests, their mean must stay within the model's `mean_abs` (the bound the
    validators' canaries apply), so a lower-precision engine serving test traffic does not pass.
 5. **Credit.** The tested rate times the share of what the endpoint was asked in the window that it delivered (at
-   most 1). Asked: the test's own requests sent in the window and the user requests the gateway sent it then
-   (answered or not, see below); delivered: the test's counted replies and the users' answers. If it delivered less
+   most 1). Asked: the user requests the gateway sent it in the window (answered or not, see below) and the test's
+   own requests sent then, these only up to what the users' answers leave of the tested rate; delivered: the test's
+   counted replies and the users' answers. If it delivered less
    than `pass_fraction` (0.95) of what it was asked, the credit is scaled by that share once more: an endpoint that
    declares twice what it serves, tested at its declaration, is credited a quarter of it, so declaring more than an
    endpoint serves never pays. A result with a
@@ -146,7 +147,10 @@ least 10% of the tested rate and enough for the test's samples. With users at th
 for its tested rate in all, not more; it is judged against what it was asked (Credit above), so users sending less
 in the window cost it nothing within their random spread (two standard deviations around its usual rate of the
 minute before, scaled by the dip of all the model's users), and users it refused count against it; an endpoint whose
-users went elsewhere beyond that spread (it was slow) is judged against their usual rate.
+users went elsewhere beyond that spread (it was slow) is judged against their usual rate. Users sending more than
+usual (a burst, or test traffic relayed through the gateway) cost it nothing either: the miner serves them first, so
+each answer beyond what the test left of the tested rate takes the place of a test request, and the test's requests
+count as asked only up to what the users' answers leave of the tested rate.
 
 ## Gateway answers
 
@@ -160,7 +164,8 @@ tests, since users' input tokens set the models' emission shares. The difference
 over the last `drift_window_tests` epochs: an endpoint whose answers to users drift beyond the model's `mean_abs`
 loses its credit, however correct its test answers are. A
 gateway answer counts in the epoch its check finished, so an epoch's verdicts depend only on checks finished before
-it began.
+it began. A sampled user request in the form of the test's requests or of a canary is logged as relayed: some miner
+forwards what it is sent to the gateway (`throughput.workload.in_mix_form`, `validator.canaries.canary_like`).
 
 The gateway also reports, per endpoint and by the second each request was sent, how many user requests it sent the
 endpoint and how many of them it answered (a report is taken once, even if the gateway posts it again). Miners
@@ -215,7 +220,7 @@ How credits and wrong answers enter the score is in `SCORING.md`.
 | Fast junk responses | receipts that do not bind scale delivered down; a signed wrong answer invalidates the hotkey |
 | Responses built to break the auditor | size and nesting limits; each endpoint is evaluated on its own |
 | Flooding a competitor's endpoint with validator traffic during its test | one request at once per validator and endpoint, no larger than the model's standard requests, and behind the test's requests while they arrive |
-| Flooding it with gateway traffic during its test, or a miner refusing users then | what an endpoint answers the gateway inside the test's window counts as delivered; the test sends only the rest of the tested rate |
+| Flooding it with gateway traffic during its test, or a miner refusing users then | what an endpoint answers the gateway inside the test's window counts as delivered, and displaces the test's requests one for one; refused users count as asked |
 | Caching or sharing answers | every request is unique |
 
 What a test proves is that an endpoint delivers its declared rate on about 60 s notice: test traffic is

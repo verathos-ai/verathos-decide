@@ -16,9 +16,10 @@ Per test:
 3. Per endpoint: delivered = replies inside the window to requests sent no earlier than ``max_latency_s`` before it,
    per second, scaled by the share of sampled responses whose receipt is valid. Every signed sample must be well
    formed; ``answer_checks_per_test`` of them are recomputed (on the bf16 screen if there is one, whose flags the
-   fp32 reference must confirm). Credit = the tested rate x the share of what was asked in the window (the test's
-   own requests and the user requests the gateways sent it) that was delivered (the test's replies and the users'
-   answers), at most 1; below ``pass_fraction`` scaled by that share once more. A sampled answer the miner signed
+   fp32 reference must confirm). Credit = the tested rate x the share of what was asked in the window (the user
+   requests the gateways sent it, and the test's own requests up to what the users' answers leave of the tested
+   rate) that was delivered (the test's replies and the users' answers), at most 1; below ``pass_fraction`` scaled by
+   that share once more. A sampled answer the miner signed
    and the reference proves wrong makes the result invalid; the evidence is kept for the verdicts. The recomputed
    answers' differences are tallied per endpoint; one whose mean over its last ``drift_window_tests`` tests exceeds
    the model's ``mean_abs`` gets no credit.
@@ -85,7 +86,8 @@ from verathos.throughput.feed import (
 )
 from verathos.throughput.follow import POLL_S, ScheduleFollower
 from verathos.throughput.policy import BLOCK_TIME_S, AuditPolicy, ScheduledTest, Session, session_headers
-from verathos.throughput.workload import WORDS
+from verathos.throughput.workload import WORDS, in_mix_form
+from verathos.validator.canaries import canary_like
 from verathos.validator.compare import RequestComparison, Tolerance
 from verathos.validator.config import ReferenceEngine
 
@@ -898,7 +900,11 @@ class Auditor:
                 break
         drift = {"drift_sum": drift_sum, "drift_count": drift_count}
         delivered = round((r.completed * (valid / len(r.samples) if r.samples else 1.0) + gateway) / policy.test_s, 2)
-        asked = (r.sent + users_asked) / policy.test_s
+        # Miners serve users first: users answered beyond what the test left of the tested rate displaced test requests
+        # one for one, so the test's requests count as asked only up to what the users' answers leave of it. Users
+        # refused count in full.
+        own_asked = min(r.sent, max(target.tested_rps * policy.test_s - gateway, 0.0))
+        asked = (users_asked + own_asked) / policy.test_s
         if evidence is not None:
             return Result(target, "invalid", evidence.reason, delivered, 0.0, evidence=evidence, **latency, **drift)
         credited = credit(target.tested_rps, delivered, policy, asked)
@@ -940,6 +946,9 @@ class Auditor:
                                      netuid=self.netuid, mechid=self.mechid)
             if answers is None:
                 continue
+            if in_mix_form(s.request.get("state")) or canary_like(s.request.get("state")):
+                log.warning("%s/%s answered the gateway a request in the form of test traffic or a canary: a miner "
+                            "relays what it is sent through the gateway", s.hotkey, s.endpoint_id)
             kept += self.store.add_sample(sample_id=sample_id, epoch=epoch, gateway=gateway, hotkey=s.hotkey,
                                           endpoint_id=s.endpoint_id, model_id=s.model_id, request_id=nonce,
                                           request=s.request, response=s.response, proof=readable(answers) is None)

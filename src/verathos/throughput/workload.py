@@ -8,6 +8,7 @@ self-measurement and the auditor's load generator build requests the same way fr
 from __future__ import annotations
 
 import random
+import re
 import secrets
 from typing import Any
 
@@ -58,3 +59,16 @@ def make_request(model_id: str, workload: Workload, rng: random.Random) -> dict[
     """One unique request of the model's mix."""
     words = " ".join(rng.choice(WORDS) for _ in range(rng.randint(*workload.state_words)))
     return {"model": model_id, "state": f"Ticket {secrets.token_hex(8)}. {words}.", "questions": workload.questions}
+
+
+_TICKET = re.compile(r"Ticket [0-9a-f]{16}")
+_WORDS = frozenset(WORDS)
+
+
+def in_mix_form(state: Any) -> bool:
+    """Whether a state has the form of the mix's (here and in the load generator): a ticket id, then only words of
+    the vocabulary. Users do not write such states, so one reaching a miner as a user's is test traffic relayed."""
+    if not isinstance(state, str) or not state.endswith("."):
+        return False
+    ticket, _, words = state[:-1].partition(". ")
+    return _TICKET.fullmatch(ticket) is not None and bool(words) and set(words.split(" ")) <= _WORDS
