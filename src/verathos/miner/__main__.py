@@ -130,10 +130,10 @@ class Publisher:
         self.signed: SignedManifest | None = None
         if config.role == "primary":
             self.peers = Peers(config.peers, hotkey=wallet.hotkey.ss58_address, netuid=config.netuid,
-                               mechid=config.mechid)
+                               mechid=self.mechid)
             self.signed = self._last_published() or build_manifest(
                 config, own_endpoints(config, endpoints, dict.fromkeys((e.endpoint_id for e in endpoints), 0.0)),
-                wallet.hotkey, cat.digest())
+                wallet.hotkey, cat)
             self.peers.seed(self.signed.manifest)
         self.serving = {e.endpoint_id for e in endpoints}
         self.auditor = subtensor.get_subnet_owner_hotkey(config.netuid)  # the subnet owner's validator runs tests
@@ -144,6 +144,11 @@ class Publisher:
         self._announced: set[object] = set()  # why the waiting measurement is wanted, as logged
         self._published = False
         self._left_out: list[str] = []
+
+    @property
+    def mechid(self) -> int:
+        """The mechanism this machine serves for: its catalog's, or the configured ``mechid``."""
+        return catalog.mechanism_of(self.catalog, self.config.mechid)
 
     # ---- callers ----
 
@@ -181,8 +186,7 @@ class Publisher:
         except (OSError, ValueError):
             return None
         m = signed.manifest
-        same = (m.hotkey, m.netuid, m.mechid) == (self.wallet.hotkey.ss58_address, self.config.netuid,
-                                                  self.config.mechid)
+        same = (m.hotkey, m.netuid, m.mechid) == (self.wallet.hotkey.ss58_address, self.config.netuid, self.mechid)
         return signed if same else None
 
     def _last_served(self) -> SignedHostEndpoints | None:
@@ -192,7 +196,7 @@ class Publisher:
             return None
         h = signed.host
         same = (h.hotkey, h.netuid, h.mechid, h.url) == (self.wallet.hotkey.ss58_address, self.config.netuid,
-                                                         self.config.mechid, self.config.base_url)
+                                                         self.mechid, self.config.base_url)
         return signed if same else None
 
     def _local_url(self, endpoint_id: str) -> str:
@@ -286,13 +290,17 @@ class Publisher:
             log.info("endpoint %s (%s): %.1f requests/s at concurrency %d (runs %s), declares %.1f%s", e.endpoint_id,
                      e.model_id, m.measured_rps, m.concurrency, ", ".join(f"{r:.1f}" for r in m.runs),
                      declared[e.endpoint_id], "" if cap is None else ", " + cap.text())
+        if catalog.mechanism_of(cat, self.config.mechid) != self.mechid:
+            log.warning("catalog %s moves the network to mechanism %d; the manifest is for it from now on",
+                        cat.digest()[:12], catalog.mechanism_of(cat, self.config.mechid))
         self.catalog = cat
         own = own_endpoints(self.config, listed, declared)
-        self.local = build_host_endpoints(self.config, own, self.wallet.hotkey, cat.digest())
+        self.local = build_host_endpoints(self.config, own, self.wallet.hotkey, cat)
         self.endpoints_path.parent.mkdir(parents=True, exist_ok=True)
         self.endpoints_path.write_text(self.local.model_dump_json())
         self.serving = {e.endpoint_id for e in listed}
         if self.peers is not None:
+            self.peers.mechid = self.mechid
             self.merge()
         return True
 
@@ -352,7 +360,7 @@ class Publisher:
             for line in left_out:
                 log.error(line)
             self._left_out = left_out
-        signed = build_manifest(self.config, endpoints, self.wallet.hotkey, self.catalog.digest())
+        signed = build_manifest(self.config, endpoints, self.wallet.hotkey, self.catalog)
         if signed.manifest.digest() != self.signed.manifest.digest():
             self.signed, self._published = signed, False
 
@@ -440,7 +448,8 @@ def build_app(config: MinerConfig, keypair, publisher: Publisher, authorizer: Pe
                       auditors=publisher.auditors, admissions=publisher.admissions, serving=lambda: publisher.serving,
                       max_state_tokens=max_state_tokens, max_caller_request=max_caller_request,
                       on_test_traffic=publisher.note_test_traffic, testing=publisher.test_arriving,
-                      gateways=publisher.gateways, catalog_digest=lambda: publisher.catalog.digest(), budget=budget)
+                      gateways=publisher.gateways, catalog_digest=lambda: publisher.catalog.digest(),
+                      mechid=lambda: publisher.mechid, budget=budget)
 
 
 def resolve_catalog(subtensor: bt.Subtensor, config: MinerConfig) -> catalog.Catalog:

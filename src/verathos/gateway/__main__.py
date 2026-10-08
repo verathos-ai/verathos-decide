@@ -132,7 +132,7 @@ async def serve(config: GatewayConfig) -> None:
     router = Router(share=1 / config.instances, max_latency_s=2.0, observer=served)
     gateway = Gateway(config=config, hotkey=keypair.ss58_address, catalog=lambda: current[0], accounts=accounts,
                       meter=meter, router=router, sampler=sampler, served=served, routes=lambda: routes.table,
-                      upstream=Upstream(keypair, client, netuid=config.netuid, mechid=config.mechid),
+                      upstream=Upstream(keypair, client, netuid=config.netuid),
                       limiter=RateLimiter())
 
     @contextlib.asynccontextmanager

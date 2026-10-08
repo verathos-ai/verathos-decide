@@ -10,6 +10,7 @@ from collections.abc import Callable, Collection
 
 import bittensor as bt
 
+from verathos.catalog import Catalog, mechanism_of
 from verathos.miner.config import EndpointConfig, MinerConfig
 from verathos.protocol.manifest import (
     Endpoint,
@@ -32,19 +33,19 @@ def own_endpoints(config: MinerConfig, endpoints: list[EndpointConfig],
                      tier=e.tier, capacity_rps=capacity_rps[e.endpoint_id]) for e in endpoints]
 
 
-def build_manifest(config: MinerConfig, endpoints: list[Endpoint], keypair, catalog_digest: str) -> SignedManifest:
-    """Sign the hotkey's manifest. The same endpoints and catalog always give the same manifest, so a restart does not
-    change the on-chain commitment."""
-    manifest = Manifest(netuid=config.netuid, mechid=config.mechid, hotkey=keypair.ss58_address,
-                        catalog_digest=catalog_digest, endpoints=endpoints)
+def build_manifest(config: MinerConfig, endpoints: list[Endpoint], keypair, cat: Catalog) -> SignedManifest:
+    """Sign the hotkey's manifest, built for ``cat`` and its mechanism (or the configured ``mechid``). The same
+    endpoints and catalog always give the same manifest, so a restart does not change the on-chain commitment."""
+    manifest = Manifest(netuid=config.netuid, mechid=mechanism_of(cat, config.mechid), hotkey=keypair.ss58_address,
+                        catalog_digest=cat.digest(), endpoints=endpoints)
     return SignedManifest.create(manifest, keypair)
 
 
-def build_host_endpoints(config: MinerConfig, endpoints: list[Endpoint], keypair,
-                         catalog_digest: str) -> SignedHostEndpoints:
-    """Sign what this machine serves, for the primary (``GET /v1/endpoints``)."""
-    host = HostEndpoints(netuid=config.netuid, mechid=config.mechid, hotkey=keypair.ss58_address,
-                         catalog_digest=catalog_digest, url=config.base_url, endpoints=endpoints)
+def build_host_endpoints(config: MinerConfig, endpoints: list[Endpoint], keypair, cat: Catalog) -> SignedHostEndpoints:
+    """Sign what this machine serves, for the primary (``GET /v1/endpoints``), built for ``cat`` as the manifest
+    is."""
+    host = HostEndpoints(netuid=config.netuid, mechid=mechanism_of(cat, config.mechid), hotkey=keypair.ss58_address,
+                         catalog_digest=cat.digest(), url=config.base_url, endpoints=endpoints)
     return SignedHostEndpoints.create(host, keypair)
 
 

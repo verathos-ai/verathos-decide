@@ -13,7 +13,7 @@ import logging
 import secrets
 import threading
 import time
-from collections.abc import Collection
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import httpx
@@ -106,11 +106,13 @@ class ManifestCache:
         with self._lock:
             self._accepted[hotkey] = (time.monotonic(), manifest_digest, manifest)
 
-    def get(self, n: Neuron, catalog_digests: Collection[str]) -> tuple[float, Manifest] | None:
-        """(seconds since it was fetched, the manifest), if it may stand in for the axon's (see the class)."""
+    def get(self, n: Neuron, catalogs: Mapping[str, int]) -> tuple[float, Manifest] | None:
+        """(seconds since it was fetched, the manifest), if it may stand in for the axon's (see the class): still
+        committed, and built for one of ``catalogs`` (as ``discover`` takes them)."""
         with self._lock:
             held = self._accepted.get(n.hotkey)
-        if held is None or held[1] != committed_digest(n.commitment) or held[2].catalog_digest not in catalog_digests:
+        if (held is None or held[1] != committed_digest(n.commitment)
+                or catalogs.get(held[2].catalog_digest) != held[2].mechid):
             return None
         age = time.monotonic() - held[0]
         return (age, held[2]) if age <= self.hold_s else None
@@ -121,18 +123,17 @@ class ManifestCache:
             self._accepted = {k: v for k, v in self._accepted.items() if now - v[0] <= self.hold_s}
 
 
-async def _fetch_manifest(n: Neuron, netuid: int, mechid: int, client: httpx.AsyncClient,
-                          catalog_digests: Collection[str], cache: ManifestCache | None) -> DiscoveredMiner | None:
+async def _fetch_manifest(n: Neuron, netuid: int, client: httpx.AsyncClient, catalogs: Mapping[str, int],
+                          cache: ManifestCache | None) -> DiscoveredMiner | None:
     base = axon_base(n.axon_ip, n.axon_port)
     try:
         if not is_public(n.axon_ip) or not 0 < n.axon_port < 65536:
             raise ManifestRejected("the axon is not on a public address")
         document = await request_json(client, "GET", base + "/v1/manifest", limit=MAX_MANIFEST_BYTES,
                                       timeout=FETCH_TIMEOUT_S)
-        manifest = accept(document, hotkey=n.hotkey, netuid=netuid, mechid=mechid, commitment=n.commitment,
-                          catalog_digests=catalog_digests)
+        manifest = accept(document, hotkey=n.hotkey, netuid=netuid, commitment=n.commitment, catalogs=catalogs)
     except Exception as e:  # whatever a neuron serves, it only costs that neuron its discovery
-        held = cache.get(n, catalog_digests) if cache is not None else None
+        held = cache.get(n, catalogs) if cache is not None else None
         if held is None:
             log.info("uid %d manifest not accepted: %s", n.uid, str(e) or type(e).__name__)
             return None
@@ -144,20 +145,20 @@ async def _fetch_manifest(n: Neuron, netuid: int, mechid: int, client: httpx.Asy
     return DiscoveredMiner(n.uid, n.hotkey, base, manifest)
 
 
-async def discover(neurons: list[Neuron], netuid: int, mechid: int, client: httpx.AsyncClient,
-                   catalog_digests: Collection[str], cache: ManifestCache | None = None) -> list[DiscoveredMiner]:
+async def discover(neurons: list[Neuron], netuid: int, client: httpx.AsyncClient, catalogs: Mapping[str, int],
+                   cache: ManifestCache | None = None) -> list[DiscoveredMiner]:
     """Fetch and accept the manifest of every neuron that has a manifest commitment, from its axon on a public
     address, or from ``cache`` while the axon serves none that is accepted.
 
-    ``catalog_digests`` are the catalogs a manifest may be built for: the current one, plus the previous one while
-    miners re-publish after a change.
+    ``catalogs`` maps the digests of the catalogs a manifest may be built for (the current one, plus the previous one
+    while miners re-publish after a change) to the mechanism a manifest built for each is for.
     """
     candidates = [n for n in neurons if committed_digest(n.commitment) is not None]
     limit = asyncio.Semaphore(FETCH_CONCURRENCY)
 
     async def fetch(n: Neuron) -> DiscoveredMiner | None:
         async with limit:
-            return await _fetch_manifest(n, netuid, mechid, client, catalog_digests, cache)
+            return await _fetch_manifest(n, netuid, client, catalogs, cache)
 
     found = await asyncio.gather(*(fetch(n) for n in candidates))
     if cache is not None:

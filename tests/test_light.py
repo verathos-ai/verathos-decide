@@ -48,13 +48,14 @@ class Chain:
         self.owner, self.block = owner, block
         self.neurons = {owner: neuron(0, *SOURCE_AXON), own: neuron(5)}
         self.set: list[dict] = []
-        self.last_update: list[int] = []  # per UID, on mechanism 1
+        self.last_update: dict[int, list[int]] = {}  # per mechanism, per UID
         self.substrate = SimpleNamespace(query=self.query)
 
     def query(self, module: str, item: str, params: list):
         if item == "LastUpdate":
-            assert params == [4096 + 405]  # mechanism 1's, not the subnet's mechanism 0
-            return SimpleNamespace(value=self.last_update)
+            mechanism, netuid = divmod(params[0], 4096)  # the chain keeps each mechanism's apart
+            assert netuid == 405
+            return SimpleNamespace(value=self.last_update.get(mechanism, []))
         return SimpleNamespace(value=7)  # the weights version key
 
     def get_current_block(self) -> int:
@@ -133,7 +134,8 @@ def validator(tmp_path, chain: Chain, own: Keypair, served: list, *, fetched: li
 
     wallet = SimpleNamespace(hotkey=own)
     return light.LightValidator(settings, chain, own.ss58_address, SimpleNamespace(catalog=CAT),
-                                set_weights=lambda w: validator_main.set_weights(settings, chain, wallet, w),
+                                set_weights=lambda w, mechid: validator_main.set_weights(settings, chain, wallet, w,
+                                                                                         mechid),
                                 state_path=tmp_path / "light.json", fetch=fetch)
 
 
@@ -154,7 +156,8 @@ def test_a_light_validator_sets_exactly_the_weights_its_source_published(tmp_pat
     chain.block += 3
     v.step()
     assert chain.set == [{"netuid": 405, "uids": [3, 7, 12], "weights": [WEIGHTS[3], WEIGHTS[7], WEIGHTS[12]],
-                          "mechid": 1, "version_key": 7}]  # exactly, the version key and mechanism as full ones use
+                          "mechid": CAT.mechanism, "version_key": 7}]  # exactly, the version key and the catalog's
+    # mechanism, as full ones use
     assert fetched == [f"http://{SOURCE_AXON[0]}:{SOURCE_AXON[1]}{NETWORK_PATH}"] * 2
     assert (f"epoch 100: set the weights of the subnet owner's validator {owner.ss58_address}: 3 UIDs, top 3: 0.512, "
             "7: 0.300, 12: 0.188") in caplog.messages
@@ -337,8 +340,9 @@ def auditor_and_light(tmp_path, cat: catalog.Catalog):
     throughput = SimpleNamespace(auditor_hotkey=owner.ss58_address, manifests=ManifestCache(60.0),
                                  identities=Identities(), holding=lambda: False, verdicts=no_verdicts,
                                  update_slots=lambda miners, neurons, epoch: None)
-    current = SimpleNamespace(catalog=cat, for_epoch=lambda st, block: cat, accepted=lambda: {cat.digest()})
-    auditor_cfg = SimpleNamespace(netuid=405, mechid=1, references={}, dry_run=False)
+    current = SimpleNamespace(catalog=cat, for_epoch=lambda st, block: cat,
+                              accepted=lambda: {cat.digest(): cat.mechanism})
+    auditor_cfg = SimpleNamespace(netuid=405, mechid=None, references={}, dry_run=False)
     board = StatusBoard()
     app = FastAPI()
     add_network_route(app, board, owner, 405)
@@ -398,6 +402,23 @@ def test_the_miner_share_steps_down_by_epoch_and_light_validators_set_the_audito
     assert [stepping.scoring.miner_share_at(e) for e in (103, 104, 10**6)] == [0.26, 0.15, 0.15]
 
 
+def test_the_auditor_and_light_validators_set_weights_on_the_catalogs_mechanism(tmp_path) -> None:
+    """The mechanism comes from the committed catalog: the auditor sets the epoch's weights on it and publishes it,
+    and a light validator sets them on the mechanism of the catalog it follows, or on the one its mechid names."""
+    moved = catalog.Catalog.parse({**CAT.document(), "mechanism": 1})
+    chain, follower, board, auditor_epoch = auditor_and_light(tmp_path, moved)
+    state = ScoreState(ema={"hkA/gpu0": 0.6, "hkB/gpu0": 0.2}, uid_of={"hkA/gpu0": 1, "hkB/gpu0": 2})
+    published = auditor_epoch(state, 100)
+    assert published["mechid"] == 1 and NetworkStatus.model_validate_json(board.network()).mechanism == 1
+    follower.step()
+    assert chain.set[-1] == published
+    follower.cfg = follower.cfg.model_copy(update={"mechid": 0})
+    published = auditor_epoch(state, 101)
+    chain.block = 101 * BLOCKS + OFFSET + 5
+    follower.step()
+    assert chain.set[-1] == {**published, "mechid": 0}
+
+
 def test_a_light_configuration_needs_no_references(tmp_path) -> None:
     light_config = ValidatorConfig.model_validate({"netuid": 96, "wallet_name": "v", "hotkey_name": "h",
                                                    "mode": "light"})
@@ -409,7 +430,8 @@ def test_a_light_configuration_needs_no_references(tmp_path) -> None:
 
 def test_weights_wait_out_the_rate_limit_of_their_own_mechanism(tmp_path, monkeypatch, caplog) -> None:
     """The chain limits how often a UID sets weights, per mechanism: a set it would refuse waits the blocks left of
-    this mechanism's limit (the fake chain answers only mechanism 1's last sets), one it allows goes at once."""
+    this mechanism's limit (a set on mechanism 0 just before does not hold back one on mechanism 1), one it allows
+    goes at once."""
     from verathos.validator import __main__ as validator_main
 
     caplog.set_level(logging.INFO, logger="verathos.validator")
@@ -422,12 +444,13 @@ def test_weights_wait_out_the_rate_limit_of_their_own_mechanism(tmp_path, monkey
         chain.block += round(seconds / light.BLOCK_TIME_S)
 
     monkeypatch.setattr(validator_main.time, "sleep", sleep)
-    chain.last_update = [0] * 6
-    chain.last_update[5] = chain.block - 70  # 30 of the 100 blocks left
+    chain.last_update = {0: [0] * 6, 1: [0] * 6}
+    chain.last_update[0][5] = chain.block - 1
+    chain.last_update[1][5] = chain.block - 70  # 30 of the 100 blocks left
     settings, wallet = config(tmp_path), SimpleNamespace(hotkey=own)
-    assert validator_main.set_weights(settings, chain, wallet, WEIGHTS)
+    assert validator_main.set_weights(settings, chain, wallet, WEIGHTS, 1)
     assert slept == [30 * light.BLOCK_TIME_S] and len(chain.set) == 1
     assert "the chain allows this UID's next weights on mechanism 1 in 30 blocks; setting them then" in caplog.messages
-    chain.last_update[5] = chain.block - 100
+    chain.last_update[1][5] = chain.block - 100
     slept.clear()
-    assert validator_main.set_weights(settings, chain, wallet, WEIGHTS) and slept == [] and len(chain.set) == 2
+    assert validator_main.set_weights(settings, chain, wallet, WEIGHTS, 1) and slept == [] and len(chain.set) == 2

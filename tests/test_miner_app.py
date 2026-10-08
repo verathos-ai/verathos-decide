@@ -67,9 +67,9 @@ def post(client: TestClient, caller: Keypair, miner: Keypair, path: str, payload
 
 def test_manifest_is_public_and_acceptable(setup) -> None:
     client, miner, *_ , manifest = setup
-    assert accept(client.get("/v1/manifest").json(), hotkey=miner.ss58_address, netuid=405, mechid=1,
+    assert accept(client.get("/v1/manifest").json(), hotkey=miner.ss58_address, netuid=405,
                   commitment=commitment_value(manifest.manifest.digest()),
-                  catalog_digests={manifest.manifest.catalog_digest})
+                  catalogs={manifest.manifest.catalog_digest: 1})
 
 
 def test_answer_carries_binding_receipt(setup) -> None:

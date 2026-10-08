@@ -12,7 +12,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class GatewayConfig(BaseModel):
     network: str = "finney"
     netuid: int
-    mechid: int = 1
     wallet_name: str
     hotkey_name: str = Field(description="The gateway's hotkey: one the catalog lists under gateways")
     database_url: str = Field(description="postgresql+asyncpg://... in production; sqlite+aiosqlite:///path for "

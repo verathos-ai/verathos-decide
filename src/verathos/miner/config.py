@@ -36,7 +36,8 @@ class EndpointConfig(BaseModel):
 class MinerConfig(BaseModel):
     network: str = "finney"
     netuid: int
-    mechid: int = 1
+    mechid: int | None = Field(None, ge=0, description="Mechanism to publish the manifest for instead of the "
+                               "catalog's; none: the catalog's")
     wallet_name: str
     hotkey_name: str
     public_host: str = Field(description="Public IP address validators and gateways reach this miner at")

@@ -89,13 +89,13 @@ def test_a_slow_reference_shrinks_the_canary_pool_instead_of_delaying_the_epoch(
 
     async def run():
         async with httpx.AsyncClient(transport=HostRouter(apps)) as client:
-            endpoints = [e for m in await discover(neurons, 405, 1, client, {catalog.load().digest()})
+            endpoints = [e for m in await discover(neurons, 405, client, {catalog.load().digest(): 1})
                          for e in m.endpoints()]
             started = time_module.monotonic()
             results = await audit_epoch(endpoints, epoch=1, secret=b"k" * 32, keypair=validator,
                                         references={"kev-4b": SlowReference("kev-4b")},
                                         tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client,
-                                        netuid=405, mechid=1, pool_size=16, per_endpoint=6, budget_s=2.0)
+                                        netuid=405, pool_size=16, per_endpoint=6, budget_s=2.0)
             return results, time_module.monotonic() - started
 
     results, took = asyncio.run(run())
@@ -119,12 +119,12 @@ def test_epoch_scores_honest_and_zeroes_cheater() -> None:
     async def run():
         transport = HostRouter({honest: honest_app, cheat: cheat_app, ghost: ghost_app})
         async with httpx.AsyncClient(transport=transport) as client:
-            miners = await discover(neurons, 405, 1, client, {catalog.load().digest()})
+            miners = await discover(neurons, 405, client, {catalog.load().digest(): 1})
             endpoints = [e for m in miners for e in m.endpoints()]
             results = await audit_epoch(endpoints, epoch=1, secret=b"k" * 32, keypair=validator,
                                         references={"kev-4b": MockEngine("kev-4b")},
                                         tolerances={"kev-4b": Tolerance(min_probabilities=20)}, client=client,
-                                        netuid=405, mechid=1, pool_size=10, per_endpoint=6)
+                                        netuid=405, pool_size=10, per_endpoint=6)
             return miners, results
 
     miners, results = asyncio.run(run())
@@ -181,12 +181,12 @@ def test_a_lost_challenge_at_the_axon_is_retried_and_a_canary_counts_only_within
 
     async def run():
         async with httpx.AsyncClient(transport=FirstChallengeLost()) as client:
-            endpoints = [e for m in await discover(neurons, 405, 1, client, {catalog.load().digest()})
+            endpoints = [e for m in await discover(neurons, 405, client, {catalog.load().digest(): 1})
                          for e in m.endpoints()]
             return await audit_epoch(endpoints, epoch=1, secret=b"k" * 32, keypair=validator,
                                      references={"kev-4b": MockEngine("kev-4b")},
                                      tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client,
-                                     netuid=405, mechid=1, pool_size=4, per_endpoint=2, request_timeout_s=0.2)
+                                     netuid=405, pool_size=4, per_endpoint=2, request_timeout_s=0.2)
 
     results = asyncio.run(run())
     lost, slow = (results[f"{keys[n].ss58_address}/gpu0"] for n in ("lost", "slow"))
@@ -246,12 +246,12 @@ def test_endpoints_on_several_machines_are_checked_where_they_are_and_another_se
 
     async def epoch(n: int):
         async with httpx.AsyncClient(transport=transport) as client:
-            (found,) = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commit)], 405, 1, client,
-                                      {catalog.load().digest()})
+            (found,) = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commit)], 405, client,
+                                      {catalog.load().digest(): 1})
             return found, await audit_epoch(found.endpoints(), epoch=n, secret=b"k" * 32, keypair=validator,
                                             references={"kev-4b": MockEngine("kev-4b")},
                                             tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client,
-                                            netuid=405, mechid=1, pool_size=4, per_endpoint=3,
+                                            netuid=405, pool_size=4, per_endpoint=3,
                                             identities=identities)
 
     found, results = asyncio.run(epoch(7))
@@ -295,14 +295,14 @@ def test_a_validator_stays_within_the_miners_request_budget(caplog) -> None:
     def epoch(n: int) -> int:
         async def run():
             async with httpx.AsyncClient(transport=transport) as client:
-                (found,) = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commit)], 405, 1, client,
-                                          {catalog.load().digest()})
+                (found,) = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commit)], 405, client,
+                                          {catalog.load().digest(): 1})
                 for _ in range(3):  # the auditor's discovery, before and after the canaries
                     await identities.verify(found.endpoints(), n, validator, client, retry=False)
                 await audit_epoch(found.endpoints(), epoch=n, secret=b"k" * 32, keypair=validator,
                                   references={"kev-4b": MockEngine("kev-4b")},
                                   tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client, netuid=405,
-                                  mechid=1, pool_size=16, per_endpoint=10, identities=identities)
+                                  pool_size=16, per_endpoint=10, identities=identities)
                 await identities.verify(found.endpoints(), n, validator, client, retry=False)
 
         before = sum(n for (host, kind), n in transport.seen.items() if host == axon and kind != "manifest")
@@ -318,11 +318,11 @@ def test_a_validator_stays_within_the_miners_request_budget(caplog) -> None:
 
     async def over_budget():
         async with httpx.AsyncClient(transport=HostRouter(apps)) as client:
-            (found,) = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commit)], 405, 1, client,
-                                      {catalog.load().digest()})
+            (found,) = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commit)], 405, client,
+                                      {catalog.load().digest(): 1})
             return (await audit_epoch(found.endpoints(), epoch=3, secret=b"k" * 32, keypair=validator,
                                       references={"kev-4b": MockEngine("kev-4b")}, tolerances={"kev-4b": Tolerance()},
-                                      client=client, netuid=405, mechid=1, pool_size=8, per_endpoint=6))
+                                      client=client, netuid=405, pool_size=8, per_endpoint=6))
 
     (result,) = asyncio.run(over_budget()).values()
     assert result.identity_ok and result.answered == 3 and result.errors == ["refused: HTTP 429"] * 3
@@ -352,12 +352,12 @@ def test_a_manifest_accepted_before_stands_in_while_the_axon_is_out() -> None:
     def epoch(n: int, commitment: str = commit):
         async def run():
             async with httpx.AsyncClient(transport=Transport()) as client:
-                found = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commitment)], 405, 1, client,
-                                       {catalog.load().digest()}, cache)
+                found = await discover([Neuron(1, hotkey.ss58_address, axon, 80, commitment)], 405, client,
+                                       {catalog.load().digest(): 1}, cache)
                 results = await audit_epoch([e for m in found for e in m.endpoints()], epoch=n, secret=b"k" * 32,
                                             keypair=validator, references={"kev-4b": MockEngine("kev-4b")},
                                             tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client,
-                                            netuid=405, mechid=1, pool_size=4, per_endpoint=2,
+                                            netuid=405, pool_size=4, per_endpoint=2,
                                             identities=identities)
                 return found, {r.endpoint.endpoint.endpoint_id: r for r in results.values()}
 
@@ -752,7 +752,7 @@ def test_hostile_replies_fail_the_endpoint_without_aborting_the_epoch() -> None:
         async with httpx.AsyncClient(transport=HostRouter(apps)) as client:
             return (await audit_epoch([ep], epoch=1, secret=b"k" * 32, keypair=validator,
                                       references={"kev-4b": MockEngine("kev-4b")},
-                                      tolerances={"kev-4b": Tolerance()}, client=client, netuid=405, mechid=1,
+                                      tolerances={"kev-4b": Tolerance()}, client=client, netuid=405,
                                       pool_size=4, per_endpoint=3))[ep.key]
 
     result = asyncio.run(run(signed))
@@ -833,10 +833,10 @@ def test_huge_numbers_and_deep_json_are_malformed_not_fatal() -> None:
     async def run():
         async with httpx.AsyncClient(transport=HostRouter({"10.0.0.9": app})) as client:
             found = await discover([Neuron(1, hostile_kp.ss58_address, "10.0.0.9", 80,
-                                           commitment_value("0" * 64))], 405, 1, client, {"0" * 64})
+                                           commitment_value("0" * 64))], 405, client, {"0" * 64: 1})
             results = await audit_epoch([ep], epoch=1, secret=b"k" * 32, keypair=validator,
                                         references={"kev-4b": MockEngine("kev-4b")},
-                                        tolerances={"kev-4b": Tolerance()}, client=client, netuid=405, mechid=1,
+                                        tolerances={"kev-4b": Tolerance()}, client=client, netuid=405,
                                         pool_size=4, per_endpoint=3)
             return found, results
 
@@ -854,7 +854,7 @@ def test_chain_trouble_fetching_verdicts_is_an_unavailable_feed() -> None:
         def auditor_url(self):
             raise ConnectionError("node down")
 
-    t = Throughput(netuid=405, mechid=1, policy=AuditPolicy(), auditor_hotkey="aud", chain=BrokenChain())
+    t = Throughput(netuid=405, policy=AuditPolicy(), auditor_hotkey="aud", chain=BrokenChain())
     with pytest.raises(feed.VerdictsUnavailable, match="ConnectionError"):
         asyncio.run(t._fetch(None, 9))
 

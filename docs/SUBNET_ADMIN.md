@@ -9,27 +9,41 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[chain,ops]"
 .venv/bin/verathos-subnet --network finney --netuid 96 status
 ```
 
-`status` shows the UID cap, the mechanisms and their emission split, the owner hotkey, the committed catalog digest,
-the digest of the catalog shipped with this code, the current epoch and the committed catalog's miner share in it.
+`status` shows the UID cap, the mechanisms and their emission split, the owner hotkey, the committed catalog digest
+and its mechanism, the digest of the catalog shipped with this code, the current epoch and the committed catalog's
+miner share in it.
 
 ## Mechanisms
 
-The network scores on mechanism 1. Two mechanisms require a UID cap of 128 (max UIDs x mechanisms <= 256):
+The catalog names the mechanism the network runs on (`mechanism`; 1 when a catalog names none): miners publish
+their manifests for it and validators set weights on it, so every node follows the committed catalog and installs
+need no setting for it. The shipped catalog names mechanism 0, as on SN96: the subnet is full at 256 UIDs, and the
+network runs on its only mechanism. A test network's catalog names its own (netuid 405: `"mechanism": 1`).
+`commit-catalog` refuses a catalog whose mechanism the subnet does not have (its mechanism count must exceed it).
+
+A second mechanism is only for a subnet that wants one and can have it: two mechanisms require a UID cap of 128
+(max UIDs x mechanisms <= 256), so at most 128 registered UIDs.
 
 ```bash
-.venv/bin/verathos-subnet --network finney --netuid 96 setup-mechanisms --split 90,10 --wallet <owner wallet>
+.venv/bin/verathos-subnet --network test --netuid 405 setup-mechanisms --split 90,10 --wallet <owner wallet>
 ```
 
-It lowers the UID cap if needed (only possible with at most 128 registered UIDs), sets the mechanism count to 2 and
-the emission split between mechanisms 0 and 1. Calls wait out the admin freeze window at the end of each tempo.
+It lowers the UID cap if needed, sets the mechanism count to 2 and the emission split between mechanisms 0 and 1.
+Calls wait out the admin freeze window at the end of each tempo.
+
+Moving the network to another mechanism is a catalog commit like any other: miners re-publish their manifests for
+the new mechanism within minutes, validators accept manifests built for the previous catalog (for its mechanism) for
+one more epoch and set each epoch's weights on the mechanism of the catalog it is scored under. The weights set on
+the previous mechanism stay there until validators set others. A node's `mechid` (miner and validator
+configuration) overrides the catalog's; leave it unset.
 
 ## Catalog: models and policy
 
 The catalog lists the served models (pinned weights, engine and engine revision, verification tolerances, the
-standard request mix `workload`, `price`, `anchor_share`, `first_test_rps`, `relative_speed`, status), the epoch
-length, the scoring settings (`scoring`, including the [miner share](#miner-share)) and the throughput-audit policy
-(`throughput_audit`). Miners and validators use whichever catalog the owner hotkey commits; publishing a new one needs
-no code release.
+standard request mix `workload`, `price`, `anchor_share`, `first_test_rps`, `relative_speed`, status), the
+[mechanism](#mechanisms), the epoch length, the scoring settings (`scoring`, including the
+[miner share](#miner-share)) and the throughput-audit policy (`throughput_audit`). Miners and validators use
+whichever catalog the owner hotkey commits; publishing a new one needs no code release.
 
 `price` is what users pay for the model, in USD per million input tokens, and the model's share of the emission
 follows what its users pay (`SCORING.md`). `anchor_share` is the model's share while
@@ -95,9 +109,9 @@ To publish a catalog:
        --hotkey <owner hotkey> --file catalog.json
    ```
 
-   It validates the file (an unknown `throughput_audit` setting is an error), stores it in `catalog_dir` and commits
-   its digest. Mirrors (`catalog_mirrors` in miner and
-   validator configs) can serve the same file; every copy is checked against the digest.
+   It validates the file (an unknown `throughput_audit` setting is an error, and so is a mechanism the subnet does
+   not have), stores it in `catalog_dir` and commits its digest. Mirrors (`catalog_mirrors` in miner and validator
+   configs) can serve the same file; every copy is checked against the digest.
 
 Miners and validators check the commitment every minute: miners re-publish their manifests (measuring again if a
 model's request mix changed), the auditor applies a new audit policy at once, and validators score each epoch

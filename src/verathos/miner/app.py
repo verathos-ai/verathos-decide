@@ -91,6 +91,7 @@ def create_app(
     testing: Callable[[], bool] = lambda: False,
     gateways: Callable[[], Collection[str]] | None = None,
     catalog_digest: Callable[[], str] | None = None,
+    mechid: Callable[[], int] | None = None,
     budget: RequestBudget | None = None,
 ) -> FastAPI:
     """``manifest`` gives the hotkey's manifest this machine serves (None on a worker), ``host_endpoints`` this
@@ -100,9 +101,9 @@ def create_app(
     (default: ``max_concurrency`` slots); ``serving`` the endpoints answered (default: those the manifest lists);
     ``max_state_tokens`` a model's limit (``api.prompt_chars``); ``max_caller_request`` the largest request of a model
     callers other than gateways may send (``caller_request_bytes``); ``gateways`` the callers exempt from the
-    per-caller limits (default: the configured ``gateway_hotkeys``); ``catalog_digest`` the catalog receipts name
-    (default: the manifest's); ``budget`` the requests each caller other than a gateway may send an endpoint per
-    epoch (default: no limit)."""
+    per-caller limits (default: the configured ``gateway_hotkeys``); ``catalog_digest`` and ``mechid`` the catalog and
+    mechanism receipts name (default: the manifest's); ``budget`` the requests each caller other than a gateway may
+    send an endpoint per epoch (default: no limit)."""
     app = FastAPI(title="Verathos miner")
     nonces = NonceCache()
     endpoints = {e.endpoint_id: e for e in config.endpoints}
@@ -111,6 +112,7 @@ def create_app(
     sessions = SessionGate(config.netuid, hotkey)
     gateways = gateways or (lambda: config.gateway_hotkeys)
     catalog_digest = catalog_digest or (lambda: manifest().manifest.catalog_digest)
+    mechid = mechid or (lambda: manifest().manifest.mechid)
     in_flight: dict[tuple[str, str], int] = {}  # (caller, endpoint) -> requests, for callers other than gateways
 
     def error(status: int, message: str) -> JSONResponse:
@@ -264,7 +266,7 @@ def create_app(
             log.warning("engine %s returned malformed answers; not signed", endpoint_id)
             return error(502, "engine returned malformed answers")
         receipt = Receipt(
-            netuid=config.netuid, mechid=config.mechid, miner_hotkey=hotkey, endpoint_id=endpoint_id,
+            netuid=config.netuid, mechid=mechid(), miner_hotkey=hotkey, endpoint_id=endpoint_id,
             model_id=endpoint.model_id, catalog_digest=catalog_digest(), caller_hotkey=caller.hotkey,
             request_nonce=caller.nonce, request_sha256=digest(raw), answers_sha256=digest(answers),
             received_ms=received_ms, responded_ms=int(time.time() * 1000),

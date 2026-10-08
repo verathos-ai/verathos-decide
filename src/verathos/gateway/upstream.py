@@ -69,8 +69,8 @@ class UpstreamFailure(Exception):
 
 
 class Upstream:
-    def __init__(self, keypair: Keypair, client: httpx.AsyncClient, *, netuid: int, mechid: int) -> None:
-        self.keypair, self.client, self.netuid, self.mechid = keypair, client, netuid, mechid
+    def __init__(self, keypair: Keypair, client: httpx.AsyncClient, *, netuid: int) -> None:
+        self.keypair, self.client, self.netuid = keypair, client, netuid
         self.hotkey = keypair.ss58_address
 
     async def call(self, route: Route, request: dict[str, Any], body: bytes, request_sha256: str,
@@ -108,8 +108,7 @@ class Upstream:
         response = parse_response(text)
         signed = None if response is None else signed_exchange(
             response, request, request_id=headers[HDR_NONCE], hotkey=route.hotkey, endpoint_id=route.endpoint_id,
-            model_id=route.model_id, callers={self.hotkey}, netuid=self.netuid, mechid=self.mechid,
-            request_sha256=request_sha256)
+            model_id=route.model_id, callers={self.hotkey}, netuid=self.netuid, request_sha256=request_sha256)
         if signed is None:
             raise UpstreamFailure("receipt", "miner", "no receipt binding this request and these answers")
         answers, receipt = signed

@@ -2,9 +2,9 @@
 
 The validator checks the owner's commitment every ``POLICY_WATCH_S``, like the miners, so a new throughput-audit
 policy reaches the audit within a minute of the miners. Each epoch is scored under the catalog committed at its first
-block (``for_epoch``), the same for every validator. Manifests built for the previous catalog stay acceptable for
-one epoch after a change, while miners re-publish; the change is kept on disk, so this holds across a restart, also
-for a change made while the validator was down.
+block (``for_epoch``), the same for every validator. Manifests built for the previous catalog (for its mechanism)
+stay acceptable for one epoch after a change, while miners re-publish; the change is kept on disk, so this holds
+across a restart, also for a change made while the validator was down.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import bittensor as bt
 
@@ -31,7 +32,7 @@ class CatalogFollower:
         self.network, self.netuid, self.store, self.mirrors = network, netuid, store, mirrors
         self.catalog = self._wait(st)
         self.on_change: list[Callable[[catalog.Catalog], None]] = []
-        self._previous: tuple[str, float] | None = None
+        self._previous: tuple[str, int, float] | None = None  # (digest, its mechanism, accepted until)
         self._lock = threading.Lock()
         self._state_path = state_path  # this validator's own: a catalog store may be shared
         self._resume()
@@ -51,19 +52,28 @@ class CatalogFollower:
             log.warning("%s unreadable, starting without a previous catalog: %s", self._state_path, exc)
             followed = None
         if followed is not None and followed != self.catalog.digest():
-            self._previous = (followed, time.time() + self._grace_s())
+            mechanism = self._mechanism(followed, saved.get("mechanism"))
+            self._previous = (followed, mechanism, time.time() + self._grace_s())
         elif followed is not None and previous and until > time.time():
-            self._previous = (previous, until)
+            self._previous = (previous, self._mechanism(previous, saved.get("previous_mechanism")), until)
         self._save()
+
+    def _mechanism(self, catalog_digest: str, saved: Any) -> int:
+        """The mechanism of a catalog followed before: as saved, else from the store, else the current catalog's."""
+        if isinstance(saved, int) and not isinstance(saved, bool) and saved >= 0:
+            return saved
+        stored = self.store.get(catalog_digest)
+        return (stored or self.catalog).mechanism
 
     def _save(self) -> None:
         """Keep the followed catalog and the grace on disk; a failure to keep them only costs the grace after a
         restart."""
-        previous, until = self._previous or (None, 0.0)
+        previous, mechanism, until = self._previous or (None, None, 0.0)
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._state_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"catalog": self.catalog.digest(), "previous": previous, "until": until}))
+            tmp.write_text(json.dumps({"catalog": self.catalog.digest(), "mechanism": self.catalog.mechanism,
+                                       "previous": previous, "previous_mechanism": mechanism, "until": until}))
             tmp.replace(self._state_path)
         except OSError as exc:
             log.warning("keeping the followed catalog in %s failed: %s", self._state_path, exc)
@@ -76,13 +86,13 @@ class CatalogFollower:
                 log.error("%s; retrying in 60 s", exc)
                 time.sleep(60)
 
-    def accepted(self) -> set[str]:
-        """Catalog digests a manifest may be built for."""
+    def accepted(self) -> dict[str, int]:
+        """The digests of the catalogs a manifest may be built for, each with its mechanism."""
         with self._lock:
-            digests = {self.catalog.digest()}
-            if self._previous and time.time() < self._previous[1]:
-                digests.add(self._previous[0])
-        return digests
+            catalogs = {self.catalog.digest(): self.catalog.mechanism}
+            if self._previous and time.time() < self._previous[2]:
+                catalogs.setdefault(self._previous[0], self._previous[1])
+        return catalogs
 
     def for_epoch(self, st: bt.Subtensor, start_block: int) -> catalog.Catalog:
         """The catalog committed at an epoch's first block, so every validator scores the epoch under the same one,
@@ -105,7 +115,7 @@ class CatalogFollower:
         if new.digest() == self.catalog.digest():
             return False
         with self._lock:
-            self._previous = (self.catalog.digest(), time.time() + self._grace_s())
+            self._previous = (self.catalog.digest(), self.catalog.mechanism, time.time() + self._grace_s())
             self.catalog = new
             self._save()
         log.info("catalog %s committed", new.digest()[:12])

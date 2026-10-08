@@ -65,12 +65,10 @@ def test_a_manifest_naming_a_non_public_host_is_rejected() -> None:
         document = signed.model_dump(mode="json")
         commitment = commitment_value(signed.manifest.digest())
         if host == "8.8.8.8":
-            accept(document, hotkey=keypair.ss58_address, netuid=405, mechid=1, commitment=commitment,
-                   catalog_digests={"0" * 64})
+            accept(document, hotkey=keypair.ss58_address, netuid=405, commitment=commitment, catalogs={"0" * 64: 1})
             continue
         with pytest.raises(ManifestRejected, match="gpu1: its URL is not"):
-            accept(document, hotkey=keypair.ss58_address, netuid=405, mechid=1, commitment=commitment,
-                   catalog_digests={"0" * 64})
+            accept(document, hotkey=keypair.ss58_address, netuid=405, commitment=commitment, catalogs={"0" * 64: 1})
 
 
 def test_the_gateway_routes_to_public_hosts_only() -> None:

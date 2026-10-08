@@ -7,8 +7,9 @@ Discovery uses only native chain state:
   version.
 
 A fetched manifest is accepted only if its signature verifies against the hotkey, its digest equals the hotkey's
-current commitment, and every endpoint URL is ``http://<ip>:<port>/e/<endpoint_id>`` on a public unicast address: the
-axon, or another machine of the miner. Signature and digest cover the JSON exactly as received, so nodes running
+current commitment, it is built for a catalog the validator accepts and for that catalog's mechanism, and every
+endpoint URL is ``http://<ip>:<port>/e/<endpoint_id>`` on a public unicast address: the axon, or another machine of
+the miner. Signature and digest cover the JSON exactly as received, so nodes running
 different code versions agree on them. A listed host gets traffic only once the endpoint proved control at its URL
 (``validator.discovery.Identities``).
 
@@ -21,7 +22,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from collections.abc import Collection
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from bittensor_wallet import Keypair
@@ -194,9 +195,11 @@ def endpoint_host(url: str, endpoint_id: str) -> str | None:
     return host
 
 
-def accept(document: Any, *, hotkey: str, netuid: int, mechid: int, commitment: str | None,
-           catalog_digests: Collection[str]) -> Manifest:
-    """Validator-side acceptance of a fetched manifest document (the parsed JSON body). Raises ManifestRejected."""
+def accept(document: Any, *, hotkey: str, netuid: int, commitment: str | None,
+           catalogs: Mapping[str, int]) -> Manifest:
+    """Validator-side acceptance of a fetched manifest document (the parsed JSON body): ``catalogs`` maps the digest of
+    each catalog a manifest may be built for to the mechanism a manifest built for it is for. Raises
+    ManifestRejected."""
     if not isinstance(document, dict) or not isinstance(document.get("manifest"), dict):
         raise ManifestRejected("not a signed manifest")
     raw = document["manifest"]
@@ -213,10 +216,12 @@ def accept(document: Any, *, hotkey: str, netuid: int, mechid: int, commitment: 
         if isinstance(exc, ManifestRejected):
             raise
         raise ManifestRejected(f"malformed manifest: {exc}") from None
-    if manifest.hotkey != hotkey or manifest.netuid != netuid or manifest.mechid != mechid:
-        raise ManifestRejected("manifest is for another hotkey, netuid or mechanism")
-    if manifest.catalog_digest not in catalog_digests:
+    if manifest.hotkey != hotkey or manifest.netuid != netuid:
+        raise ManifestRejected("manifest is for another hotkey or netuid")
+    if manifest.catalog_digest not in catalogs:
         raise ManifestRejected("manifest was built for another catalog")
+    if manifest.mechid != catalogs[manifest.catalog_digest]:
+        raise ManifestRejected(f"manifest is for mechanism {manifest.mechid}, not {catalogs[manifest.catalog_digest]}")
     hosts = set()
     for e in manifest.endpoints:
         host = endpoint_host(e.url, e.endpoint_id)

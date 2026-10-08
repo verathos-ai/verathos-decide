@@ -146,12 +146,12 @@ def test_tests_in_which_the_endpoint_was_as_good_as_down_set_no_cap_but_start_th
 
 
 def publisher_with(tmp_path, rps: dict[str, float], *, role: str = "primary", host: str = "203.0.113.5",
-                   port: int = 8091) -> tuple[miner_main.Publisher, list[bool]]:
-    """A publisher whose measurement gives ``rps`` per endpoint (stored, and reused unless asked to measure again);
-    -> (publisher, the ``remeasure`` flag of each measurement)."""
+                   port: int = 8091, **fields) -> tuple[miner_main.Publisher, list[bool]]:
+    """A publisher whose measurement gives ``rps`` per endpoint (stored, and reused unless asked to measure again),
+    configured with ``fields`` besides; -> (publisher, the ``remeasure`` flag of each measurement)."""
     config = MinerConfig.model_validate({
         "netuid": 405, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": port, "role": role,
-        "state_dir": str(tmp_path),
+        "state_dir": str(tmp_path), **fields,
         "endpoints": [{"endpoint_id": e, "model_id": "kev-4b", "engine_url": "http://127.0.0.1:9"} for e in rps]})
     keypair = kp()
     publisher = miner_main.Publisher(config, SimpleNamespace(hotkey=keypair), CATALOG, publish_on_chain=True,
@@ -273,7 +273,7 @@ def test_a_changed_declaration_is_published_by_the_primary_and_served_by_a_worke
     hotkey = worker.wallet.hotkey
     app = create_app(config=worker.config, keypair=hotkey, manifest=lambda: worker.signed, engines={},
                      authorized=lambda hk: False, auditors=worker.auditors, host_endpoints=lambda: worker.local)
-    peers = Peers(["http://198.51.100.7:20017"], hotkey=hotkey.ss58_address, netuid=405, mechid=1)
+    peers = Peers(["http://198.51.100.7:20017"], hotkey=hotkey.ss58_address, netuid=405, mechid=CATALOG.mechanism)
 
     def primary_lists() -> list[Endpoint]:
         async def poll():

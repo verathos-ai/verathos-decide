@@ -103,8 +103,9 @@ def test_manifests_of_the_previous_catalog_stay_accepted_across_a_validator_rest
 
     from verathos.validator import follow
 
-    first = catalog.load()
-    second = catalog.Catalog.parse({**first.document(), "gateways": [Keypair.create_from_uri("//gw").ss58_address]})
+    first = catalog.load()  # mechanism 0
+    second = catalog.Catalog.parse({**first.document(), "mechanism": 1,
+                                    "gateways": [Keypair.create_from_uri("//gw").ss58_address]})
     committed = {"catalog": first}
     monkeypatch.setattr(follow, "current_catalog", lambda *args, **kwargs: committed["catalog"])
     store = catalog.CatalogStore(tmp_path)
@@ -113,15 +114,20 @@ def test_manifests_of_the_previous_catalog_stay_accepted_across_a_validator_rest
         return follow.CatalogFollower(None, "test", 405, store, [], state_path=tmp_path / "followed.json")
 
     running = start()
-    assert running.accepted() == {first.digest()}
+    assert running.accepted() == {first.digest(): 0}
     committed["catalog"] = second
-    assert running.refresh(None) and running.accepted() == {first.digest(), second.digest()}
-    assert start().accepted() == {first.digest(), second.digest()}  # restarted inside the grace
+    # each catalog's manifests are for its own mechanism
+    assert running.refresh(None) and running.accepted() == {first.digest(): 0, second.digest(): 1}
+    assert start().accepted() == {first.digest(): 0, second.digest(): 1}  # restarted inside the grace
     committed["catalog"] = first  # changed back while the validator was down: miners still announce the second
-    assert start().accepted() == {first.digest(), second.digest()}
+    assert start().accepted() == {first.digest(): 0, second.digest(): 1}
     state = json.loads((tmp_path / "followed.json").read_text())
     (tmp_path / "followed.json").write_text(json.dumps({**state, "until": 0}))
-    assert start().accepted() == {first.digest()}  # the grace is over
+    assert start().accepted() == {first.digest(): 0}  # the grace is over
+    # a state kept by an earlier release names no mechanisms: the stored catalog's
+    (tmp_path / "followed.json").write_text(json.dumps({"catalog": second.digest(), "previous": None, "until": 0}))
+    store.put(second)
+    assert start().accepted() == {first.digest(): 0, second.digest(): 1}
 
 
 def test_settings_this_code_does_not_know_are_found_before_publishing() -> None:

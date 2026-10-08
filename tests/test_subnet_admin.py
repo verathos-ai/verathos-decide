@@ -14,24 +14,33 @@ OWNER = "5Owner"
 
 
 class Chain:
-    def __init__(self, block: int = 1000 * 180) -> None:
-        self.block, self.commitments = block, []
+    def __init__(self, block: int = 1000 * 180, mechanisms: int = 1) -> None:
+        self.block, self.mechanisms, self.commitments = block, mechanisms, []
 
-    def get_subnet_owner_hotkey(self, netuid: int) -> str:
+    def get_subnet_owner_hotkey(self, netuid: int, block: int | None = None) -> str:
         return OWNER
+
+    def get_uid_for_hotkey_on_subnet(self, hotkey: str, netuid: int, block: int | None = None) -> int:
+        return 0
+
+    def get_commitment(self, netuid: int, uid: int, block: int | None = None) -> str | None:
+        return self.commitments[-1] if self.commitments else None
 
     def get_current_block(self) -> int:
         return self.block
+
+    def get_mechanism_count(self, netuid: int) -> int:
+        return self.mechanisms
 
     def set_commitment(self, wallet, netuid: int, value: str):
         self.commitments.append(value)
         return SimpleNamespace(success=True)
 
 
-def catalog_file(tmp_path, **scoring):
+def catalog_file(tmp_path, mechanism: int = 0, **scoring):
     document = catalog.load().document()
     path = tmp_path / "catalog.json"
-    path.write_text(json.dumps({**document, "scoring": {**document["scoring"], **scoring}}))
+    path.write_text(json.dumps({**document, "mechanism": mechanism, "scoring": {**document["scoring"], **scoring}}))
     return path
 
 
@@ -63,3 +72,19 @@ def test_commit_catalog_refuses_an_invalid_or_mistyped_miner_share(tmp_path) -> 
     with pytest.raises(ValueError, match="miner_share"):
         commit(chain, path, tmp_path)
     assert chain.commitments == []
+
+
+def test_commit_catalog_needs_the_catalogs_mechanism_on_chain_and_says_when_the_network_moves(tmp_path,
+                                                                                            capsys) -> None:
+    chain = Chain(mechanisms=1)  # a subnet with mechanism 0 only, as SN96 at 256 UIDs
+    with pytest.raises(SystemExit, match="the catalog names mechanism 1, but netuid 405 has 1 mechanism"):
+        commit(chain, catalog_file(tmp_path, mechanism=1), tmp_path)
+    assert chain.commitments == []
+    commit(chain, catalog_file(tmp_path, mechanism=0), tmp_path)
+    assert "mechanism 0; active models" in capsys.readouterr().out
+    chain.mechanisms = 2  # a second mechanism set up
+    commit(chain, catalog_file(tmp_path, mechanism=1), tmp_path)
+    out = capsys.readouterr().out
+    assert "the network moves from mechanism 0 to 1" in out and len(chain.commitments) == 2
+    commit(chain, catalog_file(tmp_path, mechanism=1, miner_share=0.8), tmp_path)
+    assert "moves" not in capsys.readouterr().out

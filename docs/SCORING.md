@@ -30,11 +30,12 @@ references one at a time checks the models whose references fit in the epoch's r
 so that each of `k` models is checked at least once every `2k` epochs, and takes the others' results from its source
 (`VALIDATING.md`).
 
-Every request is signed by the validator and bound to the miner and a nonce. Every answer comes with a receipt
-signed by the miner hotkey that binds the request, the answers, the endpoint, the model, the caller, the nonce, the
-netuid and the mechanism. A request the endpoint declines (an error status, or no answer within the audit policy's
-`request_timeout_s`, 10 s) counts as unanswered. A reply without a valid receipt, or whose answers are malformed (a
-probability that is not a number in [0, 1]), fails the request as a hard failure.
+Every request is signed by the validator and bound to the miner and a nonce. Every answer comes with a receipt signed
+by the miner hotkey that binds the request, the answers, the endpoint, the model, the caller, the nonce and the
+netuid, and names the catalog and mechanism the miner serves under (not checked against the validator's, so answers
+given while a new catalog is adopted stay valid). A request the endpoint declines (an error status, or no answer
+within the audit policy's `request_timeout_s`, 10 s) counts as unanswered. A reply without a valid receipt, or whose
+answers are malformed (a probability that is not a number in [0, 1]), fails the request as a hard failure.
 
 ## Comparison
 
@@ -112,11 +113,11 @@ endpoints is on probation inherits the remaining probation, so renaming an endpo
 A UID's value is the sum of its endpoints' EMAs, normalised over all UIDs. Endpoints whose UID now belongs to another
 hotkey are ignored. The miners' values are then scaled to sum to the epoch's miner share, the catalog's
 `scoring.miner_share` (0.59 in the shipped catalog), and the subnet owner's UID gets the rest; the weights are set on
-mechanism 1 once per epoch. The chain pays the subnet owner hotkey no incentive: it burns it, or recycles it under the
-subnet's `RecycleOrBurn` setting (`SUBNET_ADMIN.md`). The share is a constant or moves linearly from one value to
-another over a number of epochs; each epoch's comes from the catalog and the epoch number alone, rounded to 6
-decimals, so every validator sets the same split. If no endpoint has a positive score, all weight goes to the subnet
-owner's UID. If the owner hotkey holds no UID, the miners' values are set as they are.
+the catalog's mechanism (`SUBNET_ADMIN.md`) once per epoch. The chain pays the subnet owner hotkey no incentive: it
+burns it, or recycles it under the subnet's `RecycleOrBurn` setting (`SUBNET_ADMIN.md`). The share is a constant or
+moves linearly from one value to another over a number of epochs; each epoch's comes from the catalog and the epoch
+number alone, rounded to 6 decimals, so every validator sets the same split. If no endpoint has a positive score, all
+weight goes to the subnet owner's UID. If the owner hotkey holds no UID, the miners' values are set as they are.
 
 Everything above is what a full validator does. A full validator running its references one at a time scores the
 endpoints of the models it does not check in an epoch with the source's published results for them: the score the

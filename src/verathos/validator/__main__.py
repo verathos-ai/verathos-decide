@@ -2,7 +2,8 @@
 
 Per epoch (``epoch_blocks`` from the catalog, independent of the subnet tempo): snapshot chain, discover miners, audit
 every endpoint with the epoch's canaries spread over the first part of the epoch, score, publish the status with the
-weights, and set those weights on the configured mechanism (dry run until that mechanism exists).
+weights, and set those weights on the catalog's mechanism, or the configured ``mechid`` (dry run until that mechanism
+exists).
 
 Every full validator takes part in the throughput audit (see ``validator.throughput``): the auditor runs the tests,
 the others apply its signed verdicts; endpoints score in proportion to the capacity they proved. A light validator
@@ -151,6 +152,13 @@ def refused_by_miners(neurons: list[Neuron], hotkey: str, auditor: str, cat: cat
     return None
 
 
+def manifest_catalogs(cfg: ValidatorConfig, cat: catalog.Catalog, current: CatalogFollower) -> dict[str, int]:
+    """The catalogs a manifest may be built for now (``cat``, and those ``current`` accepts), each with the mechanism a
+    manifest built for it is for: the catalog's, or the configured ``mechid``."""
+    accepted = {**current.accepted(), cat.digest(): cat.mechanism}
+    return {d: m if cfg.mechid is None else cfg.mechid for d, m in accepted.items()}
+
+
 def missing_references(cfg: ValidatorConfig, cat: catalog.Catalog) -> list[str]:
     return [m.model_id for m in cat.models if m.status == "active" and m.model_id not in cfg.references]
 
@@ -229,7 +237,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     source's results."""
     started = time.monotonic()
     cat = current.for_epoch(st, epoch * current.catalog.epoch_blocks)
-    sc, policy = cat.scoring, cat.audit_policy()
+    sc, policy, mechanism = cat.scoring, cat.audit_policy(), catalog.mechanism_of(cat, cfg.mechid)
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
     if why := refused_by_miners(neurons, wallet.hotkey.ss58_address, throughput.auditor_hotkey, cat):
         log.critical("epoch %d: %s. Every miner refuses this validator, so it sends no canaries and sets no weights "
@@ -255,7 +263,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         # No pool limit: a miner's hanging connections must not delay requests to the others.
         limits = httpx.Limits(max_connections=None, max_keepalive_connections=256)
         async with httpx.AsyncClient(limits=limits) as client:
-            miners = await discover(neurons, cfg.netuid, cfg.mechid, client, {cat.digest(), *current.accepted()},
+            miners = await discover(neurons, cfg.netuid, client, manifest_catalogs(cfg, cat, current),
                                     throughput.manifests)
             throughput.update_slots(miners, neurons, epoch)
             endpoints = [e for m in miners for e in m.endpoints() if e.endpoint.tier == "open"
@@ -269,7 +277,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                                     timings=runner.timings)
             results = await audit_epoch(endpoints, epoch=epoch, secret=secret, keypair=wallet.hotkey,
                                         references=references, tolerances=tolerances, client=client,
-                                        netuid=cfg.netuid, mechid=cfg.mechid, pool_size=sc.canary_pool_size,
+                                        netuid=cfg.netuid, pool_size=sc.canary_pool_size,
                                         per_endpoint=sc.canaries_per_endpoint,
                                         budget_s=blocks_left * BLOCK_TIME_S * sc.canary_spread_fraction,
                                         holding=throughput.holding, request_timeout_s=policy.request_timeout_s,
@@ -340,10 +348,11 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         scored_models={m.model_id for m in cat.models if m.status == "active"}, state=state, model_shares=shares,
         weights=uid_weights, drifted=proven.drifted, user_availability=proven.user_availability,
         latency_factors=factors, taken=taken.status if taken else None, miner_share=miner_share), epoch=epoch,
-        epoch_blocks=cat.epoch_blocks, model_shares=shares, weights=uid_weights, miner_share=miner_share)
+        epoch_blocks=cat.epoch_blocks, model_shares=shares, weights=uid_weights, miner_share=miner_share,
+        mechanism=mechanism)
     # The epoch is scored; a failure from here on must not run it again.
     try:
-        set_weights(cfg, st, wallet, uid_weights)
+        set_weights(cfg, st, wallet, uid_weights, mechanism)
     except Exception:
         log.exception("setting weights failed this epoch")
 
@@ -370,14 +379,14 @@ def weights_to_set(w: dict[int, float], hotkey_of_uid: dict[int, str], owner_hot
     return out
 
 
-def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: dict[int, float]) -> bool:
-    """Set ``w`` on the configured mechanism once the chain's weights rate limit allows, retried once per block up to
+def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: dict[int, float], mechid: int) -> bool:
+    """Set ``w`` on mechanism ``mechid`` once the chain's weights rate limit allows, retried once per block up to
     ``WEIGHT_ATTEMPTS`` times; in a dry run, or before the mechanism exists on chain, only logged. Whether that is done
     (with nothing to set, it is)."""
     if not w:
         return True
-    if cfg.dry_run or not chain.mechanism_ready(st, cfg.netuid, cfg.mechid):
-        log.info("dry run (mechanism %d %s): weights %s", cfg.mechid,
+    if cfg.dry_run or not chain.mechanism_ready(st, cfg.netuid, mechid):
+        log.info("dry run (mechanism %d %s): weights %s", mechid,
                  "not enabled on chain" if not cfg.dry_run else "configured dry", w)
         return True
     uid = st.get_uid_for_hotkey_on_subnet(wallet.hotkey.ss58_address, cfg.netuid)
@@ -385,11 +394,11 @@ def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: di
         log.warning("weights not set: this hotkey holds no UID on netuid %d", cfg.netuid)
         return False
     for attempt in range(1, WEIGHT_ATTEMPTS + 1):
-        if wait := chain.weights_wait(st, cfg.netuid, cfg.mechid, uid):
+        if wait := chain.weights_wait(st, cfg.netuid, mechid, uid):
             log.info("the chain allows this UID's next weights on mechanism %d in %d blocks; setting them then",
-                     cfg.mechid, wait)
+                     mechid, wait)
             time.sleep(wait * BLOCK_TIME_S)
-        if chain.submit_weights(st, wallet, cfg.netuid, cfg.mechid, w):
+        if chain.submit_weights(st, wallet, cfg.netuid, mechid, w):
             return True
         log.warning("setting weights failed (attempt %d of %d); retrying in one block", attempt, WEIGHT_ATTEMPTS)
         time.sleep(BLOCK_TIME_S)
@@ -418,7 +427,8 @@ def main() -> None:
                               state_path=cfg.state_dir.expanduser() / "catalog_followed.json")
     if cfg.mode == "light":  # no references, no miners: the source's verified weights
         current.start()
-        light.run(cfg, st, wallet, current, set_weights=lambda w: set_weights(cfg, st, wallet, w), once=args.once)
+        light.run(cfg, st, wallet, current, set_weights=lambda w, mechid: set_weights(cfg, st, wallet, w, mechid),
+                  once=args.once)
         st.close()
         return
     secret = load_secret(state_dir)
@@ -437,9 +447,9 @@ def main() -> None:
         source = f"the validator {cfg.source_hotkey}" if cfg.source_hotkey else "the subnet owner's validator"
         log.info("references one at a time: %s, each started for its model's canaries and stopped after; a model not "
                  "checked in an epoch takes the results of %s", ", ".join(sorted(cfg.references)), source)
-    throughput = Throughput.start(network=cfg.network, netuid=cfg.netuid, mechid=cfg.mechid,
-                                  current=lambda: current.catalog, st=st, wallet=wallet, references=cfg.references,
-                                  screens=cfg.audit_screens, state_dir=state_dir)
+    throughput = Throughput.start(network=cfg.network, netuid=cfg.netuid, current=lambda: current.catalog, st=st,
+                                  wallet=wallet, references=cfg.references, screens=cfg.audit_screens,
+                                  state_dir=state_dir)
     board = StatusBoard(state_dir / "status.json")
     if why := refused_by_miners(chain.snapshot(st, cfg.netuid)[0], wallet.hotkey.ss58_address,
                                 throughput.auditor_hotkey, current.catalog):
@@ -456,6 +466,9 @@ def main() -> None:
                       probation=lambda: [key for key, left in list(state.probation.items()) if left > 0],
                       gateways=lambda: current.catalog.gateways)
     pinned = {m.model_id: (m.hf_revision, m.engine.revision) for m in current.catalog.models}
+    mechanism = [catalog.mechanism_of(current.catalog, cfg.mechid)]
+    log.info("setting weights on mechanism %d (%s)", mechanism[0],
+             "the catalog's" if cfg.mechid is None else "mechid in the configuration")
 
     def adopt(cat: catalog.Catalog) -> None:
         if missing := missing_references(cfg, cat):
@@ -471,11 +484,15 @@ def main() -> None:
                              "update this validator's references to them (scripts/install.sh validator --yes)",
                              cat.scoring.revision_transition_epochs)
             pinned[m.model_id] = (m.hf_revision, m.engine.revision)
+        if (now := catalog.mechanism_of(cat, cfg.mechid)) != mechanism[0]:
+            log.warning("catalog %s moves the network to mechanism %d: epochs scored under it set weights there, and "
+                        "manifests for mechanism %d stay accepted for an epoch", cat.digest()[:12], now, mechanism[0])
+            mechanism[0] = now
         throughput.set_policy(cat.audit_policy())
 
     current.on_change.append(adopt)
     current.start()
-    throughput.start_slot_refresh(cfg.network, current.accepted)
+    throughput.start_slot_refresh(cfg.network, lambda: manifest_catalogs(cfg, current.catalog, current))
     wait_for_references({m: r for m, r in cfg.references.items() if runner is None or not r.command})
 
     done = state.last_epoch

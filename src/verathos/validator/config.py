@@ -57,7 +57,8 @@ def _engines(value: Any) -> Any:
 class ValidatorConfig(BaseModel):
     network: str = "finney"
     netuid: int
-    mechid: int = 1
+    mechid: int | None = Field(None, ge=0, description="Mechanism to set weights on and accept manifests for instead "
+                               "of the catalog's; none: the catalog's")
     wallet_name: str
     hotkey_name: str
     mode: Literal["full", "light"] = Field("full", description="full: check the miners and score them; light: set the "

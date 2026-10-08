@@ -135,7 +135,7 @@ class Setup:
             config=self.config, hotkey=self.gateway_kp.ss58_address, catalog=lambda: cat, accounts=self.accounts,
             meter=self.meter, router=self.router, sampler=self.sampler, served=self.served,
             routes=lambda: self.router_table,
-            upstream=Upstream(self.gateway_kp, self.client, netuid=405, mechid=1), limiter=RateLimiter())
+            upstream=Upstream(self.gateway_kp, self.client, netuid=405), limiter=RateLimiter())
         self.app = create_app(self.gateway)
         self.key = asyncio.run(self._account(rate, burst, monthly_quota))
 

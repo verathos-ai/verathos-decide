@@ -1,9 +1,10 @@
 """Subnet administration: ``verathos-subnet``. The changing commands are signed with the subnet owner's keys.
 
-    status            mechanisms, emission split, UID cap, the committed catalog and the shipped one, the epoch
-                      and the miner share in it
+    status            mechanisms, emission split, UID cap, the committed catalog (its mechanism) and the shipped one,
+                      the epoch and the miner share in it
     setup-mechanisms  mechanism count 2 and the emission split (owner coldkey)
-    commit-catalog    publish a catalog file: store it where the owner's validator serves it, commit its digest
+    commit-catalog    publish a catalog file: store it where the owner's validator serves it, commit its digest; the
+                      mechanism it names must exist on chain
 
 The owner coldkey comes from a bittensor wallet (``--wallet``, password prompt) or, for unattended test networks,
 from a mnemonic in the OS keyring (``--keyring SERVICE:USER``).
@@ -92,6 +93,7 @@ def status(st: bt.Subtensor, netuid: int) -> None:
         "committed_catalog": committed,
         "shipped_catalog": shipped.digest(),
         "shipped_catalog_is_committed": committed == shipped.digest(),
+        "catalog_mechanism": cat.mechanism if cat else None,
         "epoch": epoch,
         "miner_share": cat.scoring.miner_share_at(epoch) if cat else None,
     }, indent=2), flush=True)
@@ -124,8 +126,17 @@ def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path 
     if unknown := cat.unknown_settings():
         raise SystemExit(f"settings this code does not know: {', '.join(unknown)}")
     cat.anchor_shares(strict=True)
-    stored = catalog.CatalogStore(store_dir).put(cat)
-    print(f"catalog {cat.digest()} stored at {stored}; active models: "
+    if (count := st.get_mechanism_count(netuid)) <= cat.mechanism:
+        raise SystemExit(f"the catalog names mechanism {cat.mechanism}, but netuid {netuid} has {count} mechanism(s) "
+                         "(0 to count - 1): name an existing one, or add it first (setup-mechanisms)")
+    store = catalog.CatalogStore(store_dir)
+    previous = store.get(committed_catalog(st, netuid) or "")
+    if previous is not None and previous.mechanism != cat.mechanism:
+        print(f"the network moves from mechanism {previous.mechanism} to {cat.mechanism}: miners publish their "
+              "manifests for it within minutes, and validators set weights there from the first epoch scored under "
+              "this catalog", flush=True)
+    stored = store.put(cat)
+    print(f"catalog {cat.digest()} stored at {stored}; mechanism {cat.mechanism}; active models: "
           f"{[m.model_id for m in cat.models if m.status == 'active']}", flush=True)
     print(miner_share_line(cat, st.get_current_block() // cat.epoch_blocks), flush=True)
     value = catalog.commitment_value(cat.digest())

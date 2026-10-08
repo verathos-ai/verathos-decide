@@ -1,6 +1,7 @@
 {
   "version": 1,
   "revision": "2026-10-08",
+  "mechanism": 0,
   "epoch_blocks": 180,
   "models": [
     {

@@ -2,12 +2,13 @@
 
 Each epoch the source (the subnet owner's validator, the auditor, or the validator ``source_hotkey`` names, which
 holds a permit and runs a service) scores the network, publishes its results with the weights it sets at
-``GET /v1/network``, signed with its hotkey, and sets them. A light validator fetches that document from the source's
-axon and sets exactly those weights through the code full validators use (version key, commit-reveal, retries, dry
-run), only from a document that verifies: signed by the source hotkey under ``verathos/network-status/v1`` for this
-netuid, issued within ``STATUS_MAX_AGE_S`` of its clock, for the current or the previous epoch of the catalog's length,
-and for a later epoch than the weights it set last. It sends nothing to miners, runs no reference engine and needs no
-stake beyond the validator permit that setting weights takes.
+``GET /v1/network``, signed with its hotkey, and sets them. A light validator fetches that document from the
+source's axon and sets exactly those weights, on the mechanism of the catalog it follows (or the configured
+``mechid``), through the code full validators use (version key, commit-reveal, retries, dry run), only from a document
+that verifies: signed by the source hotkey under ``verathos/network-status/v1`` for this netuid, issued within
+``STATUS_MAX_AGE_S`` of its clock, for the current or the previous epoch of the catalog's length, and for a later
+epoch than the weights it set last. It sends nothing to miners, runs no reference engine and needs no stake beyond the
+validator permit that setting weights takes.
 
 The source scores an epoch once its canaries are out, after the first ``canary_spread_fraction`` of the epoch, and
 publishes the results then. A light validator asks for epoch ``e``'s results from that point of epoch ``e`` every
@@ -30,7 +31,7 @@ import bittensor as bt
 import httpx
 from pydantic import ValidationError
 
-from verathos.catalog import Catalog
+from verathos.catalog import Catalog, mechanism_of
 from verathos.protocol.http import ResponseTooLarge, get_json
 from verathos.protocol.manifest import axon_base
 from verathos.protocol.status import MAX_NETWORK_BYTES, NETWORK_DOMAIN, NETWORK_PATH, NetworkStatus, unverified
@@ -99,10 +100,11 @@ def describe(weights: dict[int, float]) -> str:
 
 class LightValidator:
     """Sets each epoch's weights from the source's published results (see the module). ``current.catalog``: the
-    catalog followed; ``set_weights``: the full validators' way of setting weights, True once they are set."""
+    catalog followed; ``set_weights``: the full validators' way of setting weights on a mechanism, True once they are
+    set."""
 
     def __init__(self, cfg: ValidatorConfig, st: bt.Subtensor, hotkey: str, current: Any, *,
-                 set_weights: Callable[[dict[int, float]], bool], state_path: Path,
+                 set_weights: Callable[[dict[int, float], int], bool], state_path: Path,
                  fetch: Callable[..., Any] = get_json, clock: Callable[[], float] = time.time) -> None:
         self.cfg, self.st, self.hotkey, self.current = cfg, st, hotkey, current
         self.set_weights, self.state_path, self.fetch, self.clock = set_weights, state_path, fetch, clock
@@ -195,7 +197,7 @@ class LightValidator:
                           f"epoch {network.epoch})")
         if why := self.permit():
             raise Refused(why)
-        if not self.set_weights(network.weights):
+        if not self.set_weights(network.weights, mechanism_of(self.current.catalog, self.cfg.mechid)):
             raise Refused("setting them on chain failed")
         self._save(network.epoch, epoch_blocks)
         if network.weights:
@@ -210,7 +212,7 @@ class LightValidator:
 
 
 def run(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, current: Any, *,
-        set_weights: Callable[[dict[int, float]], bool], once: bool = False) -> None:
+        set_weights: Callable[[dict[int, float], int], bool], once: bool = False) -> None:
     """Run a light validator; with ``once``, try to set the source's latest results once and return."""
     hotkey = wallet.hotkey.ss58_address
     if hotkey == st.get_subnet_owner_hotkey(cfg.netuid):

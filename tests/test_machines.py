@@ -112,12 +112,12 @@ def test_a_worker_runs_the_full_miner_service_and_reveals_no_more_than_the_manif
     authorizer = miner_main.permits(cfg, publisher)
     client = TestClient(miner_main.build_app(cfg, miner, publisher, authorizer, {"w-gpu0": MockEngine("kev-4b")}))
     assert client.get(ENDPOINTS_PATH).status_code == 404  # nothing measured yet
-    publisher.local = build_host_endpoints(cfg, own_endpoints(cfg, cfg.endpoints, {"w-gpu0": 18.9}), miner,
-                                           CATALOG.digest())
+    publisher.local = build_host_endpoints(cfg, own_endpoints(cfg, cfg.endpoints, {"w-gpu0": 18.9}), miner, CATALOG)
 
     assert client.get("/v1/manifest").status_code == 404  # the primary serves the hotkey's manifest
     document = client.get(ENDPOINTS_PATH).json()
-    host = accept_host(document, hotkey=miner.ss58_address, netuid=405, mechid=1, url="http://198.51.100.7:20017")
+    host = accept_host(document, hotkey=miner.ss58_address, netuid=405, mechid=CATALOG.mechanism,
+                       url="http://198.51.100.7:20017")
     assert set(document["host"]) == set(HostEndpoints.model_fields)
     assert [set(e) for e in document["host"]["endpoints"]] == [set(Endpoint.model_fields)]
     assert host.endpoints[0].url == "http://198.51.100.7:20017/e/w-gpu0" and "127.0.0.1" not in json.dumps(document)
@@ -323,11 +323,11 @@ def test_two_machines_end_to_end(tmp_path, monkeypatch) -> None:
 
         async def validate():
             async with httpx.AsyncClient() as client:
-                miners = await discover(neurons, 405, 1, client, {CATALOG.digest()})
+                miners = await discover(neurons, 405, client, {CATALOG.digest(): CATALOG.mechanism})
                 return await audit_epoch([e for m in miners for e in m.endpoints()], epoch=5, secret=b"k" * 32,
                                          keypair=validator, references={"kev-4b": MockEngine("kev-4b")},
                                          tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client,
-                                         netuid=405, mechid=1, pool_size=4, per_endpoint=2,
+                                         netuid=405, pool_size=4, per_endpoint=2,
                                          identities=Identities())
 
         before = {e: engine.calls for e, engine in engines.items()}
@@ -340,15 +340,15 @@ def test_two_machines_end_to_end(tmp_path, monkeypatch) -> None:
         from tests.test_throughput import FakeChain, block_hash
 
         fake_chain = FakeChain(head=5 * 180 + 40)
-        auditor = Auditor(netuid=405, mechid=1, keypair=auditor_kp, chain=fake_chain, policy=policy,
+        auditor = Auditor(netuid=405, keypair=auditor_kp, chain=fake_chain, policy=policy,
                           catalog=lambda: CATALOG, references={}, db_path=tmp_path / "throughput.sqlite",
                           runner=make_runner(httpx.AsyncHTTPTransport()))
-        throughput = Throughput(netuid=405, mechid=1, policy=policy, auditor_hotkey=auditor_kp.ss58_address,
+        throughput = Throughput(netuid=405, policy=policy, auditor_hotkey=auditor_kp.ss58_address,
                                 chain=fake_chain, auditor=auditor)
 
         async def refresh():
             async with httpx.AsyncClient() as client:
-                return await throughput.refresh(neurons, {CATALOG.digest()}, 5, client)
+                return await throughput.refresh(neurons, {CATALOG.digest(): CATALOG.mechanism}, 5, client)
 
         throughput.update_slots(asyncio.run(refresh()), neurons, 5)
         assert sorted(t.slot.url for t in auditor.targets(policy)) == sorted(e.url for e in manifest.endpoints)

@@ -1,7 +1,9 @@
 """Signed receipts: the miner's commitment to an answer.
 
 Every answer carries a receipt signed by the miner hotkey. It binds the exact request and the exact answers, so a
-later reference recomputation that disagrees is attributable and cannot be denied.
+later reference recomputation that disagrees is attributable and cannot be denied. It is checked against the caller,
+the request's nonce and the subnet; the catalog and mechanism it names are the miner's when it answered, and a reader
+does not require its own, so answers given while a new catalog is adopted stay valid.
 """
 
 from __future__ import annotations
@@ -90,7 +92,7 @@ def too_deep(value: Any, limit: int) -> bool:
 
 
 def signed_exchange(response: dict[str, Any], request: dict[str, Any], *, request_id: str, hotkey: str,
-                    endpoint_id: str, model_id: str, callers: Collection[str], netuid: int, mechid: int,
+                    endpoint_id: str, model_id: str, callers: Collection[str], netuid: int,
                     request_sha256: str | None = None) -> tuple[Any, SignedReceipt] | None:
     """(the answers, the receipt as validated) of a response if its receipt is the miner's signature over exactly this
     request and these answers, issued to one of ``callers`` for the request with nonce ``request_id``; None
@@ -99,7 +101,7 @@ def signed_exchange(response: dict[str, Any], request: dict[str, Any], *, reques
     try:
         answers = response["answers"]
         receipt = issued_receipt(response["receipt"], request_id=request_id, hotkey=hotkey, endpoint_id=endpoint_id,
-                                 model_id=model_id, callers=callers, netuid=netuid, mechid=mechid)
+                                 model_id=model_id, callers=callers, netuid=netuid)
     except (KeyError, TypeError):
         return None
     if receipt is None or not receipt.binds(request, answers, request_sha256=request_sha256):
@@ -114,7 +116,7 @@ def signed_answers(response: dict[str, Any], request: dict[str, Any], **binding:
 
 
 def issued_receipt(document: Any, *, request_id: str, hotkey: str, endpoint_id: str, model_id: str,
-                   callers: Collection[str], netuid: int, mechid: int) -> SignedReceipt | None:
+                   callers: Collection[str], netuid: int) -> SignedReceipt | None:
     """The receipt if it is the miner's valid signature for this endpoint and model, issued to one of ``callers`` for
     the request with nonce ``request_id`` on this subnet; None otherwise. It says nothing about which request and
     answers it binds (see ``SignedReceipt.binds``)."""
@@ -125,5 +127,5 @@ def issued_receipt(document: Any, *, request_id: str, hotkey: str, endpoint_id: 
     r = receipt.receipt
     issued = (receipt.signature_valid() and r.miner_hotkey == hotkey and r.endpoint_id == endpoint_id
               and r.model_id == model_id and r.caller_hotkey in callers and r.request_nonce == request_id
-              and r.netuid == netuid and r.mechid == mechid)
+              and r.netuid == netuid)
     return receipt if issued else None

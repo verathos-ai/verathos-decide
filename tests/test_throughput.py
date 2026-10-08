@@ -360,7 +360,7 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
         for uid, name in enumerate(keys, start=1):
             apps[hosts[name]], manifest = miner_app(hosts[name], keys[name], auditor_kp, engines[name], 40.0)
             miners.append(DiscoveredMiner(uid, keys[name].ss58_address, f"http://{hosts[name]}:80", manifest))
-        auditor = Auditor(netuid=405, mechid=1, keypair=auditor_kp, chain=chain, policy=policy,
+        auditor = Auditor(netuid=405, keypair=auditor_kp, chain=chain, policy=policy,
                           catalog=catalog.load, references={}, db_path=tmp_path / "throughput.sqlite",
                           runner=make_runner(HostRouter(apps)))
         auditor.update_slots(slots(miners))
@@ -376,7 +376,7 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
         auditor.follower.poll()
         verdicts = auditor.verdicts(4).verdicts
 
-        validator = Throughput(netuid=405, mechid=1, policy=policy, auditor_hotkey=auditor_kp.ss58_address,
+        validator = Throughput(netuid=405, policy=policy, auditor_hotkey=auditor_kp.ss58_address,
                                chain=chain)
         accepted = await validator.proven_invalid(verdicts.invalid, {"kev-4b": reference}, catalog.load())
         agrees = await validator.proven_invalid(verdicts.invalid, {"kev-4b": MockEngine("kev-4b", salt="kev-4b-int4")},
@@ -449,16 +449,16 @@ def test_the_auditor_tests_an_endpoint_only_once_it_proved_control_at_its_url(tm
                 return httpx.Response(504)
             return await self.inner.handle_async_request(request)
 
-    auditor = Auditor(netuid=405, mechid=1, keypair=auditor_kp, chain=FakeChain(head=5 * 180), policy=AuditPolicy(),
+    auditor = Auditor(netuid=405, keypair=auditor_kp, chain=FakeChain(head=5 * 180), policy=AuditPolicy(),
                       catalog=catalog.load, references={}, db_path=tmp_path / "throughput.sqlite")
-    throughput = Throughput(netuid=405, mechid=1, policy=auditor.policy, auditor_hotkey=auditor_kp.ss58_address,
+    throughput = Throughput(netuid=405, policy=auditor.policy, auditor_hotkey=auditor_kp.ss58_address,
                             chain=auditor.chain, auditor=auditor)
     neurons = [Neuron(1, miner_kp.ss58_address, axon, 80, commitment_value(signed.manifest.digest()))]
 
     def refresh(epoch: int) -> list[str]:
         async def run():
             async with httpx.AsyncClient(transport=Transport()) as client:
-                return await throughput.refresh(neurons, {digest}, epoch, client)
+                return await throughput.refresh(neurons, {digest: 1}, epoch, client)
 
         throughput.update_slots(asyncio.run(run()), neurons, epoch)
         return [t.slot.endpoint_id for t in auditor.targets(auditor.policy)]
@@ -471,7 +471,7 @@ def test_the_auditor_tests_an_endpoint_only_once_it_proved_control_at_its_url(tm
 
 def test_a_test_whose_selection_block_is_not_final_is_void(tmp_path) -> None:
     chain = FakeChain(head=3 * 180 + 40)
-    auditor = Auditor(netuid=405, mechid=1, keypair=kp(), chain=chain, policy=AuditPolicy(), catalog=catalog.load,
+    auditor = Auditor(netuid=405, keypair=kp(), chain=chain, policy=AuditPolicy(), catalog=catalog.load,
                       references={}, db_path=tmp_path / "t.sqlite")
     reorged = ScheduledTest(3, 3 * 180 + 30, "00" * 32, 3 * 180 + 35)
     auditor.store.add_test(reorged)
@@ -514,7 +514,7 @@ def test_auditor_with_the_load_generator_over_tcp(tmp_path) -> None:
         time.sleep(0.05)
 
     chain = FakeChain(head=3 * 180 + 40)
-    auditor = Auditor(netuid=405, mechid=1, keypair=auditor_kp, chain=chain, policy=policy, catalog=catalog.load,
+    auditor = Auditor(netuid=405, keypair=auditor_kp, chain=chain, policy=policy, catalog=catalog.load,
                       references={}, db_path=tmp_path / "throughput.sqlite")
     auditor.update_slots(slots(miners))
     selection = chain.head_block - policy.lead_blocks
@@ -598,7 +598,7 @@ def _result(target_id: str, *, completed: int = 160, samples: list | None = None
 def _auditor(tmp_path, cat: catalog.Catalog | None = None, **policy_overrides):
     """An auditor on ``cat`` (the shipped catalog by default)."""
     policy = dataclasses.replace(AuditPolicy(), **policy_overrides)
-    return Auditor(netuid=405, mechid=1, keypair=kp(), chain=FakeChain(head=3 * 180 + 40), policy=policy,
+    return Auditor(netuid=405, keypair=kp(), chain=FakeChain(head=3 * 180 + 40), policy=policy,
                    catalog=catalog.load if cat is None else lambda: cat, references={},
                    db_path=tmp_path / "t.sqlite")
 
@@ -693,7 +693,7 @@ def test_a_new_epoch_length_renumbers_the_auditors_history_instead_of_wiping_it(
     from verathos.throughput.feed import GATEWAY_EVIDENCE, Evidence
 
     chain = FakeChain(head=100 * 180 + 40)
-    auditor = Auditor(netuid=405, mechid=1, keypair=kp(), chain=chain, policy=AuditPolicy(), catalog=catalog.load,
+    auditor = Auditor(netuid=405, keypair=kp(), chain=chain, policy=AuditPolicy(), catalog=catalog.load,
                       references={}, db_path=tmp_path / "t.sqlite")
     slot = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 30.0)
     auditor.update_slots([slot])
@@ -724,7 +724,7 @@ def test_a_new_epoch_length_renumbers_the_auditors_history_instead_of_wiping_it(
     assert auditor.store.demand_ema(50) == {"kev-4b": pytest.approx(9.0)}  # the average goes on from it
     assert auditor.store.users(49)[("hk", "gpu0", "kev-4b")] == UserTally(15, 2, 13, {50: 13})  # merged
 
-    restarted = Auditor(netuid=405, mechid=1, keypair=auditor.keypair, chain=chain, policy=AuditPolicy(),
+    restarted = Auditor(netuid=405, keypair=auditor.keypair, chain=chain, policy=AuditPolicy(),
                         catalog=catalog.load, references={}, db_path=tmp_path / "t.sqlite")  # back to 180
     assert restarted.store._query("SELECT epoch FROM tests") == [(100,)]
 
@@ -735,7 +735,7 @@ def test_a_hotkeys_status_lists_its_results_of_the_last_ten_tests_which_the_audi
     from verathos.throughput.auditor import KEEP_EPOCHS, Result, Target
 
     chain = FakeChain(head=40 * 180 + 1)
-    auditor = Auditor(netuid=405, mechid=1, keypair=kp(), chain=chain, policy=AuditPolicy(), catalog=catalog.load,
+    auditor = Auditor(netuid=405, keypair=kp(), chain=chain, policy=AuditPolicy(), catalog=catalog.load,
                       references={}, db_path=tmp_path / "t.sqlite")
     slots = [Slot(kp().ss58_address, f"gpu{i}", f"http://x/e/gpu{i}", "kev-4b", 50.0) for i in range(MAX_ENDPOINTS)]
     slots = [dataclasses.replace(s, hotkey=slots[0].hotkey) for s in slots]  # one hotkey's full manifest

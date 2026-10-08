@@ -74,7 +74,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--network", default="test")
     p.add_argument("--netuid", type=int, default=405)
-    p.add_argument("--mechid", type=int, default=1)
+    p.add_argument("--mechid", type=int, default=None, help="the mechanism to expect (default: the catalog's)")
     p.add_argument("--uid", type=int, required=True)
     p.add_argument("--caller-wallet", required=True)
     p.add_argument("--caller-hotkey", required=True)
@@ -88,9 +88,10 @@ def main() -> None:
     hotkey, axon = mg.hotkeys[args.uid], mg.axons[args.uid]
     base = axon_base(axon.ip, axon.port)
     cat = current_catalog(st, args.netuid, catalog.CatalogStore(), [])
+    mechid = catalog.mechanism_of(cat, args.mechid)
     document = json.loads(urllib.request.urlopen(base + "/v1/manifest", timeout=10).read())
-    manifest = accept(document, hotkey=hotkey, netuid=args.netuid, mechid=args.mechid,
-                      commitment=st.get_commitment(args.netuid, args.uid), catalog_digests={cat.digest()})
+    manifest = accept(document, hotkey=hotkey, netuid=args.netuid, commitment=st.get_commitment(args.netuid, args.uid),
+                      catalogs={cat.digest(): mechid})
     print(f"manifest accepted: catalog {manifest.catalog_digest[:12]}, "
           f"endpoints {[e.endpoint_id for e in manifest.endpoints]}")
 
@@ -127,7 +128,7 @@ def main() -> None:
             receipt.signature_valid() and receipt.binds(request, response["answers"]) and r.miner_hotkey == hotkey
             and r.endpoint_id == endpoint.endpoint_id and r.model_id == endpoint.model_id
             and r.caller_hotkey == caller.ss58_address and r.request_nonce == headers[HDR_NONCE]
-            and r.netuid == args.netuid and r.mechid == args.mechid
+            and r.netuid == args.netuid
         )
         tally.add(compare_request(ref, distributions(response["answers"]), tally.tolerance))
     print(f"requests {tally.requests}, receipts valid {receipts_ok}/{tally.requests}, "

@@ -344,6 +344,7 @@ reference.
 | Field | Meaning |
 |---|---|
 | `network` | `finney`, `test`, or a subtensor websocket URL |
+| `mechid` | the mechanism the manifest is for, instead of the one the catalog names (`SUBNET_ADMIN.md`); leave it unset to follow the catalog |
 | `public_host`, `port` | the public IP address and port validators reach this machine's endpoints at (on the primary also the axon); the miner listens on `listen_host` (default `0.0.0.0`) at `port` |
 | `role` | `primary` (default): publishes the hotkey's manifest; `worker`: serves its endpoints for a primary and writes nothing on chain ([One hotkey, several GPUs and machines](#one-hotkey-several-gpus-and-machines)) |
 | `peers` | primary only: the workers' `ip:port`, whose endpoints the manifest lists |
@@ -373,17 +374,18 @@ On start the miner:
    machine that served endpoints before waits for a throughput test already selected
    ([When the miner measures](#when-the-miner-measures)). Meanwhile it serves the manifest it last published. An
    endpoint that cannot be measured is withdrawn, and the miner stops only if none is left;
-4. signs a manifest listing its endpoints and their declared capacity (on a primary with `peers`, the workers' too),
-   points its axon at `public_host:port` (`serve_axon`) and commits the manifest digest (`set_commitment`); both are
-   free and only sent when they change, so a restart with the same configuration and measurements writes nothing. A
-   worker signs only its own endpoints and serves them to its primary at `GET /v1/endpoints`;
-5. checks the owner's commitment and its engines every minute; when the owner commits a new catalog it re-signs
-   and re-publishes the manifest by itself, withdrawing endpoints whose model was retired and measuring again if the
-   catalog changed what a measurement depends on (a model's request mix or `max_latency_s`); when an engine changed
-   (its version, weights or settings), it measures again; when an endpoint fell short in its last two throughput
-   tests, it measures again and declares at most what the endpoint delivered in them
-   ([Falling short](#falling-short)). A failed measurement keeps the current manifest, a measurement that a
-   throughput test interrupts is retried later, and one that waits for a test starts after it.
+4. signs a manifest for the catalog's mechanism listing its endpoints and their declared capacity (on a primary with
+   `peers`, the workers' too), points its axon at `public_host:port` (`serve_axon`) and commits the manifest digest
+   (`set_commitment`); both are free and only sent when they change, so a restart with the same configuration and
+   measurements writes nothing. A worker signs only its own endpoints and serves them to its primary at
+   `GET /v1/endpoints`;
+5. checks the owner's commitment and its engines every minute; when the owner commits a new catalog it re-signs and
+   re-publishes the manifest by itself (for the new catalog's mechanism, if it names another), withdrawing endpoints
+   whose model was retired and measuring again if the catalog changed what a measurement depends on (a model's
+   request mix or `max_latency_s`); when an engine changed (its version, weights or settings), it measures again;
+   when an endpoint fell short in its last two throughput tests, it measures again and declares at most what the
+   endpoint delivered in them ([Falling short](#falling-short)). A failed measurement keeps the current manifest, a
+   measurement that a throughput test interrupts is retried later, and one that waits for a test starts after it.
 
 Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted from
 hotkeys holding a validator permit and at least the catalog's `scoring.validator_min_stake` of stake (the

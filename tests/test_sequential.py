@@ -355,12 +355,12 @@ def test_the_endpoints_of_models_not_checked_get_no_canaries_and_no_challenge() 
 
     async def run():
         async with httpx.AsyncClient(transport=transport) as client:
-            endpoints = [e for m in await discover(neurons, 405, 1, client, {CAT.digest()}) for e in m.endpoints()]
+            endpoints = [e for m in await discover(neurons, 405, client, {CAT.digest(): 1}) for e in m.endpoints()]
             sequence = Sequence(refs, ["kev-4b", "kev-9b"], overdue=set(), per_endpoint=4, timings=timings)
             started = time.monotonic()
             results = await audit_epoch(endpoints, epoch=3, secret=SECRET, keypair=validator, references=refs,
                                         tolerances={"kev-4b": Tolerance(min_probabilities=1)}, client=client,
-                                        netuid=405, mechid=1, pool_size=8, per_endpoint=4, budget_s=2.0,
+                                        netuid=405, pool_size=8, per_endpoint=4, budget_s=2.0,
                                         one_at_a_time=sequence)
             return sequence, results, time.monotonic() - started
 
@@ -386,7 +386,7 @@ def test_a_validator_checking_every_model_one_at_a_time_scores_as_with_resident_
 
     async def run(sequential: bool):
         async with httpx.AsyncClient(transport=Counting(apps)) as client:
-            endpoints = [e for m in await discover(neurons, 405, 1, client, {CAT.digest()}) for e in m.endpoints()]
+            endpoints = [e for m in await discover(neurons, 405, client, {CAT.digest(): 1}) for e in m.endpoints()]
             if sequential:
                 timings = Timings()
                 refs = references(Slot(), timings, times={m: (0.02, 0.0, 0.01) for m in ("kev-4b", "kev-9b")})
@@ -395,7 +395,7 @@ def test_a_validator_checking_every_model_one_at_a_time_scores_as_with_resident_
             else:
                 refs, sequence = {m: MockEngine(m) for m in ("kev-4b", "kev-9b")}, None
             results = await audit_epoch(endpoints, epoch=3, secret=SECRET, keypair=validator, references=refs,
-                                        tolerances=tolerances, client=client, netuid=405, mechid=1, pool_size=8,
+                                        tolerances=tolerances, client=client, netuid=405, pool_size=8,
                                         per_endpoint=4, budget_s=None, one_at_a_time=sequence)
             return endpoints, results
 
@@ -822,10 +822,10 @@ def test_an_epoch_checks_what_fits_takes_the_rest_from_the_source_and_sets_one_w
     throughput = SimpleNamespace(auditor_hotkey=owner.ss58_address, manifests=ManifestCache(1000.0),
                                  update_slots=lambda *args: None, holding=lambda: False, identities=Identities(),
                                  verdicts=verdicts, proven_invalid=proven_invalid)
-    # a short epoch: canaries over a twentieth of one block's time
-    cat = CAT.model_copy(update={"scoring": CAT.scoring.model_copy(update={
+    # a short epoch: canaries over a twentieth of one block's time; on mechanism 1, the miners' manifests'
+    cat = CAT.model_copy(update={"mechanism": 1, "scoring": CAT.scoring.model_copy(update={
         "canary_spread_fraction": 0.05, "canary_pool_size": 4, "canaries_per_endpoint": 2})})
-    current = SimpleNamespace(catalog=cat, for_epoch=lambda st, block: cat, accepted=lambda: [CAT.digest()])
+    current = SimpleNamespace(catalog=cat, for_epoch=lambda st, block: cat, accepted=lambda: {CAT.digest(): 1})
     cfg = ValidatorConfig(netuid=405, wallet_name="v", hotkey_name="h", state_dir=tmp_path,
                           reference_mode="sequential", references={m: FAKE.model_dump() for m in ("kev-4b", "kev-9b")})
     timings = seeded_timings(**{"kev-4b": (0.02, 0.0, 0.01), "kev-9b": (60.0, 1.0, 0.01)})  # kev-9b never fits
@@ -855,7 +855,8 @@ def test_an_epoch_checks_what_fits_takes_the_rest_from_the_source_and_sets_one_w
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=transport, **kw))
     monkeypatch.setattr(validator_main, "source_results", from_source)
     weights_set: list = []
-    monkeypatch.setattr(validator_main, "set_weights", lambda cfg, st, wallet, w: weights_set.append(w))
+    monkeypatch.setattr(validator_main, "set_weights",
+                        lambda cfg, st, wallet, w, mechid: weights_set.append(w) if mechid == 1 else None)
 
     def epoch(state: ScoreState, board: StatusBoard) -> None:
         asyncio.run(validator_main.run_epoch(cfg, st, SimpleNamespace(hotkey=validator), SECRET, state, 7, 1,

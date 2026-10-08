@@ -110,7 +110,7 @@ def _invalid(reason: str) -> RequestComparison:
 
 
 async def _canary(result: EndpointResult, request: dict[str, Any], reference: dict[str, dict[str, float]],
-                  keypair: Keypair, client: httpx.AsyncClient, netuid: int, mechid: int, timeout_s: float) -> None:
+                  keypair: Keypair, client: httpx.AsyncClient, netuid: int, timeout_s: float) -> None:
     """Send one canary and record its outcome. A request the endpoint declines (no 2xx reply within ``timeout_s``)
     costs availability; a reply whose receipt does not bind it, or whose answers are malformed, fails the request
     outright."""
@@ -143,7 +143,7 @@ async def _canary(result: EndpointResult, request: dict[str, Any], reference: di
         bound = (receipt.signature_valid() and receipt.binds(request, answers) and r_.miner_hotkey == ep.hotkey
                  and r_.endpoint_id == ep.endpoint.endpoint_id and r_.model_id == ep.endpoint.model_id
                  and r_.caller_hotkey == keypair.ss58_address and r_.request_nonce == headers[HDR_NONCE]
-                 and r_.netuid == netuid and r_.mechid == mechid)
+                 and r_.netuid == netuid)
         comparison = compare_request(reference, got, result.tolerance) if bound else None
     except Exception as e:  # anything a reply can make the parser or comparison raise fails the request
         result.errors.append(f"malformed reply: {type(e).__name__}")
@@ -157,7 +157,7 @@ async def _canary(result: EndpointResult, request: dict[str, Any], reference: di
 
 async def _audit_endpoint(result: EndpointResult, canaries: list[tuple[dict[str, Any], dict[str, dict[str, float]]]],
                           keypair: Keypair, client: httpx.AsyncClient, spread_s: float, rng: random.Random,
-                          holding: Callable[[], bool], netuid: int, mechid: int, identities: Identities, epoch: int,
+                          holding: Callable[[], bool], netuid: int, identities: Identities, epoch: int,
                           timeout_s: float) -> None:
     """Send the endpoint its canaries, each only while it has proven control at its URL this epoch."""
     ep = result.endpoint
@@ -175,7 +175,7 @@ async def _audit_endpoint(result: EndpointResult, canaries: list[tuple[dict[str,
             result.identity_ok = identities.verified(ep.key, ep.url, epoch)
             if not result.identity_ok:
                 continue
-        await _canary(result, request, reference, keypair, client, netuid, mechid, timeout_s)
+        await _canary(result, request, reference, keypair, client, netuid, timeout_s)
     if not result.identity_ok:
         result.errors.append("identity not proven at its URL")
 
@@ -190,7 +190,6 @@ async def audit_epoch(
     tolerances: dict[str, Tolerance],
     client: httpx.AsyncClient,
     netuid: int,
-    mechid: int,
     pool_size: int = 16,
     per_endpoint: int = 10,
     budget_s: float | None = None,
@@ -237,7 +236,7 @@ async def audit_epoch(
                              identity_ok=identities.verified(ep.key, ep.url, epoch))
         results[ep.key] = res
         tasks.append(_audit_endpoint(res, picked, keypair, client, spread_s, random.Random(rng.random()), holding,
-                                     netuid, mechid, identities, epoch, request_timeout_s))
+                                     netuid, identities, epoch, request_timeout_s))
     for res, outcome in zip(results.values(), await asyncio.gather(*tasks, return_exceptions=True)):
         if isinstance(outcome, BaseException):  # an aborted audit verifies nothing, so it fails
             log.error("audit of %s failed: %r", res.endpoint.key, outcome)

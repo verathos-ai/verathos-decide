@@ -121,7 +121,7 @@ def test_sampled_gateway_answers_prove_wrong_answers(tmp_path) -> None:
     assert set(json.loads(evidence.response)) == {"receipt"}
     assert all(r == ("{}", "") for r in auditor.store._query("SELECT request, response FROM samples"))
 
-    validator = Throughput(netuid=405, mechid=1, policy=AuditPolicy(), auditor_hotkey=auditor.hotkey,
+    validator = Throughput(netuid=405, policy=AuditPolicy(), auditor_hotkey=auditor.hotkey,
                            chain=auditor.chain)
     with_gateway = catalog.Catalog.parse({**catalog.load().document(), "gateways": [gateway.ss58_address]})
     reference = {"kev-4b": MockEngine("kev-4b")}
@@ -593,7 +593,7 @@ def test_a_discovery_that_finds_no_miner_keeps_the_endpoints_known(tmp_path) -> 
     auditor = _auditor(tmp_path)
     slot = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 20.0)
     auditor.update_slots([slot])
-    throughput = Throughput(netuid=405, mechid=1, policy=auditor.policy, auditor_hotkey=auditor.hotkey,
+    throughput = Throughput(netuid=405, policy=auditor.policy, auditor_hotkey=auditor.hotkey,
                             chain=auditor.chain, auditor=auditor)
     throughput.update_slots([], [Neuron(1, "hk", "1.2.3.4", 8091, "commitment")], 3)  # every fetch failed
     assert auditor._slots == [slot]
@@ -628,7 +628,7 @@ def test_served_verdicts_are_the_same_after_a_restart(tmp_path) -> None:
     first = auditor.verdicts(4)
     auditor.store.add_sample(sample_id="late", epoch=3, gateway="gw", hotkey="hk", endpoint_id="gpu0",
                              model_id="kev-4b", request_id="n", request={}, response="{}", proof=False)
-    restarted = Auditor(netuid=405, mechid=1, keypair=auditor.keypair, chain=auditor.chain, policy=auditor.policy,
+    restarted = Auditor(netuid=405, keypair=auditor.keypair, chain=auditor.chain, policy=auditor.policy,
                         catalog=catalog.load, references={}, db_path=tmp_path / "t.sqlite")
     restarted.follower.poll()
     assert restarted.verdicts(4).model_dump_json() == first.model_dump_json()

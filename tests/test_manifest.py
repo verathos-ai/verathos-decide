@@ -37,10 +37,9 @@ def make(keypair: Keypair, **overrides) -> Manifest:
     return Manifest(**fields)
 
 
-def check(document, keypair: Keypair, *, commitment: str, hotkey: str | None = None, mechid: int = 1,
-          catalogs=(CATALOG,)) -> Manifest:
-    return accept(document, hotkey=hotkey or keypair.ss58_address, netuid=405, mechid=mechid,
-                  commitment=commitment, catalog_digests=catalogs)
+def check(document, keypair: Keypair, *, commitment: str, hotkey: str | None = None, catalogs=None) -> Manifest:
+    return accept(document, hotkey=hotkey or keypair.ss58_address, netuid=405, commitment=commitment,
+                  catalogs={CATALOG: 1} if catalogs is None else catalogs)
 
 
 @pytest.fixture()
@@ -94,10 +93,26 @@ def test_rejects_other_hotkey_and_mechanism(keypair: Keypair) -> None:
     commitment = commitment_value(signed.manifest.digest())
     with pytest.raises(ManifestRejected, match="hotkey"):
         check(signed.model_dump(mode="json"), keypair, commitment=commitment, hotkey=other.ss58_address)
-    with pytest.raises(ManifestRejected, match="mechanism"):
-        check(signed.model_dump(mode="json"), keypair, commitment=commitment, mechid=2)
     with pytest.raises(ValueError):
         SignedManifest.create(make(keypair), other)
+
+
+def test_a_manifest_is_for_the_mechanism_of_the_catalog_it_is_built_for(keypair: Keypair) -> None:
+    """While validators accept the previous catalog too, each catalog's manifests are for its own mechanism."""
+    previous = "1" * 64
+    for catalog_digest, mechid in ((CATALOG, 0), (previous, 1)):
+        signed = SignedManifest.create(make(keypair, catalog_digest=catalog_digest, mechid=mechid), keypair)
+        assert check(signed.model_dump(mode="json"), keypair, commitment=commitment_value(signed.manifest.digest()),
+                     catalogs={CATALOG: 0, previous: 1}) == signed.manifest
+    for catalog_digest, mechid in ((CATALOG, 1), (previous, 0)):
+        signed = SignedManifest.create(make(keypair, catalog_digest=catalog_digest, mechid=mechid), keypair)
+        with pytest.raises(ManifestRejected, match=f"manifest is for mechanism {mechid}, not {1 - mechid}"):
+            check(signed.model_dump(mode="json"), keypair, commitment=commitment_value(signed.manifest.digest()),
+                  catalogs={CATALOG: 0, previous: 1})
+    signed = SignedManifest.create(make(keypair, catalog_digest="2" * 64), keypair)
+    with pytest.raises(ManifestRejected, match="another catalog"):
+        check(signed.model_dump(mode="json"), keypair, commitment=commitment_value(signed.manifest.digest()),
+              catalogs={CATALOG: 1, previous: 1})
 
 
 def test_endpoints_may_be_on_several_machines(keypair: Keypair) -> None:
@@ -155,8 +170,8 @@ def test_accepts_previous_catalog_during_transition(keypair: Keypair) -> None:
     signed = SignedManifest.create(make(keypair), keypair)
     commitment = commitment_value(signed.manifest.digest())
     with pytest.raises(ManifestRejected, match="another catalog"):
-        check(signed.model_dump(mode="json"), keypair, commitment=commitment, catalogs=("1" * 64,))
-    assert check(signed.model_dump(mode="json"), keypair, commitment=commitment, catalogs=("1" * 64, CATALOG))
+        check(signed.model_dump(mode="json"), keypair, commitment=commitment, catalogs={"1" * 64: 1})
+    assert check(signed.model_dump(mode="json"), keypair, commitment=commitment, catalogs={"1" * 64: 1, CATALOG: 1})
 
 
 def test_ipv6_public_hosts_are_normalised_as_the_chain_returns_them() -> None:

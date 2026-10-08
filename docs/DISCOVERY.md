@@ -33,8 +33,9 @@ Miners and the model catalog are discovered from native chain state only. No EVM
 
 Rules:
 - Only hotkeys with a manifest commitment and an axon on a public address are contacted.
-- A manifest is accepted only if it is signed by the hotkey that owns the axon, is for this netuid and mechanism,
-  its digest equals that hotkey's current commitment, and every endpoint URL is exactly
+- A manifest is accepted only if it is signed by the hotkey that owns the axon, is for this netuid, is built for the
+  committed catalog (or, for one epoch after a change, the previous one) and for that catalog's mechanism, its digest
+  equals that hotkey's current commitment, and every endpoint URL is exactly
   `http://<ip>:<port>/e/<endpoint_id>`: the IP a public unicast address written as the chain writes axons (not
   private, shared, loopback, link-local, multicast, reserved, unspecified or documentation, and not an IPv6 form of
   an IPv4 address), the port 1-65535, nothing else. The host is the axon or any other machine of the miner. A

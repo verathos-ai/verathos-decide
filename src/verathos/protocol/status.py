@@ -88,6 +88,7 @@ class NetworkStatus(BaseModel):
     # the share of the mechanism's miner emission the miners' weights sum to; the subnet owner's UID has the rest.
     # None from a validator of an older release.
     miner_share: float | None = None
+    mechanism: int | None = None  # the mechanism the weights are set on; None from a validator of an older release
     # per UID, exactly the weights the validator set after the epoch (in a dry run, would have set); a UID absent gets
     # none. None from a validator of an older release.
     weights: dict[int, float] | None = None

@@ -3,7 +3,8 @@
 The catalog is a JSON document. The subnet owner commits its digest on chain; miners and validators use the catalog
 whose digest equals the owner's current commitment, whatever its source: the copy shipped with the code, a local
 cache, the owner's axon, or a mirror. A new catalog therefore takes effect without a code release. The digest covers
-the JSON document as published, so nodes whose code knows fewer fields still agree on it.
+the JSON document as published, so nodes whose code knows fewer fields still agree on it. The catalog also names the
+subnet mechanism the network runs on: miners publish their manifests for it and validators set weights on it.
 
 Only ``active`` models are scored. ``candidate`` models may be served and checked on the network but are not scored;
 ``retired`` models are ignored.
@@ -34,6 +35,7 @@ CATALOG_PATH = "/v1/catalog/{digest}"
 DEFAULT_CACHE_DIR = Path("~/.verathos/catalog")
 MAX_CATALOG_BYTES = 1 << 20
 SHARE_DIGITS = 6  # decimals of the miners' share an epoch's weights are formed with
+DEFAULT_MECHANISM = 1  # of a catalog that names none
 
 
 class Engine(BaseModel):
@@ -138,6 +140,8 @@ class Scoring(BaseModel):
 class Catalog(BaseModel):
     version: Literal[1] = 1
     revision: str
+    mechanism: int = Field(DEFAULT_MECHANISM, ge=0, description="The subnet mechanism the network runs on: miners "
+                           "publish their manifests for it, validators set weights on it")
     epoch_blocks: int = Field(180, ge=50, description="Length of the subnet's scoring epoch in blocks; validators "
                               "score, set weights and evaluate capacity evidence once per epoch")
     models: list[CatalogModel]
@@ -214,6 +218,12 @@ class Catalog(BaseModel):
 
     def get(self, model_id: str) -> CatalogModel | None:
         return next((m for m in self.models if m.model_id == model_id), None)
+
+
+def mechanism_of(cat: Catalog, override: int | None = None) -> int:
+    """The mechanism a node works on under ``cat``: ``override`` (its configuration's ``mechid``) if set, else the
+    catalog's."""
+    return cat.mechanism if override is None else override
 
 
 def is_ss58(value: str) -> bool:

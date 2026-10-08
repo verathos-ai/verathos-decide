@@ -97,11 +97,12 @@ class StatusBoard:
 
     def publish(self, by_hotkey: dict[str, HotkeyStatus], *, epoch: int | None = None, epoch_blocks: int | None = None,
                 model_shares: dict[str, float] | None = None, weights: dict[int, float] | None = None,
-                miner_share: float | None = None) -> None:
+                miner_share: float | None = None, mechanism: int | None = None) -> None:
         """Replace the status with ``by_hotkey``. The network's document also states ``weights`` (per UID, as set)
-        and the epoch, its length, the emission shares and the miner share (by default the first hotkey's)."""
+        and the ``mechanism`` they are set on, and the epoch, its length, the emission shares and the miner share (by
+        default the first hotkey's)."""
         network = _network(by_hotkey, epoch=epoch, epoch_blocks=epoch_blocks, model_shares=model_shares,
-                           weights=weights, miner_share=miner_share).model_dump_json().encode()
+                           weights=weights, miner_share=miner_share, mechanism=mechanism).model_dump_json().encode()
         with self._lock:
             self._by_hotkey, self._network = by_hotkey, network
             self.revision += 1

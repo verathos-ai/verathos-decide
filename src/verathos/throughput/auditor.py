@@ -815,13 +815,13 @@ def credit(tested_rps: float, delivered_rps: float, policy: AuditPolicy, asked_r
 
 
 class Auditor:
-    def __init__(self, *, netuid: int, mechid: int, keypair: Keypair, chain: SubtensorChainView,
+    def __init__(self, *, netuid: int, keypair: Keypair, chain: SubtensorChainView,
                  policy: AuditPolicy, catalog: Callable[[], catalog_module.Catalog],
                  references: dict[str, ReferenceEngine], db_path: Path, runner: Runner = loadgen.run,
                  screens: dict[str, ReferenceEngine] | None = None) -> None:
         """``references`` recompute answers in fp32; a model with an entry in ``screens`` is screened there first
         (bf16), and the fp32 reference only confirms what the screen flags."""
-        self.netuid, self.mechid, self.keypair, self.chain = netuid, mechid, keypair, chain
+        self.netuid, self.keypair, self.chain = netuid, keypair, chain
         self.hotkey = keypair.ss58_address
         self.policy, self.catalog, self.runner = policy, catalog, runner
         self.reference_specs, self.screen_specs = references, screens or {}
@@ -1073,8 +1073,7 @@ class Auditor:
             response = parse_response(sample.response)
             answers = None if response is None else signed_answers(
                 response, sample.request, request_id=sample.request_id, hotkey=slot.hotkey,
-                endpoint_id=slot.endpoint_id, model_id=slot.model_id, callers={self.hotkey}, netuid=self.netuid,
-                mechid=self.mechid)
+                endpoint_id=slot.endpoint_id, model_id=slot.model_id, callers={self.hotkey}, netuid=self.netuid)
             if answers is not None:
                 signed.append((sample, answers))
         valid, evidence, drift_sum, drift_count = len(signed), None, 0.0, 0
@@ -1170,7 +1169,7 @@ class Auditor:
                 continue
             answers = signed_answers(response, s.request, request_id=nonce, hotkey=s.hotkey,
                                      endpoint_id=s.endpoint_id, model_id=s.model_id, callers={gateway},
-                                     netuid=self.netuid, mechid=self.mechid)
+                                     netuid=self.netuid)
             if answers is None:
                 continue
             if in_mix_form(s.request.get("state")) or canary_like(s.request.get("state")):

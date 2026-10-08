@@ -13,7 +13,7 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import bittensor as bt
@@ -51,11 +51,9 @@ def slots(miners: list[DiscoveredMiner]) -> list[Slot]:
 
 
 class Throughput:
-    def __init__(self, *, netuid: int, mechid: int, policy: AuditPolicy, auditor_hotkey: str,
-                 chain: SubtensorChainView, auditor: Auditor | None = None,
-                 follower: ScheduleFollower | None = None) -> None:
-        self.netuid, self.mechid, self.policy, self.auditor_hotkey, self.chain = (netuid, mechid, policy,
-                                                                                  auditor_hotkey, chain)
+    def __init__(self, *, netuid: int, policy: AuditPolicy, auditor_hotkey: str, chain: SubtensorChainView,
+                 auditor: Auditor | None = None, follower: ScheduleFollower | None = None) -> None:
+        self.netuid, self.policy, self.auditor_hotkey, self.chain = netuid, policy, auditor_hotkey, chain
         self.auditor, self.follower = auditor, follower
         # what the validator knows of the miners, shared by its canary audit and the auditor's refresh
         self.identities = Identities()
@@ -63,7 +61,7 @@ class Throughput:
         self._last: feed.Verdicts | None = None
 
     @classmethod
-    def start(cls, *, network: str, netuid: int, mechid: int, current: Callable[[], catalog.Catalog],
+    def start(cls, *, network: str, netuid: int, current: Callable[[], catalog.Catalog],
               st: bt.Subtensor, wallet: bt.Wallet, references: dict[str, ReferenceEngine],
               screens: dict[str, ReferenceEngine], state_dir: Path) -> Throughput:
         """The auditor role if this validator's hotkey is the subnet owner's, else a schedule follower."""
@@ -74,15 +72,13 @@ class Throughput:
             follower = ScheduleFollower(chain, policy)
             follower.start()
             log.info("throughput tests are run by %s; applying its verdicts", auditor_hotkey)
-            return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
-                       follower=follower)
-        auditor = Auditor(netuid=netuid, mechid=mechid, keypair=wallet.hotkey, chain=chain, policy=policy,
+            return cls(netuid=netuid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain, follower=follower)
+        auditor = Auditor(netuid=netuid, keypair=wallet.hotkey, chain=chain, policy=policy,
                           catalog=current, references=references, screens=screens,
                           db_path=state_dir / "throughput.sqlite")
         auditor.start()
         log.info("throughput auditor running (%s mode)", policy.mode)
-        return cls(netuid=netuid, mechid=mechid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain,
-                   auditor=auditor)
+        return cls(netuid=netuid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain, auditor=auditor)
 
     def set_policy(self, policy: AuditPolicy) -> None:
         """Adopt the policy of a newly committed catalog."""
@@ -96,10 +92,10 @@ class Throughput:
 
     # ---- the auditor's endpoints ----
 
-    def start_slot_refresh(self, network: str, catalog_digests: Callable[[], Collection[str]],
+    def start_slot_refresh(self, network: str, catalogs: Callable[[], Mapping[str, int]],
                            interval_s: float = SLOT_REFRESH_S) -> None:
         """Re-discover miners every ``interval_s`` so new or changed endpoints are tested within minutes rather than
-        from the next epoch (auditor only)."""
+        from the next epoch (auditor only); ``catalogs`` as ``discover`` takes them."""
         if self.auditor is None:
             return
 
@@ -109,23 +105,23 @@ class Throughput:
                 try:
                     neurons, _ = validator_chain.snapshot(st, self.netuid)
                     epoch = st.get_current_block() // self.policy.epoch_blocks
-                    self.update_slots(asyncio.run(self._refresh(neurons, catalog_digests(), epoch)), neurons, epoch)
+                    self.update_slots(asyncio.run(self._refresh(neurons, catalogs(), epoch)), neurons, epoch)
                 except Exception:
                     log.exception("throughput slot refresh failed")
                 time.sleep(interval_s)
 
         threading.Thread(target=run, name="throughput-slots", daemon=True).start()
 
-    async def _refresh(self, neurons: list[Neuron], catalog_digests: Collection[str],
+    async def _refresh(self, neurons: list[Neuron], catalogs: Mapping[str, int],
                        epoch: int) -> list[DiscoveredMiner]:
         async with httpx.AsyncClient() as client:
-            return await self.refresh(neurons, catalog_digests, epoch, client)
+            return await self.refresh(neurons, catalogs, epoch, client)
 
-    async def refresh(self, neurons: list[Neuron], catalog_digests: Collection[str], epoch: int,
+    async def refresh(self, neurons: list[Neuron], catalogs: Mapping[str, int], epoch: int,
                       client: httpx.AsyncClient) -> list[DiscoveredMiner]:
         """Discover the miners, and challenge the endpoints a test would target that were not challenged at their URL
         this epoch yet (auditor only): the epoch's canary audit tries again, within the miners' request budget."""
-        miners = await discover(neurons, self.netuid, self.mechid, client, catalog_digests, self.manifests)
+        miners = await discover(neurons, self.netuid, client, catalogs, self.manifests)
         await self.identities.verify([e for m in miners for e in m.endpoints() if testable(e.endpoint)], epoch,
                                      self.auditor.keypair, client, retry=False)
         return miners
@@ -192,7 +188,7 @@ class Throughput:
             if e.from_gateway:
                 receipt = None if response is None or model is None else issued_receipt(
                     response.get("receipt"), request_id=e.request_id, hotkey=e.hotkey, endpoint_id=e.endpoint_id,
-                    model_id=e.model_id, callers=set(cat.gateways), netuid=self.netuid, mechid=self.mechid)
+                    model_id=e.model_id, callers=set(cat.gateways), netuid=self.netuid)
                 if receipt is None:
                     log.warning("evidence against %s/%s rejected: no receipt issued to a gateway", e.hotkey,
                                 e.endpoint_id)
@@ -201,7 +197,7 @@ class Throughput:
                 continue
             answers = None if response is None else signed_answers(
                 response, e.request, request_id=e.request_id, hotkey=e.hotkey, endpoint_id=e.endpoint_id,
-                model_id=e.model_id, callers={self.auditor_hotkey}, netuid=self.netuid, mechid=self.mechid)
+                model_id=e.model_id, callers={self.auditor_hotkey}, netuid=self.netuid)
             if answers is None or model is None:
                 log.warning("evidence against %s/%s rejected: %s", e.hotkey, e.endpoint_id,
                             "unknown model" if model is None else "the receipt does not bind it")
