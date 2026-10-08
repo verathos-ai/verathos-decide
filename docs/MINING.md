@@ -396,8 +396,17 @@ endpoint gpu0 (kev-9b): 12.0 requests/s at concurrency 32 (runs 12.1, 11.9, 12.0
 The new declaration is published as any other (on a worker, the primary takes it from `GET /v1/endpoints`). The cap
 is kept across restarts and holds until the miner measures for another reason: an engine, an endpoint's
 configuration or the request mix changed, or the miner started with `--remeasure`, which is how to raise the
-declaration again once what slowed the endpoint is fixed. A further shortfall can only lower it. An endpoint makes the
-miner measure again at most once every 3 epochs, and never twice for the same tests.
+declaration again once what slowed the endpoint is fixed. A further shortfall can only lower it.
+
+If the endpoint delivered less than half the rate tested in both tests, it was as good as down then (stopped, or
+unreachable), which says nothing of what it serves when up. The miner measures again all the same, which shows whether
+it recovered, but those tests set no cap; a cap set earlier holds:
+
+```
+gpu0 delivered 0.3 and 0.0 of 11.4 in tests 45417 and 45418, as if it was down: measuring again without a cap
+```
+
+An endpoint makes the miner measure again at most once every 3 epochs, and never twice for the same tests.
 
 ## Updating
 

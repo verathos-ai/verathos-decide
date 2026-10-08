@@ -22,7 +22,7 @@ from verathos.miner import status as miner_status
 from verathos.miner.app import create_app
 from verathos.miner.config import MinerConfig
 from verathos.miner.peers import Peers, merged
-from verathos.miner.shortfall import COOLDOWN_EPOCHS, Shortfalls
+from verathos.miner.shortfall import COOLDOWN_EPOCHS, OUTAGE_SHARE, Shortfalls
 from verathos.miner.status import StatusWatcher
 from verathos.protocol.manifest import Endpoint
 from verathos.protocol.receipts import SignedReceipt
@@ -104,6 +104,42 @@ def test_an_endpoint_is_measured_again_at_most_once_per_cooldown_and_never_twice
 
     path.write_text("not json")
     assert Shortfalls(path).cap("gpu0") is None  # a damaged file caps nothing
+
+
+def test_tests_in_which_the_endpoint_was_as_good_as_down_set_no_cap_but_start_the_cooldown(tmp_path) -> None:
+    shortfalls = Shortfalls(tmp_path / "shortfalls.json")
+    declared = {"gpu0": 11.4}
+    half = OUTAGE_SHARE * 11.4
+
+    def due(*delivered: float, tested: tuple[float | None, ...] = (None, None), first: int = 45417):
+        """The shortfall of two tests at the declared rate, tested at it unless ``tested``."""
+        [s] = shortfalls.due([outcome(first + i, delivered=d, rate=declared["gpu0"], tested=t)
+                              for i, (d, t) in enumerate(zip(delivered, tested))], declared)
+        return s
+
+    outage = due(0.3, 0.0)
+    assert outage.outage and outage.cap_rps is None
+    assert outage.line() == ("gpu0 delivered 0.3 and 0.0 of 11.4 in tests 45417 and 45418, as if it was down: "
+                             "measuring again without a cap")
+    slowdown = due(10.5, 10.4)
+    assert not slowdown.outage and slowdown.cap_rps == 10.5 and "fell short" in slowdown.line()
+    assert due(half, 0.0).cap_rps == half  # at the share: a slowdown, capped at what it delivered
+    assert due(half - 0.01, 0.0).cap_rps is None  # below it in both tests: an outage
+    assert due(half - 0.01, 6.0).cap_rps == 6.0  # one test at half or more: a slowdown
+    assert due(5.0, 5.0, tested=(9.0, 11.4)).cap_rps == 5.0  # each test against its own tested rate
+    assert due(4.0, 5.0, tested=(9.0, 11.4)).cap_rps is None
+
+    shortfalls.record([due(10.5, 10.4)])
+    assert shortfalls.cap("gpu0").rps == 10.5
+    declared["gpu0"] = 10.5
+    shortfalls.record([due(0.3, 0.0, first=45421)])  # an outage keeps the earlier cap
+    assert (shortfalls.cap("gpu0").rps, shortfalls.cap("gpu0").epochs) == (10.5, (45417, 45418))
+    restarted = Shortfalls(tmp_path / "shortfalls.json")
+    assert restarted.cap("gpu0").epochs == (45417, 45418)
+    down_again = [outcome(45421, delivered=0.3, rate=10.5), outcome(45422, delivered=0.0, rate=10.5),
+                  outcome(45423, delivered=0.0, rate=10.5), outcome(45424, delivered=0.0, rate=10.5)]
+    assert restarted.due(down_again, declared) == []  # cooldown: not before epoch 45425
+    assert restarted.due(down_again + [outcome(45425, delivered=0.0, rate=10.5)], declared)[0].outage
 
 
 def publisher_with(tmp_path, rps: dict[str, float], *, role: str = "primary", host: str = "203.0.113.5",
@@ -189,6 +225,25 @@ def test_a_measurement_a_test_interrupts_is_tried_again(tmp_path) -> None:
     assert publisher.shortfalls.cap("gpu0") is None and declared(publisher) == {"gpu0": 11.4}
     publisher._measure = measuring
     assert publisher.measure_shortfalls() and declared(publisher) == {"gpu0": 10.5}
+
+
+def test_an_endpoint_that_was_down_in_both_tests_is_measured_again_without_a_cap(tmp_path, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="verathos.miner")
+    rps = {"gpu0": 12.0}
+    publisher, calls = publisher_with(tmp_path, rps)
+    assert publisher.adopt(CATALOG)
+    rps["gpu0"] = 11.0  # back up, a little slower than before
+    publisher.note_tests([outcome(45417, delivered=0.3), outcome(45418, delivered=0.0)])
+    assert publisher.measure_shortfalls() and calls[-1] is True
+    assert declared(publisher) == {"gpu0": 10.45} and publisher.shortfalls.cap("gpu0") is None
+    messages = [r.getMessage() for r in caplog.records]
+    assert ("gpu0 delivered 0.3 and 0.0 of 11.4 in tests 45417 and 45418, as if it was down: measuring again without "
+            "a cap") in messages
+    assert any(m.startswith("endpoint gpu0 (kev-4b): 11.0 requests/s") and m.endswith("declares 10.4")
+               for m in messages), messages
+    count = len(calls)
+    publisher.note_tests([outcome(45417, delivered=0.3, rate=10.45), outcome(45418, delivered=0.0, rate=10.45)])
+    assert not publisher.measure_shortfalls() and len(calls) == count  # never twice for the same tests
 
 
 def test_a_changed_declaration_is_published_by_the_primary_and_served_by_a_worker(tmp_path, monkeypatch,

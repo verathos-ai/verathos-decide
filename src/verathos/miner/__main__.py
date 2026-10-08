@@ -227,8 +227,8 @@ class Publisher:
         """Measure the endpoints ``cat`` serves (or reuse their stored measurements) through the running service and
         sign what this machine serves, and on the primary the manifest. A measurement neither starts nor continues
         while the auditor's test traffic arrives. Measured for ``shortfalls``, their tests cap those endpoints'
-        declarations; measured for any other reason, the caps are released. False if none could be measured or the
-        measurement stepped aside (``interrupted``); what is served stays."""
+        declarations unless they show an outage; measured for any other reason, the caps are released. False if none
+        could be measured or the measurement stepped aside (``interrupted``); what is served stays."""
         endpoints = servable(self.config, cat)
         if not endpoints:
             log.error("no configured endpoint serves a model of catalog %s", cat.digest()[:12])

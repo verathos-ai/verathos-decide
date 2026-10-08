@@ -57,8 +57,10 @@ not void) were both `partial` with less delivered than the rate tested, at the r
 measures again (all its endpoints in the same rounds, as above) and declares at most the higher rate the endpoint
 delivered in those two tests. The cap is kept across restarts and holds until the miner measures for another reason
 (a fingerprint changed, or `--remeasure`); a further shortfall can only lower it, so a declaration falls only on the
-tests' evidence and rises only on a measurement they did not cause. An endpoint makes the miner measure again this
-way at most once every 3 epochs, never twice for the same test.
+tests' evidence and rises only on a measurement they did not cause. Tests in which the endpoint delivered less than
+half the rate tested, both of them, show an outage rather than its capacity: the miner measures again but sets no cap
+from them. An endpoint makes the miner measure again this way at most once every 3 epochs, never twice for the same
+test.
 
 The miner never sends an engine more requests at once than its knee concurrency; further requests wait in the
 miner (up to four per engine slot).
