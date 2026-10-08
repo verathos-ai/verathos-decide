@@ -616,6 +616,15 @@ def test_an_endpoint_that_refuses_users_or_keeps_them_waiting_is_reported() -> N
     assert considered(fast) == (0, 0)  # full at speed: neither way
     for _ in range(f.cap):
         router.finished(f, Outcome.ANSWERED, 0.1)
+    router.started(f)
+    router.finished(f, Outcome.ANSWERED, 2.5)  # beyond the bound, though within twice it
+    assert considered(fast)[1] == 0  # not full: ready
+    for _ in range(f.cap):
+        router.started(f)
+    offers, late = considered(fast)
+    assert offers == late > 0  # full and late: it serves less than its capacity at the bound
+    for _ in range(f.cap):
+        router.finished(f, Outcome.ANSWERED, 0.1)
     # requests that are not user traffic are not reported
     snapshot = dict(observer.offers), dict(observer.refusals)
     for _ in range(20):
@@ -624,7 +633,7 @@ def test_an_endpoint_that_refuses_users_or_keeps_them_waiting_is_reported() -> N
     router.finished(f, Outcome.FAILED, 0.1, observe=False)
     router.penalize(f, observe=False)
     assert (observer.offers, observer.refusals) == snapshot
-    assert observer.refusals.get(fast, 0) == 0
+    assert observer.refusals.get(fast, 0) == late  # held against it only while full and late
 
 
 def test_gcra_allows_the_burst_then_the_rate() -> None:

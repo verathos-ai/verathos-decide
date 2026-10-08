@@ -12,8 +12,9 @@ is busy gets no requests for ``BUSY_S``. A slow endpoint gets fewer: its request
 The router tells an observer (the served counter) each time it considers an endpoint for a user request (draws it)
 and whether it was ready then: not busy, not behind an open breaker, and not slow (its latest answer within
 ``SLOW_FACTOR`` times the latency bound it declared its capacity at); and each request the endpoint answered busy or
-failed. Being drawn while full at speed is neither. What users get from an endpoint between tests is scored from that:
-the share of the times it was considered that it was ready.
+failed. Being drawn while full is neither, as long as its latest answer came within the latency bound: full beyond
+it, the endpoint serves less than its capacity at the bound, so it was not ready. What users get from an endpoint
+between tests is scored from that: the share of the times it was considered that it was ready.
 """
 
 from __future__ import annotations
@@ -92,6 +93,7 @@ class Endpoint:
     in_flight: int = 0
     busy_until: float = 0.0  # it refused work: no requests until then
     slow: bool = False  # its latest answer took more than SLOW_FACTOR x max_latency_s
+    latest_s: float = 0.0  # how long its latest answer took
     last_failure: str = ""  # how its latest failed attempt failed (kind and status or exception class, no content)
 
     @property
@@ -188,10 +190,11 @@ class Router:
         drawn: set[int] = set()
         for _ in range(DRAWS):
             e = pool.draw(self.rng)
+            late = e.in_flight >= e.cap and e.latest_s > self.max_latency_s  # full, and beyond the bound
             if observe and self.observer is not None and id(e) not in drawn and e.route.hotkey not in exclude and (
-                    e.in_flight < e.cap or e.slow):
+                    e.in_flight < e.cap or e.slow or late):
                 drawn.add(id(e))
-                ready = e.busy_until <= now and e.breaker.allows(now) and not e.slow
+                ready = e.busy_until <= now and e.breaker.allows(now) and not e.slow and not late
                 self.observer.offered(e.route, refused=not ready)
             if usable(e) and e not in picks:
                 picks.append(e)
@@ -228,6 +231,8 @@ class Router:
         slow = seconds is not None and seconds >= SLOW_FACTOR * self.max_latency_s
         if outcome is Outcome.ANSWERED or slow:  # a timeout at the attempt's limit is slow too
             endpoint.slow = slow
+        if outcome is Outcome.ANSWERED and seconds is not None:
+            endpoint.latest_s = seconds
         if outcome is Outcome.ANSWERED:
             self._breaker(endpoint, endpoint.breaker.succeeded)
         elif outcome is Outcome.FAILED:

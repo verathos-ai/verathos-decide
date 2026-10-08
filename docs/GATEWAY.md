@@ -68,9 +68,10 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
    often it was not ready then (busy, behind an open breaker, or its latest answer or timed-out attempt took at least
    twice the latency bound it declared its capacity at, `max_latency_s`, 2 s) or refused the request (answered busy
    or failed, refused a request another miner answered, or refused one alone). An answer counts in the second its
-   request was sent. Drawn while full at speed counts neither way. Requests that are not user traffic (admin
-   requests not counted) are left out. The auditor publishes each endpoint's tally with its credit, and validators
-   score it (`SCORING.md`).
+   request was sent. Drawn while full counts neither way while its latest answer came within `max_latency_s`; full
+   beyond it, it serves less than its capacity at the bound, so it was not ready. Requests that are not user traffic
+   (admin requests not counted) are left out. The auditor publishes each endpoint's tally with its credit, and
+   validators score it (`SCORING.md`).
 
 ## Answer checks
 
