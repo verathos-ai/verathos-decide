@@ -128,7 +128,7 @@ plan says so and how to switch:
 ```
 the network in the auditor's epoch 45412: kev-4b 33.3% of the emission, 300.0 requests/s proven; kev-9b 33.3% of the emission, 220.0 requests/s proven; clef-flash 33.3% of the emission, 400.0 requests/s proven; the median endpoint 14.6 requests/s at relative speed 1
 GPU 0 (NVIDIA A100 80GB PCIe, 80 GiB): kev-4b, endpoint gpu0, engine on 127.0.0.1:8008
-GPU 0: kev-4b, as set up before: about 1.48% of the emission (its share 33.3%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 1.70%, clef-flash 1.44%. kev-9b would pay about 1.15x as much on GPU 0: --model kev-9b to switch
+GPU 0: kev-4b, as set up before: about 1.48% of the emission (its share 33.3%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 1.70%, clef-flash 0.73%. kev-9b would pay about 1.15x as much on GPU 0: --model kev-9b to switch
 another choice: --model <id> for every GPU, or one per GPU in order, as in --model kev-9b
 ```
 
