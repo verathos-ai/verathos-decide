@@ -43,8 +43,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--public-ip", help="Public IP address validators reach the miner at (default: detected)")
     p.add_argument("--port", type=int, help=f"Public TCP port of the miner (default {DEFAULT_PORT})")
     p.add_argument("--gpus", help="GPUs to serve on, comma-separated nvidia-smi indices (default: all)")
-    p.add_argument("--model", help="Model for every GPU, or one per GPU comma-separated (default: the first active "
-                   "catalog model that fits)")
+    p.add_argument("--model", help="Model for every GPU, or one per GPU in order, comma-separated (default: the first "
+                   "active catalog model that fits; candidate models are served only when named here)")
     p.add_argument("--no-publish", action="store_true", help="Test the machine: the miner uses the shipped catalog "
                    "and writes nothing on chain, so the hotkey need not be registered")
     p.add_argument("--worker", action="store_true", help="This machine serves its GPUs for the hotkey's primary "
@@ -120,10 +120,10 @@ def select_gpus(gpus: list[host.Gpu], value: str | None) -> list[host.Gpu]:
 
 
 def choose_models(ui: Prompter, gpus: list[host.Gpu], offered: list[str], need: dict[str, int], requested: list[str],
-                  previous: dict[int, str]) -> dict[int, str]:
+                  previous: dict[int, str], scored: set[str]) -> dict[int, str]:
     """The model per GPU: the defaults (or ``requested``), asked once per kind of GPU on a terminal."""
     try:
-        chosen = plan.choose_models(gpus, offered, need, requested, previous)
+        chosen = plan.choose_models(gpus, offered, need, requested, previous, scored)
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
     if requested or not ui.interactive:
@@ -204,19 +204,22 @@ def init(argv: list[str]) -> None:
              f"{MIN_DRIVER_CUDA[1]} or newer: update the driver")
     for g in gpus:
         info(g.describe())
-    active = plan.servable_models(cat)
-    models = {m.model_id: m for m in active if plan.installable(m)}
-    for m in active:
+    served = plan.servable_models(cat)
+    models = {m.model_id: m for m in served if plan.installable(m)}
+    for m in served:
         if m.model_id not in models:
             info(f"{m.model_id} runs on the {m.engine.name} engine, which this setup does not install")
     if not models:
-        raise SystemExit("no active catalog model this setup can install")
+        raise SystemExit("no catalog model this setup can install")
+    scored = {m for m in models if models[m].status == "active"}
     try:
         need = {m: plan.miner_memory(engines.parameters(models[m]), models[m].engine.name) for m in models}
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
+    info(plan.offer_line(list(models), need, scored))
     previous = {e["gpu"]: e["model"] for e in record.engines.values()}
-    chosen = choose_models(ui, gpus, list(models), need, plan.parse_models(args.model), previous)
+    requested = plan.parse_models(args.model)
+    chosen = choose_models(ui, gpus, list(models), need, requested, previous, scored)
 
     step("Network")
     role = choose_role(ui, args, existing)
@@ -248,6 +251,8 @@ def init(argv: list[str]) -> None:
     for g in gpus:
         info(f"{g.describe()}: {chosen[g.index]}, endpoint {endpoint_ids[g.index]}, engine on "
              f"127.0.0.1:{engine_ports[endpoint_ids[g.index]]}")
+    for line in plan.choice_lines(gpus, chosen, list(models), need, scored, requested, previous):
+        info(line)
     info(f"miner at {public_ip}:{port} with hotkey {wallet_name}/{hotkey_name}, "
          + ("a worker: its primary lists its endpoints" if role == "worker" else "the primary")
          + (" (testing: nothing written on chain)" if args.no_publish else ""))

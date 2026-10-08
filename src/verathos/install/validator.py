@@ -1,7 +1,8 @@
 """``verathos-validator init``: set up this machine as a validator.
 
-A float32 reference engine for every active catalog model, on a GPU where one has room and in RAM otherwise, and the
-validator, all as system services. The setup shows the validator's first epoch start, and how to follow it.
+A float32 reference engine for every active catalog model (and, with ``--candidates``, for every candidate model that
+fits in the memory left), on a GPU where one has room and in RAM otherwise, and the validator, all as system services.
+The setup shows the validator's first epoch start, and how to follow it.
 """
 
 from __future__ import annotations
@@ -38,6 +39,9 @@ def parser() -> argparse.ArgumentParser:
                    "(gpu)")
     p.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=None, help="Compute weights without "
                    "setting them (kept until --no-dry-run)")
+    p.add_argument("--candidates", action=argparse.BooleanOptionalAction, default=None, help="Also run references for "
+                   "the catalog's candidate models (checked, scored zero) where memory is left after the active ones; "
+                   "a later run keeps them, --no-candidates removes them")
     p.add_argument("--config", type=Path, help="Validator configuration (default <home>/validator.json)")
     return p
 
@@ -104,21 +108,25 @@ def init(argv: list[str]) -> None:
     info(f"catalog {cat.revision} ({cat.digest()[:12]})")
 
     step("References")
-    active = plan.servable_models(cat)
-    for m in active:
-        if not plan.installable(m):
+    served = plan.servable_models(cat)
+    for m in served:
+        if m.status == "active" and not plan.installable(m):
             raise SystemExit(f"{m.model_id} is active and runs on the {m.engine.name} engine, which this setup does "
                              "not install; set up its reference by hand (docs/VALIDATING.md)")
-    models = {m.model_id: m for m in active}
+    candidates = sorted(m.model_id for m in served if m.status == "candidate")
+    with_candidates = args.candidates if args.candidates is not None else any(m in record.engines for m in candidates)
+    models = {m.model_id: m for m in served
+              if m.status == "active" or (with_candidates and plan.installable(m))}
     try:
         parameters = {m: engines.parameters(models[m]) for m in models}
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
     stale = [m for m in record.engines if m not in models]
     if stale and manager is not None:
-        # Their memory is free for the active models' references.
+        # Their memory is free for the other references.
         manager.remove([service_name(m) for m in stale])
-        info(f"removed the references of {', '.join(stale)}, which the catalog no longer lists as active")
+        info(f"removed the references of {', '.join(stale)}, which this setup no longer runs (not an active model"
+             + (", nor a candidate)" if with_candidates else "; candidates only with --candidates)"))
         record.engines = {m: e for m, e in record.engines.items() if m in models}
         record.services = [s for s in record.services if s not in {service_name(m) for m in stale}]
         record.save(home)
@@ -129,17 +137,31 @@ def init(argv: list[str]) -> None:
     keep = {m: e["device"] for m, e in record.engines.items()}
     try:
         placement = plan.place_references(parameters, {g.index: g.memory_free for g in gpus}, ram_free, args.device,
-                                          keep)
+                                          keep, optional=candidates)
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
+    left_out = [m for m in models if m not in placement]
+    models = {m: model for m, model in models.items() if m in placement}
     ports = plan.pick_ports(list(models), {m: e["port"] for m, e in record.engines.items()}, REFERENCE_PORT,
                             lambda p: host.port_free(p, "127.0.0.1"))
 
     step("Plan")
     for m in models:
         need = plan.reference_memory(parameters[m], "cpu" if placement[m] == "cpu" else "gpu")
-        info(f"{m}: float32 reference on {describe(placement[m])} (about {need / host.GiB:.0f} GiB), "
-             f"127.0.0.1:{ports[m]}")
+        info(f"{m}{' (' + plan.CANDIDATE + ')' if m in candidates else ''}: float32 reference on "
+             f"{describe(placement[m])} (about {need / host.GiB:.0f} GiB), 127.0.0.1:{ports[m]}")
+    for m in left_out:
+        info(f"{m} ({plan.CANDIDATE}): no reference, not enough memory left (it needs about "
+             f"{plan.reference_memory(parameters[m], 'cpu') / host.GiB:.0f} GiB of RAM or "
+             f"{plan.reference_memory(parameters[m], 'gpu') / host.GiB:.0f} GiB on a GPU); this validator does not "
+             "check its endpoints")
+    if candidates and not with_candidates:
+        info(f"not checked by this validator: {', '.join(candidates)} ({plan.CANDIDATE}); --candidates runs "
+             "their references too, where memory is left")
+    for m in served:
+        if with_candidates and m.status == "candidate" and not plan.installable(m):
+            info(f"{m.model_id} ({plan.CANDIDATE}) runs on the {m.engine.name} engine, which this setup does not "
+                 "install")
     info(f"validator with hotkey {wallet_name}/{hotkey_name}" + (", dry run: no weights set" if dry_run else ""))
     info(f"configuration {config_path}; engines and weights in {home}")
     if not ui.confirm("Go ahead?"):

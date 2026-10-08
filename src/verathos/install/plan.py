@@ -3,7 +3,7 @@ which ports the engines take."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 
 from verathos import catalog
 from verathos.install.host import GiB, Gpu
@@ -37,9 +37,13 @@ def reference_memory(parameters: int, device: str) -> int:
     return int(parameters * 4 * REFERENCE_WEIGHTS_FACTOR) + REFERENCE_FIXED[device]
 
 
+SERVED = ("active", "candidate")  # active models are scored; candidates are checked by validators and score zero
+CANDIDATE = "candidate: checked, scores zero"
+
+
 def servable_models(cat: catalog.Catalog) -> list[catalog.CatalogModel]:
-    """The catalog's active models, in catalog order."""
-    return [m for m in cat.models if m.status == "active"]
+    """The catalog's active models, then its candidates, each in catalog order."""
+    return sorted((m for m in cat.models if m.status in SERVED), key=lambda m: SERVED.index(m.status))
 
 
 def installable(model: catalog.CatalogModel) -> bool:
@@ -52,9 +56,11 @@ def fitting(models: Iterable[str], need: dict[str, int], gpu: Gpu) -> list[str]:
 
 
 def choose_models(gpus: list[Gpu], offered: list[str], need: dict[str, int], requested: list[str],
-                  previous: dict[int, str]) -> dict[int, str]:
+                  previous: dict[int, str], scored: Collection[str] | None = None) -> dict[int, str]:
     """The model each GPU serves: ``requested`` (one model for every GPU, or one per GPU in order), else what the
-    GPU served before if it is still offered and fits, else the first offered model that fits."""
+    GPU served before if it is still offered and fits, else the first ``scored`` (active) model that fits. Other
+    offered models (candidates) are served only when requested or kept from before."""
+    scored = offered if scored is None else [m for m in offered if m in scored]
     if requested and len(requested) not in (1, len(gpus)):
         raise PlanError(f"--model takes one model for all GPUs or one per GPU ({len(gpus)}), not {len(requested)}")
     chosen = {}
@@ -63,29 +69,82 @@ def choose_models(gpus: list[Gpu], offered: list[str], need: dict[str, int], req
         if requested:
             model = requested[0] if len(requested) == 1 else requested[i]
             if model not in offered:
-                raise PlanError(f"{model} is not an active catalog model this setup can install; choose from "
+                raise PlanError(f"{model} is not a catalog model this setup can install; choose from "
                                 f"{', '.join(offered)}")
             if model not in fits:
                 raise PlanError(f"{model} needs about {need[model] / GiB:.0f} GiB of GPU memory; "
                                 f"{gpu.describe()} has less")
         elif previous.get(gpu.index) in fits:
             model = previous[gpu.index]
-        elif fits:
-            model = fits[0]
+        elif default := next((m for m in scored if m in fits), None):
+            model = default
         else:
+            others = [m for m in fits if m not in scored]
             raise PlanError(f"no active catalog model fits {gpu.describe()}; the smallest needs about "
-                            f"{min(need[m] for m in offered) / GiB:.0f} GiB")
+                            f"{min(need[m] for m in scored or offered) / GiB:.0f} GiB"
+                            + (f"; with --model it can serve {', '.join(others)} ({CANDIDATE})" if others else ""))
         chosen[gpu.index] = model
     return chosen
 
 
+def _gpu_list(indexes: list[int]) -> str:
+    return ("GPU " if len(indexes) == 1 else "GPUs ") + ", ".join(map(str, indexes))
+
+
+def offer_line(offered: list[str], need: dict[str, int], scored: Collection[str]) -> str:
+    """The models a miner can serve, with the GPU memory each needs."""
+    return "models: " + ", ".join(f"{m} (about {need[m] / GiB:.0f} GiB{'' if m in scored else '; ' + CANDIDATE})"
+                                  for m in offered)
+
+
+def choice_lines(gpus: list[Gpu], chosen: dict[int, str], offered: list[str], need: dict[str, int],
+                 scored: Collection[str], requested: list[str], previous: dict[int, str]) -> list[str]:
+    """Two lines for the plan: why each GPU serves its model and what else fits, then how to choose another."""
+    def why(gpu: Gpu) -> str:
+        model = chosen[gpu.index]
+        if requested:
+            return "as --model asks"
+        if previous.get(gpu.index) == model:
+            return "as set up before"
+        if model == next((m for m in offered if m in scored and need[m] <= gpu.memory_total), None):
+            return "the first active model that fits"
+        return "as chosen"
+
+    def label(model: str, note: str = "") -> str:
+        notes = [n for n in ("" if model in scored else "candidate", note) if n]
+        return model + (f" ({'; '.join(notes)})" if notes else "")
+
+    def alternatives(gpu: Gpu) -> list[str]:
+        return [m for m in offered if need[m] <= gpu.memory_total and m != chosen[gpu.index]]
+
+    reasons: dict[tuple[str, str], list[int]] = {}
+    for gpu in gpus:
+        reasons.setdefault((chosen[gpu.index], why(gpu)), []).append(gpu.index)
+    parts = [label(m) + ("" if len(gpus) == 1 else " on " + _gpu_list(indexes)) + ", " + reason
+             for (m, reason), indexes in reasons.items()]
+    others = [label(m, "" if len(gpus) == 1 else _gpu_list(fit)) for m in offered
+              if (fit := [g.index for g in gpus if m in alternatives(g)])]
+    if not others:
+        return ["; ".join(parts) + ". No other catalog model fits"]
+    # the example changes one GPU, to a model no other GPU serves where one fits
+    example, used = [chosen[g.index] for g in gpus], set(chosen.values())
+    position, model = next(((i, m) for i, g in reversed(list(enumerate(gpus))) for m in alternatives(g)
+                            if m not in used), next((i, alternatives(g)[0]) for i, g in reversed(list(enumerate(gpus)))
+                                                    if alternatives(g)))
+    example[position] = model
+    return ["; ".join(parts) + ". Also fit: " + ", ".join(others),
+            f"another choice: --model <id> for every GPU, or one per GPU in order, as in --model {','.join(example)}"]
+
+
 def place_references(parameters: dict[str, int], gpu_free: dict[int, int], ram_free: int, device: str,
-                     keep: dict[str, str]) -> dict[str, str]:
+                     keep: dict[str, str], optional: Collection[str] = ()) -> dict[str, str]:
     """Where the reference engine of each model (model -> parameters) runs: ``"cpu"`` or ``"cuda:<index>"``.
 
     A reference an earlier setup placed stays where it is if ``device`` allows it (its memory is already taken).
     The others go, smallest first, on the GPU with the most free memory while one has room (``device`` "auto" or
-    "gpu"), else in RAM (``device`` "auto" or "cpu"). Raises PlanError if one fits nowhere."""
+    "gpu"), else in RAM (``device`` "auto" or "cpu"). The ``optional`` models (candidates) come after the others, in
+    what they leave, and are left out (absent from the result) where they do not fit. Raises PlanError if another
+    model fits nowhere."""
     if device not in ("auto", "cpu", "gpu"):
         raise PlanError(f"unknown device {device!r}")
     placement: dict[str, str] = {}
@@ -94,7 +153,8 @@ def place_references(parameters: dict[str, int], gpu_free: dict[int, int], ram_f
         if model in parameters and ((where == "cpu" and device != "gpu") or (on_gpu and device != "cpu")):
             placement[model] = where
     free, ram = dict(gpu_free), ram_free
-    for model in sorted((m for m in parameters if m not in placement), key=lambda m: (parameters[m], m)):
+    for model in sorted((m for m in parameters if m not in placement),
+                        key=lambda m: (m in optional, parameters[m], m)):
         gpu_need, cpu_need = reference_memory(parameters[model], "gpu"), reference_memory(parameters[model], "cpu")
         if device != "cpu" and free:
             index = max(free, key=lambda i: (free[i], -i))
@@ -105,6 +165,8 @@ def place_references(parameters: dict[str, int], gpu_free: dict[int, int], ram_f
         if device != "gpu" and ram >= cpu_need:
             placement[model] = "cpu"
             ram -= cpu_need
+            continue
+        if model in optional:
             continue
         needs = {"auto": f"{gpu_need / GiB:.0f} GiB on a GPU or {cpu_need / GiB:.0f} GiB of RAM",
                  "cpu": f"{cpu_need / GiB:.0f} GiB of RAM", "gpu": f"{gpu_need / GiB:.0f} GiB on a GPU"}[device]
