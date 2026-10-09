@@ -29,6 +29,9 @@ Accounts, for the service that signs users up (amounts in micro-USD; ``name``: `
     GET    /admin/v1/accounts/{name}/keys
     DELETE /admin/v1/accounts/{name}/keys/{prefix}  revokes the key
     GET    /admin/v1/accounts/{name}/usage?since=   per day and model: requests, failed, input tokens, cost
+    GET    /admin/v1/accounts/{name}/usage/series?days=&bucket=
+                                                    the same per UTC day or week, every bucket of the range, all time
+                                                    from the account's first usage (``Accounts.account_series``)
     POST   /admin/v1/accounts/{name}/credits        {"amount", "kind", "reference", "note"} -> 201, or 200 with the
                                                     entry already recorded under ``reference``; 409 if it records
                                                     another one
@@ -142,6 +145,13 @@ class NewCredit(BaseModel):
 
 def error(status: int, kind: str, message: str) -> JSONResponse:
     return JSONResponse({"error": {"type": kind, "message": message}}, status_code=status)
+
+
+def series_days(days: str | None) -> int | None:
+    """A usage series' ``days``: a whole number, or None for all time. Raises ValueError."""
+    if days is not None and not (days.isascii() and days.isdigit() and len(days) <= 6):
+        raise ValueError("days is a whole number of days")
+    return None if days is None else int(days)
 
 
 async def parse(request: Request, model: type[BaseModel]) -> BaseModel | JSONResponse:
@@ -338,6 +348,14 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
             return error(400, "invalid_request", "since is an ISO date")
         return {"since": day, "usage": await accounts.usage(name, day)}
 
+    @app.get("/admin/v1/accounts/{name}/usage/series")
+    async def account_series(name: str, days: str | None = None, bucket: str = "day"):
+        try:
+            found = await accounts.account_series(name, series_days(days), bucket)
+        except ValueError as exc:
+            return error(400, "invalid_request", str(exc))
+        return error(404, "not_found", f"no account {name!r}") if found is None else found
+
     @app.post("/admin/v1/accounts/{name}/credits")
     async def add_credit(name: str, request: Request):
         new = await parse(request, NewCredit)
@@ -372,10 +390,8 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
 
     @app.get("/admin/v1/usage/series")
     async def series(days: str | None = None, bucket: str = "day"):
-        if days is not None and not (days.isascii() and days.isdigit() and len(days) <= 6):
-            return error(400, "invalid_request", "days is a whole number of days")
         try:
-            return await accounts.series(None if days is None else int(days), bucket)
+            return await accounts.series(series_days(days), bucket)
         except ValueError as exc:
             return error(400, "invalid_request", str(exc))
 
