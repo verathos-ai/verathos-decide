@@ -54,9 +54,9 @@ Activating a model means giving it an anchor and lowering the others'; every act
 keys of a model's `images`, not those inside its `tolerance`, `engine` and `workload`). `first_test_rps` caps the rate
 of an endpoint's first test, and of all a new hotkey's endpoints together; later tests grow from what was delivered.
 
-`input_modalities` lists what a model reads: `["text"]`, the default and every shipped model's, or `["text",
-"image"]`, which opens it to images (`GATEWAY.md`, Images) within its `images` limits; any of them may be set, the
-others keep these defaults:
+`input_modalities` lists what a model reads: `["text"]`, the default and the shipped Kev models', or `["text",
+"image"]`, the shipped Clef-Flash's, which opens a model to images (`GATEWAY.md`, Images) within its `images` limits;
+any of them may be set, the others keep these defaults:
 
 ```json
 "input_modalities": ["text", "image"],

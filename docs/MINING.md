@@ -442,7 +442,7 @@ cards accumulate bfloat16 in fp32 at half their fp16 rate. Answers from all of t
 reference.
 
 A model whose catalog entry lists `image` in its `input_modalities` also gets requests with images, which the gateway
-has made canonical (`GATEWAY.md`, Images); no model of the shipped catalog does yet. The bfloat16 engine runs them in
+has made canonical (`GATEWAY.md`, Images); in the shipped catalog, Clef-Flash does. The bfloat16 engine runs them in
 passes of their own, without CUDA graphs: their images through the release's vision tower, whose features take the
 image tokens' places, and the rest as for text, with image tokens counted in a pass's token budget. The tower runs in
 float16: in bfloat16, as released, answers with images drift from the float32 reference about twice as far as text
