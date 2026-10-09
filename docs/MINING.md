@@ -195,7 +195,7 @@ It updates the code from where it was installed, and the engines and weights whe
 A GPU whose model the setup chose moves to another model only if that pays at least 1.2 times as much
 ([Models](#models)). The miner restarts and reuses its capacity measurement while nothing it depends on changed; an
 engine restarts only when its revision or settings changed, or for `verathos-engine` (Clef models) its code, which
-the miner then measures again.
+the miner then measures again. A release that changes how the miner measures makes it measure once more.
 
 A release is a tag `v<version>` signed by a release key, one that `release/allowed_signers` lists. The installer
 checks the tag it installs (`--ref`, by default the newest release) against its own copy of the file and stops at one
@@ -643,8 +643,8 @@ most 2 s before the window opened, so an endpoint whose latency stays within 2 s
 needs to be done by hand, but:
 - keep the engines warm and their GPUs free of other work: a test delivers what the hardware has at that moment;
 - run `--remeasure` after changing an endpoint's hardware; the miner measures again by itself when the engine's
-  identity, the endpoint's configuration, the request mix or `max_latency_s` changes, and when the endpoint fell
-  short in two tests ([Falling short](#falling-short));
+  identity, the endpoint's configuration, the request mix, `max_latency_s` or the way it measures changes, and when
+  the endpoint fell short in two tests ([Falling short](#falling-short));
 - serve the catalog's precision: the auditor recomputes test answers, and an endpoint whose answers drift from the
   reference over several tests loses its credit;
 - for a model whose request mix carries images (the catalog's `workload.images`; in the shipped catalog a quarter of

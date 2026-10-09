@@ -42,17 +42,20 @@ do in a test:
 
 1. warm-up runs of 8 s at concurrency `min(16, max_concurrency)`, until every endpoint's last two runs agree within
    5% (at most 13 runs);
-2. one run per concurrency step (1, 2, 4, 8, ... up to `max_concurrency`, at most 4,096); an endpoint stops climbing once its
-   throughput falls below 90% of its best or its latency (concurrency / throughput) exceeds `max_latency_s`
-   (default 2 s);
+2. one run per concurrency step (1, 2, 4, 8, ... up to `max_concurrency`, at most 4,096); a step at which an
+   endpoint's run falls below 90% of its best runs once more, every endpoint at the same concurrency, and each
+   counts the better of its two runs there, so one slow run (noise, or an engine preparing a new batch size) does not
+   end a climb; an endpoint stops climbing once that falls below 90% of its best or its latency (concurrency /
+   throughput) exceeds `max_latency_s` (default 2 s);
 3. five runs at each endpoint's knee: the lowest concurrency within 3% of its best throughput.
 
 The declared `capacity_rps` is `capacity_margin` (default 0.95) times the median of the five runs, at most what
 the endpoint delivered in tests it fell short in (below). A measurement
 takes a few minutes. It is stored in `state_dir/capacity.json` together with a fingerprint of what it depends on (the
 endpoint's model with its pinned weight and engine revisions, engine URL and `max_concurrency`, `max_latency_s`, the
-scalar fields of the engine's `GET /v1/models` document, and the request mix) and is reused until one of them
-changes. The miner checks its engines every minute and measures again when one changed; `--remeasure` measures
+scalar fields of the engine's `GET /v1/models` document, the request mix, and the version of the measurement
+method) and is reused until one of them changes: a release that changes how miners measure makes each measure again
+once. The miner checks its engines every minute and measures again when one changed; `--remeasure` measures
 again, for example after a hardware change. Whatever its reason, a measurement does not start from a test's selection
 block until one block after its traffic: the miner reads the schedule (below) before it measures (`miner/timing.py`).
 A machine that serves no endpoint yet measures at once, as no test reaches it. A measurement steps aside when the

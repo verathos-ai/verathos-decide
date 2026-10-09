@@ -31,7 +31,7 @@ from verathos.protocol.media import (
 from verathos.throughput import images
 from verathos.throughput.images import BACKGROUNDS, COLOURS, Rectangle, draw, png, png_bound
 from verathos.throughput.loadgen import mix_plan
-from verathos.throughput.measure import fingerprint
+from verathos.throughput.measure import METHOD, fingerprint
 from verathos.throughput.workload import (
     IMAGE_QUESTIONS,
     WORDS,
@@ -158,7 +158,7 @@ def test_a_share_of_the_mix_carries_images_and_asks_what_colour_their_background
 
 def test_images_change_nothing_for_a_mix_without_them() -> None:
     """The same draws, the same largest request, the same plan for the load generator and the same fingerprint of a
-    miner's measurement, so no text model is measured again."""
+    miner's measurement, so images make no text model measure again."""
     rng, again = random.Random(3), random.Random(3)
     for _ in range(50):
         request = make_request("kev-4b", KEV.workload, rng)
@@ -171,7 +171,7 @@ def test_images_change_nothing_for_a_mix_without_them() -> None:
     config = {"model_id": "kev-4b", "engine_url": "http://127.0.0.1:8008"}
     assert fingerprint(config, None, KEV.workload) == digest(
         {"endpoint": config, "engine": None, "workload": {"state_words": [150, 1200],
-                                                          "questions": KEV.workload.questions}})
+                                                          "questions": KEV.workload.questions}, "method": METHOD})
     assert fingerprint(config, None, KEV.workload) != fingerprint(config, None, CLEF.workload)
     assert mix_plan(KEV.workload) == {"state_words": [150, 1200], "questions": KEV.workload.questions}
 

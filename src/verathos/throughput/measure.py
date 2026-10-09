@@ -6,7 +6,7 @@ throughput with latency within the policy's ``max_latency_s``, measure several r
 ``capacity_margin`` times the median. Requests take the path test traffic takes, through the miner's own service
 (sessions the miner signs itself), so the service's own limits are measured too. All endpoints of a miner are measured
 in the same rounds, so endpoints sharing hardware each measure their real share, as a network-wide test sees them.
-Results are stored with a fingerprint of what they depend on and reused until that changes.
+Results are stored with a fingerprint of what they depend on (``METHOD`` among it) and reused until that changes.
 """
 
 from __future__ import annotations
@@ -40,9 +40,11 @@ STABLE_TOLERANCE = 0.05
 MAX_WARMUP_RUNS = 12
 FINAL_RUNS = 5
 CONCURRENCY_LADDER = tuple(2 ** i for i in range(13))  # 1 .. 4096
+PAST_BEST_SHARE = 0.9  # a step below this share of an endpoint's best throughput is past its best operating point
 READY_TIMEOUT_S = 900.0
 KNEE_SHARE = 0.97
 SESSION_S = 240.0  # within the session lifetime the miner's replay protection covers
+METHOD = 2  # how measurements are taken; a change that moves their results makes every endpoint measure again
 
 
 class MeasurementFailed(RuntimeError):
@@ -88,9 +90,9 @@ def engine_identity(info: Any) -> Any:
 
 
 def fingerprint(endpoint_config: dict[str, Any], engine_info: Any, workload: Workload) -> str:
-    """What a measurement depends on: the endpoint's configuration, the engine's identity and the mix."""
+    """What a measurement depends on: the endpoint's configuration, the engine's identity, the mix and the method."""
     return digest({"endpoint": endpoint_config, "engine": engine_identity(engine_info),
-                   "workload": workload.document()})
+                   "workload": workload.document(), "method": METHOD})
 
 
 class ServicePath:
@@ -183,7 +185,10 @@ async def measure_all(targets: Sequence[Target], max_latency_s: float, run_s: fl
     """Measure every endpoint in the same rounds, so endpoints sharing an engine or a GPU always compete as they do in
     a test: warm up together until every endpoint's last two runs agree, step up the concurrency ladder together
     (an endpoint past its best, or whose latency exceeds ``max_latency_s``, stays at its knee), then run the final
-    rounds together at each one's knee. In a closed loop the latency is concurrency / throughput.
+    rounds together at each one's knee. In a closed loop the latency is concurrency / throughput. A step at which an
+    endpoint's run falls below ``PAST_BEST_SHARE`` of its best is run once more as the same round, and every endpoint
+    counts the better of its two runs there: one slow run (noise, or an engine preparing a new batch size) does not
+    end a climb, while an engine past its best falls below twice and stops.
 
     -> (measurements, failures): an endpoint fails if it never answers, takes longer than ``max_latency_s`` for a
     single request, or completes nothing under load; the others are measured without it. Raises
@@ -199,14 +204,17 @@ async def measure_all(targets: Sequence[Target], max_latency_s: float, run_s: fl
     if not targets:
         return {}, failures
 
-    async def round_(concurrency: list[int]) -> list[float]:
-        return list(await asyncio.gather(*(run_load(t, c, run_s, stop) for t, c in zip(targets, concurrency))))
+    async def round_(concurrency: list[int], name: str) -> list[float]:
+        rates = list(await asyncio.gather(*(run_load(t, c, run_s, stop) for t, c in zip(targets, concurrency))))
+        log.debug("%s: %s", name, ", ".join(f"{t.endpoint_id} {r:.2f} requests/s at {c}"
+                                            for t, c, r in zip(targets, concurrency, rates)))
+        return rates
 
     ladders = [_ladder(t) for t in targets]
     warm = [min(16, ladder[-1]) for ladder in ladders]
-    previous = await round_(warm)
+    previous = await round_(warm, "warm-up")
     for _ in range(MAX_WARMUP_RUNS):
-        current = await round_(warm)
+        current = await round_(warm, "warm-up")
         stable = all(p > 0 and abs(c - p) <= STABLE_TOLERANCE * p for p, c in zip(previous, current))
         previous = current
         if stable:
@@ -218,19 +226,20 @@ async def measure_all(targets: Sequence[Target], max_latency_s: float, run_s: fl
         if not any(climbing):
             break
         held = [knee(s)[0] if s else ladder[0] for s, ladder in zip(steps, ladders)]
-        rates = await round_([ladder[step] if up else h for up, ladder, h in zip(climbing, ladders, held)])
+        concurrency = [ladder[step] if up else h for up, ladder, h in zip(climbing, ladders, held)]
+        rates = await round_(concurrency, "climb")
         for i, rps in enumerate(rates):
-            if not climbing[i]:
-                continue
-            c = ladders[i][step]
-            if rps <= 0 or c / rps > max_latency_s:
+            if climbing[i] and (rps <= 0 or concurrency[i] / rps > max_latency_s):
                 climbing[i] = False  # answers too slowly at this concurrency
-                continue
-            steps[i].append((c, rps))
-            if rps < 0.9 * max(r for _, r in steps[i]):
-                climbing[i] = False  # past the engine's best operating point
+        bars = [PAST_BEST_SHARE * max((r for _, r in s), default=0.0) for s in steps]
+        if any(up and rps < bar for up, rps, bar in zip(climbing, rates, bars)):
+            rates = [max(r, again) for r, again in zip(rates, await round_(concurrency, "climb again"))]
+        for i, rps in enumerate(rates):
+            if climbing[i]:
+                steps[i].append((concurrency[i], rps))
+                climbing[i] = rps >= bars[i]  # below: past the engine's best operating point
     best = [knee(s) if s else (ladder[0], 0.0) for s, ladder in zip(steps, ladders)]
-    finals = [await round_([b[0] for b in best]) for _ in range(FINAL_RUNS)]
+    finals = [await round_([b[0] for b in best], "final") for _ in range(FINAL_RUNS)]
     measurements = {}
     for i, t in enumerate(targets):
         runs = tuple(round(f[i], 2) for f in finals)
