@@ -1,7 +1,7 @@
 """Subnet administration: ``verathos-subnet``. The changing commands are signed with the subnet owner's keys.
 
     status            mechanisms, emission split, UID cap, the committed catalog (its mechanism) and the shipped one,
-                      the epoch and the miner share in it, the usage pool
+                      the epoch and the miner share in it, the usage pool, the referral pool
     setup-mechanisms  mechanism count 2 and the emission split (owner coldkey)
     commit-catalog    publish a catalog file: store it where the owner's validator serves it, commit its digest; the
                       mechanism it names must exist on chain, a usage pool's buyback coldkey must not be the subnet
@@ -92,6 +92,21 @@ def usage_pool_line(cat: catalog.Catalog, epoch: int) -> str:
             f"epoch {epoch} is in period {period}, which pays period {period - 1}'s")
 
 
+def referral_pool_line(cat: catalog.Catalog, epoch: int) -> str:
+    """The catalog's referral pool, and the period ``epoch`` is in."""
+    pool = cat.scoring.referral_pool
+    if pool is None:
+        return "referrals: off"
+    term = "for life" if pool.term_days is None else f"for {pool.term_days} days after the referral"
+    cap = "no cap per account" if pool.account_cap_usd is None else (
+        f"at most {pool.account_cap_usd:,.0f} USD of one account's per window")
+    period = pool.period(epoch)
+    return (f"referrals: {pool.payout_per_usd:g} USD of emission per referred USD over {pool.window_periods} periods "
+            f"of {pool.period_epochs} epochs, at most {pool.share:g} of the miner emission; top-ups count {term}, "
+            f"{cap}; {'serving' if pool.serving_only else 'any registered'} referrers, {len(pool.excluded)} hotkeys "
+            f"or coldkeys excluded; epoch {epoch} is in period {period}, which pays period {period - 1}'s")
+
+
 def status(st: bt.Subtensor, netuid: int) -> None:
     q = st.substrate.query
     committed = committed_catalog(st, netuid)
@@ -121,6 +136,8 @@ def status(st: bt.Subtensor, netuid: int) -> None:
         "release_weights_version_key": release.weights_version_key(),
         "usage_pool": cat.scoring.usage_pool.model_dump() if cat and cat.scoring.usage_pool else None,
         "usage_period": cat.scoring.usage_pool.period(epoch) if cat and cat.scoring.usage_pool else None,
+        "referral_pool": cat.scoring.referral_pool.model_dump() if cat and cat.scoring.referral_pool else None,
+        "referral_period": cat.scoring.referral_pool.period(epoch) if cat and cat.scoring.referral_pool else None,
     }, indent=2), flush=True)
 
 
@@ -212,6 +229,7 @@ def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path 
           f"{[m.model_id for m in cat.models if m.status == 'active']}", flush=True)
     print(miner_share_line(cat, st.get_current_block() // cat.epoch_blocks), flush=True)
     print(usage_pool_line(cat, st.get_current_block() // cat.epoch_blocks), flush=True)
+    print(referral_pool_line(cat, st.get_current_block() // cat.epoch_blocks), flush=True)
     value = catalog.commitment_value(cat.digest())
     result = st.set_commitment(wallet, netuid, value)
     if not getattr(result, "success", False):

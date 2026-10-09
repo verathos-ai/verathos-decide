@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from verathos.protocol.referral import fold, site_origin
 from verathos.protocol.tls import chain_network, https_url
 
 
@@ -63,6 +64,11 @@ class GatewayConfig(BaseModel):
                                    "longer is replaced, and the image refused")
     sample_window_s: float = Field(600.0, ge=10, description="One exchange per endpoint and window goes to the "
                                    "auditor")
+    referral_site: str | None = Field(None, description="The origin of the web app referral codes and moves are "
+                                      "signed for (https://host); none: no referral codes are taken")
+    referral_reserved: list[str] = Field(default_factory=list, max_length=256, description="Names no referral code "
+                                         "may contain, besides the built-in ones and the catalog's model ids (other "
+                                         "subnets' products, for example)")
     catalog_dir: Path = Path("~/.verathos/catalog")
     state_dir: Path = Path("~/.verathos/gateway")
 
@@ -75,6 +81,18 @@ class GatewayConfig(BaseModel):
     @classmethod
     def _https(cls, value: str | None) -> str | None:
         return None if value is None else https_url(value, what="auditor_url")
+
+    @field_validator("referral_site")
+    @classmethod
+    def _origin(cls, value: str | None) -> str | None:
+        return None if value is None else site_origin(value)
+
+    @field_validator("referral_reserved")
+    @classmethod
+    def _names(cls, value: list[str]) -> list[str]:
+        if any(not 1 <= len(fold(name)) <= 64 for name in value):
+            raise ValueError("each reserved name holds 1 to 64 characters besides hyphens")
+        return value
 
     @field_validator("trusted_proxies")
     @classmethod

@@ -182,6 +182,49 @@ class UsagePool(BaseModel):
         return epoch // self.period_epochs
 
 
+MAX_PAYOUT_PER_USD = 0.9  # a referred USD never earns this much emission or more: self-referral must lose money
+
+
+class ReferralPool(BaseModel):
+    """Weight on top of the scores' for referrers: the hotkeys whose referral codes brought accounts that buy credit.
+    Each period the auditor sums, per referrer, the top-ups of its referred accounts (less refunds) over the last
+    ``window_periods`` periods; a referrer is paid ``payout_per_usd / window_periods`` of that sum per period, in
+    alpha, as a share of the mechanism's miner emission, all referrers together at most ``share`` (pro rata beyond
+    it) and at most what the miner share leaves. A referred USD therefore earns at most ``payout_per_usd`` USD of
+    emission over its window (``throughput.referral``)."""
+
+    share: float = Field(0.10, gt=0, le=0.5, description="At most this share of the mechanism's miner emission per "
+                         "period goes to referrers")
+    payout_per_usd: float = Field(0.3, gt=0, le=MAX_PAYOUT_PER_USD, description="At most this many USD of emission "
+                                  "per referred USD, over its window")
+    window_periods: int = Field(30, ge=1, le=90, description="Periods a top-up counts in")
+    period_epochs: int = Field(40, ge=1, le=MAX_PERIOD_EPOCHS, description="Epochs per period: each period's record "
+                               "is paid over the epochs of the next")
+    term_days: int | None = Field(365, ge=30, le=1095, description="Days after its referral in which an account's "
+                                  "top-ups count; null: for as long as the account exists")
+    account_cap_usd: float | None = Field(10_000.0, ge=1000, le=100_000, description="At most this much of one "
+                                          "account's top-ups counts within a window's length; null: no cap")
+    serving_only: bool = Field(False, description="Pay only referrers with a positive score weight in the epoch")
+    excluded: list[str] = Field(default_factory=list, max_length=256, description="Hotkeys and coldkeys that get no "
+                                "referral pay; their part stays on the subnet owner's UID")
+
+    @field_validator("excluded")
+    @classmethod
+    def _ss58(cls, value: list[str]) -> list[str]:
+        for key in value:
+            if not is_ss58(key):
+                raise ValueError(f"referral_pool: {key!r} is not an ss58 address")
+        return value
+
+    def period(self, epoch: int) -> int:
+        """The period ``epoch`` falls in: epochs ``period x period_epochs`` up to the next period's first."""
+        return epoch // self.period_epochs
+
+    def window_s(self, epoch_blocks: int, block_time_s: float) -> float:
+        """A window's length in seconds: ``window_periods`` periods."""
+        return self.window_periods * self.period_epochs * epoch_blocks * block_time_s
+
+
 class Scoring(BaseModel):
     """Scoring settings every validator applies."""
 
@@ -206,6 +249,8 @@ class Scoring(BaseModel):
         "{from, to, start_epoch, epochs}")
     usage_pool: UsagePool | None = Field(None, description="Usage weight for the hotkeys that served paying users, "
                                          "out of what the miner share leaves; absent: none")
+    referral_pool: ReferralPool | None = Field(None, description="Referral weight for referrers, out of what the "
+                                               "miner share leaves; absent: none. Not together with a usage pool")
     revision_transition_epochs: int = Field(3, ge=0, description="Epochs after a model's pinned weights or engine "
                                             "change in place during which its answers are not checked, while miners "
                                             "and references update")
@@ -220,6 +265,14 @@ class Scoring(BaseModel):
                                                      "endpoint per epoch (canaries and identity challenges); beyond "
                                                      "them miners answer 429 until the next epoch. Default: "
                                                      "``request_budget``")
+
+    @model_validator(mode="after")
+    def _pools(self) -> Scoring:
+        # paid usage of money a referrer was rewarded for would pay twice: the two pools run together only once the
+        # usage pool weighs such usage less
+        if self.usage_pool is not None and self.referral_pool is not None:
+            raise ValueError("a referral_pool and a usage_pool do not run together")
+        return self
 
     def miner_share_at(self, epoch: int) -> float:
         """``miner_share`` in ``epoch``, rounded to ``SHARE_DIGITS`` decimals, so every validator sets the same."""
@@ -388,6 +441,9 @@ class Catalog(BaseModel):
             unknown += [f"scoring.miner_share.{k}" for k in scoring["miner_share"] if k not in known]
         if isinstance(scoring.get("usage_pool"), dict):
             unknown += [f"scoring.usage_pool.{k}" for k in scoring["usage_pool"] if k not in UsagePool.model_fields]
+        if isinstance(scoring.get("referral_pool"), dict):
+            unknown += [f"scoring.referral_pool.{k}" for k in scoring["referral_pool"]
+                        if k not in ReferralPool.model_fields]
         for m in doc.get("models") or []:
             unknown += [f"models.{m.get('model_id', '?')}.{k}" for k in m if k not in CatalogModel.model_fields]
             if isinstance(m.get("images"), dict):

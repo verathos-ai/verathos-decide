@@ -12,12 +12,14 @@ process creates): a key not among them is looked up only within a budget shared 
 from many addresses never reaches the database. While the budget is spent, such a key is refused until the reload.
 
 Credit is a ledger (``credits``): each entry names the payment or grant it records (``reference``), so recording one
-twice adds it once. The account's balance is kept with it: the entries minus the cost of the usage written.
+twice adds it once. The account's balance is kept with it: the entries minus the cost of the usage written. A refund
+(negative) names the account's top-up it returns (``refund_of``), and returns at most what is left of it; credit
+bought is the top-ups less their refunds (``BOUGHT``).
 
 Usage is paid when the account is prepaid, has topped up (``Principal.paid``), and its free credit is spent: its
-balance is no more than its top-ups (``UsageMeter.paid``). Free credit (a grant: a sign-up, the demo) is counted as
-spent first, as ``paid_cost`` counts it, so an account that only ever had free credit is unpaid, and one that topped
-up is paid once its grants are used. Only paid usage moves the models' emission shares
+balance is no more than the credit it bought (``UsageMeter.paid``). Free credit (a grant: a sign-up, the demo) is
+counted as spent first, as ``paid_cost`` counts it, so an account that only ever had free credit is unpaid, and one
+that topped up is paid once its grants are used. Only paid usage moves the models' emission shares
 (``ServedCount.paid_input_tokens``).
 
 The network's totals (``totals``) and their series per day or week (``series``) count every account's answered
@@ -43,7 +45,7 @@ from sqlalchemy import Date, case, exists, func, insert, literal_column, select,
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from verathos.gateway.db import accounts, api_keys, credits, usage_daily, usage_hourly
+from verathos.gateway.db import BOUGHT, accounts, api_keys, credits, usage_daily, usage_hourly
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.usage import UsageMeter
 
@@ -57,7 +59,8 @@ NEGATIVE_TTL_S = 10.0
 MAX_CACHED = 100_000
 KEYS_RELOAD_S = 60.0
 UNLISTED_LOOKUPS_PER_S, UNLISTED_LOOKUPS_BURST = 20.0, 100  # keys not among the loaded hashes, all clients together
-CREDIT_KINDS = ("grant", "topup", "adjust")  # free credit, a payment, an operator's correction (either sign)
+CREDIT_KINDS = ("grant", "topup", "adjust", "refund")  # free credit, a payment, an operator's correction (either
+# sign), a payment returned (negative)
 SERIES_BUCKETS = {"day": 1, "week": 7}  # days per bucket of the usage series
 SERIES_MAX_BUCKETS = 400
 
@@ -322,14 +325,16 @@ class Accounts:
                 .where(usage_daily.c.account_id.in_(topped)).group_by(usage_daily.c.account_id))
         credit = (select(credits.c.account_id, credits.c.kind, func.sum(credits.c.amount),
                          since(month, credits.c.created_at, credits.c.amount))
-                  .where(credits.c.account_id.in_(topped), credits.c.kind.in_(("grant", "topup")))
+                  .where(credits.c.account_id.in_(topped), credits.c.kind.in_(("grant", *BOUGHT)))
                   .group_by(credits.c.account_id, credits.c.kind))
         async with self.engine.connect() as conn:
             per_model = {model: [int(n or 0) for n in counts] for model, *counts in await conn.execute(answered)}
             costs = {a: (int(c or 0), int(c or 0) - int(recent or 0)) for a, c, recent in await conn.execute(cost)}
-            ledger: dict[tuple[int, str], tuple[int, int]] = {
-                (a, kind): (int(total or 0), int(total or 0) - int(recent or 0))
-                for a, kind, total, recent in await conn.execute(credit)}
+            ledger: dict[tuple[int, str], tuple[int, int]] = {}  # (account, grant | topup) -> (all, before 30 days)
+            for a, kind, total, recent in await conn.execute(credit):
+                key = (a, "grant" if kind == "grant" else "topup")
+                so_far = ledger.get(key, (0, 0))
+                ledger[key] = (so_far[0] + int(total or 0), so_far[1] + int(total or 0) - int(recent or 0))
 
         def windows(counts: list[int]) -> dict[str, int]:
             return dict(zip(("all_time", "last_24h", "last_30d"), counts))
@@ -384,15 +389,17 @@ class Accounts:
             per_model = [(model, _date(day), int(n or 0), int(t or 0)) for model, day, n, t in answered]
             credited = utc_day(credits.c.created_at)
             bought = [(_date(day), int(amount or 0)) for day, amount in await conn.execute(
-                select(credited, func.sum(credits.c.amount)).where(topups, credits.c.created_at >= since)
-                .group_by(credited))]
+                select(credited, func.sum(credits.c.amount))
+                .where(credits.c.kind.in_(BOUGHT), credits.c.created_at >= since).group_by(credited))]
             topped = select(credits.c.account_id).where(topups)
             ledger: dict[int, dict[str, int]] = {}
             for account, kind, amount in await conn.execute(
                     select(credits.c.account_id, credits.c.kind, func.sum(credits.c.amount))
-                    .where(credits.c.account_id.in_(topped), credits.c.kind.in_(("grant", "topup")))
+                    .where(credits.c.account_id.in_(topped), credits.c.kind.in_(("grant", *BOUGHT)))
                     .group_by(credits.c.account_id, credits.c.kind)):
-                ledger.setdefault(account, {})[kind] = int(amount or 0)
+                kinds = ledger.setdefault(account, {})
+                kind = "grant" if kind == "grant" else "topup"
+                kinds[kind] = kinds.get(kind, 0) + int(amount or 0)
             spent = {account: int(cost or 0) for account, cost in await conn.execute(
                 select(usage_daily.c.account_id, func.sum(usage_daily.c.cost))
                 .where(usage_daily.c.account_id.in_(topped), usage_daily.c.day < start)
@@ -434,22 +441,29 @@ class Accounts:
             return func.date(func.timezone(literal_column("'UTC'"), column), type_=Date)
         return func.date(column, type_=Date)
 
-    async def add_credit(self, account: str, amount: int, *, kind: str, reference: str,
-                         note: str | None = None) -> tuple[dict[str, Any], bool]:
+    async def add_credit(self, account: str, amount: int, *, kind: str, reference: str, note: str | None = None,
+                         refund_of: str | None = None) -> tuple[dict[str, Any], bool]:
         """Record ``amount`` micro-USD for ``account`` once per ``reference``. -> (the entry, whether it is new).
         Recording the same entry again returns it unchanged; a reference used for another entry raises Conflict, an
-        unknown account LookupError."""
+        unknown account LookupError. A refund (negative) names the account's top-up it returns (``refund_of``) and
+        returns at most what earlier refunds left of it; ValueError otherwise."""
         if kind not in CREDIT_KINDS:
             raise ValueError(f"kind is one of {CREDIT_KINDS}")
-        if amount == 0 or (amount < 0 and kind != "adjust"):
-            raise ValueError("a grant or top-up is positive; only an adjustment may be negative")
+        if amount == 0 or (amount < 0 and kind in ("grant", "topup")) or (amount > 0 and kind == "refund"):
+            raise ValueError("a grant or top-up is positive, a refund negative; an adjustment either")
+        if (kind == "refund") != (refund_of is not None):
+            raise ValueError("a refund, and only a refund, names the top-up it returns (refund_of)")
         try:
             async with self.engine.begin() as conn:
-                account_id = (await conn.execute(select(accounts.c.id).where(accounts.c.name == account))).scalar()
+                account_id = (await conn.execute(select(accounts.c.id).where(accounts.c.name == account)
+                                                 .with_for_update())).scalar()  # one refund of it at a time
                 if account_id is None:
                     raise LookupError(f"no account {account!r}")
+                if refund_of is not None and not (await conn.execute(select(exists().where(
+                        credits.c.reference == reference)))).scalar():  # recorded already: returned as it is
+                    await _refundable(conn, account_id, refund_of, -amount)
                 await conn.execute(insert(credits).values(account_id=account_id, amount=amount, kind=kind,
-                                                          reference=reference, note=note))
+                                                          reference=reference, note=note, refund_of=refund_of))
                 await conn.execute(update(accounts).where(accounts.c.id == account_id)
                                    .values(balance=accounts.c.balance + amount))
             created = True
@@ -458,7 +472,8 @@ class Accounts:
         entry = await self.credit(reference)
         if entry is None:  # the insert failed for another reason than the reference
             raise Conflict(f"credit {reference!r} could not be recorded")
-        if not created and (entry["account"], entry["amount"], entry["kind"]) != (account, amount, kind):
+        if not created and (entry["account"], entry["amount"], entry["kind"], entry["refund_of"]) != (
+                account, amount, kind, refund_of):
             raise Conflict(f"reference {reference!r} records another credit")
         if self.meter is not None:
             self.meter.forget_balance(entry["account_id"])
@@ -475,10 +490,22 @@ class Accounts:
     async def credits(self, account: str, limit: int = 100) -> list[dict[str, Any]]:
         """The account's credit entries, newest first."""
         query = (select(credits.c.id, credits.c.amount, credits.c.kind, credits.c.reference, credits.c.note,
-                        credits.c.created_at).join(accounts, credits.c.account_id == accounts.c.id)
+                        credits.c.created_at, credits.c.refund_of).join(accounts, credits.c.account_id == accounts.c.id)
                  .where(accounts.c.name == account).order_by(credits.c.id.desc()).limit(limit))
         async with self.engine.connect() as conn:
             return [dict(r._mapping) for r in await conn.execute(query)]
+
+
+async def _refundable(conn: Any, account_id: int, topup: str, amount: int) -> None:
+    """Raises ValueError unless ``topup`` is a top-up of the account of which earlier refunds left ``amount``."""
+    paid = (await conn.execute(select(credits.c.amount).where(
+        credits.c.reference == topup, credits.c.account_id == account_id, credits.c.kind == "topup"))).scalar()
+    if paid is None:
+        raise ValueError(f"refund_of {topup!r} names no top-up of the account")
+    returned = -int((await conn.execute(select(func.coalesce(func.sum(credits.c.amount), 0)).where(
+        credits.c.kind == "refund", credits.c.refund_of == topup))).scalar())
+    if amount > paid - returned:
+        raise ValueError(f"top-up {topup!r} has {paid - returned} micro-USD left to refund, not {amount}")
 
 
 def _date(value: dt.date | str) -> dt.date:

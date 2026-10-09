@@ -21,7 +21,7 @@ A prepaid account is served while its balance is positive: as read from the data
 (so other processes' charges and new credit apply within that time), minus what this process charged since and what
 its requests in flight may cost at most (``reserve``, settled when they end). A balance can therefore end below zero
 by at most one request's cost per process. An answer is paid (``paid``) once the account's free credit is spent: its
-balance, read with its top-ups, is no more than they are.
+balance, read with the credit it bought (top-ups less refunds), is no more than that.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from verathos.gateway import metrics
-from verathos.gateway.db import accounts, credits, usage_daily, usage_flushes, usage_hourly
+from verathos.gateway.db import BOUGHT, accounts, credits, usage_daily, usage_flushes, usage_hourly
 
 if TYPE_CHECKING:
     from verathos.gateway.accounts import Principal
@@ -184,7 +184,7 @@ class UsageMeter:
 
     async def _read_balance(self, account_id: int) -> None:
         topups = select(func.coalesce(func.sum(credits.c.amount), 0)).where(
-            credits.c.account_id == account_id, credits.c.kind == "topup").scalar_subquery()
+            credits.c.account_id == account_id, credits.c.kind.in_(BOUGHT)).scalar_subquery()
         row = await self._read(select(accounts.c.balance, topups).where(accounts.c.id == account_id), row=True)
         balance, bought = row if row is not None else (0, 0)
         self._balance[account_id] = [int(balance or 0), self.clock(), int(bought or 0)]
