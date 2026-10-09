@@ -1,9 +1,11 @@
 """The exchanges the auditor checks (``protocol.gateway``).
 
-Per endpoint and window, one exchange drawn uniformly from the window's answered ones: a reservoir of one, filled
-after each answer is in, so a miner cannot tell which answers will be checked. Signed malformed answers are proof on
-their own: they always go, and a failed post keeps them for the next window. At the end of each window the picks
-are posted to the auditor in batches within its size limit, signed by the gateway.
+Per endpoint and window, one exchange drawn uniformly from the window's answered ones without images and one from
+those with images: reservoirs of one, filled after each answer is in, so a miner cannot tell which answers will be
+checked, and answers with images reach the auditor however small their share. The picks with images held at once are
+bounded (``MEDIA_PICKS_BYTES``). Signed malformed answers are proof on their own: they always go, and a failed post
+keeps them for the next window. At the end of each window the picks are posted to the auditor in batches within its
+size limit, signed by the gateway.
 
 Throughput tests: the auditor counts what an endpoint answers users during a test only once it has checked one of
 those answers, since a miner knows when a test runs. The gateway follows the public test schedule
@@ -25,6 +27,7 @@ import httpx
 from bittensor_wallet import Keypair
 
 from verathos.gateway import metrics
+from verathos.gateway.logs import Throttle
 from verathos.gateway.upstream import Exchange
 from verathos.protocol.gateway import MAX_SAMPLES_BYTES, MAX_SAMPLES_PER_POST, SAMPLES_PATH, GatewaySample
 from verathos.protocol.http import post_idempotent
@@ -35,8 +38,10 @@ from verathos.throughput.policy import BLOCK_TIME_S, AuditPolicy, ScheduledTest
 
 log = logging.getLogger(__name__)
 MAX_PROOFS = 256
+MEDIA_PICKS_BYTES = 2 << 30  # the images of the window's picks held at once, at most: a pick beyond is not taken
 BATCH_BYTES = MAX_SAMPLES_BYTES - (64 << 10)  # room for the envelope
 TEST_SAMPLE_KEEP_S = 300.0  # a test's picks are posted again on failure for this long after its sessions end
+_throttled = Throttle()
 
 
 def batches(samples: list[str]) -> list[list[str]]:
@@ -71,16 +76,18 @@ class Sampler:
                  rng: random.Random | None = None, clock: Callable[[], float] = time.time) -> None:
         self.keypair, self.client, self.auditor, self.auditor_hotkey = keypair, client, auditor, auditor_hotkey
         self.window_s, self.rng, self.clock = window_s, rng or random.Random(), clock
-        self._seen: dict[str, int] = {}
-        self._picked: dict[str, Exchange] = {}
+        self._seen: dict[tuple[str, bool], int] = {}  # (endpoint, with images) -> answers seen in the window
+        self._picked: dict[tuple[str, bool], Exchange] = {}
+        self._media_bytes = 0  # of the window's picks with images
         self._proofs: list[Exchange] = []
         self._tests: dict[str, _Test] = {}  # test id -> its traffic and picks
 
     def offer(self, exchange: Exchange) -> None:
         key = f"{exchange.route.hotkey}/{exchange.route.endpoint_id}"
-        seen = self._seen[key] = self._seen.get(key, 0) + 1
+        pool = (key, bool(exchange.request.get("images")))
+        seen = self._seen[pool] = self._seen.get(pool, 0) + 1
         if self.rng.random() * seen < 1:
-            self._picked[key] = exchange
+            self._pick(pool, exchange)
         sent = self.clock() - exchange.seconds
         for test in self._tests.values():
             if test.start <= sent <= test.end:
@@ -88,6 +95,17 @@ class Sampler:
                 pick[0] += 1
                 if self.rng.random() * pick[0] < 1:
                     pick[1] = exchange
+
+    def _pick(self, pool: tuple[str, bool], exchange: Exchange) -> None:
+        if pool[1]:
+            held = self._media_bytes - _image_bytes(self._picked.get(pool)) + _image_bytes(exchange)
+            if held > MEDIA_PICKS_BYTES:
+                if times := _throttled("media picks"):
+                    log.warning("an answer with images is not sampled: the window's picks hold %d MiB of images "
+                                "(%d times since last logged)", self._media_bytes >> 20, times)
+                return
+            self._media_bytes = held
+        self._picked[pool] = exchange
 
     def begin_test(self, test_id: str, start: float, traffic_s: float, session_s: float) -> None:
         """A test whose traffic started at ``start`` (wall clock) and lasts ``traffic_s``; its sessions end
@@ -128,7 +146,7 @@ class Sampler:
 
     async def flush(self) -> None:
         proofs, picked = self._proofs, list(self._picked.values())
-        self._seen, self._picked, self._proofs = {}, {}, []
+        self._seen, self._picked, self._proofs, self._media_bytes = {}, {}, [], 0
         if not (proofs or picked):
             return
         sent_proofs = False
@@ -185,6 +203,12 @@ class Sampler:
                 await self.flush()
             except Exception:
                 log.exception("sampling window failed")
+
+
+def _image_bytes(exchange: Exchange | None) -> int:
+    """The base64 of an exchange's images."""
+    images = exchange.request.get("images") if exchange is not None else None
+    return sum(len(i.get("base64", "")) for i in images if isinstance(i, dict)) if images else 0
 
 
 class TestFollower:

@@ -68,15 +68,15 @@ class Slow(MockEngine):
         return await super().answer(request)
 
 
-def miner(host: str, gateway: Keypair, engine) -> tuple[Keypair, FastAPI]:
+def miner(host: str, gateway: Keypair, engine, model: str = "kev-4b") -> tuple[Keypair, FastAPI]:
     keypair = kp()
     config = MinerConfig.model_validate({
         "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": 8091,
-        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1",
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": model, "engine_url": "http://127.0.0.1:1",
                        "max_concurrency": 64}]})
     signed = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest=catalog.load().digest(),
-        endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
+        endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id=model,
                             capacity_rps=40.0)], tls={config.base_url: pin(host)}), keypair)
     app = miner_app(config=config, keypair=keypair, manifest=lambda: signed, engines={"gpu0": engine},
                     authorized=lambda hk: hk == gateway.ss58_address, auditors=lambda: set(),
@@ -87,29 +87,30 @@ def miner(host: str, gateway: Keypair, engine) -> tuple[Keypair, FastAPI]:
 LONG = {**REQUEST, "state": "the customer asks about an invoice " * 40}  # its answers cost whole micro-USD
 
 
-def route(keypair: Keypair, host: str, credited: float = 20.0) -> Route:
-    return Route(hotkey=keypair.ss58_address, endpoint_id="gpu0", model_id="kev-4b",
+def route(keypair: Keypair, host: str, credited: float = 20.0, model: str = "kev-4b") -> Route:
+    return Route(hotkey=keypair.ss58_address, endpoint_id="gpu0", model_id=model,
                  url=f"https://{host}:8091/e/gpu0", tls=pin(host), credited_rps=credited, latency_ms=300.0)
 
 
 class Setup:
-    """A gateway on SQLite in front of the given miners (host -> engine), with an in-process auditor. The gateway
-    follows ``cat`` (the shipped catalog by default) with its own hotkey as the catalog's gateway."""
+    """A gateway on SQLite in front of the given miners (host -> engine) of ``model``, with an in-process auditor.
+    The gateway follows ``cat`` (the shipped catalog by default) with its own hotkey as the catalog's gateway."""
 
     def __init__(self, tmp_path, engines: dict[str, object], *, credited: float = 20.0, rate: float = 100.0,
                  burst: int = 100, monthly_quota: int | None = None, max_attempts: int = 3,
-                 attempt_timeout_s: float = 2.0, cat: catalog.Catalog | None = None) -> None:
+                 attempt_timeout_s: float = 2.0, cat: catalog.Catalog | None = None, model: str = "kev-4b",
+                 **config) -> None:
         tmp_path.mkdir(parents=True, exist_ok=True)
         self.gateway_kp = kp()
-        self.miners = {host: miner(host, self.gateway_kp, engine) for host, engine in engines.items()}
+        self.miners = {host: miner(host, self.gateway_kp, engine, model) for host, engine in engines.items()}
         url = f"sqlite+aiosqlite:///{tmp_path}/gateway.db"
         db.upgrade(url)
         self.engine = db.create_engine(url)
         self.config = GatewayConfig(netuid=405, wallet_name="w", hotkey_name="h", database_url=url,
-                                    max_attempts=max_attempts, attempt_timeout_s=attempt_timeout_s)
+                                    max_attempts=max_attempts, attempt_timeout_s=attempt_timeout_s, **config)
         self.auditor = _auditor(tmp_path)
         self.auditor.follower.poll()
-        self.auditor.update_slots([Slot(keypair.ss58_address, "gpu0", f"https://{host}:8091/e/gpu0", "kev-4b", 40.0,
+        self.auditor.update_slots([Slot(keypair.ss58_address, "gpu0", f"https://{host}:8091/e/gpu0", model, 40.0,
                                         pin(host))
                                    for host, (keypair, _) in self.miners.items()])
         auditor_app = FastAPI()
@@ -120,7 +121,7 @@ class Setup:
         self.meter = UsageMeter(self.engine)
         self.accounts = Accounts(self.engine, self.meter, ttl_s=0.0, negative_ttl_s=0.0)
         self.router = Router(share=1.0, max_latency_s=2.0, rng=random.Random(1))
-        routes = [route(keypair, host, credited) for host, (keypair, _) in self.miners.items()]
+        routes = [route(keypair, host, credited, model) for host, (keypair, _) in self.miners.items()]
         self.router_table = Routes(netuid=405, auditor=self.auditor.hotkey, epoch=3, issued_ms=1,
                                    catalog_digest=catalog.load().digest(), routes=routes)
         self.router.update(self.router_table)
@@ -572,7 +573,7 @@ def test_a_probe_whose_request_is_cancelled_does_not_keep_the_breaker_closed_to_
         s.router.started(endpoint)
         s.router.finished(endpoint, Outcome.FAILED)
     endpoint.breaker.open_until = 0.0  # its open time is over: the next request probes it
-    checked = check_request(s.gateway, json.dumps(REQUEST).encode())
+    checked = asyncio.run(check_request(s.gateway, json.dumps(REQUEST).encode()))
 
     async def cancelled():
         with pytest.raises(TimeoutError):

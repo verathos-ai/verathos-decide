@@ -12,18 +12,26 @@ Every response to ``POST /v1/systemone`` carries ``X-Request-Id`` (the client's,
 ``{"error": {"type": ..., "message": ...}}``; 429 and 503 carry ``Retry-After`` (for a used-up quota: until the next
 month).
 
-    400 invalid_request     not JSON (NaN and infinities included), or not a SystemOne request
+    400 invalid_request     not JSON (NaN and infinities included), not a SystemOne request, images to a model that
+                            reads text only or images it cannot read (a URL, not base64, not PNG, JPEG or WebP, a
+                            content_type the bytes contradict, undecodable, an aspect ratio beyond 200:1), videos or
+                            media_kwargs
     401 unauthorized        missing, unknown, revoked or expired key, or a suspended account
     402 insufficient_credit a prepaid account's balance is used up
     404 model_not_found     not an active model of the catalog
-    413 too_large           body, state, or the answers the questions would need, over the limits
+    413 too_large           body, state, images, or the answers the questions would need, over the limits
     429 rate_limited        over the key's rate (or too many invalid keys from one address)
     429 quota_exceeded      over the account's monthly quota
     500 internal            a fault of the gateway
-    503 busy                no capacity free for the model right now, or the gateway is at capacity
+    503 busy                no capacity free for the model right now, the gateway is at capacity, or its image
+                            decoders are all busy
     503 unavailable         no miner serves the model right now, the miners failed or refused the request within its
-                            deadline, every miner of the model is failing, accounts cannot be checked, or the gateway
-                            has no catalog yet
+                            deadline, every miner of the model is failing, accounts cannot be checked, the gateway
+                            has no catalog yet, or its image decoders cannot start
+
+A request is forwarded as its model, state and questions (other fields are dropped) with its images made canonical
+(``protocol.media``, in the decode workers of ``gateway.media``): its canonical JSON is the body the miners receive
+and their receipts bind.
 """
 
 from __future__ import annotations
@@ -52,6 +60,7 @@ from verathos.gateway.accounts import Accounts, Principal, well_formed_key
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.logs import Throttle
+from verathos.gateway.media import CanonicalImage, Decoders, DecodersBusy, DecodingUnavailable
 from verathos.gateway.router import Endpoint, Outcome, Router
 from verathos.gateway.routes import stale_after_s
 from verathos.gateway.sampler import Sampler
@@ -60,7 +69,9 @@ from verathos.gateway.stats import DEGRADED_SUCCESS, ModelStats
 from verathos.gateway.upstream import Exchange, Upstream, UpstreamFailure
 from verathos.gateway.usage import UsageMeter, month_start
 from verathos.protocol.api import (
+    MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
+    REFUSED_FIELDS,
     STATE_CHARS_PER_TOKEN,
     Choice,
     SystemOneRequest,
@@ -68,8 +79,9 @@ from verathos.protocol.api import (
     question_keys,
     text,
 )
-from verathos.protocol.canonical import digest
+from verathos.protocol.canonical import canonical_json, sha256_hex
 from verathos.protocol.gateway import Routes
+from verathos.protocol.media import ImageRefused, request_image_tokens, sent_image
 from verathos.throughput.workload import in_mix_form
 from verathos.validator.canaries import canary_like
 
@@ -103,6 +115,20 @@ class Gateway:
     limiter: RateLimiter
     clock: Callable[[], float] = time.monotonic
     stats: ModelStats = field(default_factory=ModelStats)
+    decoders: Decoders | None = None  # by default from the configuration
+
+    def __post_init__(self) -> None:
+        if self.decoders is None:
+            self.decoders = Decoders(self.config.media_workers, self.config.max_media_in_flight,
+                                     self.config.media_timeout_s)
+
+    def body_limit(self) -> int:
+        """The most a request's body may hold: a text model's ``max_body_bytes``, or an active image model's
+        ``max_request_bytes`` if larger."""
+        cat = self.catalog()
+        image_models = [m.images.max_request_bytes for m in (cat.models if cat is not None else [])
+                        if m.status == "active" and m.reads_images()]
+        return max([self.config.max_body_bytes, *image_models])
 
     def routes_state(self) -> dict[str, Any] | None:
         """The routes in use; stale: older than ``routes.stale_after_s``."""
@@ -191,12 +217,24 @@ class Unchecked(Exception):
 
 @dataclass(frozen=True)
 class Checked:
-    raw: dict[str, Any]
-    body: bytes
+    raw: dict[str, Any]  # the request as forwarded: its model, state and questions, and its images made canonical
+    body: bytes  # its canonical JSON
     parsed: SystemOneRequest
     request_sha256: str
     price: float  # the model's, USD per million input tokens
-    min_tokens: int  # billed at least, whatever the miner signs
+    min_tokens: int  # billed at least, whatever the miner signs: one per 8 characters of the state, and the images'
+    max_tokens: int  # billed at most: one per byte of the request without its images, and the images' tokens
+    image_tokens: int = 0  # the images' input tokens (``protocol.media.request_image_tokens``)
+
+
+@dataclass(frozen=True)
+class Screened:
+    """A request that passed the checks made before its images are decoded."""
+
+    raw: dict[str, Any]
+    parsed: SystemOneRequest
+    model: catalog_module.CatalogModel
+    images: list[tuple[str, str]]  # (media type, base64) of each image as sent
 
 
 NO_ANSWER = {  # why a forwarded request got no answer -> the API error
@@ -215,16 +253,19 @@ def validation_message(exc: ValidationError) -> str:
     return f"{where + ': ' if where else ''}{first['msg']}{more}"[:300]
 
 
-def check_request(g: Gateway, body: bytes) -> Checked:
-    """A body the gateway can forward: strict JSON, a SystemOne request for an active model miners serve now, within
-    the model's limit (``prompt_chars``) and with answers that fit a response, whose state is not one of the subnet's
-    test requests or canaries (a miner relaying them through the gateway would have its answers counted as users').
-    Raises Rejected."""
+def screen(g: Gateway, body: bytes) -> Screened:
+    """The checks made before any image is decoded: strict JSON, a SystemOne request without videos or media_kwargs
+    for an active model miners serve now, within the model's body limit and prompt limit (``prompt_chars``), with
+    answers that fit a response, whose state is not one of the subnet's test requests or canaries (a miner relaying
+    them through the gateway would have its answers counted as users'), and with images only to a model that reads
+    them, within its limits as far as they can be checked undecoded (``protocol.media.sent_image``). Raises
+    Rejected."""
     try:
         raw = json.loads(body, parse_constant=_no_constants)
+        if isinstance(raw, dict) and (refused := [why for field, why in REFUSED_FIELDS.items() if field in raw]):
+            raise Rejected(400, "invalid_request", refused[0])
         parsed = SystemOneRequest.model_validate(raw)
-        request_sha256 = digest(raw)
-        state, prompt = text(parsed.state), prompt_chars(parsed)
+        prompt = prompt_chars(parsed)
     except ValidationError as exc:
         raise Rejected(400, "invalid_request", f"not a SystemOne request: {validation_message(exc)}") from None
     except (ValueError, TypeError, RecursionError) as exc:
@@ -237,6 +278,12 @@ def check_request(g: Gateway, body: bytes) -> Checked:
     model = cat.get(parsed.model)
     if model is None or model.status != "active":
         raise Rejected(404, "model_not_found", f"{parsed.model} is not served")
+    if parsed.images and not model.reads_images():
+        raise Rejected(400, "invalid_request", f"{model.model_id} reads text only", model=model.model_id)
+    limit = model.images.max_request_bytes if model.reads_images() else g.config.max_body_bytes
+    if len(body) > limit:
+        raise Rejected(413, "too_large", f"the body exceeds {limit} bytes, {model.model_id}'s limit",
+                       model=model.model_id)
     if parsed.model not in g.router.models():
         raise Rejected(503, "unavailable", f"no miner serves {parsed.model} right now", 30, parsed.model)
     if prompt > STATE_CHARS_PER_TOKEN * model.max_state_tokens:
@@ -245,7 +292,79 @@ def check_request(g: Gateway, body: bytes) -> Checked:
     if answer_bytes(parsed) > MAX_RESPONSE_BYTES:
         raise Rejected(413, "too_large", "the answers to these questions would exceed a response's size limit",
                        model=parsed.model)
-    return Checked(raw, body, parsed, request_sha256, model.price, len(state) // STATE_CHARS_PER_BILLED_TOKEN)
+    return Screened(raw, parsed, model, sent_images(parsed.images or [], model))
+
+
+def sent_images(images: list[Any], model: catalog_module.CatalogModel) -> list[tuple[str, str]]:
+    """(media type, base64) of each image of a request, checked within the model's limits as far as they can be
+    undecoded. Raises Rejected."""
+    limits, sent, total = model.images, [], 0
+    if len(images) > limits.max_count:
+        raise Rejected(413, "too_large", f"{model.model_id} takes at most {limits.max_count} images per request",
+                       model=model.model_id)
+    for index, item in enumerate(images):
+        try:
+            content_type, data, size = sent_image(item, limits)
+        except ImageRefused as refused:
+            raise rejection(refused, f"images.{index}: {refused}", model.model_id) from None
+        sent.append((content_type, data))
+        total += size
+    if total > limits.max_total_bytes:
+        raise Rejected(413, "too_large", f"the images hold {total} bytes, more than {model.model_id} takes "
+                                         f"({limits.max_total_bytes})", model=model.model_id)
+    return sent
+
+
+def rejection(refused: ImageRefused, message: str, model_id: str) -> Rejected:
+    return Rejected(refused.status, "too_large" if refused.status == 413 else "invalid_request", message,
+                    model=model_id)
+
+
+def with_images(text_body: bytes, images: list[CanonicalImage]) -> bytes:
+    """The canonical JSON of a request with its images, from that of the request without them: ``images`` sorts
+    before its other fields, and neither base64 nor a media type needs escaping."""
+    items = b",".join(b'{"base64":"' + i.base64.encode("ascii") + b'","content_type":"' + i.content_type.encode()
+                      + b'"}' for i in images)
+    return b'{"images":[' + items + b"]," + text_body[1:]
+
+
+async def check_request(g: Gateway, body: bytes) -> Checked:
+    """A body the gateway can forward (``screen``), with its images made canonical by the decoders: the request as
+    forwarded, at most ``MAX_REQUEST_BYTES`` without its images and the model's ``max_request_bytes`` with them, and
+    the bounds of the input tokens it is billed. Raises Rejected."""
+    screened = screen(g, body)
+    model, model_id = screened.model, screened.model.model_id
+    images: list[CanonicalImage] = []
+    if screened.images:
+        try:
+            images = await g.decoders.canonical(screened.images, model.images)
+        except DecodersBusy:
+            raise Rejected(503, "busy", "the gateway's image decoders are all busy", 1, model_id) from None
+        except DecodingUnavailable:
+            raise Rejected(503, "unavailable", "the gateway cannot decode images right now", 5, model_id) from None
+        except ImageRefused as refused:
+            raise rejection(refused, str(refused), model_id) from None
+    raw = screened.raw
+    forwarded = {"model": raw["model"], "state": raw["state"], "questions": raw["questions"]}
+    try:
+        text_body = canonical_json(forwarded)
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise Rejected(400, "invalid_request", f"not a SystemOne request: {exc}"[:500]) from None
+    if len(text_body) > MAX_REQUEST_BYTES:
+        raise Rejected(413, "too_large", f"the request without its images exceeds {MAX_REQUEST_BYTES} bytes",
+                       model=model_id)
+    image_tokens = request_image_tokens([(i.width, i.height) for i in images], model.images.token_px)
+    forwarded_body = text_body
+    if images:
+        forwarded = {"images": [{"base64": i.base64, "content_type": i.content_type} for i in images], **forwarded}
+        forwarded_body = with_images(text_body, images)
+        if len(forwarded_body) > model.images.max_request_bytes:
+            raise Rejected(413, "too_large", f"with its images made canonical the request exceeds "
+                                             f"{model.images.max_request_bytes} bytes, {model_id}'s limit",
+                           model=model_id)
+    min_tokens = len(text(screened.parsed.state)) // STATE_CHARS_PER_BILLED_TOKEN + image_tokens
+    return Checked(forwarded, forwarded_body, screened.parsed, sha256_hex(forwarded_body), model.price, min_tokens,
+                   len(text_body) + image_tokens, image_tokens)
 
 
 async def forward(g: Gateway, checked: Checked, started: float, attempts: list[dict[str, Any]] | None = None, *,
@@ -284,7 +403,7 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
             try:
                 exchange = await g.upstream.call(endpoint.route, checked.raw, checked.body, checked.request_sha256,
                                                  checked.parsed, min(g.config.attempt_timeout_s, remaining),
-                                                 min_tokens=checked.min_tokens)
+                                                 min_tokens=checked.min_tokens, max_tokens=checked.max_tokens)
                 outcome = Outcome.ANSWERED
                 note["outcome"] = "answered"
             except UpstreamFailure as failure:
@@ -510,18 +629,20 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
             return reject(503, "unavailable", "accounts cannot be checked right now", request_id, 5)
         if not funded:
             return reject(402, "insufficient_credit", "the account's credit is used up", request_id)
-        body = bytearray()
+        body, limit = bytearray(), g.body_limit()
         async for chunk in request.stream():
             body += chunk
-            if len(body) > g.config.max_body_bytes:
-                return reject(413, "too_large", f"the body exceeds {g.config.max_body_bytes} bytes", request_id)
+            if len(body) > limit:
+                return reject(413, "too_large", f"the body exceeds {limit} bytes", request_id)
             if not hold(request, len(chunk)):
                 return reject(503, "busy", "the gateway is at capacity", request_id, 1)
         try:
-            checked = check_request(g, bytes(body))
+            checked = await check_request(g, bytes(body))
         except Rejected as r:
             return reject(r.status, r.kind, r.message, request_id, r.retry_after, model=r.model)
-        most = len(checked.body) * checked.price  # the most the answer may cost: one token per byte of the request
+        if checked.image_tokens and not hold(request, len(checked.body)):  # the request with its canonical images
+            return reject(503, "busy", "the gateway is at capacity", request_id, 1, model=checked.parsed.model)
+        most = checked.max_tokens * checked.price  # the most the answer may cost
         try:
             funded = await bounded("balance lookup", g.meter.reserve(principal, most))
         except Unchecked:
@@ -552,9 +673,11 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         metrics.REQUEST_SECONDS.labels(model).observe(g.clock() - started)
         if isinstance(outcome, Exchange):
             # rendered before anything is recorded: an answer that cannot be delivered is neither billed nor counted
-            response = JSONResponse({"id": request_id, "model": model, "answers": outcome.answers,
-                                     "usage": {"input_tokens": outcome.input_tokens}, "receipt": outcome.receipt},
-                                    headers={"X-Request-Id": request_id})
+            usage = {"input_tokens": outcome.input_tokens}
+            if checked.image_tokens:
+                usage["image_tokens"] = checked.image_tokens
+            response = JSONResponse({"id": request_id, "model": model, "answers": outcome.answers, "usage": usage,
+                                     "receipt": outcome.receipt}, headers={"X-Request-Id": request_id})
             g.stats.record(model, "answered", g.clock() - started)
             paid = g.meter.paid(principal)  # before its cost is charged
             g.meter.record(principal, model, answered=True, input_tokens=outcome.input_tokens, price=checked.price)

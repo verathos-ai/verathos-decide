@@ -19,3 +19,9 @@ ROUTES_AGE = Gauge("gateway_routes_age_seconds", "Age of the routes in use")
 BREAKERS_OPEN = Gauge("gateway_breakers_open", "Endpoints whose circuit breaker is open")
 USAGE_FLUSH_FAILURES = Counter("gateway_usage_flush_failures_total", "Failed usage writes")
 SAMPLES = Counter("gateway_samples_total", "Sampled exchanges by outcome (submitted, kept, failed)", ["outcome"])
+IMAGES = Counter("gateway_images_total", "Users' images by outcome (canonical, refused, failed: the decoder failed)",
+                 ["outcome"])
+IMAGE_SECONDS = Histogram("gateway_image_seconds", "Time to make one image canonical, in a decoder",
+                          buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0))
+IMAGE_BYTES = Histogram("gateway_image_bytes", "Bytes of the images made canonical",
+                        buckets=(16 << 10, 64 << 10, 256 << 10, 512 << 10, 1 << 20, 2 << 20, 4 << 20))

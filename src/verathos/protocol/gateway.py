@@ -26,7 +26,8 @@ from bittensor_wallet import Keypair
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from verathos.protocol import signing
-from verathos.protocol.api import MAX_RESPONSE_BYTES
+from verathos.protocol.api import MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES
+from verathos.protocol.media import MAX_IMAGE_REQUEST_BYTES, MAX_IMAGE_TOKENS
 from verathos.protocol.tls import PIN_PATTERN
 
 ROUTES_PATH = "/v1/routes"
@@ -34,10 +35,12 @@ ROUTES_DOMAIN = "verathos/routes/v1"
 SAMPLES_PATH = "/v1/gateway/samples"
 SERVED_PATH = "/v1/gateway/served"
 MAX_SAMPLES_PER_POST = 64
-MAX_SAMPLES_BYTES = 8 << 20
+# A post of samples, at most: one sample of the largest request an image model may take, with its response, fits.
+MAX_SAMPLES_BYTES = MAX_IMAGE_REQUEST_BYTES + (1 << 20)
 MAX_SERVED_COUNTS = 20_000  # entries per post ...
 MAX_SERVED_BYTES = 8 << 20  # ... and bytes
-MAX_REQUEST_BYTES = 1 << 20  # a gateway request's body, at most
+MAX_INPUT_TOKENS = MAX_REQUEST_BYTES + MAX_IMAGE_TOKENS  # one answer is billed at most: a token per byte of its
+# request without images, and its images' tokens
 
 
 class Route(BaseModel):
@@ -142,8 +145,8 @@ class ServedCount(BaseModel):
             raise ValueError("latency buckets out of range")
         if sum(self.latency.values()) > self.answered:
             raise ValueError("more latencies than answers")
-        if self.input_tokens > self.answered * MAX_REQUEST_BYTES:
-            raise ValueError("more input tokens than the requests' bytes")
+        if self.input_tokens > self.answered * MAX_INPUT_TOKENS:
+            raise ValueError("more input tokens than the requests can hold")
         if (self.paid_input_tokens or 0) > self.input_tokens:
             raise ValueError("more paid input tokens than input tokens")
         return self

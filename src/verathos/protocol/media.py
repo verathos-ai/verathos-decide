@@ -126,7 +126,34 @@ def decoded_size(data: str) -> int:
     return len(data) // 4 * 3 - (2 if data.endswith("==") else 1 if data.endswith("=") else 0)
 
 
-def b64decode(data: str, limit: int | None = None) -> bytes:
+def sent_image(item: Any, limits: ImageLimits) -> tuple[str, str, int]:
+    """(media type, base64, bytes) of an image a user sent, checked as far as it can be without decoding it: a data
+    URL or object of PNG, JPEG or WebP whose base64 holds at most ``max_bytes``, whose bytes start as its media type
+    says and whose header, where its first ``HEADER_BYTES`` hold it, gives a size within the limits (the decoder
+    reads any other header). Raises ImageRefused."""
+    content_type, data = wire_image(item)
+    if content_type not in USER_TYPES:
+        raise ImageRefused(400, "content_type must be image/png, image/jpeg or image/webp")
+    size = decoded_size(data)
+    if size > limits.max_bytes:
+        raise ImageRefused(413, f"{size} bytes, more than the model takes ({limits.max_bytes})")
+    if not data.isascii():
+        raise ImageRefused(400, _NOT_BASE64)
+    start = b64decode(data, HEADER_BYTES)
+    kind = sniff(start)
+    if kind is None:
+        raise ImageRefused(400, "not a PNG, JPEG or WebP image")
+    if kind != content_type:
+        raise ImageRefused(400, f"its bytes are {kind}, not {content_type}")
+    try:
+        found = header(start)
+    except ValueError:  # incomplete within the start, or a header only the decoder reads: it decides
+        return content_type, data, size
+    check_size(found.width, found.height, limits)
+    return content_type, data, size
+
+
+def b64decode(data: str | bytes, limit: int | None = None) -> bytes:
     """Strict base64 ``data`` decoded, or with ``limit`` its start: at least that many bytes, if it holds them. Raises
     ImageRefused."""
     if limit is not None:
@@ -326,12 +353,10 @@ def canonical_image(data: bytes, content_type: str, limits: ImageLimits) -> Cano
                 if image.getexif().get(_ORIENTATION, 1) in (5, 6, 7, 8):
                     width, height = height, width
                 upright = ImageOps.exif_transpose(image).convert("RGB")
-    except ImageRefused:
+    except (ImageRefused, MemoryError):
         raise
     except (Image.DecompressionBombError, Image.DecompressionBombWarning):
         raise ImageRefused(413, f"more pixels than the model takes ({limits.max_input_pixels})") from None
-    except MemoryError:
-        raise ImageRefused(413, "it takes more memory to decode than the gateway gives one image") from None
     except Exception:
         raise ImageRefused(400, "it could not be decoded") from None
     if upright.size != (width, height):

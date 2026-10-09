@@ -76,9 +76,9 @@ class Upstream:
         self.hotkey = keypair.ss58_address
 
     async def call(self, route: Route, request: dict[str, Any], body: bytes, request_sha256: str,
-                   parsed: SystemOneRequest, timeout_s: float, *, min_tokens: int = 0) -> Exchange:
-        """One attempt at ``route``; the input tokens the miner signs are taken within [``min_tokens``, one per byte of
-        the request] (the auditor checks sampled counts against its reference). Raises UpstreamFailure."""
+                   parsed: SystemOneRequest, timeout_s: float, *, min_tokens: int = 0, max_tokens: int) -> Exchange:
+        """One attempt at ``route``; the input tokens the miner signs are taken within [``min_tokens``,
+        ``max_tokens``] (the auditor checks sampled counts against its reference). Raises UpstreamFailure."""
         url = route.url + "/v1/systemone"
         headers = {"Content-Type": "application/json", "Accept-Encoding": "identity",
                    **sign_request(self.keypair, "POST", urlsplit(url).path, body, route.hotkey)}
@@ -115,7 +115,7 @@ class Upstream:
         if signed is None:
             raise UpstreamFailure("receipt", "miner", "no receipt binding this request and these answers")
         answers, receipt = signed
-        tokens = min(max(receipt.receipt.input_tokens, min_tokens), len(body))
+        tokens = min(max(receipt.receipt.input_tokens, min_tokens), max_tokens)
         exchange = Exchange(route, request, text, answers, receipt.model_dump(mode="json"), tokens)
         if not well_formed(parsed, answers):
             raise UpstreamFailure("malformed", "miner", "signed malformed answers", exchange=exchange)
