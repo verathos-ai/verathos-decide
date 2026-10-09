@@ -41,6 +41,7 @@ engines and services:
 | Question | Default |
 |---|---|
 | Wallet/hotkey | the hotkey on the machine, or the one set up before |
+| Role of this machine | primary, or the one set up before ([One hotkey, several GPUs and machines](#one-hotkey-several-gpus-and-machines)) |
 | Public IP address of this machine | detected |
 | Public TCP port of the miner | 8091 |
 | Model for each kind of GPU | the one that pays best now, measured from the network; or the one named before with `--model` ([Models](#models)) |
@@ -109,7 +110,7 @@ differs by GPU: kev-9b and clef-flash serve 0.92 times kev-4b's requests on an H
 times and clef-flash 0.65 times, on an RTX 5090 kev-9b 0.55 times.
 
 Each GPU serves one model: by default the active model that pays best on it now. The setup reads the auditor's
-network status (`GET /v1/network` on the subnet owner's axon, signed once per epoch) and uses it only if the subnet
+network status (`GET /v1/network` on the subnet owner's axon, built once per epoch) and uses it only if the subnet
 owner hotkey signed it for this subnet within two epochs of the machine's clock. From it, per active model:
 
 - its share of the emission: its share of the scores, as the auditor published it for its last epoch
@@ -125,19 +126,20 @@ emission (availability to users and latency left out). Where the hotkey already 
 other machines, or on this machine's GPUs placed before), it adds what the hotkey's part gains,
 `s ((H + x) / (C + x) - H / C)`. GPUs whose model is named by hand count first; then each GPU in order takes the
 active model that adds most, and the GPUs after it count it, so a machine with several GPUs spreads over the models
-where that pays more. For example, with each model at a third of the emission and 300, 120 and 400 requests/s
-proven on kev-4b, kev-9b and clef-flash, an A100 whose measurement declares 13.9 requests/s of kev-4b adds about
-`0.333 x 13.9 / 313.9 = 1.5%` there, `0.333 x 12.8 / 132.8 = 3.2%` on kev-9b (12.8 = 13.9 x 0.92) and
-`0.333 x 12.8 / 412.8 = 1.0%` on clef-flash: it serves kev-9b.
+where that pays more. For example, with each model at a third of the scores (0.197 of the emission at the shipped
+miner share of 0.59) and 300, 120 and 400 requests/s proven on kev-4b, kev-9b and clef-flash, an A100 whose
+measurement declares 13.9 requests/s of kev-4b adds about `0.197 x 13.9 / 313.9 = 0.87%` there,
+`0.197 x 12.8 / 132.8 = 1.9%` on kev-9b (12.8 = 13.9 x 0.92) and `0.197 x 12.8 / 412.8 = 0.61%` on clef-flash: it
+serves kev-9b.
 
 On an update, a GPU keeps the model it serves unless another pays at least 1.2 times as much: a switch downloads the
 model and measures again, and the numbers move with every epoch. When another pays at least 1.1 times as much, the
 plan says so and how to switch:
 
 ```
-the network in the auditor's epoch 45412: kev-4b 33.3% of the emission, 300.0 requests/s proven; kev-9b 33.3% of the emission, 240.0 requests/s proven; clef-flash 33.3% of the emission, 400.0 requests/s proven; the median endpoint 14.6 requests/s at relative speed 1
+the network in the auditor's epoch 45412: kev-4b 19.7% of the emission, 300.0 requests/s proven; kev-9b 19.7% of the emission, 240.0 requests/s proven; clef-flash 19.7% of the emission, 400.0 requests/s proven; the median endpoint 14.6 requests/s at relative speed 1
 GPU 0 (NVIDIA A100 80GB PCIe, 80 GiB): kev-4b, endpoint gpu0, engine on 127.0.0.1:8008
-GPU 0: kev-4b, as set up before: about 1.48% of the emission (its share 33.3%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 1.69%, clef-flash 1.03%. kev-9b would pay about 1.14x as much on GPU 0: --model kev-9b to switch
+GPU 0: kev-4b, as set up before: about 0.87% of the emission (its share 19.7%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 0.99%, clef-flash 0.61%. kev-9b would pay about 1.14x as much on GPU 0: --model kev-9b to switch
 another choice: --model <id> for every GPU, or one per GPU in order, as in --model kev-9b
 ```
 
@@ -227,7 +229,7 @@ stay for a later install; `--purge` deletes them too (other files in `~/.veratho
 | `the NVIDIA driver supports CUDA 12.x` | the engines need a driver for CUDA 12.8 or newer |
 | `port ... is in use` | choose another port with `--port` |
 | validators cannot reach the miner | the setup's check, `curl -sk --pinnedpubkey ... https://<public ip>:<port>/v1/manifest` (on a worker `/v1/endpoints`), from another machine must answer: open the port for inbound TCP (`ufw allow <port>/tcp`, the provider's firewall). Behind port forwarding, as in most rented containers, the outside port must be the same as the port inside: each machine is listed at one port |
-| `peer ...: endpoint ... left out` | endpoint ids must be unique across the hotkey's machines: give the worker another `--name` |
+| `endpoint ... of peer ... left out` | endpoint ids must be unique across the hotkey's machines: give the worker another `--name` |
 | `peer ...: its TLS certificate (pin ...) is not the one it names` | the worker's port is served by another process, or its certificate changed while it ran: restart the worker's miner |
 | `status unavailable: ... names no TLS pin for the auditor` | the committed catalog does not name the auditor's certificate yet: the miner serves as usual and reads its status once the subnet owner commits one |
 | an engine keeps stopping | its log says why; out of GPU memory: another model, or a GPU free of other work |
@@ -383,7 +385,7 @@ reference.
 | `model_id` | a catalog model |
 | `engine_url`, `engine_api_key` | the endpoint's engine and its bearer token, if it needs one: `http://127.0.0.1:<port>` on this machine, or `https://` elsewhere |
 | `engine_tls_pin` | an https engine's certificate pin (`DISCOVERY.md`); without one, a public CA's certificate for its hostname |
-| `max_concurrency` | highest concurrency the capacity measurement tries (default 256); the engine never gets more requests at once than the concurrency the measurement settles on |
+| `max_concurrency` | highest concurrency the capacity measurement tries (default 256); between measurements, the engine never gets more requests at once than the concurrency the measurement settles on |
 | `gateway_hotkeys` | callers allowed in addition to validators with a permit |
 | `catalog_mirrors` | extra catalog sources, https URL templates with `{digest}`, tried after the owner's axon |
 | `catalog_dir` | local catalog store (default `~/.verathos/catalog`) |
@@ -455,12 +457,14 @@ endpoint gpu0 (kev-4b): 19.9 requests/s at concurrency 32 (runs 19.2, 22.9, 19.1
 manifest committed on chain (2968f3219dc7)
 serving 1 endpoints on port 8091; throughput tests are accepted from 5F...; status is logged once per epoch
 validator's epoch 45351:
-  gpu0 (kev-4b): qualifying, checked but not scored until it passes a throughput test; answers pass 10/10, mean diff 0.0014
-throughput test of epoch 45351 (block 8163045), gpu0: passed, delivered 18.9 of 18.9 requests/s, p95 latency 1630 ms; credited 18.9
-validator's epoch 45352:
-  emission shares: kev-4b 50.0%, kev-9b 50.0%
+  emission shares: clef-flash 33.3%, kev-4b 33.3%, kev-9b 33.3%
   miner share 59.00%: the scores below are shares of it; the subnet owner's UID gets the rest of the miners' emission
-  gpu0 (kev-4b): scored 12.40% of the epoch's emission, average 2.48%; proven 18.9 of 18.9 requests/s declared; answers pass 10/10, mean diff 0.0014
+  gpu0 (kev-4b): qualifying, checked but not scored until it passes a throughput test; answers pass 10/10, mean diff 0.0014
+throughput test of epoch 45351 (block 8163225), gpu0: passed, delivered 18.9 of 18.9 requests/s, p95 latency 1630 ms; credited 18.9
+validator's epoch 45352:
+  emission shares: clef-flash 33.3%, kev-4b 33.3%, kev-9b 33.3%
+  miner share 59.00%: the scores below are shares of it; the subnet owner's UID gets the rest of the miners' emission
+  gpu0 (kev-4b): scored 12.40% of the epoch's emission, average 2.48%; proven 18.9 of 18.9 requests/s declared; ready for users 100%, latency factor 1.00; answers pass 10/10, mean diff 0.0014
 ```
 
 | Endpoint state | Meaning |
@@ -547,7 +551,7 @@ at most the higher rate it delivered in those two tests:
 throughput test of epoch 45418 (block 8175283), gpu0: BELOW the tested rate, delivered 10.4 of 11.4 requests/s, p95 latency 1810 ms; credited 9.5 (delivered 10.4 of 11.4 requests/s asked)
 gpu0 fell short in tests 45417 and 45418 (delivered 10.5 and 10.4 of 11.4): measuring again
 measuring the capacity of 1 endpoints (about 3 minutes)
-endpoint gpu0 (kev-9b): 12.0 requests/s at concurrency 32 (runs 12.1, 11.9, 12.0, 12.0, 11.8), declares 10.5, at most the 10.5 it delivered in tests 45417 and 45418
+endpoint gpu0 (kev-9b): 12.0 requests/s at concurrency 16 (runs 12.1, 11.9, 12.0, 12.0, 11.8), declares 10.5, at most the 10.5 it delivered in tests 45417 and 45418
 ```
 
 The new declaration is published as any other (on a worker, the primary takes it from `GET /v1/endpoints`). The cap
