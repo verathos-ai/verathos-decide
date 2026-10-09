@@ -2,12 +2,13 @@
 
 The subnet owner's validator serves catalogs by digest (``GET /v1/catalog/{digest}``) so miners and validators can
 fetch a newly committed catalog; as the throughput auditor it serves its signed verdicts
-(``GET /v1/throughput/{epoch}``), and to the subnet's gateways the routes and the intake for sampled exchanges
-(``protocol.gateway``). It serves each hotkey's status (``GET /v1/status/{hotkey}``, see ``validator.status``) and all
-of them at once with the weights it set (``GET /v1/network``, which light validators follow), both signed with its
-hotkey (``protocol.status``). A full validator with a ``public_host`` serves these two as well; other validators run no
-service. The service presents the validator's certificate (``protocol.tls``, kept in its state directory): the
-auditor's pin is in the catalog, another validator's in its chain commitment (``protocol.callers``).
+(``GET /v1/throughput/{epoch}``), and to the subnet's gateways the routes and the intake for sampled exchanges, served
+counts and referrals (``protocol.gateway``). It serves each hotkey's status (``GET /v1/status/{hotkey}``, see
+``validator.status``) and all of them at once with the weights it set (``GET /v1/network``, which light validators
+follow), both signed with its hotkey (``protocol.status``). A full validator with a ``public_host`` serves these two
+as well; other validators run no service. The service presents the validator's certificate (``protocol.tls``, kept in
+its state directory): the auditor's pin is in the catalog, another validator's in its chain commitment
+(``protocol.callers``).
 
 A hotkey's signed status is built at most once per ``STATUS_CACHE_S`` (sooner once the board publishes an epoch or the
 auditor records, confirms or voids a test), and may be cached as long; the network's is built once per epoch and
@@ -41,9 +42,11 @@ from verathos.catalog import CATALOG_PATH, CatalogStore
 from verathos.protocol.gateway import (
     MAX_SAMPLES_BYTES,
     MAX_SAMPLES_PER_POST,
+    REFERRALS_PATH,
     ROUTES_PATH,
     SAMPLES_PATH,
     SERVED_PATH,
+    ReferralReport,
     ServedReport,
 )
 from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, verify_request
@@ -180,8 +183,8 @@ def add_verdicts_route(app: FastAPI, auditor: Auditor) -> None:
 
 def add_gateway_routes(app: FastAPI, auditor: Auditor, *, probation: Callable[[], Collection[str]],
                        gateways: Callable[[], Collection[str]]) -> None:
-    """The routes for the subnet's gateways, and the intake of their sampled exchanges and served counts (signed by
-    a catalog gateway, with a declared length within the limit, read within ``INTAKE_BODY_S``, at most
+    """The routes for the subnet's gateways, and the intake of their sampled exchanges, served counts and referrals
+    (signed by a catalog gateway, with a declared length within the limit, read within ``INTAKE_BODY_S``, at most
     ``INTAKE_CONCURRENCY`` at once)."""
     nonces, slots = NonceCache(), asyncio.Semaphore(INTAKE_CONCURRENCY)
 
@@ -245,6 +248,23 @@ def add_gateway_routes(app: FastAPI, auditor: Auditor, *, probation: Callable[[]
             except ValidationError as e:
                 return JSONResponse({"error": f"invalid report: {e.error_count()} errors"}, status_code=422)
             return {"taken": await asyncio.to_thread(auditor.accept_served, report.counts, report.report_id)}
+
+    @app.post(REFERRALS_PATH)
+    async def post_referrals(request: Request):
+        if slots.locked():
+            return JSONResponse({"error": "busy"}, status_code=503)
+        async with slots:
+            gateway, body = await intake(request)
+            if gateway is None:
+                return body
+            try:
+                report = ReferralReport.model_validate_json(body)
+            except ValidationError as e:
+                return JSONResponse({"error": f"invalid report: {e.error_count()} errors"}, status_code=422)
+            taken = await asyncio.to_thread(auditor.accept_referrals, gateway, report)
+            if taken is None:
+                return JSONResponse({"error": "the chain head is not known yet"}, status_code=503)
+            return taken
 
 
 def start_service(*, st: bt.Subtensor, wallet: bt.Wallet, netuid: int, public_host: str, port: int, identity: Identity,

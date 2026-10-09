@@ -67,6 +67,30 @@ class ThroughputOutcome(BaseModel):
     latency_p95_ms: float = 0.0
 
 
+class ReferrerStatus(BaseModel):
+    """A referrer's part of the referral pool in the epoch, from the auditor's record of the period before
+    (``throughput.referral``)."""
+
+    codes: dict[str, list[int]] = {}  # each of its codes: micro-USD referred per period of the window, oldest first
+    referred_micros: int = 0  # their sum, at least 0
+    share: float = 0.0  # its part of the mechanism's miner emission by the record, before the miner share's limit
+    unpaid: str | None = None  # why it is paid none of it this epoch: no UID, the subnet owner's, excluded, not serving
+
+
+class ReferralPeriod(BaseModel):
+    """The referral pool's record an epoch pays: the auditor's, of the period before the epoch's."""
+
+    period: int
+    first_block: int
+    end_block: int
+    window_periods: int  # the window: the record's period and the ones before it, ending at end_block
+    payout_per_usd: float  # the most a referred USD earns over its window, in USD of emission
+    share: float  # what the record sizes, of the mechanism's miner emission, before the miner share's limit
+    referred_micros: int  # every referrer's referred micro-USD over the window
+    rate_per_usd: float  # what a referred USD earns over its window at this epoch's rate: payout_per_usd, less when
+    # the referrers' caps exceed the record's share or the miner share leaves less
+
+
 class HotkeyStatus(BaseModel):
     hotkey: str
     uid: int | None = None
@@ -78,11 +102,16 @@ class HotkeyStatus(BaseModel):
     model_shares: dict[str, float] = {}  # each active model's share of the epoch's emission
     miner_share: float | None = None  # the share of the miners' emission the scores paid (None: an older release)
     usage_share: float | None = None  # the share the usage pool paid (None: no pool, or an older release)
+    referral_share: float | None = None  # the share the referral pool paid (None: no pool)
+    serving_weight: float = 0.0  # of the UID's weight, what its scores gave it
     usage_weight: float = 0.0  # of the UID's weight, what the usage pool gave it
+    referral_weight: float = 0.0  # of the UID's weight, what the referral pool gave it
+    referral: ReferrerStatus | None = None  # its figures as a referrer (None: none in the record the epoch pays)
 
 
 class NetworkStatus(BaseModel):
-    """Every hotkey's status in the validator's last scored epoch."""
+    """Every hotkey's status in the validator's last scored epoch: the hotkeys with endpoints, and the referrers of
+    the record the epoch pays."""
 
     epoch: int | None = None
     epoch_blocks: int | None = None
@@ -93,6 +122,10 @@ class NetworkStatus(BaseModel):
     # the share of the mechanism's miner emission the usage pool's weights sum to, to the hotkeys that served paying
     # users; None without a usage pool, or from a validator of an older release
     usage_share: float | None = None
+    # the share the referral pool's weights sum to, to the referrers, and the record they come from; None without the
+    # pool (the record: or without one for the epoch)
+    referral_share: float | None = None
+    referral: ReferralPeriod | None = None
     mechanism: int | None = None  # the mechanism the weights are set on; None from a validator of an older release
     # per UID, exactly the weights the validator set after the epoch (in a dry run, would have set); a UID absent gets
     # none. None from a validator of an older release.

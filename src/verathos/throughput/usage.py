@@ -33,7 +33,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from verathos.catalog import SHARE_DIGITS, Catalog, UsagePool
+from verathos.catalog import SHARE_DIGITS, Catalog, ReferralPool, UsagePool
 from verathos.protocol.http import get_json
 from verathos.protocol.tls import CA
 
@@ -141,7 +141,7 @@ def _close(a: float, b: float) -> bool:
     return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
 
 
-def period_blocks(pool: UsagePool, epoch_blocks: int, period: int) -> tuple[int, int]:
+def period_blocks(pool: UsagePool | ReferralPool, epoch_blocks: int, period: int) -> tuple[int, int]:
     """The period's first block and the next period's (its reference block)."""
     length = pool.period_epochs * epoch_blocks
     return period * length, (period + 1) * length

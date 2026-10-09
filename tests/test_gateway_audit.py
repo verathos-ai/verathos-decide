@@ -845,7 +845,8 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
     Store(tmp_path / "old.sqlite", epoch_blocks=180)  # today's, less what versions 5 on added
     db = sqlite3.connect(tmp_path / "old.sqlite")
     db.executescript("DROP TABLE demand; DROP TABLE users; DROP TABLE meta; DROP TABLE shares; DROP TABLE paid; "
-                     "DROP TABLE burns; DROP TABLE unscanned; DROP TABLE usage; "
+                     "DROP TABLE burns; DROP TABLE unscanned; DROP TABLE usage; DROP TABLE referral_codes; "
+                     "DROP TABLE referral_moves; DROP TABLE referral_entries; DROP TABLE referral; "
                      "DROP INDEX results_by_endpoint; DROP INDEX samples_by_test; "
                      "ALTER TABLE samples DROP COLUMN test_id; ALTER TABLE samples DROP COLUMN media; "
                      "INSERT INTO tests VALUES ('kept', 3, 560, 'h', 565, 'confirmed', ''); "
@@ -856,7 +857,7 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
     assert store._query("PRAGMA user_version")[0][0] == SCHEMA_VERSION
     assert store.demand_ema(10) == {}
     assert {"test_id", "media"} <= {column[1] for column in store._query("PRAGMA table_info(samples)")}
-    assert store.paid(0, 10) == {}
+    assert store.paid(0, 10) == {} and store.referral_recorded_through() == 0
 
 
 def test_verdicts_take_a_few_queries_whatever_the_number_of_endpoints(tmp_path) -> None:
