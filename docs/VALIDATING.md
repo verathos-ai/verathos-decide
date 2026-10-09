@@ -322,6 +322,7 @@ stay). Wallets are never touched.
 
 | Problem | What to do |
 |---|---|
+| `weights not set: the chain holds 10 unrevealed weight commits of this hotkey ...` | the chain reveals committed weights as it runs the subnet's epochs and keeps at most 10 unrevealed commits of a hotkey per epoch; it has not run one for a while, so the validator sends no commit it would refuse (and charge for) and commits again once the chain has revealed them. Nothing to do on this machine |
 | `UID ... has no validator permit yet` | the chain takes weights, and miners answer, only from validators with a permit, which follows the stake |
 | `epoch ...: no weights set: no results of the source verified by block ...` | light: the reason follows. The auditor's axon unreachable, or its results not out yet, cost that epoch only, and the weights set before stay on chain; `not signed within 300 s of this machine's clock`: sync the clock (NTP); `it lists no weights` or `it is not signed`: the auditor runs an older release; `names no TLS pin for the auditor`: the committed catalog does not name the auditor's certificate yet; `certificate pin ... is not the pinned ...`: the source serves another certificate than the catalog (or its commitment) names, as during a rotation; `commits no TLS pin`: the `source_hotkey` validator publishes no identity |
 | `catalog ... names ... as the auditor's TLS pin, but this service's certificate has pin ...` | the auditor: commit a catalog naming its pin, `commit-catalog` on its machine (`SUBNET_ADMIN.md`) |

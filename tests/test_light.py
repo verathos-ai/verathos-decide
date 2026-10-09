@@ -54,9 +54,18 @@ class Chain:
         self.set: list[dict] = []
         self.last_update: dict[int, list[int]] = {}  # per mechanism, per UID
         self.version_floor = 7  # the subnet's WeightsVersionKey
+        self.epoch_index = 22664  # the subnet's SubnetEpochIndex
+        self.unrevealed: dict[tuple[int, int], list[tuple]] = {}  # TimelockedWeightCommits by mechanism and epoch
         self.substrate = SimpleNamespace(query=self.query)
 
     def query(self, module: str, item: str, params: list):
+        if item == "SubnetEpochIndex":
+            assert params == [405]
+            return SimpleNamespace(value=self.epoch_index)
+        if item == "TimelockedWeightCommits":
+            mechanism, netuid = divmod(params[0], 4096)
+            assert netuid == 405
+            return SimpleNamespace(value=self.unrevealed.get((mechanism, params[1]), []))
         if item == "LastUpdate":
             mechanism, netuid = divmod(params[0], 4096)  # the chain keeps each mechanism's apart
             assert netuid == 405
@@ -530,3 +539,29 @@ def test_a_validator_whose_release_the_subnet_retired_sets_no_weights_and_says_w
     chain.version_floor = release.weights_version_key()
     v.step()
     assert [s["version_key"] for s in chain.set] == [release.weights_version_key()]
+
+
+def test_no_weights_are_committed_while_the_chain_holds_as_many_unrevealed_as_it_keeps(tmp_path, monkeypatch,
+                                                                                      caplog) -> None:
+    """The chain keeps at most 10 unrevealed weight commits of a hotkey per epoch of the subnet and refuses (and
+    charges for) another until it runs the epoch that reveals them: a validator at the limit sends none and says why,
+    one below it commits."""
+    from verathos.validator import __main__ as validator_main
+
+    caplog.set_level(logging.INFO, logger="verathos.validator")
+    owner, own, other = kp(), kp(), kp()
+    chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET + 5)
+    monkeypatch.setattr(validator_main.time, "sleep", lambda s: pytest.fail("refused at once, not retried"))
+    commit = (own.ss58_address, chain.block - 100, "0x00", 1)
+    chain.unrevealed = {(1, chain.epoch_index + 1): [commit] * 10 + [(other.ss58_address, 1, "0x00", 1)] * 3}
+    settings, wallet = config(tmp_path), SimpleNamespace(hotkey=own)
+    assert not validator_main.set_weights(settings, chain, wallet, WEIGHTS, 1)
+    assert chain.set == [] and ("weights not set: the chain holds 10 unrevealed weight commits of this hotkey on "
+                                "mechanism 1, the most it keeps, until it runs the subnet's epoch that reveals them"
+                                ) in caplog.messages
+    caplog.clear()  # asked again in the same epoch of the subnet: said once
+    assert not validator_main.set_weights(settings, chain, wallet, WEIGHTS, 1)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING] and chain.set == []
+    assert validator_main.set_weights(settings, chain, wallet, WEIGHTS, 0) and len(chain.set) == 1  # another mechanism
+    chain.epoch_index += 2  # the chain ran the subnet's epochs and revealed them
+    assert validator_main.set_weights(settings, chain, wallet, WEIGHTS, 1) and len(chain.set) == 2

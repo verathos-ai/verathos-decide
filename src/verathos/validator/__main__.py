@@ -62,6 +62,7 @@ from verathos.validator.throughput import Throughput
 
 log = logging.getLogger("verathos.validator")
 WEIGHT_ATTEMPTS = 10
+_SAID_UNREVEALED: set[tuple[int, int, int]] = set()  # (netuid, mechanism, epoch counter) said at warning level
 REFERENCE_WAIT_S = 900.0  # the most the first epoch waits for reference engines still loading their models
 EVIDENCE_SHARE = 0.1  # of the epoch, the most rechecking the auditor's evidence may take
 OWNER_RESIDENT = ("this is the subnet owner's hotkey: its validator is the auditor, which checks test answers at any "
@@ -441,6 +442,11 @@ def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: di
                 return True
         except chain.ReleaseTooOld as exc:
             log.error("weights not set: %s", exc)
+            return False
+        except chain.CommitsUnrevealed as exc:  # said once per epoch of the subnet: a light validator asks often
+            said = (cfg.netuid, mechid, exc.epoch)
+            log.log(logging.DEBUG if said in _SAID_UNREVEALED else logging.WARNING, "weights not set: %s", exc)
+            _SAID_UNREVEALED.add(said)
             return False
         log.warning("setting weights failed (attempt %d of %d); retrying in one block", attempt, WEIGHT_ATTEMPTS)
         time.sleep(BLOCK_TIME_S)
