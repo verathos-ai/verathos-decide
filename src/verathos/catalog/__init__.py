@@ -227,6 +227,9 @@ class Catalog(BaseModel):
                                     "{hotkey, egress}")
     auditor: AuditorIdentity | None = Field(None, description="The auditor's TLS pin and egress addresses; nodes reach "
                                             "the auditor only once the catalog names its pin")
+    firewall: Literal["observe", "enforce"] = Field("observe", description="Miners' firewalls: observe (learn and "
+                                                    "report, drop nothing) or enforce (drop connections from other "
+                                                    "addresses than the callers'), each miner once its own checks pass")
     _document: Any = PrivateAttr(None)
 
     @classmethod

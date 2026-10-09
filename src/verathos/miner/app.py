@@ -11,6 +11,10 @@ the auditor, gateways, the auditor's test sessions. Test traffic carries the aud
 test instead of a per-request signature (see ``throughput.policy``); its receipts name the auditor as caller and the
 request id as nonce.
 
+With the firewall (``miner.firewall``), the source address of each request authenticated as a caller is reported
+(``on_verified``), and while it enforces, a connection from an address it does not allow is refused before its request
+is read (``SourceGate``).
+
 Callers other than gateways (validators) need only their canaries: one request at once per endpoint, at most the size
 of the model's largest standard request (``caller_request_bytes``), at most the catalog's budget of requests per
 endpoint and epoch (``admission.RequestBudget``), and while test traffic arrives their requests wait behind it
@@ -74,6 +78,22 @@ def caller_request_bytes(model_id: str, workload: Workload) -> int:
     return max(workload.max_request_bytes(model_id), canaries.max_request_bytes(model_id))
 
 
+class SourceGate:
+    """The service's first middleware: a request from an address ``allows`` refuses is answered 403 before anything of
+    it is read."""
+
+    def __init__(self, app, allows: Callable[[str | None], bool]) -> None:
+        self.app, self.allows = app, allows
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and not self.allows((scope.get("client") or (None,))[0]):
+            await send({"type": "http.response.start", "status": 403,
+                        "headers": [(b"content-type", b"application/json"), (b"connection", b"close")]})
+            await send({"type": "http.response.body", "body": b'{"error": "source address not allowed"}'})
+            return
+        await self.app(scope, receive, send)
+
+
 def create_app(
     *,
     config: MinerConfig,
@@ -93,6 +113,8 @@ def create_app(
     catalog_digest: Callable[[], str] | None = None,
     mechid: Callable[[], int] | None = None,
     budget: RequestBudget | None = None,
+    on_verified: Callable[[str, str | None], None] = lambda hotkey, address: None,
+    allows: Callable[[str | None], bool] | None = None,
 ) -> FastAPI:
     """``manifest`` gives the hotkey's manifest this machine serves (None on a worker), ``host_endpoints`` this
     machine's own endpoints document (None until there is one). ``auditors`` gives the hotkeys whose test sessions are
@@ -101,16 +123,20 @@ def create_app(
     (default: ``max_concurrency`` slots); ``serving`` the endpoints answered (default: those the manifest lists);
     ``max_state_tokens`` a model's limit (``api.prompt_chars``); ``max_caller_request`` the largest request of a model
     callers other than gateways may send (``caller_request_bytes``); ``gateways`` the callers exempt from the
-    per-caller limits (default: the configured ``gateway_hotkeys``); ``catalog_digest`` and ``mechid`` the catalog and
+    per-caller limits (default: the configured ``gateways``); ``catalog_digest`` and ``mechid`` the catalog and
     mechanism receipts name (default: the manifest's); ``budget`` the requests each caller other than a gateway may
-    send an endpoint per epoch (default: no limit)."""
+    send an endpoint per epoch (default: no limit); ``on_verified`` is called with the hotkey and source address of
+    each request authenticated as a caller (a signature, or the auditor's test session), and ``allows`` decides which
+    source addresses are served at all (``SourceGate``; default: all)."""
     app = FastAPI(title="Verathos miner")
+    if allows is not None:
+        app.add_middleware(SourceGate, allows=allows)
     nonces = NonceCache()
     endpoints = {e.endpoint_id: e for e in config.endpoints}
     admissions = admissions or {e.endpoint_id: Admission(e.max_concurrency) for e in config.endpoints}
     hotkey = keypair.ss58_address
     sessions = SessionGate(config.netuid, hotkey)
-    gateways = gateways or (lambda: config.gateway_hotkeys)
+    gateways = gateways or (lambda: [g.hotkey for g in config.gateways])
     catalog_digest = catalog_digest or (lambda: manifest().manifest.catalog_digest)
     mechid = mechid or (lambda: manifest().manifest.mechid)
     in_flight: dict[tuple[str, str], int] = {}  # (caller, endpoint) -> requests, for callers other than gateways
@@ -146,6 +172,7 @@ def create_app(
             caller = verify_request(dict(request.headers), request.method, request.url.path, body, hotkey, nonces)
         except RequestRejected as e:
             return None, None, error(401, str(e))
+        on_verified(caller.hotkey, request.client.host if request.client else None)
         if budget is not None and caller.hotkey not in gateways():
             wait_s = budget.take(caller.hotkey, endpoint_id)
             if wait_s is not None:
@@ -164,6 +191,7 @@ def create_app(
             return None, None, error(401, str(e))
         if session.auditor != hotkey:
             on_test_traffic()
+            on_verified(session.auditor, request.client.host if request.client else None)
         body = await read_body(request)
         if body is None:
             return None, None, error(413, "request too large or too slow")

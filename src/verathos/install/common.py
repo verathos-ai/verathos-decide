@@ -124,6 +124,7 @@ class Record:
     config: str = ""
     engines: dict[str, dict] = field(default_factory=dict)  # per endpoint or model: model, device, port
     paths: list[str] = field(default_factory=list)  # engine checkouts used
+    firewall: bool = False  # the miner's firewall helper is set up (``install.firewall``)
 
     @staticmethod
     def path(home: Path, role: str) -> Path:
@@ -413,6 +414,11 @@ def uninstall(role: str, argv: list[str]) -> None:
         info(f"removed services: {', '.join(record.services)}")
     elif record.services:
         info(f"stop what runs under your process manager (pm2: pm2 delete {' '.join(record.services)})")
+    from verathos.install import firewall
+
+    if record.firewall or (role == "miner" and firewall.installed()):
+        removed = firewall.remove()
+        info(f"removed the firewall: {', '.join(removed)}" if removed else "no firewall to remove")
     other = Record.load(home, "validator" if role == "miner" else "miner")
     still_used = set(other.paths)
     for path in record.paths:
