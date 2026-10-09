@@ -186,14 +186,14 @@ signed by a gateway the catalog lists. The auditor keeps, for endpoints it tests
 and the answers and names that gateway (up to 8 per endpoint and epoch, and 2 with images; signed malformed answers
 always), and recomputes per endpoint and epoch a random `gateway_checks_per_epoch` of them, and besides those
 `gateway_image_checks_per_epoch` with images, between tests (screen and fp32 reference as above; an answer with images
-on the fp32 reference alone, which gets the images as the miner received them: a screen serves text). A wrong answer is
-evidence like one in a test; so is a receipt signing more or fewer input tokens than the reference counts (beyond 2% and
-2 tokens), here and in tests, since users' input tokens are what they are billed and set the models' emission shares.
-The differences form a drift tally of their own over the last `drift_window_tests` epochs: an endpoint whose answers to
-users drift beyond the model's `mean_abs` loses its credit, however correct its test answers are. A gateway answer
-counts in the epoch its check finished, so an epoch's verdicts depend only on checks finished before it began. A sampled
-user request in the form of the test's requests or of a canary is logged as relayed: some miner forwards what it is sent
-to the gateway (`throughput.workload.in_mix_form`, `validator.canaries.canary_like`).
+on the fp32 reference alone, which gets the images as the miner received them). A wrong answer is evidence like one in a
+test; so is a receipt signing more or fewer input tokens than the reference counts (beyond 2% and 2 tokens), here and in
+tests, since users' input tokens are what they are billed and set the models' emission shares. The differences form a
+drift tally of their own over the last `drift_window_tests` epochs: an endpoint whose answers to users drift beyond the
+model's `mean_abs` loses its credit, however correct its test answers are. A gateway answer counts in the epoch its
+check finished, so an epoch's verdicts depend only on checks finished before it began. A sampled user request in the
+form of the test's requests or of a canary is logged as relayed: some miner forwards what it is sent to the gateway
+(`throughput.workload.in_mix_form`, `validator.canaries.canary_like`).
 
 A sampled request with images is held in the auditor's memory only, never in its database, until its check (at most
 2 GiB of images at once; a sample beyond is not kept); the row keeps the receipt and the other columns. Once it is

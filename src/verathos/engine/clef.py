@@ -7,16 +7,18 @@ defines the encoding (token ids and the question and option spans) and the head,
 Two paths:
 - ``reference``: the release's own ``systemone`` on one request at a time, any device and dtype. Validators run it in
   float32 on CPU as the reference; on a GPU, float32 is computed without TF32.
-- ``fast`` (CUDA, bfloat16): the backbone runs as ``verathos.engine.qwen35.Backbone`` on right-padded batches replayed
-  from CUDA graphs (``verathos.engine.graphs``); the head runs for the whole pass at once
-  (``verathos.engine.clef_head``). Requests are tokenized as they arrive and batched by length under a token budget.
+- ``fast`` (CUDA, bfloat16): the backbone runs as ``verathos.engine.qwen35.Backbone`` on right-padded batches; the head
+  runs for the whole pass at once (``verathos.engine.clef_head``). Requests are encoded as they arrive and batched by
+  kind and length under a token budget that counts image tokens. Text passes replay CUDA graphs
+  (``verathos.engine.graphs``); passes of requests with images run eagerly as the release's forward computes them: the
+  images through the release's vision tower, its features in place of the image tokens' embeddings, and the release's
+  3-axis positions.
 
 Both give the release a record built from the request (``Prepared.body``): its model, state and questions, never
-another field of it. The reference also takes images, which must be canonical (``protocol.media``): they are decoded
-to RGB here and given to the release's processor as pixels with the engine's own processor arguments (no resizing: a
-canonical image has the size the processor would choose, and its aspect ratio may round past the processor's limit),
-so the release never fetches, opens or resizes anything. ``videos`` and ``media_kwargs`` are refused, and the fast path
-refuses images.
+another field of it, and its images, which must be canonical (``protocol.media``): they are decoded to RGB here and
+given to the release's processor as pixels with the engine's own processor arguments (no resizing: a canonical image
+has the size the processor would choose, and its aspect ratio may round past the processor's limit), so the release
+never fetches, opens or resizes anything. ``videos`` and ``media_kwargs`` are refused.
 """
 
 from __future__ import annotations
@@ -38,9 +40,19 @@ MEDIA_KWARGS = {"do_resize": False}  # the processor arguments of a record with 
 
 
 @dataclass(frozen=True)
+class Media:
+    """The images of a request as the fast path's passes take them, made when the request is prepared."""
+
+    pixel_values: Any  # [patches, values per patch] in the vision tower's dtype, as the release's processor made them
+    grid: Any  # [images, 3]: each image's patches in time, height and width (the release's image_grid_thw)
+    positions: Any  # [3, tokens]: the release's 3-axis positions of the request's tokens
+
+
+@dataclass(frozen=True)
 class Prepared:
     body: dict[str, Any]  # the record the release reads (``record``)
     encoded: Any  # the release's EncodedRecord
+    media: Media | None = None  # the fast path's images of a request with images
 
 
 def _release_module(path: Path):
@@ -69,16 +81,13 @@ def _validate(body: dict[str, Any]) -> None:
             raise ValueError(f"{question_id}: criteria must not be empty")
 
 
-def record(body: dict[str, Any], bounds: dict[str, int] | None) -> dict[str, Any]:
-    """The record the release reads for a request: its model, state and questions, and with ``bounds`` (the images
-    the processor takes as they are: ``image_bounds``) its canonical images decoded to RGB, with ``MEDIA_KWARGS``.
-    Raises ValueError for a request the release refuses, images where they are not served, or an image that is not
-    canonical."""
+def record(body: dict[str, Any], bounds: dict[str, int]) -> dict[str, Any]:
+    """The record the release reads for a request: its model, state and questions, and its canonical images decoded to
+    RGB, with ``MEDIA_KWARGS``; ``bounds`` are the images the processor takes as they are (``image_bounds``). Raises
+    ValueError for a request the release refuses or an image that is not canonical."""
     _validate(body)
     out = {"model": body["model"], "state": body["state"], "questions": body["questions"]}
     if body.get("images"):
-        if bounds is None:
-            raise ValueError("images are not served by this engine")
         out["images"] = canonical_pixels(body["images"], **bounds)
         out["media_kwargs"] = dict(MEDIA_KWARGS)
     return out
@@ -140,15 +149,16 @@ class FastEngine:
 
         self.torch = torch
         self.module = _release_module(path)
-        model, processor = self.module.load_release_model(str(path), device=device, dtype=torch.bfloat16)
+        model, self.processor = self.module.load_release_model(str(path), device=device, dtype=torch.bfloat16)
         model.eval()
         base = model.language_model
-        self.tokenizer = processor.tokenizer
+        self.tokenizer = self.processor.tokenizer
         self.pad_id = self.tokenizer.pad_token_id
+        self.image_bounds = image_bounds(self.processor)
         self.head = model.head
         self.output_embedding = base.get_output_embeddings().weight
-        if hasattr(base.model, "visual"):  # text requests only: the vision tower is not used
-            del base.model.visual
+        self.vision = base.model  # the release's vision tower (get_image_features) and positions (get_rope_index)
+        self.image_token_id = base.config.image_token_id
         self.backbone = Backbone(base.model.language_model)
         torch.cuda.empty_cache()
         self.device = torch.device(device)
@@ -167,47 +177,85 @@ class FastEngine:
         self.forward.capture_all()
 
     def prepare(self, body: dict[str, Any]) -> Prepared:
-        release = record(body, None)
-        return Prepared(release, self.module.encode_record(self.tokenizer, release, max_length=self.max_length))
+        release = record(body, self.image_bounds)
+        encoded = self.module.encode_record(self.tokenizer, release, max_length=self.max_length,
+                                            processor=self.processor)
+        return Prepared(release, encoded, None if encoded.media is None else self._media(encoded))
+
+    def _media(self, encoded: Any) -> Media:
+        """A request's images as a pass takes them, checked as the release's forward checks them: its image tokens
+        must be as many as its images' features (its text holding the image token would add some)."""
+        torch = self.torch
+        media, ids = encoded.media, torch.tensor([encoded.input_ids])
+        grid = media["image_grid_thw"]
+        if int((ids == self.image_token_id).sum()) != int(grid.prod(-1).sum()) // self.vision.visual.spatial_merge_unit:
+            raise ValueError("a request with images may not hold <|image_pad|> in its text")
+        types = torch.zeros_like(ids)  # the release's mm_token_type_ids: which tokens are image tokens
+        offset, values = media["token_offset"], media["mm_token_type_ids"]
+        types[0, offset : offset + len(values)] = torch.tensor(values)
+        positions, _ = self.vision.get_rope_index(ids, types, image_grid_thw=grid)
+        # cast as the release's tower casts them first, here so a waiting request holds half the bytes
+        return Media(media["pixel_values"].to(self.vision.visual.dtype), grid, positions[:, 0])
 
     def passes(self, items: list[Prepared]) -> list[list[int]]:
-        """Indexes grouped by length: each group's padded size stays within the token budget (a single longer request
-        forms its own group)."""
+        """Indexes grouped by kind and length: requests with images and text requests in passes of their own, each
+        group's padded size within the token budget, which counts image tokens (a single longer request forms its own
+        group)."""
         from verathos.engine.graphs import bucket_length
 
-        order = sorted(range(len(items)), key=lambda i: len(items[i].encoded.input_ids))
+        order = sorted(range(len(items)), key=lambda i: (items[i].media is not None, len(items[i].encoded.input_ids)))
         groups: list[list[int]] = []
         for i in order:
             length = bucket_length(len(items[i].encoded.input_ids), self.length_step)
             group = groups[-1] if groups else None
-            if group and len(group) < self.max_rows and (len(group) + 1) * length <= self.max_batch_tokens:
+            if (group and (items[group[0]].media is None) == (items[i].media is None) and len(group) < self.max_rows
+                    and (len(group) + 1) * length <= self.max_batch_tokens):
                 group.append(i)
             else:
                 groups.append([i])
         return groups
 
-    def _pass(self, records: list[Any]) -> list[list[Any]]:
+    def _pass(self, items: list[Prepared]) -> list[list[Any]]:
+        """Option logits of one pass: of text requests only, or of requests with images only (``passes``)."""
         from verathos.engine.clef_head import batched_head
         from verathos.engine.graphs import bucket_length
 
         torch = self.torch
+        records = [item.encoded for item in items]
+        media = [item.media for item in items if item.media is not None]
         length = bucket_length(max(len(r.input_ids) for r in records), self.length_step)
-        batch = self.forward.graphed_batch(len(records), length) or len(records)
+        batch = len(records) if media else self.forward.graphed_batch(len(records), length) or len(records)
         ids = torch.full((batch, length), self.pad_id, dtype=torch.long)
         mask = torch.zeros((len(records), length), dtype=torch.long)
         for row, record in enumerate(records):
             ids[row, : len(record.input_ids)] = torch.tensor(record.input_ids)
             mask[row, : len(record.input_ids)] = 1
         ids = ids.to(self.device, non_blocking=True)
-        hidden = self.forward(ids)
+        hidden = self._media_forward(ids, media) if media else self.forward(ids)
         lengths = mask.sum(1).to(self.device, non_blocking=True)
         return batched_head(self.head, hidden, ids, lengths, records, self.output_embedding)
+
+    def _media_forward(self, ids: Any, media: list[Media]) -> Any:
+        """Last hidden states of a pass of requests with images, as the release's forward computes them: the images'
+        features from its vision tower (attention within each image) in place of the image tokens' embeddings, in
+        order, and its 3-axis positions (padding after a request keeps position 0: it never reaches the request)."""
+        torch = self.torch
+        pixels = torch.cat([m.pixel_values for m in media]).to(self.device, non_blocking=True)
+        grid = torch.cat([m.grid for m in media]).to(self.device, non_blocking=True)
+        features = torch.cat(self.vision.get_image_features(pixels, grid, return_dict=True).pooler_output)
+        embeds = torch.nn.functional.embedding(ids, self.backbone.embed)
+        embeds = embeds.masked_scatter((ids == self.image_token_id)[..., None], features.to(embeds.dtype))
+        positions = torch.zeros((3, *ids.shape), dtype=torch.long)
+        for row, m in enumerate(media):
+            positions[:, row, : m.positions.shape[1]] = m.positions
+        positions = positions.to(self.device, non_blocking=True)
+        return self.backbone.forward(inputs_embeds=embeds, position_ids=positions)
 
     def run(self, items: list[Prepared]) -> list[dict[str, Any]]:
         out: list[dict[str, Any] | None] = [None] * len(items)
         with self.torch.inference_mode():
             for group in self.passes(items):
-                logits = self._pass([items[i].encoded for i in group])
+                logits = self._pass([items[i] for i in group])
                 for i, record_logits in zip(group, logits):
                     out[i] = self._answer(items[i], record_logits)
         return out  # type: ignore[return-value]

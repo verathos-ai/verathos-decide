@@ -442,10 +442,11 @@ cards accumulate bfloat16 in fp32 at half their fp16 rate. Answers from all of t
 reference.
 
 A model whose catalog entry lists `image` in its `input_modalities` also gets requests with images, which the gateway
-has made canonical (`GATEWAY.md`, Images); no model of the shipped catalog does. The bfloat16 engine serves text
-requests only and answers a request with images 422; the float32 engine (`--dtype float32`) runs the release's own
-code on them. Either engine gives the release only a request's model, state and questions, and images only as decoded
-pixels: nothing fetches a URL or opens a path.
+has made canonical (`GATEWAY.md`, Images); no model of the shipped catalog does yet. The bfloat16 engine runs them in
+passes of their own, without CUDA graphs: their images through the release's vision tower, whose features take the
+image tokens' places, and the rest as for text, with image tokens counted in a pass's token budget. The float32 engine
+(`--dtype float32`) runs the release's own code on them. Either engine gives the release only a request's model, state
+and questions, and images only as decoded pixels: nothing fetches a URL or opens a path.
 
 ### 4. Configure
 
