@@ -471,6 +471,8 @@ def test_the_messages_of_the_installers_code_name_the_variables_set_here() -> No
     assert container.named("as --model asks; with --model it can serve x") == "as MODEL asks; with MODEL it can serve x"
     assert container.named("--gpus takes GPU numbers") == "GPUS takes GPU numbers"
     assert container.named("--peers: x; --name: y; --allow: z") == "PEERS: x; NAME: y; ALLOW: z"
+    assert container.named("a full validator (--full); --light sets") == (
+        "a full validator (compose.validator-full.yml); compose.validator.yml sets")
 
 
 def test_variables_are_read_as_set_and_refused_with_their_names() -> None:
@@ -945,11 +947,13 @@ def test_the_follower_keeps_following_after_a_round_fails_and_stops_with_the_sup
         watched.lines[0])
 
 
-def test_a_light_validator_container_sets_the_auditors_weights_with_the_hotkey_alone(box) -> None:
+def test_a_light_validator_container_sets_the_auditors_weights_with_the_hotkey_alone(box, capsys) -> None:
     box.hotkey = "5Validator"
     p = container.validator({"WALLET": "v", "MODE": "light", "NETWORK": "test"}, box.data, box.remote)
     assert p.command == [str(Path(sys.prefix) / "bin" / "verathos-validator"), "--config",
                          str(box.data / "validator.json")]
+    out = capsys.readouterr().out  # the mode is the compose file here, not an option
+    assert "where a full validator (compose.validator-full.yml) checks answers itself" in out and "--full" not in out
     config = ValidatorConfig.load(box.data / "validator.json")
     assert (config.mode, config.auto_update, config.netuid, config.references) == ("light", False, 405, {})
     assert (config.state_dir, config.catalog_dir) == (box.data / "validator", box.data / "catalog")
@@ -985,7 +989,9 @@ def test_a_full_validator_container_takes_its_references_from_the_reference_mach
         "full", "resident", {}, None)
     assert config.egress_ips == ["203.0.113.7"] and config.auto_update is False
     assert (box.data / "validator.json").stat().st_mode & 0o777 == 0o600  # it holds the keys
-    assert "the screens of kev-4b are the auditor's: not configured here" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "the screens of kev-4b are the auditor's: not configured here" in out
+    assert "(compose.validator.yml sets the subnet owner's validator's results instead)" in out and "--light" not in out
     container.validator({**env, "PUBLIC_IP": "203.0.113.9", "PORT": "20099", "EGRESS_IPS": "203.0.113.9"}, box.data,
                         box.remote)
     config = ValidatorConfig.load(box.data / "validator.json")

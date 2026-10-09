@@ -50,12 +50,14 @@ SETUP_RETRY_S = 60.0  # a setup that stops waits this long before the container 
 INSTALLED = ".verathos-installed"  # in an engine installed into <data>/engines: the purposes its install completed
 MINER = ("miner",)  # the purpose of a miner's engines: bfloat16, with the fused kernels
 TRUE, FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
-# The installer's options in the messages of its code, as they are set here: variables of the .env. "--model x"
-# becomes MODEL=x where x is a value (a model, a list, <id> or auto).
+# The installer's options in the messages of its code, as they are set here: variables of the .env, and the compose
+# file of a validator's mode. "--model x" becomes MODEL=x where x is a value (a model, a list, <id> or auto).
 VARIABLES = ((re.compile(r"--model (?=auto\b|<|[\w.]*[-\d,])"), "MODEL="), (re.compile(r"--model\b"), "MODEL"),
              (re.compile(r"--gpus\b"), "GPUS"), (re.compile(r"--peers\b"), "PEERS"), (re.compile(r"--name\b"), "NAME"),
              (re.compile(r"--public-ip\b"), "PUBLIC_IP"), (re.compile(r"--allow\b"), "ALLOW"),
-             (re.compile(r"--egress-ip\b"), "EGRESS_IPS"), (re.compile(r"--remote-engines\b"), "REMOTE_ENGINES_DIR"))
+             (re.compile(r"--egress-ip\b"), "EGRESS_IPS"), (re.compile(r"--remote-engines\b"), "REMOTE_ENGINES_DIR"),
+             (re.compile(r"--light\b"), "compose.validator.yml"),
+             (re.compile(r"--full\b"), "compose.validator-full.yml"))
 
 
 def named(text: str) -> str:
@@ -879,7 +881,7 @@ def validator(env: Mapping[str, str], data: Path = DATA, remote_dir: Path = REMO
 
     step("Plan")
     for line in setup.mode_lines(mode, cat, owner=False):
-        info(line)
+        info(named(line))
     remote = screens = egress = None
     if mode == "full":
         files = sorted(remote_dir.glob("*.json")) if remote_dir.is_dir() else []
