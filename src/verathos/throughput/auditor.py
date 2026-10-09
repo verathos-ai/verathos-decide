@@ -733,11 +733,6 @@ class Store:
                      checked_epoch, sample_id))
         self._settle_media()
 
-    def media_held(self) -> tuple[int, int]:
-        """(pending samples whose requests with images are held in memory, their images' bytes)."""
-        with self._lock:
-            return len(self._media), self._media_bytes
-
     def offenders(self, since_epoch: int) -> set[str]:
         """Hotkeys with a wrong answer proven since ``since_epoch``, confirmed or not yet."""
         rows = self._query(

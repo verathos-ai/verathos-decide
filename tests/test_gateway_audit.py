@@ -926,6 +926,11 @@ def test_a_sample_check_never_blocks_the_auditors_event_loop_while_verdicts_are_
 
 # ---- answers to requests with images ----
 
+def held(store) -> tuple[int, int]:
+    """(pending samples whose requests with images the store holds in memory, their images' bytes)."""
+    return len(store._media), store._media_bytes
+
+
 class Seeing(MockEngine):
     """Answers as the mock engine and keeps the requests it is asked, a reference that shows what it recomputed."""
 
@@ -969,14 +974,14 @@ def test_answers_with_images_are_sampled_apart_held_in_memory_only_and_checked_w
     assert auditor.accept_samples(gateway.ss58_address, with_images + text) == 2 + 3  # two with images per epoch
     rows = auditor.store._query("SELECT media, request FROM samples ORDER BY media")
     assert [m for m, _ in rows] == [0, 0, 0, 1, 1] and all(r == "{}" for m, r in rows if m)
-    assert auditor.store.media_held()[0] == 2
+    assert held(auditor.store)[0] == 2
     image_data = with_images[0].request["images"][0]["base64"][100:160]
     assert image_data.encode() not in (tmp_path / "t.sqlite").read_bytes()  # no image in the database
     reference = Seeing("clef-flash")
     asyncio.run(auditor.check_samples(Checks({"clef-flash": reference}, {})))
     states = auditor.store._query("SELECT media, state FROM samples ORDER BY media, state")
     assert states == [(0, "checked"), (0, "checked"), (0, "skipped"), (1, "checked"), (1, "skipped")]
-    assert auditor.store.media_held() == (0, 0)  # given up once checked or skipped
+    assert held(auditor.store) == (0, 0)  # given up once checked or skipped
     assert sum(bool(r.get("images")) for r in reference.asked) == 1  # recomputed with its images
     auditor.chain.head_block = 4 * 180 + 1
     auditor.follower.poll()
@@ -1017,7 +1022,7 @@ def test_a_proof_with_images_is_kept_without_its_images_and_needs_no_recompute(t
     auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)])
     assert auditor.accept_samples(gateway.ss58_address, [sample]) == 1
     ((media, proof, stored),) = auditor.store._query("SELECT media, proof, request FROM samples")
-    assert (media, proof) == (0, 1) and "images" not in json.loads(stored) and auditor.store.media_held()[0] == 0
+    assert (media, proof) == (0, 1) and "images" not in json.loads(stored) and held(auditor.store)[0] == 0
     reference = Seeing("clef-flash")
     asyncio.run(auditor.check_samples(Checks({"clef-flash": reference}, {})))
     assert auditor.store._query("SELECT state, reason FROM samples") == [("checked", "malformed answers")]
@@ -1039,7 +1044,7 @@ def test_the_images_of_pending_samples_held_at_once_are_bounded(tmp_path, monkey
     auditor.update_slots([Slot(k.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)
                           for k in (miner_kp, other_kp)])
     assert auditor.accept_samples(gateway.ss58_address, samples) == 1
-    assert auditor.store.media_held() == (1, size)
+    assert held(auditor.store) == (1, size)
 
 
 def test_answers_with_images_are_not_kept_when_the_policy_checks_none(tmp_path) -> None:
@@ -1071,4 +1076,4 @@ def test_a_tests_pick_with_images_is_checked_from_memory(tmp_path) -> None:
     assert auditor.store._query("SELECT request, media FROM samples") == [("{}", 1)]
     assert auditor.store.test_sample("ab" * 32, "hk", "gpu0") == ("t", "n", request, "{}")
     auditor.store.finish_sample("t", "checked")
-    assert auditor.store.media_held() == (0, 0) and auditor.store.test_sample("ab" * 32, "hk", "gpu0") is None
+    assert held(auditor.store) == (0, 0) and auditor.store.test_sample("ab" * 32, "hk", "gpu0") is None
