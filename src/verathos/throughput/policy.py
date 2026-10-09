@@ -66,7 +66,8 @@ class AuditPolicy:
     regrow_after: int = 3
     min_test_share: float = 0.125  # ... but at least this share of the model's first_test_rps
     drift_window_tests: int = 8  # tests over which an endpoint's recomputed answers are held to mean_abs
-    gateway_checks_per_epoch: int = 2  # sampled gateway answers the auditor recomputes per endpoint and epoch
+    gateway_checks_per_epoch: int = 2  # sampled gateway answers the auditor recomputes per endpoint and epoch ...
+    gateway_image_checks_per_epoch: int = 1  # ... and besides those, answers to requests with images
 
     def validate(self) -> None:
         if self.mode not in ("enforce", "observe"):
@@ -83,8 +84,8 @@ class AuditPolicy:
                self.credit_ttl_epochs, self.drift_window_tests) < 1:
             raise ValueError("lead_blocks, samples_per_test, answer_checks_per_test, qualification_tests, "
                              "credit_ttl_epochs and drift_window_tests must be at least 1")
-        if self.gateway_checks_per_epoch < 0:
-            raise ValueError("gateway_checks_per_epoch cannot be negative")
+        if self.gateway_checks_per_epoch < 0 or self.gateway_image_checks_per_epoch < 0:
+            raise ValueError("gateway_checks_per_epoch and gateway_image_checks_per_epoch cannot be negative")
         if self.answer_checks_per_test > self.samples_per_test:
             raise ValueError("answer_checks_per_test cannot exceed samples_per_test")
         if not 1 <= self.retest_growth <= self.rate_growth:

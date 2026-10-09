@@ -441,6 +441,12 @@ The backbone's matrix multiplications are most of the work, so a GPU's bfloat16 
 cards accumulate bfloat16 in fp32 at half their fp16 rate. Answers from all of them stay within 0.014 of the float32
 reference.
 
+A model whose catalog entry lists `image` in its `input_modalities` also gets requests with images, which the gateway
+has made canonical (`GATEWAY.md`, Images); no model of the shipped catalog does. The bfloat16 engine serves text
+requests only and answers a request with images 422; the float32 engine (`--dtype float32`) runs the release's own
+code on them. Either engine gives the release only a request's model, state and questions, and images only as decoded
+pixels: nothing fetches a URL or opens a path.
+
 ### 4. Configure
 
 `miner.json`:
@@ -511,23 +517,28 @@ On start the miner:
    endpoint delivered in them ([Falling short](#falling-short)). A failed measurement keeps the current manifest, a
    measurement that a throughput test interrupts is retried later, and one that waits for a test starts after it.
 
-Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted from
-hotkeys holding a validator permit and at least the catalog's `scoring.validator_min_stake` of stake (the
-metagraph's `S`: alpha stake plus TAO stake weighted as for permits; both read every 10 minutes), from the auditor
-whatever its stake, from the subnet's gateways (the catalog's `gateways`) and the miner's own `gateways`, and
-as test traffic under a session the auditor signed; while the firewall enforces, only from their addresses
-([Firewall](#firewall)). Other callers are refused before their request body is read; bodies are capped at 1 MiB and must arrive within 10 s, and a request's state, question ids,
-instructions and criteria together may hold at most 4 characters per token of the model's `max_state_tokens`. A
-validator gets one request at once per endpoint (HTTP 429 beyond that), each no larger than the largest request of
-the model's request mix (HTTP 413), at most the catalog's `scoring.validator_requests_per_epoch` per endpoint and
-epoch (default 4 x `canary_pool_size`, 64; beyond, HTTP 429 with `Retry-After` until the next epoch), and while the
-auditor's test traffic arrives its requests wait behind the test's; gateways and test traffic are not limited. The miner signs only well-formed answers (one distribution per question over its options,
-with the `noul`, `choice` and `score` derived from it; fields other than an answer type's own are dropped before
-signing): an engine that returns anything else gets an error back to the caller, never a signed receipt. The auditor
-recomputes a sample of the answers given to the subnet's gateway, as it does test answers: serve users the same
-model, at the same precision.
-The input tokens a receipt signs are checked against the reference's count too: users are billed for them and they
-set each model's share of the emission, so signing more or fewer than the reference counts is a wrong answer.
+Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted from hotkeys
+holding a validator permit and at least the catalog's `scoring.validator_min_stake` of stake (the metagraph's `S`: alpha
+stake plus TAO stake weighted as for permits; both read every 10 minutes), from the auditor whatever its stake, from the
+subnet's gateways (the catalog's `gateways`) and the miner's own `gateways`, and as test traffic under a session the
+auditor signed; while the firewall enforces, only from their addresses ([Firewall](#firewall)). Other callers are
+refused before their request body is read; bodies are capped at 1 MiB (for a model whose catalog entry lists `image`, at
+its `images.max_request_bytes`, 13 MiB by default) and must arrive within 10 s, and a request's state, question ids,
+instructions and criteria together may hold at most 4 characters per token of the model's `max_state_tokens`. Images
+reach an engine only for a model that reads them, at most its `images.max_count`, each canonical as the gateway makes it
+(an object of `image/png` or `image/jpeg` in base64, 8-bit RGB with nothing but its header and tables before its pixels,
+its sides multiples of `images.token_px` and its pixels within the model's budget); anything else gets 422 before the
+engine sees it. A validator gets one request at once per endpoint (HTTP 429 beyond that), each no larger than the
+largest request of the model's request mix (HTTP 413), at most the catalog's `scoring.validator_requests_per_epoch` per
+endpoint and epoch (default 4 x `canary_pool_size`, 64; beyond, HTTP 429 with `Retry-After` until the next epoch), and
+while the auditor's test traffic arrives its requests wait behind the test's; gateways and test traffic are not limited.
+The miner signs only well-formed answers (one distribution per question over its options, with the `noul`, `choice` and
+`score` derived from it; fields other than an answer type's own are dropped before signing): an engine that returns
+anything else gets an error back to the caller, never a signed receipt. The auditor recomputes a sample of the answers
+given to the subnet's gateway, as it does test answers: serve users the same model, at the same precision. The input
+tokens a receipt signs are checked against the reference's count too: users are billed for them and they set each
+model's share of the emission, so signing more or fewer than the reference counts is a wrong answer. A request's images
+count as the release counts them: (width / 32) x (height / 32) + 2 tokens each, and one more for the request.
 
 ## Reading the log
 

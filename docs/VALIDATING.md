@@ -382,6 +382,11 @@ reference needs about 41 GiB of RAM (47 GiB on a GPU).
 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8103 --device cpu --dtype float32
 ```
 
+For a model whose catalog entry lists `image` in its `input_modalities`, the reference also reads the canonical images
+of the requests it recomputes (`GATEWAY.md`, Images), decoded to pixels and given to the release's processor without
+resizing; on a GPU it computes float32 without TF32. An image adds up to 1,026 tokens to a request at the default
+pixel budget, and the auditor's recomputes must finish within 30 s: give the auditor's reference of such a model a GPU.
+
 References one at a time are not started by hand: give each its command in `references` and set `reference_mode` to
 `sequential` ([3. Configure](#3-configure)); the validator runs the command from `directory` with `environment` over
 its own, and the engine must serve on the URL's port on `127.0.0.1`:
@@ -436,7 +441,7 @@ of a full validator:
 | `mechid` | the catalog's | mechanism the weights are set on and manifests are accepted for, instead of the catalog's `mechanism`; leave it unset to follow the catalog |
 | `references` | {} | full: model id -> the model's fp32 reference engine: a URL (plain http on `127.0.0.1` only), or `{"url", "api_key", "tls_pin"}` for a remote engine over https, accepted by its certificate's pin or, without one, by a public CA's certificate for its hostname (the Kev server takes its key from `KEV_API_KEY`), or for references one at a time `{"url", "command", "directory", "environment"}`: the command that serves it at the URL on `127.0.0.1`, which the validator runs when it checks the model (the installer writes them; a reference without a command is taken as running). Every `active` model needs one: the validator does not start without, and stops when a new catalog activates a model it has none for; `candidate` models without one are not audited by this validator. Light validators ignore it |
 | `reference_mode` | `resident` | full: `resident` or `sequential` (one at a time, [References](#references-resident-or-one-at-a-time)); the subnet owner's validator does not start one at a time |
-| `audit_screens` | {} | auditor only: model id -> a bf16 engine (same forms) that screens the sampled test answers; an answer it flags counts as wrong only once the fp32 reference confirms it |
+| `audit_screens` | {} | auditor only: model id -> a bf16 engine (same forms) that screens the sampled answers to text requests; an answer it flags counts as wrong only once the fp32 reference confirms it, and answers to requests with images go to the reference alone |
 | `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database; references one at a time: their times (`references.json`) and logs (`references/`); light: the last epoch whose weights it set |
 | `dry_run` | false | compute weights without setting them (light: log the weights it would set) |
 | `auto_update` | false (the installer sets true, except for the subnet owner's validator) | install each new release by itself between epochs, then exit for the process manager to start it ([Update](#update)) |
@@ -599,7 +604,9 @@ If the validator's hotkey is the auditor, it also:
 - runs every scheduled test with the load generator, checks the sampled answers on its reference engines, and
   confirms tests once their selection block is final;
 - serves the subnet's gateway its routes (`GET /v1/routes`) and takes its sampled exchanges
-  (`POST /v1/gateway/samples`, signed by a catalog gateway), which it checks between tests (`GATEWAY.md`).
+  (`POST /v1/gateway/samples`, signed by a catalog gateway), which it checks between tests (`GATEWAY.md`); a sampled
+  request with images is held in memory only until its check, never in its database, and the process writes no core
+  dump.
 
 The auditor database is `state_dir/throughput.sqlite`. Keep the auditor running continuously: a test it misses is
 not run, and endpoints keep the credit of their last test for `credit_ttl_epochs` (the gateway's routes keep it

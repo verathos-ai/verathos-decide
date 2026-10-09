@@ -44,6 +44,17 @@ def test_engine_answers_and_rejects_malformed_requests() -> None:
     assert client.post("/v1/systemone", json={**REQUEST, "state": "bad"}).status_code == 422
 
 
+def test_a_body_beyond_the_largest_request_a_model_may_take_is_refused_unread() -> None:
+    from verathos.engine.server import MAX_BODY_BYTES
+
+    engine = RecordingEngine()
+    client = TestClient(create_app(engine))
+    big = {**REQUEST, "state": "x" * MAX_BODY_BYTES}
+    assert client.post("/v1/systemone", json=big).status_code == 413
+    assert client.post("/v1/systemone", content=b"[" * 10).status_code == 422
+    assert engine.batches == []
+
+
 def test_requests_waiting_on_a_running_batch_join_the_next_batch() -> None:
     release = threading.Event()
     engine = RecordingEngine(release)

@@ -15,6 +15,7 @@ answer is proof against the miner.
     usage.py      usage and its cost counted in memory and written in batches; monthly quotas and prepaid credit
     routes.py     the auditor's signed routes, polled and kept
     router.py     endpoint choice: proven capacity, load, circuit breakers
+    media.py      the image decoders: worker processes that make users' images canonical
     upstream.py   signed requests to miners, receipt checks
     sampler.py    the exchanges submitted to the auditor
     served.py     what the miners did for users, per endpoint and second, reported to the auditor

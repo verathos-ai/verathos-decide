@@ -242,7 +242,7 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
         if isinstance(command, JSONResponse):
             return command
         try:
-            checked = check_request(g, json.dumps(command.request).encode())
+            checked = await check_request(g, json.dumps(command.request).encode())
         except Rejected as r:
             return JSONResponse({"error": {"type": r.kind, "message": r.message}}, status_code=r.status)
         started, attempts, target = g.clock(), [], command.target
@@ -262,8 +262,8 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
             g.served.record(outcome.route, outcome.input_tokens, outcome.seconds)
             reply["counted"] = True
         return {**reply, "endpoint": f"{outcome.route.hotkey}/{outcome.route.endpoint_id}", "url": outcome.route.url,
-                "answers": outcome.answers, "input_tokens": outcome.input_tokens, "receipt": outcome.receipt,
-                "response": outcome.response}
+                "answers": outcome.answers, "input_tokens": outcome.input_tokens, "image_tokens": checked.image_tokens,
+                "receipt": outcome.receipt, "response": outcome.response}
 
     accounts = g.accounts
 
@@ -400,7 +400,8 @@ async def _to_target(g: Gateway, checked: Checked, target: Target, attempts: lis
     note: dict[str, Any] = {"endpoint": endpoint.key}
     try:
         exchange = await g.upstream.call(endpoint.route, checked.raw, checked.body, checked.request_sha256,
-                                         checked.parsed, g.config.request_timeout_s, min_tokens=checked.min_tokens)
+                                         checked.parsed, g.config.request_timeout_s, min_tokens=checked.min_tokens,
+                                         max_tokens=checked.max_tokens)
         note["outcome"] = "answered"
         return dataclasses.replace(exchange, seconds=time.monotonic() - started)
     except UpstreamFailure as failure:

@@ -31,17 +31,21 @@ PATH = "/e/gpu0/v1/systemone"
 PIN = "ab" * 32  # the miner machines' certificate pin, as their manifests name it
 
 
-def miner(keypair: Keypair, engine: MockEngine, gateway: Keypair):
+def miner(keypair: Keypair, engine: MockEngine, gateway: Keypair, model: str = "kev-4b"):
+    """A miner serving ``model`` with ``engine``; clef-flash reads images."""
+    from verathos.protocol.media import ImageLimits
+
     config = MinerConfig.model_validate({
         "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5",
-        "port": 8091, "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1"}]})
+        "port": 8091, "endpoints": [{"endpoint_id": "gpu0", "model_id": model, "engine_url": "http://127.0.0.1:1"}]})
     signed = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest=catalog.load().digest(),
-        endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
+        endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id=model,
                             capacity_rps=40.0)], tls={config.base_url: PIN}), keypair)
     return create_app(config=config, keypair=keypair, manifest=lambda: signed, engines={"gpu0": engine},
                       authorized=lambda hk: hk == gateway.ss58_address, auditors=lambda: set(),
-                      gateways=lambda: {gateway.ss58_address})
+                      gateways=lambda: {gateway.ss58_address},
+                      image_limits=lambda m: ImageLimits() if m == "clef-flash" else None)
 
 
 async def exchange(app, caller: Keypair, receiver: Keypair, request: dict) -> httpx.Response:
@@ -649,7 +653,7 @@ def test_samples_to_check_are_drawn_per_endpoint_and_proofs_always_go(tmp_path) 
                                 model_id="kev-4b", request_id="n9", request={}, response="{}", proof=False)
     assert store.add_sample(sample_id="p", epoch=3, gateway="gw", hotkey="hk", endpoint_id="gpu0",
                             model_id="kev-4b", request_id="np", request={}, response="{}", proof=True)
-    chosen = {row[0] for row in store.samples_to_check(3, 2, random.Random(1))}
+    chosen = {row[0] for row in store.samples_to_check(3, 2, 1, random.Random(1))}
     assert "p" in chosen and len(chosen) == 3
     skipped = store._query("SELECT COUNT(*) FROM samples WHERE state = 'skipped'")[0][0]
     assert skipped == 6
@@ -659,7 +663,7 @@ def test_samples_to_check_are_drawn_per_endpoint_and_proofs_always_go(tmp_path) 
     assert store._query("SELECT state FROM samples WHERE sample_id = ?", (picked,))[0][0] == "unchecked"
     store.add_sample(sample_id="old", epoch=1, gateway="gw", hotkey="hk", endpoint_id="gpu1", model_id="kev-4b",
                      request_id="no", request={}, response="{}", proof=False)
-    store.samples_to_check(3, 2, random.Random(1))
+    store.samples_to_check(3, 2, 1, random.Random(1))
     assert store._query("SELECT state FROM samples WHERE sample_id = 'old'")[0][0] == "unchecked"
 
 
@@ -843,7 +847,7 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
     db.executescript("DROP TABLE demand; DROP TABLE users; DROP TABLE meta; DROP TABLE shares; DROP TABLE paid; "
                      "DROP TABLE burns; DROP TABLE unscanned; DROP TABLE usage; "
                      "DROP INDEX results_by_endpoint; DROP INDEX samples_by_test; "
-                     "ALTER TABLE samples DROP COLUMN test_id; "
+                     "ALTER TABLE samples DROP COLUMN test_id; ALTER TABLE samples DROP COLUMN media; "
                      "INSERT INTO tests VALUES ('kept', 3, 560, 'h', 565, 'confirmed', ''); "
                      "PRAGMA user_version = 4;")
     db.close()
@@ -851,7 +855,7 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
     assert store._query("SELECT test_id FROM tests") == [("kept",)]
     assert store._query("PRAGMA user_version")[0][0] == SCHEMA_VERSION
     assert store.demand_ema(10) == {}
-    assert "test_id" in {column[1] for column in store._query("PRAGMA table_info(samples)")}
+    assert {"test_id", "media"} <= {column[1] for column in store._query("PRAGMA table_info(samples)")}
     assert store.paid(0, 10) == {}
 
 
@@ -918,3 +922,195 @@ def test_a_sample_check_never_blocks_the_auditors_event_loop_while_verdicts_are_
 
     assert asyncio.run(run()) > 20  # ... while the loop went on
     assert auditor.store._query("SELECT state FROM samples")[0][0] == "checked"
+
+
+# ---- answers to requests with images ----
+
+def held(store) -> tuple[int, int]:
+    """(pending samples whose requests with images the store holds in memory, their images' bytes)."""
+    return len(store._media), store._media_bytes
+
+
+class Seeing(MockEngine):
+    """Answers as the mock engine and keeps the requests it is asked, a reference that shows what it recomputed."""
+
+    def __init__(self, model: str, salt: str = "") -> None:
+        super().__init__(model, salt)
+        self.asked: list[dict] = []
+
+    async def answer(self, request):
+        self.asked.append(request)
+        return await super().answer(request)
+
+
+def image_request(i: int, size: tuple[int, int] = (256, 320)) -> dict:
+    from tests.images import canonical
+
+    return {"model": "clef-flash", "state": f"What is in the picture? Ticket {i}.", "images": [canonical(*size)],
+            "questions": {"corner": {"type": "noul", "instructions": "Is there a green corner?"}}}
+
+
+def image_samples(app, keypair: Keypair, gateway: Keypair, requests: list[dict]) -> list[GatewaySample]:
+    async def collect():
+        out = []
+        for request in requests:
+            r = await exchange(app, gateway, keypair, request)
+            assert r.status_code == 200, r.text
+            out.append(GatewaySample(hotkey=keypair.ss58_address, endpoint_id="gpu0", model_id="clef-flash",
+                                     request=request, response=r.text))
+        return out
+
+    return asyncio.run(collect())
+
+
+def test_answers_with_images_are_sampled_apart_held_in_memory_only_and_checked_with_their_images(tmp_path) -> None:
+    gateway, miner_kp = kp(), kp()
+    app = miner(miner_kp, MockEngine("clef-flash", salt="a cheaper model"), gateway, "clef-flash")
+    with_images = image_samples(app, miner_kp, gateway, [image_request(i) for i in range(3)])
+    text = image_samples(app, miner_kp, gateway, [{**image_request(i + 10), "images": []} for i in range(3)])
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)])
+    assert auditor.accept_samples(gateway.ss58_address, with_images + text) == 2 + 3  # two with images per epoch
+    rows = auditor.store._query("SELECT media, request FROM samples ORDER BY media")
+    assert [m for m, _ in rows] == [0, 0, 0, 1, 1] and all(r == "{}" for m, r in rows if m)
+    assert held(auditor.store)[0] == 2
+    image_data = with_images[0].request["images"][0]["base64"][100:160]
+    assert image_data.encode() not in (tmp_path / "t.sqlite").read_bytes()  # no image in the database
+    reference = Seeing("clef-flash")
+    asyncio.run(auditor.check_samples(Checks({"clef-flash": reference}, {})))
+    states = auditor.store._query("SELECT media, state FROM samples ORDER BY media, state")
+    assert states == [(0, "checked"), (0, "checked"), (0, "skipped"), (1, "checked"), (1, "skipped")]
+    assert held(auditor.store) == (0, 0)  # given up once checked or skipped
+    assert sum(bool(r.get("images")) for r in reference.asked) == 1  # recomputed with its images
+    auditor.chain.head_block = 4 * 180 + 1
+    auditor.follower.poll()
+    (evidence,) = auditor.verdicts(4).verdicts.invalid  # the cheaper model's answers are wrong
+    assert evidence.request == {} and set(json.loads(evidence.response)) == {"receipt"}
+
+
+def test_a_restart_gives_up_the_pending_samples_with_images(tmp_path) -> None:
+    from verathos.throughput.auditor import Store
+
+    gateway, miner_kp = kp(), kp()
+    app = miner(miner_kp, MockEngine("clef-flash"), gateway, "clef-flash")
+    (sample,) = image_samples(app, miner_kp, gateway, [image_request(1)])
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)])
+    assert auditor.accept_samples(gateway.ss58_address, [sample]) == 1
+    restarted = Store(tmp_path / "t.sqlite", epoch_blocks=180)
+    ((state, reason, request),) = restarted._query("SELECT state, reason, request FROM samples")
+    assert (state, request) == ("unchecked", "{}") and "restarted" in reason
+
+
+def test_a_proof_with_images_is_kept_without_its_images_and_needs_no_recompute(tmp_path) -> None:
+    from verathos.protocol.canonical import digest
+    from verathos.protocol.receipts import Receipt, SignedReceipt
+
+    gateway, miner_kp = kp(), kp()
+    request, answers = image_request(1), {"corner": {"type": "noul", "noul": 2.0}}  # signed malformed answers
+    receipt = Receipt(netuid=405, mechid=1, miner_hotkey=miner_kp.ss58_address, endpoint_id="gpu0",
+                      model_id="clef-flash", catalog_digest=catalog.load().digest(), caller_hotkey=gateway.ss58_address,
+                      request_nonce="ab" * 16, request_sha256=digest(request), answers_sha256=digest(answers),
+                      received_ms=1, responded_ms=2, input_tokens=100)
+    response = {"answers": answers, "receipt": SignedReceipt.create(receipt, miner_kp).model_dump(mode="json")}
+    sample = GatewaySample(hotkey=miner_kp.ss58_address, endpoint_id="gpu0", model_id="clef-flash", request=request,
+                           response=json.dumps(response))
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)])
+    assert auditor.accept_samples(gateway.ss58_address, [sample]) == 1
+    ((media, proof, stored),) = auditor.store._query("SELECT media, proof, request FROM samples")
+    assert (media, proof) == (0, 1) and "images" not in json.loads(stored) and held(auditor.store)[0] == 0
+    reference = Seeing("clef-flash")
+    asyncio.run(auditor.check_samples(Checks({"clef-flash": reference}, {})))
+    assert auditor.store._query("SELECT state, reason FROM samples") == [("checked", "malformed answers")]
+    assert reference.asked == []  # wrong without a recompute
+
+
+def test_the_images_of_pending_samples_held_at_once_are_bounded(tmp_path, monkeypatch) -> None:
+    from verathos.throughput import auditor as auditor_module
+
+    gateway, miner_kp, other_kp = kp(), kp(), kp()
+    samples = image_samples(miner(miner_kp, MockEngine("clef-flash"), gateway, "clef-flash"), miner_kp, gateway,
+                            [image_request(1)])
+    samples += image_samples(miner(other_kp, MockEngine("clef-flash"), gateway, "clef-flash"), other_kp, gateway,
+                             [image_request(2)])
+    size = len(samples[0].request["images"][0]["base64"])
+    monkeypatch.setattr(auditor_module, "MEDIA_SAMPLES_BYTES", size + size // 2)
+    auditor = _auditor(tmp_path)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(k.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)
+                          for k in (miner_kp, other_kp)])
+    assert auditor.accept_samples(gateway.ss58_address, samples) == 1
+    assert held(auditor.store) == (1, size)
+
+
+def test_answers_with_images_are_not_kept_when_the_policy_checks_none(tmp_path) -> None:
+    gateway, miner_kp = kp(), kp()
+    app = miner(miner_kp, MockEngine("clef-flash"), gateway, "clef-flash")
+    samples = image_samples(app, miner_kp, gateway, [image_request(1), {**image_request(2), "images": []}])
+    auditor = _auditor(tmp_path, gateway_image_checks_per_epoch=0)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)])
+    assert auditor.accept_samples(gateway.ss58_address, samples) == 1
+    assert auditor.store._query("SELECT media FROM samples") == [(0,)]
+
+
+def test_the_policy_sets_how_many_answers_with_images_are_checked() -> None:
+    from verathos.throughput.policy import policy_from
+
+    assert AuditPolicy().gateway_image_checks_per_epoch == 1
+    assert policy_from({"gateway_image_checks_per_epoch": 2}, 180, strict=True).gateway_image_checks_per_epoch == 2
+    with pytest.raises(ValueError, match="cannot be negative"):
+        policy_from({"gateway_image_checks_per_epoch": -1}, 180)
+
+
+def test_a_tests_pick_with_images_is_checked_from_memory(tmp_path) -> None:
+    auditor = _auditor(tmp_path)
+    request = image_request(1)
+    assert auditor.store.add_sample(sample_id="t", epoch=3, gateway="gw", hotkey="hk", endpoint_id="gpu0",
+                                    model_id="clef-flash", request_id="n", request=request, response="{}",
+                                    proof=False, test_id="ab" * 32)
+    assert auditor.store._query("SELECT request, media FROM samples") == [("{}", 1)]
+    assert auditor.store.test_sample("ab" * 32, "hk", "gpu0") == ("t", "n", request, "{}")
+    auditor.store.finish_sample("t", "checked")
+    assert held(auditor.store) == (0, 0) and auditor.store.test_sample("ab" * 32, "hk", "gpu0") is None
+
+
+def test_answers_with_images_are_recomputed_on_the_reference_never_on_a_screen(tmp_path) -> None:
+    from verathos.miner.engine import EngineError
+
+    class TextScreen(Seeing):
+        """A bfloat16 screen, which serves text requests only."""
+
+        async def answer(self, request):
+            if request.get("images"):
+                raise EngineError("engine returned 422: images are not served by this engine")
+            return await super().answer(request)
+
+    gateway, miner_kp = kp(), kp()
+    app = miner(miner_kp, MockEngine("clef-flash"), gateway, "clef-flash")
+    samples = image_samples(app, miner_kp, gateway, [image_request(1), image_request(2)])
+    samples += image_samples(app, miner_kp, gateway, [{**image_request(i), "images": []} for i in (3, 4)])
+    auditor = _auditor(tmp_path, gateway_image_checks_per_epoch=2)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)])
+    assert auditor.accept_samples(gateway.ss58_address, samples) == 4
+    screen, reference = TextScreen("clef-flash"), Seeing("clef-flash")
+    asyncio.run(auditor.check_samples(Checks({"clef-flash": reference}, {"clef-flash": screen})))
+    states = sorted(auditor.store._query("SELECT media, state FROM samples"))
+    assert states == [(0, "checked"), (0, "checked"), (1, "checked"), (1, "checked")]
+    assert not any(r.get("images") for r in screen.asked) and len(screen.asked) == 2
+    assert sum(bool(r.get("images")) for r in reference.asked) == 2
+    # without a reference, a screen cannot check an answer with images: it is given up, not tried on the screen
+    (tmp_path / "other").mkdir()
+    other = _auditor(tmp_path / "other", gateway_image_checks_per_epoch=2)
+    other.follower.poll()
+    other.update_slots([Slot(miner_kp.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)])
+    assert other.accept_samples(gateway.ss58_address, samples[:1]) == 1
+    screen = TextScreen("clef-flash")
+    asyncio.run(other.check_samples(Checks({}, {"clef-flash": screen})))
+    assert other.store._query("SELECT state, reason FROM samples") == [("unchecked", "no reference for the model")]
+    assert screen.asked == []

@@ -40,9 +40,9 @@ configuration) overrides the catalog's; leave it unset.
 
 ## Catalog: models and policy
 
-The catalog lists the served models (pinned weights, engine and engine revision, verification tolerances, the
-standard request mix `workload`, `price`, `anchor_share`, `first_test_rps`, `relative_speed`, status), the
-[mechanism](#mechanisms), the epoch length, the scoring settings (`scoring`, including the
+The catalog lists the served models (pinned weights, engine and engine revision, verification tolerances, the standard
+request mix `workload`, `price`, `anchor_share`, `first_test_rps`, `relative_speed`, the input each reads with its image
+limits, status), the [mechanism](#mechanisms), the epoch length, the scoring settings (`scoring`, including the
 [miner share](#miner-share) and the [usage pool](#usage-pool)) and the throughput-audit policy (`throughput_audit`).
 Miners and validators use whichever catalog the owner hotkey commits; publishing a new one needs no code release.
 
@@ -50,9 +50,31 @@ Miners and validators use whichever catalog the owner hotkey commits; publishing
 follows what its users pay (`SCORING.md`). `anchor_share` is the model's share while
 there is no user demand; the active models' anchors must sum to 1 (`commit-catalog` refuses a catalog whose do not).
 Activating a model means giving it an anchor and lowering the others'; every active model keeps at least
-`min_model_share`, whatever its anchor. `commit-catalog` also refuses settings this code does not know (it does not
-check the keys inside a model's `tolerance`, `engine` and `workload`). `first_test_rps` caps the rate of an endpoint's first test, and of all a new hotkey's
-endpoints together; later tests grow from what was delivered.
+`min_model_share`, whatever its anchor. `commit-catalog` also refuses settings this code does not know (it checks the
+keys of a model's `images`, not those inside its `tolerance`, `engine` and `workload`). `first_test_rps` caps the rate
+of an endpoint's first test, and of all a new hotkey's endpoints together; later tests grow from what was delivered.
+
+`input_modalities` lists what a model reads: `["text"]`, the default and every shipped model's, or `["text",
+"image"]`, which opens it to images (`GATEWAY.md`, Images) within its `images` limits; any of them may be set, the
+others keep these defaults:
+
+```json
+"input_modalities": ["text", "image"],
+"images": {"max_count": 4, "max_bytes": 4194304, "max_total_bytes": 8388608, "max_input_pixels": 16777216,
+           "max_pixels": 1048576, "min_pixels": 65536, "token_px": 32, "max_request_bytes": 13631488}
+```
+
+`max_count` images per request, `max_bytes` per image and `max_total_bytes` per request as sent, `max_input_pixels` per
+image as sent, `max_pixels` the pixel budget an image is resized into (at least `min_pixels`), `token_px` the side of
+one image token, as the model's processor has it, and `max_request_bytes` the body of a request with images. Every node
+refuses limits that do not hold together (`token_px` squared <= `min_pixels` <= `max_pixels` <= `max_input_pixels`,
+`max_bytes` <= `max_total_bytes`, `max_request_bytes` from 1 MiB to 15 MiB, at most 1,048,576 image tokens per request);
+`commit-catalog` refuses a modality this code does not serve (`video` among them), `image` for a model whose engine
+reads no images (the Kev engine), a `token_px` other than its engine's (32 for Clef), and a pixel budget beyond what its
+engine takes as it is (65,536 to 16,777,216 pixels for Clef). Older nodes ignore both fields, and the catalog's digest
+covers them, so every node agrees on the catalog. Open a model to images once the gateway, the auditor and the model's
+miners run a release that reads them, the miners' engines serve them (the bfloat16 Clef engine serves text only,
+`MINING.md`), and the auditor's reference of the model runs on a GPU (`VALIDATING.md`).
 
 `relative_speed` is the model's speed relative to the other models: the requests/s of its standard mix one GPU
 serves within `max_latency_s`, measured for every model on the same reference GPU and divided by one model's (1.0;
@@ -140,12 +162,13 @@ To publish a catalog:
        --hotkey <owner hotkey> --file catalog.json
    ```
 
-   It validates the file (an unknown `throughput_audit` setting is an error, and so is a mechanism the subnet does
-   not have), fills in `auditor.tls` and `auditor.egress` where the file names none, from the auditor's
-   configuration on this machine (`--validator-config`, default `~/.verathos/validator.json`: the certificate in
-   its `state_dir` and its `egress_ips`), refuses an `auditor.tls` other than that certificate's, stores the result
-   in the owner validator's `catalog_dir` (`--catalog-dir`, default `~/.verathos/catalog`) and commits its digest. Mirrors (`catalog_mirrors` in miner and validator
-   configs) can serve the same file; every copy is checked against the digest.
+   It validates the file (an unknown `throughput_audit` setting is an error, and so are a mechanism the subnet does not
+   have and a model's input this code does not serve), fills in `auditor.tls` and `auditor.egress` where the file names
+   none, from the auditor's configuration on this machine (`--validator-config`, default `~/.verathos/validator.json`:
+   the certificate in its `state_dir` and its `egress_ips`), refuses an `auditor.tls` other than that certificate's,
+   stores the result in the owner validator's `catalog_dir` (`--catalog-dir`, default `~/.verathos/catalog`) and commits
+   its digest. Mirrors (`catalog_mirrors` in miner and validator configs) can serve the same file; every copy is checked
+   against the digest.
 
 Miners and validators check the commitment every minute: miners re-publish their manifests (measuring again if a
 model's request mix changed), the auditor applies a new audit policy at once, and validators score each epoch

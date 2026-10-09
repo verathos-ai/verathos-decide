@@ -6,13 +6,17 @@ defines the encoding (token ids and the question and option spans) and the head,
 
 Two paths:
 - ``reference``: the release's own ``systemone`` on one request at a time, any device and dtype. Validators run it in
-  float32 on CPU as the reference.
+  float32 on CPU as the reference; on a GPU, float32 is computed without TF32.
 - ``fast`` (CUDA, bfloat16): the backbone runs as ``verathos.engine.qwen35.Backbone`` on right-padded batches replayed
   from CUDA graphs (``verathos.engine.graphs``); the head runs for the whole pass at once
   (``verathos.engine.clef_head``). Requests are tokenized as they arrive and batched by length under a token budget.
 
-Both serve text requests only: a request with ``images`` or ``videos`` is refused, so the release never fetches or
-decodes media and both paths answer the same requests.
+Both give the release a record built from the request (``Prepared.body``): its model, state and questions, never
+another field of it. The reference also takes images, which must be canonical (``protocol.media``): they are decoded
+to RGB here and given to the release's processor as pixels with the engine's own processor arguments (no resizing: a
+canonical image has the size the processor would choose, and its aspect ratio may round past the processor's limit),
+so the release never fetches, opens or resizes anything. ``videos`` and ``media_kwargs`` are refused, and the fast path
+refuses images.
 """
 
 from __future__ import annotations
@@ -24,14 +28,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from verathos.protocol.api import REFUSED_FIELDS
+from verathos.protocol.media import canonical_pixels
+
 log = logging.getLogger(__name__)
 
 QUESTION_TYPES = ("noul", "choice", "score")
+MEDIA_KWARGS = {"do_resize": False}  # the processor arguments of a record with images: canonical images keep their size
 
 
 @dataclass(frozen=True)
 class Prepared:
-    body: dict[str, Any]
+    body: dict[str, Any]  # the record the release reads (``record``)
     encoded: Any  # the release's EncodedRecord
 
 
@@ -44,7 +52,11 @@ def _release_module(path: Path):
 
 
 def _validate(body: dict[str, Any]) -> None:
-    """The release's request checks (``systemone``), raised before a request joins a batch."""
+    """The release's request checks (``systemone``), and the fields no request may carry, raised before a request
+    joins a batch."""
+    for field, why in REFUSED_FIELDS.items():
+        if field in body:
+            raise ValueError(why)
     questions = body.get("questions")
     if not isinstance(body.get("model"), str) or "state" not in body:
         raise ValueError("model and state are required")
@@ -55,8 +67,29 @@ def _validate(body: dict[str, Any]) -> None:
             raise ValueError(f"{question_id}: type must be noul, choice, or score")
         if question["type"] != "noul" and not question.get("criteria"):
             raise ValueError(f"{question_id}: criteria must not be empty")
-    if body.get("images") or body.get("videos"):
-        raise ValueError("images and videos are not served; requests are text")
+
+
+def record(body: dict[str, Any], bounds: dict[str, int] | None) -> dict[str, Any]:
+    """The record the release reads for a request: its model, state and questions, and with ``bounds`` (the images
+    the processor takes as they are: ``image_bounds``) its canonical images decoded to RGB, with ``MEDIA_KWARGS``.
+    Raises ValueError for a request the release refuses, images where they are not served, or an image that is not
+    canonical."""
+    _validate(body)
+    out = {"model": body["model"], "state": body["state"], "questions": body["questions"]}
+    if body.get("images"):
+        if bounds is None:
+            raise ValueError("images are not served by this engine")
+        out["images"] = canonical_pixels(body["images"], **bounds)
+        out["media_kwargs"] = dict(MEDIA_KWARGS)
+    return out
+
+
+def image_bounds(processor: Any) -> dict[str, int]:
+    """The images a release's processor takes as they are: sides multiples of its patch size times its merge size,
+    pixels within its size range."""
+    images = processor.image_processor
+    return {"token_px": images.patch_size * images.merge_size, "min_pixels": images.size["shortest_edge"],
+            "max_pixels": images.size["longest_edge"]}
 
 
 class ReferenceEngine:
@@ -65,15 +98,19 @@ class ReferenceEngine:
     def __init__(self, path: Path, device: str, dtype: str) -> None:
         import torch
 
+        if device.startswith("cuda") and dtype == "float32":
+            # float32 throughout: matmuls are by default; convolutions (the vision tower's patch embedding) are not
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
         self.module = _release_module(path)
         self.model, self.processor = self.module.load_release_model(
             str(path), device=device, dtype=getattr(torch, dtype)
         )
         self.model.eval()
+        self.image_bounds = image_bounds(self.processor)
 
     def prepare(self, body: dict[str, Any]) -> Prepared:
-        _validate(body)
-        return Prepared(body, None)
+        return Prepared(record(body, self.image_bounds), None)
 
     def passes(self, items: list[Prepared]) -> list[list[int]]:
         return [[i] for i in range(len(items))]
@@ -130,8 +167,8 @@ class FastEngine:
         self.forward.capture_all()
 
     def prepare(self, body: dict[str, Any]) -> Prepared:
-        _validate(body)
-        return Prepared(body, self.module.encode_record(self.tokenizer, body, max_length=self.max_length))
+        release = record(body, None)
+        return Prepared(release, self.module.encode_record(self.tokenizer, release, max_length=self.max_length))
 
     def passes(self, items: list[Prepared]) -> list[list[int]]:
         """Indexes grouped by length: each group's padded size stays within the token budget (a single longer request

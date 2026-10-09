@@ -42,8 +42,11 @@ digest proves, are fetched accepting any certificate.
    the model's `max_state_tokens` (4 characters per token, as miners count; JSON as canonical JSON), and questions
    whose answers fit a response (64 KiB), and whose state is not in the form of the subnet's test requests or
    canaries (`throughput.workload.in_mix_form`, `validator.canaries.canary_like`: a miner relaying them through the
-   gateway would have its answers to them counted as users'). Requests no miner could answer are refused here, so
-   they cannot count against miners.
+   gateway would have its answers to them counted as users'), with a body within the model's limit and images only
+   for a model that reads them, within its limits and made canonical by the gateway's decoders ([Images](#images)).
+   Requests no miner could answer are refused here, so they cannot count against miners. A request is forwarded as
+   its model, state and questions, with its canonical images (other top-level fields are dropped): its canonical JSON
+   is the body every miner receives and its receipt binds.
 4. **Endpoint.** Two endpoints of the model are drawn in proportion to their proven capacity; the one with fewer
    requests in flight per unit of capacity takes the request. In this process an endpoint takes at most
    `credited rps x max_latency_s / instances` requests at once, what it serves within the latency bound.
@@ -65,11 +68,12 @@ digest proves, are fetched accepting any certificate.
    flight longer. After 3 failures in a row an endpoint's circuit breaker opens for 5 s; one probe request then
    decides, and each failed probe doubles the time (up to 120 s). A probe that times out stays the one probe until
    its request is settled: it fails if another miner answers the request.
-7. **Response.** The answers, the input tokens the miner signed in its receipt (at most one per byte of the
-   request, at least one per 8 characters of the state; the auditor checks sampled counts against its reference,
-   too many or too few being a wrong answer), the receipt itself and the request id. Usage is counted per account,
-   key, model and day, and written every 5 s, with every account's answered requests and input tokens per model and
-   hour (the network's totals).
+7. **Response.** The answers, the input tokens the miner signed in its receipt (at most one per byte of the request
+   without its images, at least one per 8 characters of the state, each bound with the images' tokens added; the auditor
+   checks sampled counts against its reference, too many or too few being a wrong answer), the receipt itself and the
+   request id; with images, their tokens too (`usage.image_tokens`). Usage is counted per account, key, model and day,
+   and written every 5 s, with every account's answered requests and input tokens per model and hour (the network's
+   totals).
 8. **Report.** Every 5 s the gateway tells the auditor, per endpoint and second, the user requests it sent it and those
    it answered (with input tokens, the paid ones apart, and durations), how often it considered it for a request (drew
    it), and how often it was not ready then (busy, behind an open breaker, or its latest answer or timed-out attempt
@@ -82,11 +86,15 @@ digest proves, are fetched accepting any certificate.
 
 ## Answer checks
 
-The gateway's hotkey is listed in the catalog (`gateways`), so a miner can tell user traffic from validator
-traffic. To keep it from answering users with a cheaper model, the gateway keeps one exchange per endpoint and
-sampling window (`sample_window_s`, 10 minutes), drawn uniformly from the window's answers after they are in, and
-sends the window's picks to the auditor. The auditor keeps up to 8 per endpoint and epoch and recomputes a random
-`gateway_checks_per_epoch` (2) of them, between tests:
+The gateway's hotkey is listed in the catalog (`gateways`), so a miner can tell user traffic from validator traffic. To
+keep it from answering users with a cheaper model, the gateway keeps per endpoint and sampling window
+(`sample_window_s`, 10 minutes) one exchange of a request without images and one of a request with images, each drawn
+uniformly from the window's answers after they are in, so answers with images reach the auditor however few they are
+(what it holds for the auditor, its picks and signed malformed answers, carries at most 2 GiB of images at once, and one
+signed malformed answer with images per endpoint; one beyond is not kept), and sends the window's picks to the auditor,
+serialized off the event loop. The auditor keeps up to 8 per endpoint and epoch, and 2 with images, and recomputes a
+random `gateway_checks_per_epoch` (2) of them, and besides those `gateway_image_checks_per_epoch` (1) with images,
+between tests:
 - a wrong answer is evidence: the auditor publishes the miner's signed receipt (not the request), every validator
   checks that the receipt was issued to a catalog gateway, and the hotkey is reset and put on probation
   (`SCORING.md`);
@@ -123,6 +131,10 @@ answer to a user carries only the receipt. Validators check that the miner answe
 auditor's word for the wrongness, as they take it for capacity; test evidence, whose requests are synthetic, stays
 fully checkable by every validator.
 
+Images are decoded at the gateway only, and their metadata never leaves it ([Images](#images)); the gateway keeps
+no request content (usage rows are counts). The auditor holds a sampled request with images in memory only, never in
+its database, until its check; a restart gives it up. Neither the gateway nor the auditor writes a core dump.
+
 Between the gateway and the miners, and to the auditor, requests and answers travel over TLS, each certificate
 accepted by its pin only: whoever is on the path reads nothing, and a machine presenting another certificate gets no
 request. When the gateway runs next to the auditor, `auditor_url` can name its loopback or private address
@@ -154,7 +166,8 @@ view of the miners does not take a model off the gateway. Once the current table
    "egress": [...]}`) and commit the catalog (`SUBNET_ADMIN.md`). Miners serve it from their next catalog check.
    Miners' firewalls drop connections from any other address once they enforce (`MINING.md`, Firewall): list every
    address the gateway's requests leave from, and commit a catalog with the new ones before moving it.
-3. Install: `VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway]"`.
+3. Install: `VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway]"`. Images are decoded only on Linux
+   5.13 or later with Landlock enabled ([Images](#images)).
 4. PostgreSQL (SQLite only for development):
 
    ```bash
@@ -185,8 +198,10 @@ view of the miners does not take a model off the gateway. Once the current table
    | `trusted_proxies` | localhost | networks whose `X-Forwarded-For` is believed |
    | `request_timeout_s`, `attempt_timeout_s`, `max_attempts` | 10, 4, 3 | the miners' deadline per request, per attempt, attempts |
    | `max_in_flight` | 4096 | requests in flight per process; more get 503 |
-   | `max_body_bytes` | 1 MiB | |
-   | `max_in_flight_bytes` | 256 MiB | request bodies held in this process at once; more get 503 |
+   | `max_body_bytes` | 1 MiB | the body of a request to a model that reads text only (at most 1 MiB); a model that reads images takes its catalog's `images.max_request_bytes` |
+   | `body_timeout_s` | 60 | receiving a request's body, at most, once its key, rate, quota and credit pass; slower gets 408 |
+   | `max_in_flight_bytes` | 256 MiB | request bodies held in this process at once, and requests with their images made canonical; more get 503 |
+   | `media_workers`, `max_media_in_flight`, `media_timeout_s` | 4, 8, 2 | image decode workers, requests decoded or waiting for one at once (more get 503 `busy`), the most one image may take ([Images](#images)) |
    | `sample_window_s` | 600 | one exchange per endpoint and window goes to the auditor |
    | `admin_host`, `admin_port`, `admin_token_file` | 127.0.0.1, -, - | the admin API (see below); off without a port |
    | `accounts_token_file`, `accounts_prefix` | -, `u_` | the account service's token and the accounts it reaches (see below) |
@@ -231,6 +246,8 @@ location / {
     proxy_next_upstream error timeout non_idempotent;
     proxy_next_upstream_tries 2;
     proxy_connect_timeout 1s;
+    client_max_body_size 14m;
+    proxy_request_buffering off;
 }
 ```
 
@@ -244,9 +261,9 @@ systemctl restart verathos-gateway;         until curl -sf http://127.0.0.1:8080
 On SIGTERM a process stops accepting connections, so the proxy sends new requests to the other one; it finishes
 the requests in flight (their checks and `request_timeout_s`), writes usage, samples and served counts (10 s each
 at most; what cannot be written is logged), and exits. A request whose process fails before answering goes to the
-other process once. A process is ready as soon as it has started: it serves the routes it kept on disk while it
-fetches new ones. A restart of the auditor does not reach users: the gateways keep their routes until it serves new
-ones. A key's rate limit starts afresh on the other process.
+other process once, unless nginx already passed its body on. A process is ready as soon as it has started: it serves
+the routes it kept on disk while it fetches new ones. A restart of the auditor does not reach users: the gateways keep
+their routes until it serves new ones. A key's rate limit starts afresh on the other process.
 
 ### More than one process
 
@@ -286,8 +303,10 @@ curl -s https://<gateway>/v1/systemone -H "Authorization: Bearer $KEY" -H "Conte
 ```
 
 `GET /v1/models` (computed at most every 15 s) lists the catalog's active models, each with its state limit
-(`max_state_tokens`), the input it accepts (`input_modalities`: `["text"]`, a state of plain text or JSON, for every
-model), price (`price.usd_per_million_input_tokens`; `usd_per_million_output_tokens` is 0), license, weights
+(`max_state_tokens`), the input it reads (`input_modalities`: `"text"`, a state of plain text or JSON, and `"image"`
+for a model that reads images, whose `images` gives its limits, formats and aspect ratio as in [Images](#images); null
+for a model that reads text only), price (`price.usd_per_million_input_tokens`; `usd_per_million_output_tokens` is
+0), license, weights
 (`weights.repo`, `weights.revision`, `base_model`), whether it is `available` now (a routable endpoint that is not
 failing), and its `state` and `latency_ms` as `GET /v1/status` gives them.
 `GET /health` answers while the process runs.
@@ -319,16 +338,94 @@ Every response to `POST /v1/systemone` carries `X-Request-Id` (the client's, if 
 
 | Status | Type | When |
 |---|---|---|
-| 400 | `invalid_request` | not JSON (NaN and infinities included), or not a SystemOne request |
+| 400 | `invalid_request` | not JSON (NaN and infinities included), not a SystemOne request, images to a model that reads text only or an image it cannot read ([Images](#images)), `videos` or `media_kwargs` |
 | 401 | `unauthorized` | missing, unknown, revoked or expired key, or a suspended account |
 | 402 | `insufficient_credit` | a prepaid account's balance is used up |
 | 404 | `model_not_found` | not an active model of the catalog |
-| 413 | `too_large` | body, state, or the answers the questions would need, over the limits |
+| 408 | `timeout` | the body took longer than `body_timeout_s` to arrive |
+| 413 | `too_large` | body, state, images, or the answers the questions would need, over the limits |
 | 429 | `rate_limited` | over the key's rate, or too many invalid keys from the address; `Retry-After` |
 | 429 | `quota_exceeded` | the month's quota is used up; `Retry-After` until the next month |
 | 500 | `internal` | a fault of the gateway |
-| 503 | `busy` | no capacity free for the model now, or the gateway is at capacity (`max_in_flight`, `max_in_flight_bytes`); `Retry-After` |
-| 503 | `unavailable` | no miner serves the model right now, none answered in time or the miners refused the request, every miner of the model is failing (`Retry-After: 30`), accounts cannot be checked, or the gateway has no catalog yet (starting); `Retry-After` |
+| 503 | `busy` | no capacity free for the model now, the gateway is at capacity (`max_in_flight`, `max_in_flight_bytes`), or its image decoders are all busy (`max_media_in_flight`); `Retry-After` |
+| 503 | `unavailable` | no miner serves the model right now, none answered in time or the miners refused the request, every miner of the model is failing (`Retry-After: 30`), accounts cannot be checked, the gateway has no catalog yet (starting), or its image decoders cannot start; `Retry-After` |
+
+## Images
+
+A model whose catalog entry lists `image` in its `input_modalities` takes images with a request, in Cloudflare Clef's
+shape (its `images` extension of the SystemOne API), so Clef clients switch by their base URL. `GET /v1/models` says
+which models do, and their limits; no model of the shipped catalog does.
+
+```bash
+curl -s https://<gateway>/v1/systemone -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d '{
+  "model": "clef-flash",
+  "state": {"task": "Expense report line 4", "claimed_total": "84.20 EUR"},
+  "images": ["data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ...",
+             {"content_type": "image/png", "base64": "iVBORw0KGgoAAAANSUhEUg..."}],
+  "questions": {"matches": {"type": "noul", "instructions": "Does the receipt total match the claimed total?"}}}'
+```
+
+```json
+{"id": "...", "model": "clef-flash", "answers": {"matches": {"type": "noul", "noul": 0.93}},
+ "usage": {"input_tokens": 1475, "image_tokens": 1041}, "receipt": {...}}
+```
+
+For a 4032 x 3024 photo (read at 1152 x 864: 974 tokens) and a 200 x 200 PNG (read at 256 x 256: 66 tokens), and one
+for the request.
+
+- An image is a base64 data URL (`data:image/png;base64,...`, likewise `image/jpeg` and `image/webp`; the scheme and
+  the type in any case) or `{"content_type", "base64"}`, in strict base64: the standard alphabet with its padding, no
+  whitespace. The images come before the state, in their order, so instructions can say "the first image".
+- Images are embedded only: nothing in the network fetches a URL or opens a path, and a URL gets 400 ("remote URLs are
+  not accepted: embed the image as base64").
+- The bytes decide the format: PNG, JPEG or WebP, and a `content_type` the bytes contradict gets 400. An animated PNG
+  or WebP counts as its first frame. GIF, SVG, HEIC, AVIF, TIFF and BMP get 400.
+- A model that reads text only answers images with 400 (`kev-4b reads text only`); `videos` and `media_kwargs` get
+  400 for every model.
+- An error names the image by its place, from 0: `images.1: its bytes are image/jpeg, not image/png`.
+
+The limits are the model's (the catalog's `images`; here the defaults):
+
+| Limit | Default | Beyond |
+|---|---|---|
+| images per request | 4 (`max_count`) | 413 |
+| bytes of one image, decoded from base64 | 4 MiB (`max_bytes`) | 413 |
+| bytes of a request's images | 8 MiB (`max_total_bytes`) | 413 |
+| the body | 13 MiB (`max_request_bytes`); a model that reads text only, 1 MiB | 413 |
+| pixels of one image as sent | 16,777,216 (`max_input_pixels`) | 413 |
+| its longer side over its shorter | 200 | 400 |
+| pixels of one image as the model reads it | 1,048,576 (`max_pixels`), at least 65,536 (`min_pixels`) | resized, keeping its aspect ratio |
+
+The gateway makes every image canonical before a miner receives it: its first frame, turned upright by its EXIF
+orientation, in RGB (an alpha channel is dropped, not composited, as the model's processor drops it), resized with
+bicubic resampling to the size the model's processor would choose within its pixel budget (each side a multiple of
+`token_px`, 32), and encoded without metadata: a PNG as PNG, a JPEG or WebP as JPEG at quality 95 without chroma
+subsampling. EXIF (a GPS position, the device), XMP, ICC profiles and comments never leave the gateway. A 4032 x 3024
+photo is read at 1152 x 864, 1920 x 1080 at 1344 x 768, 800 x 600 at 800 x 608, 100 x 100 at 256 x 256. Answers to
+an image beyond the budget can differ from those of a service that reads it at a larger size; send images at the
+budget for the same answers.
+
+An image costs (width / 32) x (height / 32) + 2 input tokens at its canonical size, and a request with images one more
+(the line break after them), at the model's price: 1,026 tokens at 1024 x 1024, 258 at 512 x 512. `usage.image_tokens`
+is the gateway's count of them, part of `input_tokens`.
+
+The miner's receipt binds the request as forwarded: its model, state and questions with the canonical images. The
+gateway, the auditor and validators can check its `request_sha256`; a client holding only its own files cannot.
+
+Users' image files are decoded only in the gateway's decode workers: `media_workers` processes, each a fresh
+interpreter without the gateway's memory, descriptors or environment, with a 1 GiB address space and no core dumps.
+Before it reads an image, a worker is confined for good: it opens and executes no file (Landlock), so it reads none of
+the gateway's keys or configuration, and it creates no socket and signals no process (seccomp). Images are decoded
+only on Linux 5.13 or later with Landlock among its security modules (`/sys/kernel/security/lsm` lists `landlock`);
+elsewhere requests with images get 503 `unavailable`, which the gateway logs as it starts. The size an image's header
+gives is checked before a pixel is decoded, and a worker's result again before it is forwarded. An image that takes a
+worker longer than `media_timeout_s` (2 s) gets 413 and the worker is replaced, as it is after 256 images. At most
+`max_media_in_flight` requests are decoded or wait for a worker at once; more get 503 `busy`.
+
+Behind nginx, `client_max_body_size 14m` lets image bodies through and `proxy_request_buffering off` passes a body on
+as it arrives ([Restarts without downtime](#restarts-without-downtime)): nginx then holds no body whole, in memory or
+in a temporary file on disk, and the gateway reads a body only once its key, rate, quota and credit pass, within
+`body_timeout_s` (60 s; 408 beyond). Beyond `max_body_bytes`, a body may hold more only as its images' base64.
 
 ## Accounts and keys
 
@@ -356,11 +453,12 @@ correction, the only kind that may be negative) and a `reference` naming the pay
 reference is recorded once: adding the same entry again changes nothing, and a reference already used for another
 entry is refused. So a payment processor's retries never add a payment twice.
 
-Each process reads a prepaid account's balance at most 5 s before using it and subtracts what it charged since and
-what its requests in flight may cost at most (one token per byte of the request), reserved when a request is accepted
-and settled to its real cost when it ends. New credit therefore applies within 5 s (at once when recorded through
-this process), and other processes' charges within about 10 s (they write every 5 s). A request is accepted while
-that remainder is positive, so a balance ends below zero by at most one request's cost per process.
+Each process reads a prepaid account's balance at most 5 s before using it and subtracts what it charged since and what
+its requests in flight may cost at most (one token per byte of the request without its images, and the most image tokens
+the model's limits allow), reserved when a request is accepted, before its images are decoded, and settled to its real
+cost when it ends. New credit therefore applies within 5 s (at once when recorded through this process), and other
+processes' charges within about 10 s (they write every 5 s). A request is accepted while that remainder is positive, so
+a balance ends below zero by at most one request's cost per process.
 
 ## Admin API
 
@@ -463,18 +561,19 @@ curl -s http://127.0.0.1:8090/admin/v1/systemone -H "Authorization: Bearer $(cat
   untouched); it must be a routable endpoint of the model. Without it, the request is routed as users' requests are.
 - `count`: whether the exchange counts as user traffic: served counts (test windows, demand) and the sampler. Off by
   default. Admin requests are never billed to an account.
-- The reply holds the endpoint, its URL, the answers, input tokens, the receipt, the miner's response as received,
-  every attempt (endpoint, outcome, failure kind and blame, milliseconds) and the total time; 502 with the attempts
-  if no endpoint answered.
+- The reply holds the endpoint, its URL, the answers, input and image tokens, the receipt, the miner's response as
+  received, every attempt (endpoint, outcome, failure kind and blame, milliseconds) and the total time; 502 with the
+  attempts if no endpoint answered.
 
 ## Metrics
 
 `gateway_requests_total{model,outcome}`, `gateway_request_seconds{model}`, `gateway_upstream_seconds{model}`,
 `gateway_upstream_failures_total{kind}`, `gateway_retries_total`, `gateway_in_flight`, `gateway_routes{model}`,
 `gateway_routes_age_seconds`, `gateway_breakers_open`, `gateway_usage_flush_failures_total`,
-`gateway_samples_total{outcome}`.
+`gateway_samples_total{outcome}`, `gateway_images_total{outcome}` (canonical, refused, failed: a decoder failed and was
+replaced), `gateway_image_seconds`, `gateway_image_bytes` (canonical).
 
 The log says when an endpoint's breaker opens (with its latest failure: the kind and a status or exception class)
 and closes, and each kind of failed attempt per endpoint at most once a minute, with how often it happened (an
-unexpected error each time, with its traceback); it never
-holds a key or what a user sent.
+unexpected error each time, with its traceback), and a decoder replaced, with why; it never holds a key, what a
+user sent or an image.

@@ -1,9 +1,12 @@
 """The exchanges the auditor checks (``protocol.gateway``).
 
-Per endpoint and window, one exchange drawn uniformly from the window's answered ones: a reservoir of one, filled
-after each answer is in, so a miner cannot tell which answers will be checked. Signed malformed answers are proof on
-their own: they always go, and a failed post keeps them for the next window. At the end of each window the picks
-are posted to the auditor in batches within its size limit, signed by the gateway.
+Per endpoint and window, one exchange drawn uniformly from the window's answered ones without images and one from
+those with images: reservoirs of one, filled after each answer is in, so a miner cannot tell which answers will be
+checked, and answers with images reach the auditor however small their share. Signed malformed answers are proof on
+their own: they always go (one with images per endpoint: one proves it), and a failed post keeps them for the next
+window. The images of the exchanges held for the auditor are bounded (``IMAGES_HELD_BYTES``): one that would go beyond
+is not kept. At the end of each window the picks are posted to the auditor in batches within its size limit, signed by
+the gateway; they are serialized off the event loop.
 
 Throughput tests: the auditor counts what an endpoint answers users during a test only once it has checked one of
 those answers, since a miner knows when a test runs. The gateway follows the public test schedule
@@ -25,6 +28,7 @@ import httpx
 from bittensor_wallet import Keypair
 
 from verathos.gateway import metrics
+from verathos.gateway.logs import Throttle
 from verathos.gateway.upstream import Exchange
 from verathos.protocol.gateway import MAX_SAMPLES_BYTES, MAX_SAMPLES_PER_POST, SAMPLES_PATH, GatewaySample
 from verathos.protocol.http import post_idempotent
@@ -35,8 +39,10 @@ from verathos.throughput.policy import BLOCK_TIME_S, AuditPolicy, ScheduledTest
 
 log = logging.getLogger(__name__)
 MAX_PROOFS = 256
+IMAGES_HELD_BYTES = 2 << 30  # the images of the exchanges held for the auditor at once (picks, proofs, tests' picks)
 BATCH_BYTES = MAX_SAMPLES_BYTES - (64 << 10)  # room for the envelope
 TEST_SAMPLE_KEEP_S = 300.0  # a test's picks are posted again on failure for this long after its sessions end
+_throttled = Throttle()
 
 
 def batches(samples: list[str]) -> list[list[str]]:
@@ -71,23 +77,39 @@ class Sampler:
                  rng: random.Random | None = None, clock: Callable[[], float] = time.time) -> None:
         self.keypair, self.client, self.auditor, self.auditor_hotkey = keypair, client, auditor, auditor_hotkey
         self.window_s, self.rng, self.clock = window_s, rng or random.Random(), clock
-        self._seen: dict[str, int] = {}
-        self._picked: dict[str, Exchange] = {}
+        self._seen: dict[tuple[str, bool], int] = {}  # (endpoint, with images) -> answers seen in the window
+        self._picked: dict[tuple[str, bool], Exchange] = {}
         self._proofs: list[Exchange] = []
+        self._sending: list[Exchange] = []  # the last window's, while they are posted
         self._tests: dict[str, _Test] = {}  # test id -> its traffic and picks
 
     def offer(self, exchange: Exchange) -> None:
         key = f"{exchange.route.hotkey}/{exchange.route.endpoint_id}"
-        seen = self._seen[key] = self._seen.get(key, 0) + 1
-        if self.rng.random() * seen < 1:
-            self._picked[key] = exchange
+        pool = (key, bool(exchange.request.get("images")))
+        seen = self._seen[pool] = self._seen.get(pool, 0) + 1
+        if self.rng.random() * seen < 1 and self._room(exchange, self._picked.get(pool)):
+            self._picked[pool] = exchange
         sent = self.clock() - exchange.seconds
         for test in self._tests.values():
             if test.start <= sent <= test.end:
                 pick = test.picks.setdefault(key, [0, None])
                 pick[0] += 1
-                if self.rng.random() * pick[0] < 1:
+                if self.rng.random() * pick[0] < 1 and self._room(exchange, pick[1]):
                     pick[1] = exchange
+
+    def _room(self, adding: Exchange, replacing: Exchange | None = None) -> bool:
+        """Whether ``adding`` fits the images held for the auditor, in place of ``replacing``."""
+        size = _image_bytes(adding)
+        if not size:
+            return True
+        held = sum(_image_bytes(e) for e in (*self._picked.values(), *self._proofs, *self._sending,
+                                             *(e for t in self._tests.values() for _, e in t.picks.values())))
+        if held - _image_bytes(replacing) + size <= IMAGES_HELD_BYTES:
+            return True
+        if times := _throttled("images held"):
+            log.warning("an answer with images is not kept for the auditor: %d MiB of images are held (%d times since "
+                        "last logged)", held >> 20, times)
+        return False
 
     def begin_test(self, test_id: str, start: float, traffic_s: float, session_s: float) -> None:
         """A test whose traffic started at ``start`` (wall clock) and lasts ``traffic_s``; its sessions end
@@ -108,9 +130,7 @@ class Sampler:
             except Exception as exc:
                 log.warning("the auditor's address is unknown: %s", exc)
                 auditor = None
-            serialized = [GatewaySample(hotkey=e.route.hotkey, endpoint_id=e.route.endpoint_id,
-                                        model_id=e.route.model_id, request=e.request, response=e.response,
-                                        test_id=test_id).model_dump_json() for e in picks]
+            serialized = await asyncio.to_thread(_serialized, picks, test_id)
             sent = [await self._post(auditor, batch) for batch in batches(serialized)]
             if all(sent) or now > test.post_at + TEST_SAMPLE_KEEP_S:
                 if not all(sent):
@@ -123,12 +143,18 @@ class Sampler:
                 "test_picks": sum(len(t.picks) for t in self._tests.values())}
 
     def proof(self, exchange: Exchange) -> None:
-        if len(self._proofs) < MAX_PROOFS:
+        """Keep signed malformed answers for the auditor: ``MAX_PROOFS``, and one with images per endpoint."""
+        route = exchange.route
+        if len(self._proofs) >= MAX_PROOFS or (exchange.request.get("images") and any(
+                p.request.get("images") and (p.route.hotkey, p.route.endpoint_id) == (route.hotkey, route.endpoint_id)
+                for p in self._proofs)):
+            return
+        if self._room(exchange):
             self._proofs.append(exchange)
 
     async def flush(self) -> None:
         proofs, picked = self._proofs, list(self._picked.values())
-        self._seen, self._picked, self._proofs = {}, {}, []
+        self._seen, self._picked, self._proofs, self._sending = {}, {}, [], proofs + picked
         if not (proofs or picked):
             return
         sent_proofs = False
@@ -141,9 +167,7 @@ class Sampler:
             for exchanges, is_proof in ((proofs, True), (picked, False)):
                 if not exchanges:
                     continue
-                serialized = [GatewaySample(hotkey=e.route.hotkey, endpoint_id=e.route.endpoint_id,
-                                            model_id=e.route.model_id, request=e.request,
-                                            response=e.response).model_dump_json() for e in exchanges]
+                serialized = await asyncio.to_thread(_serialized, exchanges)
                 failed = 0
                 for batch in batches(serialized):
                     if not await self._post(auditor, batch):
@@ -151,6 +175,7 @@ class Sampler:
                 if is_proof:
                     sent_proofs = not failed
         finally:
+            self._sending = []
             if proofs and not sent_proofs:  # proofs are kept for the next window, whatever stopped this one
                 self._proofs = (proofs + self._proofs)[:MAX_PROOFS]
 
@@ -185,6 +210,18 @@ class Sampler:
                 await self.flush()
             except Exception:
                 log.exception("sampling window failed")
+
+
+def _serialized(exchanges: list[Exchange], test_id: str | None = None) -> list[str]:
+    """The exchanges as samples to post (``protocol.gateway.GatewaySample``)."""
+    return [GatewaySample(hotkey=e.route.hotkey, endpoint_id=e.route.endpoint_id, model_id=e.route.model_id,
+                          request=e.request, response=e.response, test_id=test_id).model_dump_json() for e in exchanges]
+
+
+def _image_bytes(exchange: Exchange | None) -> int:
+    """The base64 of an exchange's images."""
+    images = exchange.request.get("images") if exchange is not None else None
+    return sum(len(i.get("base64", "")) for i in images if isinstance(i, dict)) if images else 0
 
 
 class TestFollower:

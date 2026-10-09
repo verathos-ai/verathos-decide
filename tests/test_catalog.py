@@ -183,3 +183,50 @@ def test_the_miner_share_is_a_number_or_a_linear_change_and_the_same_for_every_v
     built = catalog.load().model_copy(update={"revision": "built"})  # a catalog built in code keeps the JSON names
     assert built.document()["scoring"]["miner_share"] == document["scoring"]["miner_share"]
     assert catalog.Catalog.parse(built.document()).digest() == built.digest()
+
+
+def with_models(**changes: dict) -> dict:
+    """The shipped catalog's document with fields of some models changed (model id -> fields)."""
+    document = catalog.load().document()
+    return {**document, "models": [{**m, **changes.get(m["model_id"], {})} for m in document["models"]]}
+
+
+def test_models_read_text_until_their_entry_lists_image() -> None:
+    from verathos.protocol.media import ImageLimits
+
+    shipped = catalog.load()
+    assert all(m.input_modalities == ["text"] and not m.reads_images() for m in shipped.models)
+    assert all("input_modalities" not in m and "images" not in m for m in shipped.document()["models"])
+    seeing = catalog.Catalog.parse(with_models(**{"clef-flash": {"input_modalities": ["text", "image"],
+                                                                  "images": {"max_count": 2}}}))
+    model = seeing.get("clef-flash")
+    assert model.reads_images() and model.modalities() == ["text", "image"]
+    assert model.images == ImageLimits(max_count=2) and seeing.digest() != shipped.digest()
+    assert seeing.input_problems() == [] and seeing.unknown_settings() == []
+    newer = catalog.Catalog.parse(with_models(**{"clef-flash": {"input_modalities": ["text", "image", "audio"]}}))
+    assert newer.get("clef-flash").modalities() == ["text", "image"]  # what this code serves of what it lists
+
+
+def test_input_this_code_does_not_serve_is_found_before_publishing() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    problems = catalog.Catalog.parse(with_models(
+        **{"kev-4b": {"input_modalities": ["text", "image"]},
+           "kev-9b": {"input_modalities": ["text", "video"]},
+           "clef-flash": {"input_modalities": ["text", "image"], "images": {"token_px": 16}}})).input_problems()
+    assert problems == ["models.kev-4b: its kev engine reads no images",
+                        "models.kev-9b.input_modalities: video is not served",
+                        "models.clef-flash.images.token_px: the clef engine's image tokens are 32 pixels square, not "
+                        "16"]
+    below = catalog.Catalog.parse(with_models(**{"clef-flash": {"input_modalities": ["text", "image"],
+                                                                 "images": {"min_pixels": 16_384}}}))
+    assert below.input_problems() == ["models.clef-flash.images: the clef engine takes images of 65536 to 16777216 "
+                                      "pixels, not 16384 to 1048576"]
+    mistyped = catalog.Catalog.parse(with_models(**{"clef-flash": {"images": {"max_images": 2}}}))
+    assert mistyped.unknown_settings() == ["models.clef-flash.images.max_images"]
+    for modalities in (["image"], ["text", "text"], []):
+        with pytest.raises(ValidationError, match="input_modalities"):
+            catalog.Catalog.parse(with_models(**{"clef-flash": {"input_modalities": modalities}}))
+    with pytest.raises(ValidationError, match="max_pixels"):
+        catalog.Catalog.parse(with_models(**{"clef-flash": {"images": {"max_pixels": 32 << 20}}}))

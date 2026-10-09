@@ -5,9 +5,10 @@
     setup-mechanisms  mechanism count 2 and the emission split (owner coldkey)
     commit-catalog    publish a catalog file: store it where the owner's validator serves it, commit its digest; the
                       mechanism it names must exist on chain, a usage pool's buyback coldkey must not be the subnet
-                      owner's coldkey, and it must name the auditor's TLS pin and egress addresses and each gateway's
-                      egress addresses; run on the auditor's machine, it fills in the auditor's pin and egress
-                      addresses from the validator's configuration and certificate where the file names none
+                      owner's coldkey, it must name the auditor's TLS pin and egress addresses and each gateway's
+                      egress addresses, and its models may read only text and, where their engine reads them, images
+                      its processor takes as they are; run on the auditor's machine, it fills in the auditor's pin and
+                      egress addresses from the validator's configuration and certificate where the file names none
 
 The owner coldkey comes from a bittensor wallet (``--wallet``, password prompt) or, for unattended test networks,
 from a mnemonic in the OS keyring (``--keyring SERVICE:USER``).
@@ -189,6 +190,8 @@ def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path 
     cat.audit_policy(strict=True)  # nodes ignore settings their code does not know; a publisher must not mistype one
     if unknown := cat.unknown_settings():
         raise SystemExit(f"settings this code does not know: {', '.join(unknown)}")
+    if problems := cat.input_problems():
+        raise SystemExit("input this code does not serve: " + "; ".join(problems))
     cat.anchor_shares(strict=True)
     pool = cat.scoring.usage_pool
     if pool is not None and pool.buyback_coldkey is not None and pool.buyback_coldkey == st.substrate.query(

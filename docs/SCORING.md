@@ -21,7 +21,8 @@ Each epoch the validator derives a pool of `canary_pool_size` (16) requests per 
 epoch and the model (support tickets and code-review requests with generated details and a varying subset of questions). Miners
 cannot predict them. Canaries are signed by the validator's hotkey, so a miner can tell validator traffic from
 gateway traffic; the checks here cover what validators are served, and the throughput auditor checks a sample of the
-answers the subnet's gateway receives (`GATEWAY.md`).
+answers the subnet's gateway receives (`GATEWAY.md`). Canaries carry no images: answers to requests with images are
+checked in the auditor's samples of the gateway's answers (`THROUGHPUT_AUDIT.md`).
 The reference engine answers each canary once; every endpoint of that model receives its own random subset of
 `canaries_per_endpoint` (10) canaries, spread over the first `canary_spread_fraction` (0.6) of the epoch. Canaries
 wait while a throughput test runs (`THROUGHPUT_AUDIT.md`). If the reference engine cannot answer, the model's
@@ -88,8 +89,9 @@ Per endpoint and epoch:
 Each `active` model has a pool: a share of the epoch's emission, of the part the scores pay (the miner share,
 [Weights](#weights)). Its endpoints split it as above; `candidate` models have none. The pools follow what users pay
 for each model through the subnet's gateway:
-- demand: the input tokens of the users' requests per model (as the miners signed them), once the gateways tell
-  paid from unpaid only those users paid for, averaged over epochs (`demand_ema_alpha`, 0.1: about six hours);
+- demand: the input tokens of the users' requests per model (as the miners signed them, the tokens of a request's
+  images included), once the gateways tell paid from unpaid only those users paid for, averaged over epochs
+  (`demand_ema_alpha`, 0.1: about six hours);
 - revenue: demand x the model's `price` (USD per million input tokens, what users pay);
 - share: the model's revenue share, blended toward the catalog's `anchor_share` while the total demand is below
   `demand_full_tokens_s` (10,000 input tokens/s), and at least `min_model_share` (0.1) for every active model;

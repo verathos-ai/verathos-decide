@@ -180,18 +180,27 @@ count as asked only up to what the users' answers leave of the tested rate.
 
 ## Gateway answers
 
-The subnet's gateway (`GATEWAY.md`) sends the auditor sampled exchanges of its user traffic: one per endpoint and
-sampling window, drawn after the answers are in, signed by a gateway the catalog lists. The auditor keeps, for
-endpoints it tests, those whose receipt binds the request and the answers and names that gateway (up to 8 per
-endpoint and epoch; signed malformed answers always), and recomputes a random `gateway_checks_per_epoch` of them per
-endpoint and epoch, between tests (screen and fp32 reference as above). A wrong answer is evidence like one in a
-test; so is a receipt signing more or fewer input tokens than the reference counts (beyond 2% and 2 tokens), here
-and in tests, since users' input tokens are what they are billed and set the models' emission shares. The
-differences form a drift tally of their own over the last `drift_window_tests` epochs: an endpoint whose answers to
+The subnet's gateway (`GATEWAY.md`) sends the auditor sampled exchanges of its user traffic: per endpoint and sampling
+window one answer to a request without images and one to a request with images, each drawn after the answers are in,
+signed by a gateway the catalog lists. The auditor keeps, for endpoints it tests, those whose receipt binds the request
+and the answers and names that gateway (up to 8 per endpoint and epoch, and 2 with images; signed malformed answers
+always), and recomputes per endpoint and epoch a random `gateway_checks_per_epoch` of them, and besides those
+`gateway_image_checks_per_epoch` with images, between tests (screen and fp32 reference as above; an answer with images
+on the fp32 reference alone, which gets the images as the miner received them: a screen serves text). A wrong answer is
+evidence like one in a test; so is a receipt signing more or fewer input tokens than the reference counts (beyond 2% and
+2 tokens), here and in tests, since users' input tokens are what they are billed and set the models' emission shares.
+The differences form a drift tally of their own over the last `drift_window_tests` epochs: an endpoint whose answers to
 users drift beyond the model's `mean_abs` loses its credit, however correct its test answers are. A gateway answer
-counts in the epoch its check finished, so an epoch's verdicts depend only on checks finished before it began. A
-sampled user request in the form of the test's requests or of a canary is logged as relayed: some miner forwards
-what it is sent to the gateway (`throughput.workload.in_mix_form`, `validator.canaries.canary_like`).
+counts in the epoch its check finished, so an epoch's verdicts depend only on checks finished before it began. A sampled
+user request in the form of the test's requests or of a canary is logged as relayed: some miner forwards what it is sent
+to the gateway (`throughput.workload.in_mix_form`, `validator.canaries.canary_like`).
+
+A sampled request with images is held in the auditor's memory only, never in its database, until its check (at most
+2 GiB of images at once; a sample beyond is not kept); the row keeps the receipt and the other columns. Once it is
+checked, skipped or given up it is dropped, and a restart gives such samples up as unchecked. A proof with images needs
+no recompute: its request is kept without its images. The auditor's process writes no core dump. The tests' request mix
+has no images, so capacity is proven on text; what an endpoint does with images shows in these checks and in what users
+get from it.
 
 The gateway also reports, per endpoint and by the second each request was sent, how many user requests it sent the
 endpoint and how many of them it answered (a report is taken once, even if the gateway posts it again). Miners
@@ -309,6 +318,7 @@ recognisable by its session, so hardware used for other work between tests could
 | `min_test_share` | 0.125 | ... but at least this share of the model's `first_test_rps` |
 | `drift_window_tests` | 8 | tests (and, for gateway answers, epochs) over which an endpoint's recomputed answers must stay within the model's `mean_abs` |
 | `gateway_checks_per_epoch` | 2 | sampled gateway answers the auditor recomputes per endpoint and epoch (0: none) |
+| `gateway_image_checks_per_epoch` | 1 | besides those, sampled answers to requests with images (0: none) |
 
 Per model: `workload` (the request mix) and `first_test_rps`.
 
@@ -332,10 +342,10 @@ The auditor needs:
   block's events as it is finalized, over a connection of its own; blocks it falls further behind on are recorded as
   unscanned. In `revenue` mode it reads TAO's price in USD from CoinGecko once per period.
 
-Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers), `verdicts`
-(as served), `demand` (users' input tokens per model), `shares` (the models' emission shares), `users` (what users
-got from each endpoint) and `paid` (paid input tokens per endpoint), the last 30 epochs, more than the last 10 tests a
-hotkey's status lists; with a usage pool, `paid`, `burns`, `unscanned` and `usage` (the period records) from the
-start of the period before when that is earlier). A catalog with another `epoch_blocks` renumbers it (a
-test by its selection block, the rest by the first block of its epoch; the verdicts served for the old epochs are
-dropped), so credits, test rates, demand and wrong answers carry on.
+Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers, without the
+requests with images), `verdicts` (as served), `demand` (users' input tokens per model), `shares` (the models'
+emission shares), `users` (what users got from each endpoint) and `paid` (paid input tokens per endpoint), the last
+30 epochs, more than the last 10 tests a hotkey's status lists; with a usage pool, `paid`, `burns`, `unscanned` and
+`usage` (the period records) from the start of the period before when that is earlier). A catalog with another
+`epoch_blocks` renumbers it (a test by its selection block, the rest by the first block of its epoch; the verdicts
+served for the old epochs are dropped), so credits, test rates, demand and wrong answers carry on.

@@ -47,9 +47,20 @@ class GatewayConfig(BaseModel):
     attempt_timeout_s: float = Field(4.0, gt=0, description="Per attempt at one miner")
     max_attempts: int = Field(3, ge=1, le=5)
     max_in_flight: int = Field(4096, ge=1, description="User requests in flight in this process; more get 503")
-    max_body_bytes: int = Field(1 << 20, ge=1024, le=1 << 20)
+    max_body_bytes: int = Field(1 << 20, ge=1024, le=1 << 20, description="The body of a request to a model that "
+                                "reads text only; a model that reads images takes its catalog's "
+                                "images.max_request_bytes")
+    body_timeout_s: float = Field(60.0, gt=0, description="Receiving a request's body, at most (it is read once its "
+                                  "key, rate, quota and credit are checked); slower bodies get 408")
     max_in_flight_bytes: int = Field(256 << 20, ge=1 << 20, description="Request bodies held in this process at "
-                                     "once (they are parsed into several copies); more get 503")
+                                     "once, and requests with their images made canonical (they are parsed into "
+                                     "several copies); more get 503")
+    media_workers: int = Field(4, ge=1, description="Processes that make users' images canonical, one image at a "
+                               "time each")
+    max_media_in_flight: int = Field(8, ge=1, description="Requests whose images are made canonical or wait for a "
+                                     "worker at once, in this process; more get 503")
+    media_timeout_s: float = Field(2.0, gt=0, description="Making one image canonical, at most: a worker taking "
+                                   "longer is replaced, and the image refused")
     sample_window_s: float = Field(600.0, ge=10, description="One exchange per endpoint and window goes to the "
                                    "auditor")
     catalog_dir: Path = Path("~/.verathos/catalog")

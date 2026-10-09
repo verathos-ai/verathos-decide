@@ -157,7 +157,8 @@ def test_the_gateway_reaches_a_miner_over_pinned_tls_and_blames_it_for_another_c
                       tls=pin, credited_rps=10.0, latency_ms=100.0)
         async with tls.client() as client:
             return await Upstream(gateway, client, netuid=405).call(
-                route, request, body, digest(request), SystemOneRequest.model_validate(request), 10.0)
+                route, request, body, digest(request), SystemOneRequest.model_validate(request), 10.0,
+                max_tokens=len(body))
 
     with serving(app, served) as base:
         exchange = asyncio.run(call(base, served.pin))

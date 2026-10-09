@@ -19,6 +19,11 @@ Callers other than gateways (validators) need only their canaries: one request a
 of the model's largest standard request (``caller_request_bytes``), at most the catalog's budget of requests per
 endpoint and epoch (``admission.RequestBudget``), and while test traffic arrives their requests wait behind it
 (``admission``). More would crowd out a test, or serve a validator as a free inference service.
+
+A request's body is at most ``MAX_REQUEST_BYTES``, or for a model whose catalog entry lists image its
+``images.max_request_bytes``. Images reach only such a model, at most ``images.max_count`` of them, each canonical as
+the gateway makes it (``protocol.media.canonical_sizes``, read from its header): anything else is refused with 422
+before the engine sees it.
 """
 
 from __future__ import annotations
@@ -41,9 +46,17 @@ from verathos.miner.admission import BEHIND_TESTS, REGULAR, TEST, Admission, Req
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol import signing
-from verathos.protocol.api import STATE_CHARS_PER_TOKEN, SystemOneRequest, known_fields, prompt_chars, well_formed
+from verathos.protocol.api import (
+    MAX_REQUEST_BYTES,
+    STATE_CHARS_PER_TOKEN,
+    SystemOneRequest,
+    known_fields,
+    prompt_chars,
+    well_formed,
+)
 from verathos.protocol.canonical import canonical_json, digest
 from verathos.protocol.manifest import ENDPOINTS_PATH, SignedHostEndpoints, SignedManifest
+from verathos.protocol.media import ImageLimits, canonical_sizes
 from verathos.protocol.receipts import Receipt, SignedReceipt
 from verathos.protocol.requests import HDR_HOTKEY, NonceCache, RequestRejected, verify_request
 from verathos.throughput.policy import HDR_SESSION, SessionGate
@@ -52,7 +65,6 @@ from verathos.validator import canaries
 
 log = logging.getLogger(__name__)
 IDENTITY_DOMAIN = "verathos/identity/v1"
-MAX_REQUEST_BYTES = 1 << 20
 BODY_TIMEOUT_S = 10.0
 CALLER_CONCURRENCY = 1
 
@@ -107,6 +119,7 @@ def create_app(
     serving: Callable[[], Collection[str]] | None = None,
     max_state_tokens: Callable[[str], int | None] = lambda model_id: None,
     max_caller_request: Callable[[str], int | None] = lambda model_id: None,
+    image_limits: Callable[[str], ImageLimits | None] = lambda model_id: None,
     on_test_traffic: Callable[[], None] = lambda: None,
     testing: Callable[[], bool] = lambda: False,
     gateways: Callable[[], Collection[str]] | None = None,
@@ -122,7 +135,8 @@ def create_app(
     requests; ``testing`` whether their traffic arrives now; ``admissions`` the engine admission per endpoint
     (default: ``max_concurrency`` slots); ``serving`` the endpoints answered (default: those the manifest lists);
     ``max_state_tokens`` a model's limit (``api.prompt_chars``); ``max_caller_request`` the largest request of a model
-    callers other than gateways may send (``caller_request_bytes``); ``gateways`` the callers exempt from the
+    callers other than gateways may send (``caller_request_bytes``); ``image_limits`` the images a model takes (None:
+    it reads text only); ``gateways`` the callers exempt from the
     per-caller limits (default: the configured ``gateways``); ``catalog_digest`` and ``mechid`` the catalog and
     mechanism receipts name (default: the manifest's); ``budget`` the requests each caller other than a gateway may
     send an endpoint per epoch (default: no limit); ``on_verified`` is called with the hotkey and source address of
@@ -144,28 +158,32 @@ def create_app(
     def error(status: int, message: str) -> JSONResponse:
         return JSONResponse(status_code=status, content={"error": message})
 
-    async def read_body(request: Request) -> bytes | None:
-        """The request body, or None if it exceeds MAX_REQUEST_BYTES or takes longer than BODY_TIMEOUT_S."""
+    async def read_body(request: Request, limit: int) -> bytes | None:
+        """The request body, or None if it exceeds ``limit`` bytes or takes longer than BODY_TIMEOUT_S."""
         declared = request.headers.get("content-length", "")
-        if declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
+        if declared.isdigit() and int(declared) > limit:
             return None
         body = bytearray()
         try:
             async with asyncio.timeout(BODY_TIMEOUT_S):
                 async for chunk in request.stream():
                     body += chunk
-                    if len(body) > MAX_REQUEST_BYTES:
+                    if len(body) > limit:
                         return None
         except TimeoutError:
             return None
         return bytes(body)
+
+    def body_limit(endpoint_id: str) -> int:
+        limits = image_limits(endpoints[endpoint_id].model_id)
+        return MAX_REQUEST_BYTES if limits is None else limits.max_request_bytes
 
     async def authenticate(request: Request, endpoint_id: str):
         """-> (caller, body, None) or (None, None, error response). The claimed caller must be permitted before its
         body is read or its signature checked; a caller other than a gateway is then counted against its budget."""
         if not authorized(request.headers.get(HDR_HOTKEY, "")):
             return None, None, error(403, "caller is not a permitted validator or gateway")
-        body = await read_body(request)
+        body = await read_body(request, body_limit(endpoint_id))
         if body is None:
             return None, None, error(413, "request too large or too slow")
         try:
@@ -192,10 +210,25 @@ def create_app(
         if session.auditor != hotkey:
             on_test_traffic()
             on_verified(session.auditor, request.client.host if request.client else None)
-        body = await read_body(request)
+        body = await read_body(request, body_limit(endpoint_id))
         if body is None:
             return None, None, error(413, "request too large or too slow")
         return TestCaller(session.auditor, request_id, session.not_after_ms), body, None
+
+    def refused_images(images: list[Any], model_id: str) -> str | None:
+        """Why a request's images are not taken: a model that reads text only, more than its count, or one that is
+        not canonical."""
+        limits = image_limits(model_id)
+        if limits is None:
+            return f"{model_id} reads text only"
+        if len(images) > limits.max_count:
+            return f"{model_id} takes at most {limits.max_count} images per request"
+        try:
+            canonical_sizes(images, token_px=limits.token_px, min_pixels=limits.min_pixels,
+                            max_pixels=limits.max_pixels)
+        except ValueError as exc:
+            return f"images not canonical: {exc}"
+        return None
 
     def listed(endpoint_id: str) -> bool:
         """Whether the endpoint is served (a catalog change or a failed measurement can withdraw one)."""
@@ -256,6 +289,8 @@ def create_app(
         limit = max_state_tokens(endpoint.model_id)
         if limit is not None and prompt_chars(parsed) > STATE_CHARS_PER_TOKEN * limit:
             return error(413, "state, instructions and criteria longer than the model accepts")
+        if parsed.images and (why := refused_images(parsed.images, endpoint.model_id)):
+            return error(422, why)
         capped = (caller.hotkey, endpoint_id) if not test and caller.hotkey not in gateways() else None
         if capped is not None:
             largest = max_caller_request(endpoint.model_id)
