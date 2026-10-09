@@ -134,6 +134,58 @@ def test_image_canaries_fit_the_models_limits_and_the_requests_miners_take_from_
     assert not any("images" in c for c in canary_pool(b"k" * 32, 1, "clef-flash", 16, ImageLimits()))
 
 
+def test_image_canaries_ask_how_many_and_the_largest_shape_only_where_the_reference_answers_surely(
+        monkeypatch) -> None:
+    """Where clef-flash's float32 reference answers at 0.9 or more: how many only of two shapes on a white, black or
+    grey background or of three on a black one, without a word; which shape is the largest only on a white or black
+    background, of one at least twice as wide as any other; a bar chart is never counted and carries no word. Every
+    image keeps at least three questions to draw from. Checked against what each image's drawing calls draw."""
+    import io
+    import random
+    from collections import Counter
+
+    from PIL import Image, ImageDraw
+
+    from verathos.validator import canaries
+
+    calls: list[tuple[str, list]] = []
+
+    def recording(name: str):
+        original = getattr(ImageDraw.ImageDraw, name)
+
+        def call(pen, xy, *args, **kwargs):
+            calls.append((name, [list(p) for p in xy] if name == "polygon" else list(xy)))
+            return original(pen, xy, *args, **kwargs)
+        return call
+
+    for name in ("ellipse", "rectangle", "polygon", "text"):
+        monkeypatch.setattr(ImageDraw.ImageDraw, name, recording(name))
+
+    def span(name: str, xy: list) -> float:
+        xs, ys = ([p[0] for p in xy], [p[1] for p in xy]) if name == "polygon" else ((xy[0], xy[2]), (xy[1], xy[3]))
+        return max(max(xs) - min(xs), max(ys) - min(ys))
+
+    named = {rgb: colour for colour, rgb in canaries.COLOURS.items()}
+    offered: Counter[str] = Counter()
+    for seed in range(2000):
+        calls.clear()
+        drawn = canaries.draw(random.Random(seed), ImageLimits())
+        background = named[Image.open(io.BytesIO(drawn.png)).convert("RGB").getpixel((0, 0))]
+        words = [xy for name, xy in calls if name == "text"]
+        figures = [(name, xy) for name, xy in calls if name != "text"]
+        assert len(drawn.questions) >= 3 and set(drawn.questions) <= IMAGE_QUESTIONS
+        if "tallest" in drawn.questions:  # a bar chart
+            assert not words and not {"count", "largest"} & set(drawn.questions)
+        else:
+            counted = {"white": 2, "grey": 2, "black": 3}.get(background, 0)
+            assert ("count" in drawn.questions) == (not words and 2 <= len(figures) <= counted)
+            spans = [span(name, xy) for name, xy in figures]  # the first drawn is the largest by area
+            clear = len(spans) > 1 and spans[0] >= 2 * max(spans[1:])
+            assert ("largest" in drawn.questions) == (background in ("white", "black") and clear)
+        offered.update(list(drawn.questions))
+    assert min(offered.values()) >= 40  # each kind of question is still asked
+
+
 class ImageReading(MockEngine):
     """The mock engine whose answers depend on a request's images too; ``blind`` answers as if it had none."""
 

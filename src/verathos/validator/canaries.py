@@ -5,9 +5,9 @@ gives every endpoint of that model a different random subset. Everything is deri
 (secret, epoch, model), so the pool is reproducible by the validator and unpredictable to miners.
 
 For a model that reads images, its catalog's ``images.canary_share`` of the pool carries an image the validator draws
-(``draw``): one to six shapes in named colours on a coloured background, or a small bar chart, sometimes a word or
-number in Pillow's built-in font; a canonical PNG whose sides are multiples of the model's image token between 256 and
-512 px, asked two or three questions about what it shows with plain answers (a shape of a colour, how many, the
+(``draw``): one to six shapes in named colours on a coloured background, sometimes with a word or number in Pillow's
+built-in font, or a small bar chart; a canonical PNG whose sides are multiples of the model's image token between 256
+and 512 px, asked two or three questions about what it shows with plain answers (a shape of a colour, how many, the
 largest or the tallest, the background, a word). Its state is an ordinary canary state.
 """
 
@@ -92,6 +92,12 @@ SHAPES = ("circle", "square", "triangle", "star")
 WORDS = ("SALE", "OPEN", "STOP", "EXIT", "PAID", "HELLO", "42", "1987")
 NUMBERS = ("One", "Two", "Three", "Four", "Five", "Six")
 GRID = 3  # shapes sit in distinct cells of a GRID x GRID grid, so none overlaps another
+# where clef-flash's float32 answers to how many and to which shape is the largest are sure (0.9 or more in at least
+# 95% of canaries): how many of two shapes up to COUNTED[background] (on other backgrounds none) without a word, which
+# is the largest on a LARGEST_ON background, of a shape at least CLEARLY_LARGEST times as wide as any other
+COUNTED = {"white": 2, "grey": 2, "black": 3}
+LARGEST_ON = ("white", "black")
+CLEARLY_LARGEST = 2.0
 
 
 def seeded(secret: bytes, *parts: object) -> random.Random:
@@ -153,9 +159,9 @@ def shape_question(colour: str, shape: str) -> dict[str, Any]:
     return {"type": "noul", "instructions": f"Is there a {colour} {shape}?"}
 
 
-def count_question(what: str) -> dict[str, Any]:
-    return {"type": "score", "instructions": f"How many {what}s are there?",
-            "criteria": [f"{n} {what}{'' if n == 'One' else 's'}" for n in NUMBERS]}
+def count_question() -> dict[str, Any]:
+    return {"type": "score", "instructions": "How many shapes are there?",
+            "criteria": [f"{n} shape{'' if n == 'One' else 's'}" for n in NUMBERS]}
 
 
 def largest_question() -> dict[str, Any]:
@@ -184,14 +190,19 @@ def _star(cx: float, cy: float, r: float) -> list[tuple[float, float]]:
 
 # a shape's area as a multiple of its radius squared (half its width): the star's inner radius is 0.45 of its outer
 AREA = {"circle": math.pi, "square": 4.0, "triangle": 2.0, "star": 5 * 0.45 * math.sin(math.pi / 5)}
+# a shape's width, the longer side of its bounding box, as a multiple of its radius: a star is wider than its height
+SPAN = {"circle": 2.0, "square": 2.0, "triangle": 2.0, "star": 2 * math.cos(math.pi / 10)}
 
 
 def draw(rng: random.Random, limits: ImageLimits) -> Drawn:
     """An image canary's image, drawn from ``rng``: its sides multiples of 32 between ``IMAGE_SIDES``, fitted to the
     model's limits as its processor fits them (each a multiple of ``token_px``, the pixels within its budget). Three in
-    four show one to six shapes, each in a cell of its own, the largest of at least twice the area of any other; the
-    others a bar chart of three to five bars, the tallest at least 1.3 times as tall as any other; half of them a word
-    or number. A question about a shape or a word asks for one shown or one not shown, as often."""
+    four show one to six shapes, each in a cell of its own, the largest of at least twice the area of any other, half of
+    them with a word or number in a cell of its own; the others a bar chart of three to five bars, the tallest at least
+    1.3 times as tall as any other. A question about a shape or a word asks for one shown or one not shown, as often.
+    How many is asked only of two shapes on a white, black or grey background or of three on a black one, without a
+    word (``COUNTED``); which shape is the largest only on a white or black background, of one at least
+    ``CLEARLY_LARGEST`` times as wide as any other."""
     from PIL import Image, ImageDraw, ImageFont
 
     height, width = smart_resize(rng.randrange(IMAGE_SIDES[0], IMAGE_SIDES[1] + 1, 32),
@@ -202,13 +213,14 @@ def draw(rng: random.Random, limits: ImageLimits) -> Drawn:
     pen = ImageDraw.Draw(image)
     others = [c for c in COLOURS if c != background]
     cell_w, cell_h = width / GRID, height / GRID
-    word = rng.choice(WORDS) if rng.random() < 0.5 else None
     questions = {"background": background_question()}
+    word = None
     if rng.random() < 0.75:
+        word = rng.choice(WORDS) if rng.random() < 0.5 else None
         cells = rng.sample(range(GRID * GRID), k=rng.randint(1, 6) + (word is not None))
         word_cell = cells.pop() if word is not None else None
         largest = AREA["star"] * (0.42 * min(cell_w, cell_h)) ** 2  # a star as wide as fits its cell
-        drawn = []
+        drawn, spans = [], []
         for k, cell in enumerate(cells):
             shape, colour = rng.choice(SHAPES), rng.choice(others)
             r = math.sqrt(largest * (1.0 if k == 0 else rng.uniform(0.2, 0.45)) / AREA[shape])
@@ -223,13 +235,23 @@ def draw(rng: random.Random, limits: ImageLimits) -> Drawn:
             else:
                 pen.polygon(_star(cx, cy, r), fill=fill)
             drawn.append((colour, shape))
+            spans.append(SPAN[shape] * r)
         if rng.random() < 0.5:
             colour, shape = rng.choice(drawn)
         else:
             colour, shape = rng.choice([(c, s) for c in others for s in SHAPES if (c, s) not in drawn])
-        questions.update(shape=shape_question(colour, shape), count=count_question("shape"),
-                         largest=largest_question())
-        corner = None if word_cell is None else (word_cell % GRID * cell_w, word_cell // GRID * cell_h, cell_w)
+        questions["shape"] = shape_question(colour, shape)
+        if word is None and 2 <= len(drawn) <= COUNTED.get(background, 0):
+            questions["count"] = count_question()
+        if background in LARGEST_ON and len(drawn) > 1 and spans[0] >= CLEARLY_LARGEST * max(spans[1:]):
+            questions["largest"] = largest_question()
+        if word_cell is not None:
+            x, y = word_cell % GRID * cell_w, word_cell // GRID * cell_h
+            size = max(12, int(0.25 * min(cell_w, cell_h)))
+            while size > 12 and pen.textlength(word, font=ImageFont.load_default(size)) > 0.9 * cell_w:
+                size -= 2
+            pen.text((x + 0.05 * cell_w, y + 0.05 * cell_h), word, font=ImageFont.load_default(size),
+                     fill=COLOURS["black" if background in LIGHT else "white"])
     else:
         bars = rng.randint(3, 5)
         colours = rng.sample(others, bars)
@@ -240,15 +262,7 @@ def draw(rng: random.Random, limits: ImageLimits) -> Drawn:
             share = 1.0 if k == tallest else rng.uniform(0.3, 0.75)
             pen.rectangle(((k + 0.2) * step, bottom - share * (bottom - top), (k + 0.8) * step, bottom),
                           fill=COLOURS[colour])
-        questions.update(tallest=tallest_question(colours), count=count_question("bar"))
-        corner = (0.0, 0.0, float(width))  # above the bars
-    if word is not None and corner is not None:
-        x, y, room = corner  # where the word goes, and how wide it may be
-        size = max(12, int(0.25 * min(cell_w, cell_h)))
-        while size > 12 and pen.textlength(word, font=ImageFont.load_default(size)) > 0.9 * room:
-            size -= 2
-        pen.text((x + 0.05 * room, y + 0.05 * cell_h), word, font=ImageFont.load_default(size),
-                 fill=COLOURS["black" if background in LIGHT else "white"])
+        questions["tallest"] = tallest_question(colours)
     questions["word"] = word_question(word if word is not None and rng.random() < 0.5
                                       else rng.choice([w for w in WORDS if w != word]))
     out = io.BytesIO()
@@ -265,7 +279,7 @@ def max_request_bytes(model_id: str, images: ImageLimits | None = None) -> int:
 
     sizes = []
     image = {"content_type": PNG, "base64": "A" * (4 * -(-IMAGE_BYTES // 3))}
-    questions = {"background": background_question(), "count": count_question(longest(["shape", "bar"])),
+    questions = {"background": background_question(), "count": count_question(),
                  "largest": largest_question(), "shape": shape_question(longest(list(COLOURS)), longest(list(SHAPES))),
                  "tallest": tallest_question(list(COLOURS)), "word": word_question(longest(list(WORDS)))}
     for domain in DOMAINS.values():
