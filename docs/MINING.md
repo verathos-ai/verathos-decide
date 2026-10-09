@@ -36,6 +36,9 @@ The installer never creates, imports or reads a coldkey. Then, on the miner mach
 curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
 ```
 
+On a machine of your own with Docker, the miner also runs as a container with the engines the release ships
+([Docker](DOCKER.md)); a miner that changes its engine installs as here.
+
 After installing the code it asks a few questions, then shows its plan and asks to go ahead before it sets up
 engines and services:
 

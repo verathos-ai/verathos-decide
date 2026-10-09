@@ -1,0 +1,40 @@
+# A light validator: it sets the weights the auditor publishes each epoch; no GPU, no engines (docs/DOCKER.md).
+#   cp .env.example .env    then set WALLET and COMPOSE_FILE=compose.validator.yml
+#   docker compose up -d
+name: verathos-validator
+
+services:
+  validator:
+    image: ${IMAGE_REGISTRY:?set IMAGE_REGISTRY in .env}/verathos:${VERATHOS_VERSION:?set VERATHOS_VERSION in .env}
+    command: ["validator"]
+    restart: unless-stopped
+    stop_grace_period: 60s
+    cap_drop: [NET_RAW]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      MODE: light
+      WALLET: ${WALLET:?set WALLET in .env}
+      HOTKEY: ${HOTKEY:-default}
+      NETWORK: ${NETWORK:-finney}
+      NETUID: ${NETUID:-}
+      DRY_RUN: ${DRY_RUN:-}
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      # The hotkey and the coldkey's public key, read-only, which must exist; never the coldkey.
+      - type: bind
+        source: ${WALLETS_DIR:-~/.bittensor/wallets}/${WALLET}/hotkeys/${HOTKEY:-default}
+        target: /root/.bittensor/wallets/${WALLET}/hotkeys/${HOTKEY:-default}
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WALLETS_DIR:-~/.bittensor/wallets}/${WALLET}/coldkeypub.txt
+        target: /root/.bittensor/wallets/${WALLET}/coldkeypub.txt
+        read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"

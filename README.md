@@ -40,7 +40,8 @@ system services; with `--no-service` it needs no root and prints the commands fo
 Miners and validators then install each new release by themselves (`--no-auto-update` turns that off); running the
 command again updates them too. What it asks, what it installs, how to check, update and uninstall, and
 the manual installation: [Mining](docs/MINING.md#quick-start-one-command),
-[Validating](docs/VALIDATING.md#quick-start-one-command).
+[Validating](docs/VALIDATING.md#quick-start-one-command). On a machine of your own with Docker, each role also runs
+as a container, with the engines the release ships: [Docker](docs/DOCKER.md).
 
 Models of the shipped catalog (the installers read the catalog the subnet owner commits on chain):
 
@@ -70,6 +71,7 @@ memory for the largest only; `--candidates` adds the candidates' references wher
 |---|---|
 | [Mining](docs/MINING.md) | hardware, one-command and manual install, engines, configuration, running a miner |
 | [Validating](docs/VALIDATING.md) | light and full mode, one-command and manual install, reference engines (on the machine or a GPU machine of their own), configuration, the auditor |
+| [Docker](docs/DOCKER.md) | miners, validators and reference machines as containers, from each release's images |
 | [Scoring](docs/SCORING.md) | how answers are verified and scored |
 | [Throughput audit](docs/THROUGHPUT_AUDIT.md) | declared capacity, the network-wide tests, verdicts, policy |
 | [Gateway](docs/GATEWAY.md) | user traffic: keys, limits, routing, answer checks, running it |
@@ -89,11 +91,13 @@ src/verathos/
   engine/      verathos-engine for model families served from their repository code (Clef)
   subnet/      chain helpers miners and validators share, and the verathos-subnet admin CLI
   reference/   a reference machine's front: its engines over TLS to its callers' addresses, with a key
-  install/     guided setup: verathos-miner init, verathos-validator init, verathos-reference init, uninstall
+  install/     guided setup: verathos-miner init, verathos-validator init, verathos-reference init, uninstall;
+               verathos-container, which sets up and runs a role in a Docker container
   release.py   the release version and the weights version key
   update.py    self-update to each signed release tag
 native/loadgen/  Rust load generator the auditor drives the tests with
 scripts/       installer, miner probe
+docker/        the release's images (Dockerfile), a compose file per role, the build script
 release/       allowed_signers: the keys release tags are signed with
 docs/
 ```
