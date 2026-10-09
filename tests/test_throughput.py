@@ -710,6 +710,36 @@ def test_a_screen_flag_counts_only_once_the_fp32_reference_confirms_it() -> None
     asyncio.run(run())
 
 
+def test_answers_a_screen_cannot_recompute_are_checked_by_the_fp32_reference(caplog) -> None:
+    """A screen only makes checks faster: one that is down, or refuses a request (an engine without images), leaves
+    the check to the fp32 reference instead of leaving the answer unchecked."""
+    from verathos.miner.engine import EngineError
+
+    request = make_request("kev-4b", KEV.workload, random.Random(7))
+
+    class Refusing(MockEngine):
+        async def answer(self, request):
+            raise EngineError('engine returned 422: {"error":"invalid request: images and videos are not served"}')
+
+    async def run():
+        honest = (await MockEngine("kev-4b").answer(request))["answers"]
+        wrong = (await MockEngine("kev-4b", salt="other").answer(request))["answers"]
+        checks = Checks({"kev-4b": MockEngine("kev-4b")}, {"kev-4b": Refusing("kev-4b")}).for_test()
+        for _ in range(4):  # also once the screen's breaker is open
+            fault, comparison = await checks.check("kev-4b", request, honest, KEV.tolerance, recompute_answers=True)
+            assert fault is None and comparison is not None  # checked, by the reference
+        fault, _ = await checks.check("kev-4b", request, wrong, KEV.tolerance, recompute_answers=True)
+        assert "differ from the reference" in fault
+        unconfirmable = Checks({}, {"kev-4b": Refusing("kev-4b")}).for_test()
+        assert await unconfirmable.check("kev-4b", request, wrong, KEV.tolerance, recompute_answers=True) == (None,
+                                                                                                             None)
+
+    with caplog.at_level("WARNING", logger="verathos.throughput.auditor"):
+        asyncio.run(run())
+    assert caplog.text.count("a kev-4b recompute failed, the fp32 reference checks it: engine returned 422") == 3
+    assert caplog.text.count("a kev-4b recompute failed, the answer is unchecked: engine returned 422") == 1
+
+
 def test_a_reference_that_counts_no_input_tokens_is_reported_once(caplog) -> None:
     """Without the reference's count, the input tokens miners sign (they set the demand) cannot be checked."""
     request = make_request("kev-4b", KEV.workload, random.Random(6))

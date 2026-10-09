@@ -282,7 +282,8 @@ class Recomputes:
         self._slots = RankedSlots(REFERENCE_CONCURRENCY)
 
     async def _compare(self, engine: Engine, model_id: str, request: dict[str, Any], got: dict[str, Any],
-                       tolerance: Tolerance, rank: float = 0.0) -> RequestComparison | None:
+                       tolerance: Tolerance, rank: float = 0.0,
+                       then: str = "the answer is unchecked") -> RequestComparison | None:
         await self._slots.acquire(rank)
         try:  # the deadline and the breaker are judged when the recompute would start
             if time.monotonic() > self.deadline or self._failures.get(id(engine), 0) >= BREAKER_FAILURES:
@@ -291,7 +292,7 @@ class Recomputes:
                 comparison = await recompute(request, got, engine, tolerance)
             except ReferenceUnavailable as exc:
                 self._failures[id(engine)] = self._failures.get(id(engine), 0) + 1
-                log.warning("a %s recompute failed, the answer is unchecked: %s", model_id, exc)
+                log.warning("a %s recompute failed, %s: %s", model_id, then, exc)
                 return None
             self._failures[id(engine)] = 0
             if comparison.reference_input_tokens is None and model_id not in _UNCOUNTED:
@@ -320,7 +321,12 @@ class Recomputes:
         first = screen or reference
         if not recompute_answers or first is None:
             return None, None
-        comparison = await self._compare(first, model_id, request, got, tolerance, rank)
+        fallback = screen is not None and reference is not None
+        comparison = await self._compare(first, model_id, request, got, tolerance, rank,
+                                         "the fp32 reference checks it" if fallback else "the answer is unchecked")
+        if comparison is None and fallback:  # the screen cannot answer it (down, or refusing the request)
+            comparison = await self._compare(reference, model_id, request, got, tolerance, rank)
+            return (None, None) if comparison is None else (fault_of(comparison, tolerance), comparison)
         if comparison is None:
             return None, None
         fault = fault_of(comparison, tolerance)
