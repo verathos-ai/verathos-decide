@@ -33,9 +33,10 @@ so that each of `k` models is checked at least once every `2k` epochs, and takes
 Every request is signed by the validator and bound to the miner and a nonce. Every answer comes with a receipt signed
 by the miner hotkey that binds the request, the answers, the endpoint, the model, the caller, the nonce and the
 netuid, and names the catalog and mechanism the miner serves under (not checked against the validator's, so answers
-given while a new catalog is adopted stay valid). A request the endpoint declines (an error status, or no answer
-within the audit policy's `request_timeout_s`, 10 s) counts as unanswered. A reply without a valid receipt, or whose
-answers are malformed (a probability that is not a number in [0, 1]), fails the request as a hard failure.
+given while a new catalog is adopted stay valid). A request the endpoint declines (an error status, a reply that is
+not JSON or too large, or no answer within the audit policy's `request_timeout_s`, 10 s) counts as unanswered. A
+JSON reply without a valid receipt, or whose answers are malformed (a probability that is not a number in [0, 1]),
+fails the request as a hard failure.
 
 ## Comparison
 
@@ -80,7 +81,7 @@ Per endpoint and epoch:
   figures from the auditor's verdicts. Each endpoint weighs in a median by its proven capacity, so splitting capacity
   over more endpoints does not move it. In `observe` mode there is no latency factor and no availability to users.
   An epoch's scores sum to 1 when every active model has scored endpoints; a model whose endpoints all score zero
-  leaves its share unused.
+  leaves its share to the others, as the weights are normalised ([Weights](#weights)).
 
 ## Models
 
@@ -117,15 +118,15 @@ owner's UID gets the rest; the weights are set on the catalog's mechanism (`SUBN
 chain pays the subnet owner hotkey no incentive: it burns it, or recycles it under the subnet's `RecycleOrBurn`
 setting (`SUBNET_ADMIN.md`). The share is a constant or moves linearly from one value to another over a number of
 epochs; each epoch's comes from the catalog and the epoch number alone, rounded to 6 decimals, so every validator
-sets the same split. If no endpoint has a positive score and the usage pool pays nobody, all weight goes to the
+sets the same split. If no endpoint has a positive average and the usage pool pays nobody, all weight goes to the
 subnet owner's UID. If the owner hotkey holds no UID, the miners' and the usage pool's weights are scaled to sum to 1.
 
 Everything above is what a full validator does. A full validator running its references one at a time scores the
 endpoints of the models it does not check in an epoch with the source's published results for them: the score the
 source gave an endpoint enters its average as one it computed (zero on the source's probation, a failure as its own
 failure, held where the source could not check it), so its weights are one vector from both. A light validator
-(`VALIDATING.md`) scores nothing: it sets the weights the auditor publishes for the epoch (`GET /v1/network`, signed),
-exactly as the auditor sets them.
+(`VALIDATING.md`) scores nothing: it sets the weights its source (the auditor, or the validator `source_hotkey`
+names) publishes for the epoch (`GET /v1/network`, signed), exactly as the source sets them.
 
 ## Usage pool
 
@@ -159,6 +160,6 @@ the prices, and the miners' emission at the period's end block, and states the r
 document of the next period. Every full validator sets the same weights from it: it recomputes the record's figures from
 its inputs, and checks what its own node still holds of the burns and of the end block's emission and price (a pruned
 node keeps about 256 blocks; the rest it takes on the auditor's word, as it takes capacity). A record that fails either
-pays nothing at that validator for the period. A light validator sets the weights the auditor publishes, usage weights
+pays nothing at that validator for the period. A light validator sets the weights its source publishes, usage weights
 included. The network document states the epoch's `usage_share`, the share the usage weights sum to, and each hotkey's
 status its `usage_weight`.
