@@ -37,6 +37,7 @@ from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.throughput.usage import contradiction
 from verathos.validator import chain, light, status, usage
+from verathos.validator import egress as egress_module
 from verathos.validator.audit import EndpointResult, audit_epoch
 from verathos.validator.config import ReferenceEngine, ValidatorConfig
 from verathos.validator.discovery import DiscoveredEndpoint, Neuron, discover
@@ -237,10 +238,12 @@ def coverage_line(epoch: int, served: list[str], sequence: Sequence, why: Mappin
 
 async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, secret: bytes, state: ScoreState,
                     epoch: int, blocks_left: int, throughput: Throughput, current: CatalogFollower,
-                    board: StatusBoard, runner: Runner | None = None) -> None:
+                    board: StatusBoard, runner: Runner | None = None,
+                    egress: egress_module.Egress | None = None) -> None:
     """Score one epoch. With a ``runner``, the references run one at a time and the models not checked take the
-    source's results."""
-    started = time.monotonic()
+    source's results. While this validator's published addresses just changed (``egress``), the endpoints its requests
+    did not reach are held, not scored."""
+    started, began = time.monotonic(), time.time()
     cat = current.for_epoch(st, epoch * current.catalog.epoch_blocks)
     sc, policy, mechanism = cat.scoring, cat.audit_policy(), catalog.mechanism_of(cat, cfg.mechid)
     neurons, hotkey_of_uid = chain.snapshot(st, cfg.netuid)
@@ -343,6 +346,13 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     elif record is not None:
         log.info("  usage pool: period %d sized %.6f (%s), paid %.6f to %d UIDs", record.period, record.share,
                  record.mode, usage_share, len(usage_by_uid))
+    if egress is not None and egress.in_grace(began):
+        unreached = egress_module.excused(results)
+        for key in unreached:
+            del results[key]
+        if unreached:
+            log.warning("  this validator's published addresses changed within %d minutes: the %d endpoints its "
+                        "requests did not reach are held, not scored", egress_module.GRACE_S // 60, len(unreached))
     scores, failed, held, factors = score_epoch(state, endpoints, results, taken=taken, shares=shares, proven=proven,
                                                 invalid_hotkeys=invalid_hotkeys, sc=sc,
                                                 max_latency_s=policy.max_latency_s)
@@ -466,6 +476,38 @@ def publish_own_identity(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wall
         log.error("the validator identity was not committed on chain: %s", exc)
 
 
+def watch_egress(cfg: ValidatorConfig, wallet: bt.Wallet, current: CatalogFollower, pin: str | None,
+                 is_owner: bool) -> egress_module.Egress:
+    """Follow where this validator's requests leave from (``validator.egress``): a full validator publishes a new
+    address itself; the auditor's are the catalog's, which only the subnet owner commits, so it says what to do."""
+    from verathos.install.host import detect_public_ip
+
+    if is_owner:
+        named = list(current.catalog.auditor.egress) if current.catalog.auditor is not None else []
+
+        def publish(identity: ValidatorIdentity) -> None:
+            log.critical("the auditor's requests leave from %s, which catalog %s does not name in auditor.egress: "
+                         "miners whose firewall enforces drop its tests and canaries until the subnet owner commits a "
+                         "catalog naming it (verathos-subnet commit-catalog on this machine fills it in)",
+                         identity.egress[0], current.catalog.digest()[:12])
+
+        watch = egress_module.Egress(named, None, publish, detect_public_ip)
+    else:
+        def publish(identity: ValidatorIdentity) -> None:
+            st = bt.Subtensor(network=cfg.network)  # its own: the epoch loop holds the other
+            try:
+                chain.publish_identity(st, wallet, cfg.netuid, identity)
+            finally:
+                st.close()
+            log.warning("this validator's requests leave from %s, which it did not publish: it now publishes %s; "
+                        "miners admit it from there within their next refresh (egress_ips in validator.json keeps it "
+                        "across restarts)", identity.egress[0], ", ".join(identity.egress))
+
+        watch = egress_module.Egress(cfg.egress_ips, pin, publish, detect_public_ip)
+    watch.start()
+    return watch
+
+
 def main() -> None:
     if sys.argv[1:2] in (["init"], ["uninstall"]):
         from verathos.install import common
@@ -538,6 +580,8 @@ def main() -> None:
         log_auditor_pin(current.catalog, identity.pin)
     else:
         publish_own_identity(cfg, st, wallet, identity.pin if identity is not None else None)
+    egress = None if args.once else watch_egress(cfg, wallet, current, identity.pin if identity is not None else None,
+                                                 is_owner)
     if is_owner and cfg.auto_update:
         log.info("self-update: the auditor does not update itself (its restart would stop the throughput tests); "
                  "update it by hand")
@@ -589,7 +633,7 @@ def main() -> None:
                 blocks_left = max(next_start - block, 1)
                 trial = copy.deepcopy(state)  # an epoch that fails part way leaves no trace for its retry
                 asyncio.run(run_epoch(cfg, st, wallet, secret, trial, epoch, 1 if args.once else blocks_left,
-                                      throughput, current, board, runner))
+                                      throughput, current, board, runner, egress))
                 state = trial
                 done = state.last_epoch = epoch
                 state.save(state_path)
