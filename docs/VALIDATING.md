@@ -276,9 +276,16 @@ sets (`set_weights mechid=0 uids=3 -> True`; in a dry run the weights themselves
 dry run (mechanism 0 configured dry): weights {0: 0.41, 1: 0.3363, 12: 0.2537}
 ```
 
-With the catalog's usage pool it also logs the period it pays and what it pays
-(`usage pool: period 412 sized 0.061235 (burned), paid 0.058870 to 9 UIDs`), and an error if it refuses the auditor's
-record of a period.
+With the catalog's usage pool it also logs the period it pays and what it pays (`usage pool: period 412 sized 0.061235
+(burned), paid 0.058870 to 9 UIDs`), and an error if it refuses the auditor's record of a period. With its referral
+pool, the period it pays, what the referrers referred, what it pays and why it pays a referrer nothing (`holds no UID`,
+`the subnet owner's`, `excluded`, `not serving`), and an error if it refuses the record (with why: its figures, the
+catalog's parameters, the chain at the period's end, or a rewritten earlier period or a code moved to another coldkey):
+
+```
+  referrals: period 1284 sized 0.024811, 14 referrers referred 8,412.00 USD over 30 periods; paid 0.022106 to 12 UIDs; not paid: 1 excluded, 1 holds no UID
+  referrals: the auditor's record of period 1285 is refused (it rewrites the sum of code alice in the period ending at block 9244800): no referral weights this period
+```
 
 A validator restarted in an epoch it already scored (or, light, whose weights it set) starts with the next one.
 
@@ -637,9 +644,10 @@ Per epoch a full validator:
    and latency), each model's user demand, and any proven wrong answers;
 6. one at a time: takes the source's results for the models it did not check;
 7. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
-   probation, scales the miners' weights to the catalog's miner share for the epoch, adds the usage pool's weights
-   from the period record the verdicts state (checked against its node), gives the subnet owner's UID the rest
-   (`SCORING.md`), and sets weights on the catalog's mechanism, or `mechid` (retried once per block, up to 10 times).
+   probation, scales the miners' weights to the catalog's miner share for the epoch, adds the usage pool's or the
+   referral pool's weights from the period record the verdicts state (checked against its node; a referral record
+   also against the last one it accepted), gives the subnet owner's UID the rest (`SCORING.md`), and sets weights on
+   the catalog's mechanism, or `mechid` (retried once per block, up to 10 times).
 
 Nothing a miner returns can stop the epoch: replies are size- and time-bounded and every malformed reply is
 recorded against that endpoint. Chain errors are retried every block, and an epoch that fails part way leaves no
@@ -709,9 +717,18 @@ unanswered, not_audited), its checks, declared and proven capacity, how ready us
 scores, and, from the auditor, the hotkey's results in its last 10 tests (at most 64 endpoints each). `GET /v1/network` serves every hotkey's status of
 the last epoch at once (without the test results, built once per epoch), `weights`, per UID exactly the weights the
 validator set after the epoch (the subnet owner's UID's included), `mechanism`, the mechanism they are set on,
-`miner_share`, the epoch's miner share, and `usage_share`, the usage pool's (`SCORING.md`), for network dashboards and
-light validators. The validator publishes it
-before it sets those weights, and a restarted one serves the last epoch's until its next.
+`miner_share`, the epoch's miner share, and `usage_share` and `referral_share`, what the usage and referral pools
+pay (`SCORING.md`), for network dashboards and light validators. The validator publishes it before it sets those
+weights, and a restarted one serves the last epoch's until its next.
+
+A hotkey is listed for its endpoints and, with the referral pool, for its codes in the record the epoch pays, so a
+referrer without endpoints is listed too. Each hotkey's `weight` comes with its parts: `serving_weight` (from its
+scores), `usage_weight` and `referral_weight`; a referrer has `referral`: `codes` (each code's referred micro-USD per
+period of the window, oldest first), `referred_micros` (their sum, at least 0), `share` (its part of the miner emission
+by the record) and `unpaid` (why it is paid nothing this epoch, or null). The network document's `referral` names the
+record paid: `period`, `first_block`, `end_block`, `window_periods`, `payout_per_usd`, `share` (what it sizes, before
+the miner share's limit), `referred_micros` (every referrer's) and `rate_per_usd` (what a referred USD earns over its
+window at this epoch's rate). The record itself is in the auditor's verdicts (`THROUGHPUT_AUDIT.md`), signed.
 
 Both documents are signed with the validator's hotkey: the status's fields plus `netuid`, `auditor` (the signing
 hotkey) and `issued_ms`, signed as canonical JSON (sorted keys, no whitespace) under the domain `verathos/status/v1`

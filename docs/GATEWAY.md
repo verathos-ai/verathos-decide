@@ -23,7 +23,8 @@ digest proves, are fetched accepting any certificate.
 | Requests to miners, receipt checks | `gateway/upstream.py` |
 | Accounts, keys, limits, usage | `gateway/accounts.py`, `gateway/limits.py`, `gateway/usage.py` |
 | Routes, samples | `gateway/routes.py`, `gateway/sampler.py`, `protocol/gateway.py` |
-| The auditor's side | `throughput/auditor.py` (routes, sample checks), `validator/service.py` |
+| Referral codes, referrals, their reports | `gateway/referrals.py`, `protocol/referral.py`, `protocol/gateway.py` |
+| The auditor's side | `throughput/auditor.py` (routes, sample checks, referral records), `validator/service.py` |
 
 ## How a request is served
 
@@ -211,6 +212,8 @@ view of the miners does not take a model off the gateway. Once the current table
    | `admin_host`, `admin_port`, `admin_token_file` | 127.0.0.1, -, - | the admin API (see below); off without a port |
    | `accounts_token_file`, `accounts_prefix` | -, `u_` | the account service's token and the accounts it reaches (see below) |
    | `accounts_max_credit`, `accounts_max_credit_per_hour` | 100 USD, 1,000 USD | the account service's credit caps, in micro-USD (per process) |
+   | `referral_site` | - | the web app's origin referral codes and moves are signed for (`https://host`); none: no codes are registered ([Referrals](#referrals)) |
+   | `referral_reserved` | [] | names no referral code may contain, besides the built-in ones and the catalog's model ids (other subnets' products, for example) |
    | `state_dir`, `catalog_dir` | `~/.verathos/gateway`, `~/.verathos/catalog` | last routes, catalogs |
 
 6. Schema: `verathos-gateway --config gateway.json db upgrade` (after every update; the gateway does not start on
@@ -444,7 +447,10 @@ verathos-gateway keys list --account acme
 verathos-gateway keys revoke --account acme --prefix vd_1a2b3c4d5e6f7
 verathos-gateway usage --account acme --since 2026-10-01
 verathos-gateway credits add --account acme --usd 5 --kind topup --reference <payment id>
+verathos-gateway credits add --account acme --usd -5 --kind refund --reference <refund id> --refund-of <payment id>
 verathos-gateway credits list --account acme
+verathos-gateway referrals show --code alice
+verathos-gateway referrals revoke --code alice
 ```
 
 ### Credit
@@ -455,10 +461,12 @@ next write, so answers cost what their tokens do), and taken from the account's 
 Every account has a balance: the credit recorded minus the cost of its usage. A prepaid account (`--prepaid yes`) is
 served only while its balance is positive; others are served regardless (their balance just goes negative).
 
-Credit is a ledger. Each entry has a `kind` (`grant`: free credit, `topup`: a payment, `adjust`: an operator's
-correction, the only kind that may be negative) and a `reference` naming the payment or grant it records. A
+Credit is a ledger. Each entry has a `kind` (`grant`: free credit, `topup`: a payment, `refund`: a payment returned,
+negative, `adjust`: an operator's correction, either sign) and a `reference` naming the payment or grant it records. A
 reference is recorded once: adding the same entry again changes nothing, and a reference already used for another
-entry is refused. So a payment processor's retries never add a payment twice.
+entry is refused. So a payment processor's retries never add a payment twice. A refund names in `refund_of` the
+reference of the account's top-up it returns, and returns at most what earlier refunds left of it; the credit an
+account bought is its top-ups less their refunds, which is what paid usage, the totals and the series count.
 
 Each process reads a prepaid account's balance at most 5 s before using it and subtracts what it charged since and what
 its requests in flight may cost at most (one token per byte of the request without its images, and the most image tokens
@@ -467,10 +475,67 @@ cost when it ends. New credit therefore applies within 5 s (at once when recorde
 processes' charges within about 10 s (they write every 5 s). A request is accepted while that remainder is positive, so
 a balance ends below zero by at most one request's cost per process.
 
+## Referrals
+
+A hotkey registered on the subnet (a miner's, or any other but the subnet owner's) refers users with referral codes:
+an account signed up with a code is the code's, and its top-ups pay the code's hotkey from the catalog's referral
+pool (`SCORING.md`, Referrals). The gateway keeps the codes, which account each code referred, and what each of those
+accounts' top-ups and refunds counts, and reports that to the auditor. The web app, as the account service, registers
+codes, moves them and sets referrals through the [admin API](#referral-calls); the miner's command line talks to the
+web app (`MINING.md`, Referrals).
+
+**Codes.** A code is random, 8 characters of `abcdefghjkmnpqrstuvwxyz23456789` (no 0, o, 1, l or i), or readable, 4 to
+24 characters of a-z, digits and single hyphens, starting with a letter. Codes are unique after folding: lower case,
+hyphens dropped, `0` read as `o`, `1` as `l`, `5` as `s`, so `a1ice` cannot be taken beside `alice`, and a look-up
+reads a code the same way (`A1ICE` finds `alice`). No code contains `verathos`, `decide`, `bittensor`, `opentensor`,
+`taostats`, a model id of the catalog or a name of `referral_reserved` (each folded), nor is `official`, `support`,
+`admin`, `team` or `help` or has one of them as a hyphen-separated part. A hotkey holds at most 3 codes not revoked.
+A code is never deleted, so it is never given out twice.
+
+**Signed messages** (`protocol/referral.py`). The hotkey signs `<domain>`, a line break and the message's canonical
+JSON (sorted keys, no whitespace, UTF-8) with its sr25519 key, as hex:
+
+| Domain | Message | Signed by |
+|---|---|---|
+| `verathos/referral-code/v1` | `{"code", "hotkey", "issued_ms", "netuid", "site"}` | `hotkey` |
+| `verathos/referral-move/v1` | `{"from_hotkey", "issued_ms", "netuid", "site", "to_hotkey"}` | `to_hotkey` |
+| `verathos/referral-view/v1` | `{"expires_ms", "hotkey", "netuid", "site"}` | `hotkey` |
+
+`site` is the web app's origin (`https://host`, as `referral_site` names it), `netuid` the gateway's. A registration or
+a move is taken within 5 minutes after `issued_ms` (and a minute before it, for a clock ahead). A view is valid until
+`expires_ms`, at most a day after it is signed; it travels as a token, `<payload>.<signature>`: the message's
+canonical JSON in base64url without padding, a dot, and the signature.
+
+**Moves and revocation.** A move takes every code of `from_hotkey` to `to_hotkey`, another hotkey of the same coldkey
+(a rotated hotkey, a new registration); the web app checks on chain that the two have one owner (`Owner`), and the
+auditor applies a move only if they have at the end of each period. The operator revokes a code
+(`verathos-gateway referrals revoke --code`, or the admin token): it takes no new account, its accounts keep their
+referral, and their top-ups count no more.
+
+**Attribution.** An account has at most one code, set once by the account service, and only while the account has
+no top-up: its first top-up fixes its referrer. Grants, the referred user's bonus among them, do not.
+
+**What counts.** Each top-up and refund of a referred account is decided once, by one gateway process at a time
+(PostgreSQL's advisory lock; on SQLite, the one process), under the catalog's referral pool:
+
+- a top-up counts its amount if it was credited after the referral, within `term_days` of it and before the code was
+  revoked, at most what `account_cap_usd` leaves: what counts of the account's top-ups credited within a window's
+  length before or after it, less their refunds, stays within the cap, whatever order they are decided in;
+- a refund counts negative, at most what its top-up counted less earlier refunds of it;
+- a top-up decided while the catalog has no referral pool counts nothing, then or later.
+
+Every 30 s the gateway posts to the auditor what it has not taken yet (`POST /v1/gateway/referrals`, signed by the
+gateway's hotkey as served counts are): `{"codes": [signed registrations], "moves": [signed moves], "entries": [{"id"
+(the SHA-256 of the credit's reference), "code", "amount_micros", "credited_ms"}]}`, up to 1,000 registrations or moves
+and 5,000 entries per post. The auditor takes every item once, so a post whose answer was lost goes again as it was; if
+it answers with codes it does not know (its database started over), every registration and move goes again with
+those entries. It counts each entry in the period in which it arrives (`THROUGHPUT_AUDIT.md`). No account, address or
+reference leaves the gateway: the auditor sees codes and amounts.
+
 ## Admin API
 
 For the operators and the service that signs users up: inspection, requests routed as users' are or sent to one
-chosen endpoint, and accounts, keys, usage and credit. Off unless
+chosen endpoint, and accounts, keys, usage, credit and referrals. Off unless
 `admin_port` is set. It listens on a socket of its own, `admin_host:admin_port` (loopback by default; a private
 address at most, never `0.0.0.0`, and only with `tls_cert_file`), so the reverse proxy never reaches it, and on the
 public port its routes answer 404. Every call needs `Authorization: Bearer <token>`, the token read from `admin_token_file` at start:
@@ -484,11 +549,12 @@ with the caller's address, and every credit with the token and address that reco
 
 The service that signs users up (the web app) gets a token of its own, `accounts_token_file` (made the same way, and not
 the admin token), whose scope is narrower: only the accounts named with `accounts_prefix` (`u_`), which it creates
-prepaid; their keys, usage and ledger; changes other than `prepaid`; credit of kind `grant` or `topup`, at most
-`accounts_max_credit` per entry and `accounts_max_credit_per_hour` within an hour (per process; recording an entry again
-under its reference takes no more); and the network's usage totals and series. Anything else, including requests, state
-and routes, answers 403, and reaching a cap is logged as an error. A leaked web app token can then neither give an
-account unlimited service nor mint more than the hourly cap.
+prepaid; their keys, usage, ledger and referral; changes other than `prepaid`; credit of kind `grant` or `topup`, at
+most `accounts_max_credit` per entry and `accounts_max_credit_per_hour` within an hour (per process; recording an entry
+again under its reference takes no more), and refunds and negative adjustments, which take credit back; the network's
+usage totals and series; and referral codes (registering, looking up, moving) and referrers' figures. Anything else,
+including requests, state, routes and revoking a code, answers 403, and reaching a cap is logged as an error. A leaked
+web app token can then neither give an account unlimited service nor mint more than the hourly cap.
 
 | Call | Returns |
 |---|---|
@@ -503,10 +569,17 @@ account unlimited service nor mint more than the hourly cap.
 | `DELETE /admin/v1/accounts/{name}/keys/{prefix}` | revokes the key (within the key cache's minute) |
 | `GET /admin/v1/accounts/{name}/usage?since=YYYY-MM-DD` | per day and model: answered and failed requests, input tokens, cost (micro-USD); default since the first of the month |
 | `GET /admin/v1/accounts/{name}/usage/series?days=30&bucket=day` | the account's usage per day or week and model, below |
-| `POST /admin/v1/accounts/{name}/credits` | `{"amount" (micro-USD), "kind", "reference", "note"}` -> 201 with the entry and the new balance; 200 if `reference` already records this entry; 409 if it records another |
+| `POST /admin/v1/accounts/{name}/credits` | `{"amount" (micro-USD), "kind", "reference", "note", "refund_of"}` -> 201 with the entry and the new balance; 200 if `reference` already records this entry; 409 if it records another; 400 for a refund that names no top-up of the account or returns more than is left of it |
 | `GET /admin/v1/accounts/{name}/credits?limit=100` | the balance and the ledger, newest first |
 | `GET /admin/v1/usage/totals` | the network's totals, below |
 | `GET /admin/v1/usage/series?days=30&bucket=day` | the network's usage per day or week, below |
+| `POST /admin/v1/referral-codes` | a code's signed registration -> 201 with the code ([Referral calls](#referral-calls)) |
+| `GET /admin/v1/referral-codes/{code}` | the code it reads as, with its hotkey |
+| `DELETE /admin/v1/referral-codes/{code}` | revokes it (the admin token only) |
+| `POST /admin/v1/referral-codes/move` | a signed move -> 200 with the codes the new hotkey holds |
+| `PUT /admin/v1/accounts/{name}/referral` | `{"code"}` -> 201 with the referral; 409 once the account has another code or a top-up |
+| `GET /admin/v1/accounts/{name}/referral` | its referral or null, and whether it has topped up |
+| `GET /admin/v1/referrers/{hotkey}?days=30` | the referrer's figures per UTC day and code |
 
 Each gateway process serves the admin API on its own `admin_port`; with an active and a standby process, a client
 of the account calls tries the other one when one does not answer (a restart). Every write is in the shared
@@ -586,6 +659,71 @@ curl -s http://127.0.0.1:8090/admin/v1/systemone -H "Authorization: Bearer $(cat
 - The reply holds the endpoint, its URL, the answers, input and image tokens, the receipt, the miner's response as
   received, every attempt (endpoint, outcome, failure kind and blame, milliseconds) and the total time; 502 with the
   attempts if no endpoint answered.
+
+### Referral calls
+
+The account service's token reaches all of these but revoking. A code is answered as
+`{"code": "alice", "hotkey": "5F...", "created_at": "2026-10-09T12:00:00+00:00", "revoked_at": null}`.
+
+`POST /admin/v1/referral-codes` takes the signed registration as the miner's command line made it:
+
+```json
+{"registration": {"netuid": 96, "hotkey": "5F...", "code": "alice", "site": "https://<site>",
+                  "issued_ms": 1791590400000},
+ "signature": "8c1f..."}
+```
+
+-> 201 with the code; 200 with it if its hotkey registered it already. `GET /admin/v1/referral-codes/{code}` gives the
+code the given one reads as (in any case, folded), revoked or not; 404 for none. `DELETE` revokes it (once; again
+answers it as it is). `POST /admin/v1/referral-codes/move` takes a signed move, `{"move": {"netuid", "from_hotkey",
+"to_hotkey", "site", "issued_ms"}, "signature"}`, -> 200 with `{"from_hotkey", "to_hotkey", "codes"}` (the codes
+`to_hotkey` holds now); the same signed move again changes nothing.
+
+`PUT /admin/v1/accounts/{name}/referral` with `{"code": "alice"}` (as typed: any case, folded) -> 201 with
+`{"code", "hotkey", "referred_at"}`; 200 with it if the account has that code already. `GET` gives
+`{"referral": {"code", "hotkey", "referred_at"} | null, "topped_up": false}`.
+
+`GET /admin/v1/referrers/{hotkey}?days=30` (1 to 400, default 30) gives the referrer's figures over the last `days`
+UTC days, today's included: every code the hotkey holds (moved ones with their history, revoked ones too) with the
+accounts it referred all time, and per day and code the accounts referred, the accounts that topped up (`paying`), their
+top-ups and refunds, and what counted for the pool (micro-USD, by the day credited); `totals` over the days, `paying`
+counting each account once. Never an account, an address or a reference:
+
+```json
+{"hotkey": "5F...", "as_of": "2026-10-10T08:00:00+00:00", "since": "2026-09-11", "days": 30,
+ "codes": [{"code": "alice", "hotkey": "5F...", "created_at": "2026-09-01T10:00:00+00:00", "revoked_at": null,
+            "referred": 12}],
+ "totals": {"referred": 4, "paying": 2, "topups_micros": 60000000, "refunds_micros": 0, "counted_micros": 60000000},
+ "buckets": [{"start": "2026-09-11", "codes": {"alice": {"referred": 1, "paying": 1, "topups_micros": 10000000,
+                                                          "refunds_micros": 0, "counted_micros": 10000000}}}]}
+```
+
+| Status | Type | When |
+|---|---|---|
+| 400 | `invalid_request` | a body that is not the message (a field missing or unknown); a signature that does not verify; signed for another netuid or site, more than 5 minutes ago, or ahead of the gateway's clock; not a code; a reserved name; a move to the hotkey it is from; `days` out of range |
+| 403 | `forbidden` | revoking with the account service's token; an account outside its prefix |
+| 404 | `not_found` | no such code (a look-up, a revocation, a referral: or a revoked one); a move from a hotkey that holds no code; no such account |
+| 409 | `conflict` | the code is taken, or reads as one that is (`a1ice` beside `alice`); the hotkey holds 3 codes; the account has another code, or has topped up |
+| 503 | `unavailable` | the gateway names no `referral_site` |
+
+### The web app's part
+
+The web app checks what needs the chain and passes the rest on, unchanged:
+
+- `POST /api/referral/codes` with a signed registration: the hotkey holds a UID on the subnet and is not the subnet
+  owner's (neither `SubnetOwnerHotkey` nor a hotkey whose `Owner` is `SubnetOwner`), within its own limits (20
+  registrations an hour per address); then `POST /admin/v1/referral-codes`, answering its status and body.
+- `POST /api/referral/move` with a signed move: `Owner` of both hotkeys is one coldkey, and `to_hotkey` holds a UID;
+  then `POST /admin/v1/referral-codes/move`.
+- `GET /api/referral/dashboard?days=` with `Authorization: Referral <token>`: the token's signature verifies against its
+  hotkey under `verathos/referral-view/v1`, its `netuid` and `site` are the web app's, and `expires_ms` is in the
+  future, at most a day ahead (60 queries an hour per hotkey); then `GET /admin/v1/referrers/{hotkey}`.
+- The page `/referrals#<token>` reads the token from the fragment, which no server log holds, and sends it so.
+- A link `/r/<code>` looks the code up (`GET /admin/v1/referral-codes/{code}`): a revoked or unknown one shows nothing.
+  At sign-up the web app creates the account, then sets its referral (`PUT .../referral`); later, in Settings, while
+  `topped_up` is false.
+- Each hotkey's referral weight, its codes' sums and the period's referral share are the auditor's network document's
+  (`GET /v1/network`, `VALIDATING.md`), which the referral record in its verdicts backs.
 
 ## Metrics
 

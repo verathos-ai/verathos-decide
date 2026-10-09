@@ -11,8 +11,8 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[chain,ops]"
 
 `status` shows the UID cap, the mechanisms and their emission split, the owner hotkey, the committed catalog digest, its
 mechanism, auditor and gateways, the digest of the catalog shipped with this code, the current epoch and the committed
-catalog's miner share in it, its usage pool with the current period, the subnet's weights version key and this release's
-([Releases](#releases-and-the-weights-version-key)).
+catalog's miner share in it, its usage and referral pools with their current periods, the subnet's weights version key
+and this release's ([Releases](#releases-and-the-weights-version-key)).
 
 ## Mechanisms
 
@@ -43,7 +43,8 @@ configuration) overrides the catalog's; leave it unset.
 The catalog lists the served models (pinned weights, engine and engine revision, verification tolerances, the standard
 request mix `workload`, `price`, `anchor_share`, `first_test_rps`, `relative_speed`, the input each reads with its image
 limits, status), the [mechanism](#mechanisms), the epoch length, the scoring settings (`scoring`, including the
-[miner share](#miner-share) and the [usage pool](#usage-pool)) and the throughput-audit policy (`throughput_audit`).
+[miner share](#miner-share), the [usage pool](#usage-pool) and [referrals](#referrals)) and the throughput-audit policy
+(`throughput_audit`).
 Miners and validators use whichever catalog the owner hotkey commits; publishing a new one needs no code release.
 
 `price` is what users pay for the model, in USD per million input tokens, and the model's share of the emission
@@ -284,6 +285,33 @@ A period is its blocks: a new `period_epochs` or `epoch_blocks` starts periods o
 overlaps one already recorded has no record (its pool is not paid), so nothing counts twice. A new `buyback_coldkey`
 applies to the periods closed after the change: only its burns count in them. Run it on the test network first, with
 a test buyback coldkey and a short `period_epochs`.
+
+## Referrals
+
+`scoring.referral_pool` pays referrers, the hotkeys whose codes brought accounts that buy credit, on top of their
+scores, out of what the miner share leaves (`SCORING.md`, Referrals; `GATEWAY.md`, Referrals). The shipped catalog has
+none; `commit-catalog` refuses one together with a usage pool, and a `payout_per_usd` above 0.9.
+
+```json
+"referral_pool": {"share": 0.10, "payout_per_usd": 0.3, "window_periods": 30, "period_epochs": 40,
+                  "term_days": 365, "account_cap_usd": 10000, "serving_only": false, "excluded": ["5...", "5..."]}
+```
+
+To enable it:
+
+1. Keep the miner share below 1, and run the auditor and the full validators on a release with referrals (light
+   validators set the auditor's weights whatever their release).
+2. Set the gateway's `referral_site` to the web app's origin, and list other subnets' product names in
+   `referral_reserved`; the web app registers codes and referrals before the pool is on, and top-ups credited while the
+   catalog has no pool never count.
+3. Put the owner's own miners in `excluded`, by hotkey or coldkey (the owner's hotkey and its coldkey's hotkeys are
+   never paid), and commit a catalog with `referral_pool`. `commit-catalog` prints the pool and the current period.
+   The auditor logs each period it closes (`referrals: period ... closed`), and every validator what it pays each
+   epoch.
+
+Removing the section stops the pay at once; a top-up decided meanwhile never counts. A new `period_epochs`,
+`window_periods` or `epoch_blocks` starts the windows afresh, so no dollar counts twice. Run it on the test network
+first, with a short `period_epochs` and `window_periods`, `term_days` 30 and `account_cap_usd` 1000.
 
 ## Throughput audit
 
