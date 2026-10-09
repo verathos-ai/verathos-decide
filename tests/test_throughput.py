@@ -903,17 +903,18 @@ def test_a_hostile_response_voids_nothing_but_its_own_endpoint(tmp_path) -> None
 def test_a_hotkey_cannot_reset_its_test_rate_by_renaming_endpoints(tmp_path) -> None:
     from verathos.throughput.auditor import Result, Target
 
+    first = catalog.load().get("kev-4b").first_test_rps
     auditor = _auditor(tmp_path)
-    old = Slot("hk", "gpu0", "https://x/e/gpu0", "kev-4b", 50.0, tls=PIN)
+    old = Slot("hk", "gpu0", "https://x/e/gpu0", "kev-4b", first, tls=PIN)
     test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
     auditor.store.add_test(test)
-    auditor.store.add_results(test.test_id, [Result(Target(old, 50.0), "partial", "", 2.0, 0.16)])
+    auditor.store.add_results(test.test_id, [Result(Target(old, first), "partial", "", 2.0, 0.16)])
     # the old endpoint delivered 2 requests/s; eight renamed endpoints are tested at 2 x 2 in total
-    auditor.update_slots([Slot("hk", f"new{i}", f"https://x/e/new{i}", "kev-4b", 50.0, tls=PIN) for i in range(8)])
+    auditor.update_slots([Slot("hk", f"new{i}", f"https://x/e/new{i}", "kev-4b", first, tls=PIN) for i in range(8)])
     rates = [t.tested_rps for t in auditor.targets(auditor.policy)]
-    assert sum(rates) == pytest.approx(50.0, abs=0.1)  # at least one first test's worth, never 8 x 50
-    auditor.update_slots([Slot("fresh", f"g{i}", f"https://y/e/g{i}", "kev-4b", 50.0, tls=PIN) for i in range(8)])
-    assert sum(t.tested_rps for t in auditor.targets(auditor.policy)) == pytest.approx(50.0, abs=0.1)
+    assert sum(rates) == pytest.approx(first, abs=0.1)  # at least one first test's worth, never 8 of them
+    auditor.update_slots([Slot("fresh", f"g{i}", f"https://y/e/g{i}", "kev-4b", first, tls=PIN) for i in range(8)])
+    assert sum(t.tested_rps for t in auditor.targets(auditor.policy)) == pytest.approx(first, abs=0.1)
 
 
 def test_an_endpoint_that_switches_model_starts_from_the_new_models_first_test(tmp_path) -> None:
