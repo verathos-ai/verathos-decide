@@ -299,6 +299,10 @@ It keeps the mode, and references one at a time stay so (`--references resident`
 references that no longer fit in the memory, as when the catalog activates another model, run one at a time from then
 on. A light validator has only its code to update.
 
+The auditor builds its load generator again after each update of its code (`.venv/bin/verathos-build-loadgen`): an
+older load generator refuses a plan it does not know all of (a request mix with images, for one), and every test is
+void until it is built again.
+
 A validator set up by the installer also updates its code by itself (`auto_update` in `validator.json`;
 `--no-auto-update` turns it off, `--auto-update` on again; the subnet owner's validator, the auditor, is updated by
 hand). About every hour it reads the release tags (`v<version>`) of the repository its code came from. The newest
