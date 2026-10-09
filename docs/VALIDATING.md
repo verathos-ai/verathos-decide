@@ -350,6 +350,7 @@ command has `--no-service`, `--config` or `--home` where the setup had them.
 | `epoch ...: no weights set: no results of the source verified by block ...` | light: the reason follows. The auditor's axon unreachable, or its results not out yet, cost that epoch only, and the weights set before stay on chain; `not signed within 300 s of this machine's clock`: sync the clock (NTP); `it lists no weights` or `it is not signed`: the auditor runs an older release; `names no TLS pin for the auditor`: the committed catalog does not name the auditor's certificate yet; `certificate pin ... is not the pinned ...`: the source serves another certificate than the catalog (or its commitment) names, as during a rotation; `commits no TLS pin`: the `source_hotkey` validator publishes no identity |
 | `epoch ...: no weights set by block ...: the source's results are verified, but ...` | light: the auditor's results are fine and this validator could not set them. `setting them on chain failed`: the `weights not set: ...` line before it says why, such as the chain's limit of unrevealed commits (nothing to do); otherwise this hotkey's registration or validator permit, as the reason says |
 | `catalog ... names ... as the auditor's TLS pin, but this service's certificate has pin ...` | the auditor: commit a catalog naming its pin, `commit-catalog` on its machine (`SUBNET_ADMIN.md`) |
+| `another auditor with this hotkey runs at https://...` | the auditor runs on two machines: the one at that address, where the hotkey's axon points, answers as the auditor, so this one does not start, or stops at its next epoch. Keep one and stop the other for good (`systemctl disable --now verathos-validator` on its machine, or its process manager's stop): to run this one, stop that one first, then start this one, which points the axon at itself |
 | `no egress_ips configured` | full: set the public addresses its requests to miners come from (`--egress-ip`, or `egress_ips` in `validator.json`) |
 | every endpoint `request failed: ConnectTimeout` | miners' firewalls drop this validator's requests: they leave from an address it does not publish ([Egress addresses](#egress-addresses-and-miners-firewalls)) |
 | `this is the subnet owner's hotkey: its validator is the auditor ... runs in full mode` | the owner's validator is never light: `install.sh validator --full` |
@@ -742,7 +743,9 @@ If the validator's hotkey is the auditor, it also:
 
 The auditor database is `state_dir/throughput.sqlite`. Keep the auditor running continuously: a test it misses is
 not run, and endpoints keep the credit of their last test for `credit_ttl_epochs` (the gateway's routes keep it
-until the next confirmed test). A test running when it restarts is void.
+until the next confirmed test). A test running when it restarts is void. To move the auditor to another machine, stop
+the old one first: an auditor does not start while another with its hotkey answers at the hotkey's axon, and stops at
+its next epoch once another one moved the axon.
 
 ### The auditor's GPU for a model that reads images
 

@@ -10,6 +10,9 @@ the others apply its signed verdicts; endpoints score in proportion to the capac
 usage pool, the hotkeys that served paying users get weight on top, from the period record the verdicts state
 (``validator.usage``). A light validator (``mode: light``, ``validator.light``) does none of this: it sets the weights
 its source validator publishes.
+
+The subnet owner's validator, the auditor, does not start while another auditor with its hotkey answers at the hotkey's
+axon, and stops at an epoch's start once another one moved the axon (``validator.singleton``).
 """
 
 from __future__ import annotations
@@ -34,10 +37,11 @@ from verathos import update as self_update
 from verathos.engine import code_version
 from verathos.protocol import tls
 from verathos.protocol.callers import ValidatorIdentity
+from verathos.protocol.manifest import axon_base
 from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.throughput.usage import contradiction
-from verathos.validator import chain, light, status, usage
+from verathos.validator import chain, light, singleton, status, usage
 from verathos.validator import egress as egress_module
 from verathos.validator.audit import EndpointResult, audit_epoch
 from verathos.validator.config import ReferenceEngine, ValidatorConfig
@@ -604,8 +608,9 @@ def main() -> None:
                         for m, e in section.items() if e.remote()):
         log.info("engines on other machines: %s", ", ".join(remote))
     runner = None
+    is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)
     if cfg.reference_mode == "sequential":
-        if wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid):
+        if is_owner:
             raise SystemExit(OWNER_RESIDENT)
         if cfg.source_hotkey == wallet.hotkey.ss58_address:
             raise SystemExit("source_hotkey is this validator's own hotkey: name the validator whose results the "
@@ -614,6 +619,16 @@ def main() -> None:
         source = f"the validator {cfg.source_hotkey}" if cfg.source_hotkey else "the subnet owner's validator"
         log.info("references one at a time: %s, each started for its model's canaries and stopped after; a model not "
                  "checked in an epoch takes the results of %s", ", ".join(sorted(cfg.references)), source)
+    own = axon_base(cfg.public_host, cfg.port) if cfg.public_host else None  # where the auditor points its axon
+
+    def other_auditor() -> str | None:
+        """Where another auditor with this hotkey answers (``validator.singleton``); None for other validators."""
+        if not is_owner:
+            return None
+        return singleton.another_auditor(st, cfg.netuid, wallet.hotkey.ss58_address, own, current.catalog)
+
+    if other := other_auditor():  # before its tests, its axon and its weights
+        raise SystemExit(singleton.REFUSED.format(url=other))
     throughput = Throughput.start(network=cfg.network, netuid=cfg.netuid, current=lambda: current.catalog, st=st,
                                   wallet=wallet, references=cfg.references, screens=cfg.audit_screens,
                                   state_dir=state_dir)
@@ -622,7 +637,6 @@ def main() -> None:
                                 throughput.auditor_hotkey, current.catalog):
         log.critical("%s. Every miner refuses this validator's requests, and it sets no weights until that changes",
                      why)
-    is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)
     identity = None
     if is_owner or throughput.auditor is not None or cfg.public_host:
         if not cfg.public_host:
@@ -687,6 +701,9 @@ def main() -> None:
                 if moved := auditor_moved(st, cfg.netuid, throughput.auditor_hotkey):
                     # the roles are set at the start: the supervisor's restart takes up the new auditor
                     log.critical("the subnet owner hotkey is now %s, the auditor; restarting", moved)
+                    os._exit(1)
+                if other := other_auditor():  # its restart is refused while that one runs
+                    log.critical("%s", singleton.STOPPED.format(url=other))
                     os._exit(1)
                 blocks_left = max(next_start - block, 1)
                 trial = copy.deepcopy(state)  # an epoch that fails part way leaves no trace for its retry
