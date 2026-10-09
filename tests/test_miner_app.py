@@ -357,3 +357,85 @@ def test_while_test_traffic_arrives_a_validators_request_waits_behind_it() -> No
 
     assert asyncio.run(run()) == [200, 200, 200]
     assert engine.answered == ["user", "test", "canary"]
+
+
+class Recording(MockEngine):
+    def __init__(self, model: str) -> None:
+        super().__init__(model)
+        self.received: list[dict] = []
+
+    async def answer(self, request):
+        self.received.append(request)
+        return await super().answer(request)
+
+
+@pytest.fixture()
+def seeing():
+    """A miner with an endpoint of a model that reads images (gpu0) and one of a model that reads text only (gpu1)."""
+    from verathos.protocol.media import ImageLimits
+
+    miner, validator = (Keypair.create_from_mnemonic(Keypair.generate_mnemonic()) for _ in range(2))
+    config = MinerConfig.model_validate({
+        "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5", "port": 8091,
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": "clef-flash", "engine_url": "http://127.0.0.1:1"},
+                      {"endpoint_id": "gpu1", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:2"}]})
+    manifest = SignedManifest.create(Manifest(
+        netuid=405, mechid=1, hotkey=miner.ss58_address, catalog_digest=catalog.load().digest(),
+        endpoints=[Endpoint(endpoint_id=e, url=config.endpoint_url(e), model_id=m, capacity_rps=40.0)
+                   for e, m in (("gpu0", "clef-flash"), ("gpu1", "kev-4b"))], tls={config.base_url: PIN}), miner)
+    engines = {"gpu0": Recording("clef-flash"), "gpu1": Recording("kev-4b")}
+    app = create_app(config=config, keypair=miner, manifest=lambda: manifest, engines=engines,
+                     authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set(),
+                     gateways=lambda: {validator.ss58_address},
+                     image_limits=lambda model_id: ImageLimits() if model_id == "clef-flash" else None)
+    return TestClient(app), miner, validator, engines
+
+
+IMAGE_REQUEST = {"model": "clef-flash", "state": "What is in the image?",
+                 "questions": {"corner": {"type": "noul", "instructions": "Is there a green corner?"}}}
+
+
+def test_canonical_images_reach_the_engine_of_a_model_that_reads_them(seeing) -> None:
+    from tests.images import canonical
+
+    client, miner, validator, engines = seeing
+    request = {**IMAGE_REQUEST, "images": [canonical(256, 320), canonical(1024, 768, "JPEG")]}
+    r = post(client, validator, miner, "/e/gpu0/v1/systemone", request)
+    assert r.status_code == 200, r.text
+    assert engines["gpu0"].received == [request]
+    assert SignedReceipt.model_validate(r.json()["receipt"]).binds(request, r.json()["answers"])
+
+
+def test_images_that_are_not_canonical_or_not_for_the_model_never_reach_an_engine(seeing) -> None:
+    from tests.images import b64, canonical, data_url, encoded, item
+
+    client, miner, validator, engines = seeing
+    refused = [("http://169.254.169.254/latest/meta-data/", "images.0: not {"),
+               ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "images.0: not {"),
+               ("/etc/passwd", "images.0: not {"), (b64(encoded(256, 256)), "images.0: not {"),
+               (data_url(encoded(256, 256), "image/png"), "images.0: not {"),
+               (item(encoded(256, 256, "WEBP"), "image/webp"), "images.0: not {"),
+               (item(encoded(1056, 1024), "image/png"), "images.0: 1056 x 1024 pixels, outside"),
+               (item(encoded(256, 256, "JPEG"), "image/jpeg"), "images.0: not in the canonical form")]
+    for image, why in refused:
+        r = post(client, validator, miner, "/e/gpu0/v1/systemone", {**IMAGE_REQUEST, "images": [image]})
+        assert r.status_code == 422 and why in r.json()["error"], r.text
+    five = {**IMAGE_REQUEST, "images": [canonical(256, 256)] * 5}
+    assert "at most 4 images" in post(client, validator, miner, "/e/gpu0/v1/systemone", five).json()["error"]
+    text_only = {**REQUEST, "images": [canonical(256, 256)]}
+    r = post(client, validator, miner, "/e/gpu1/v1/systemone", text_only)
+    assert r.status_code == 422 and r.json()["error"] == "kev-4b reads text only"
+    for refused_field in ({"videos": []}, {"media_kwargs": {"do_resize": True}}):
+        assert post(client, validator, miner, "/e/gpu0/v1/systemone", {**IMAGE_REQUEST, **refused_field}
+                    ).status_code == 422
+    assert engines["gpu0"].received == [] and engines["gpu1"].received == []
+
+
+def test_a_body_is_held_to_its_models_limit(seeing) -> None:
+    from verathos.miner.app import MAX_REQUEST_BYTES
+
+    client, miner, validator, engines = seeing
+    long_state = "x" * (2 * MAX_REQUEST_BYTES)
+    assert post(client, validator, miner, "/e/gpu1/v1/systemone", {**REQUEST, "state": long_state}).status_code == 413
+    assert post(client, validator, miner, "/e/gpu0/v1/systemone",
+                {**IMAGE_REQUEST, "state": long_state}).status_code == 200

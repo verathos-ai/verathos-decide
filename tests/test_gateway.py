@@ -68,8 +68,11 @@ class Slow(MockEngine):
         return await super().answer(request)
 
 
-def miner(host: str, gateway: Keypair, engine, model: str = "kev-4b") -> tuple[Keypair, FastAPI]:
+def miner(host: str, gateway: Keypair, engine, model: str = "kev-4b",
+          cat: catalog.Catalog | None = None) -> tuple[Keypair, FastAPI]:
+    """A miner serving ``model`` with ``engine`` under ``cat`` (the shipped catalog by default)."""
     keypair = kp()
+    cat = cat or catalog.load()
     config = MinerConfig.model_validate({
         "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": 8091,
         "endpoints": [{"endpoint_id": "gpu0", "model_id": model, "engine_url": "http://127.0.0.1:1",
@@ -80,7 +83,8 @@ def miner(host: str, gateway: Keypair, engine, model: str = "kev-4b") -> tuple[K
                             capacity_rps=40.0)], tls={config.base_url: pin(host)}), keypair)
     app = miner_app(config=config, keypair=keypair, manifest=lambda: signed, engines={"gpu0": engine},
                     authorized=lambda hk: hk == gateway.ss58_address, auditors=lambda: set(),
-                    gateways=lambda: {gateway.ss58_address})
+                    gateways=lambda: {gateway.ss58_address},
+                    image_limits=lambda m: cat.get(m).images if cat.get(m).reads_images() else None)
     return keypair, app
 
 
@@ -102,7 +106,7 @@ class Setup:
                  **config) -> None:
         tmp_path.mkdir(parents=True, exist_ok=True)
         self.gateway_kp = kp()
-        self.miners = {host: miner(host, self.gateway_kp, engine, model) for host, engine in engines.items()}
+        self.miners = {host: miner(host, self.gateway_kp, engine, model, cat) for host, engine in engines.items()}
         url = f"sqlite+aiosqlite:///{tmp_path}/gateway.db"
         db.upgrade(url)
         self.engine = db.create_engine(url)

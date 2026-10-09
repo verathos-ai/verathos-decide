@@ -53,6 +53,7 @@ from verathos.protocol.manifest import (
     endpoint_host,
     is_public,
 )
+from verathos.protocol.media import ImageLimits
 from verathos.protocol.status import ThroughputOutcome
 from verathos.subnet.chain import CHAIN_ERRORS, committed_catalog, current_catalog, one_line
 from verathos.throughput.chain import SubtensorChainView
@@ -475,10 +476,15 @@ def build_app(config: MinerConfig, keypair, publisher: Publisher, authorizer: Pe
         model = publisher.catalog.get(model_id)
         return caller_request_bytes(model_id, model.workload) if model is not None else None
 
+    def image_limits(model_id: str) -> ImageLimits | None:
+        model = publisher.catalog.get(model_id)
+        return model.images if model is not None and model.reads_images() else None
+
     return create_app(config=config, keypair=keypair, manifest=lambda: publisher.signed,
                       host_endpoints=lambda: publisher.local, engines=engines, authorized=authorizer,
                       auditors=publisher.auditors, admissions=publisher.admissions, serving=lambda: publisher.serving,
                       max_state_tokens=max_state_tokens, max_caller_request=max_caller_request,
+                      image_limits=image_limits,
                       on_test_traffic=publisher.note_test_traffic, testing=publisher.test_arriving,
                       gateways=publisher.gateways, catalog_digest=lambda: publisher.catalog.digest(),
                       mechid=lambda: publisher.mechid, budget=budget,
