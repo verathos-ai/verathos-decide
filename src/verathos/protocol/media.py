@@ -20,10 +20,12 @@ checking the canonical form needs no decoder (``header``).
 from __future__ import annotations
 
 import binascii
+import ctypes
 import io
 import math
 import re
 import struct
+import sys
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -53,6 +55,7 @@ _ORIENTATION = 0x0112  # the EXIF orientation tag; 5 to 8 swap width and height
 _DATA_URL = re.compile(r"data:(image/[a-z]+);base64,", re.IGNORECASE)
 _HEADER_STEPS = 1024  # markers and fill bytes a JPEG header is read through, at most
 _NOT_BASE64 = "not base64: the standard alphabet with its padding, without whitespace"
+_PR_SET_DUMPABLE = 4
 
 
 class ImageLimits(BaseModel):
@@ -101,6 +104,17 @@ class ImageRefused(ValueError):
 
 class Incomplete(ValueError):
     """The bytes end before the image's header does."""
+
+
+def keep_out_of_dumps() -> None:
+    """Keep this process's memory, users' requests and images among it, out of core dumps: no core file
+    (RLIMIT_CORE 0) and, on Linux, not dumpable at all, which holds also where the system pipes core dumps to a
+    collector."""
+    import resource
+
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    if sys.platform == "linux" and ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_DUMPABLE) failed")
 
 
 # ---- what users send ----

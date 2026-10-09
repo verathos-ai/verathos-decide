@@ -7,8 +7,9 @@ core dump, is killed and replaced when an image takes it longer than ``timeout_s
 worker of its own as one is free; at most ``max_in_flight`` requests are decoded or wait for a worker at a time, and
 more are told the decoders are busy.
 
-A worker's reply is data, never code: a length-prefixed JSON header and the canonical image's base64, whose form and
-size the gateway checks again (``protocol.media.canonical_header``) before it forwards the image or counts its tokens.
+A worker's reply is data, never code: a length-prefixed JSON header and the canonical image's base64, which the
+gateway decodes strictly and whose form and size it checks again (``protocol.media.canonical_header``) before it
+forwards the image or counts its tokens: a worker that a decoder's flaw took over can at worst send a wrong image.
 
     python -m verathos.gateway.media <memory bytes>   a worker: jobs on stdin, replies on stdout
 """
@@ -33,7 +34,6 @@ from typing import Any
 from verathos.gateway import metrics
 from verathos.gateway.logs import Throttle
 from verathos.protocol.media import (
-    CANONICAL_HEADER_BYTES,
     JPEG,
     MAX_IMAGE_REQUEST_BYTES,
     PNG,
@@ -42,6 +42,7 @@ from verathos.protocol.media import (
     b64decode,
     canonical_header,
     canonical_image,
+    keep_out_of_dumps,
 )
 
 log = logging.getLogger(__name__)
@@ -74,6 +75,10 @@ class CanonicalImage:
 def _frame(header: dict[str, Any], payload: bytes) -> bytes:
     head = json.dumps(header).encode()
     return _FRAME.pack(len(head), len(payload)) + head + payload
+
+
+def _no_constants(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
 
 
 class _Worker:
@@ -117,7 +122,7 @@ class _Worker:
         head_size, size = _FRAME.unpack_from(reply)
         if len(reply) != _FRAME.size + head_size + size:
             raise ValueError("more than one frame")
-        head = json.loads(reply[_FRAME.size:_FRAME.size + head_size])
+        head = json.loads(reply[_FRAME.size:_FRAME.size + head_size], parse_constant=_no_constants)
         if not isinstance(head, dict):
             raise ValueError("a reply header that is not an object")
         return head, bytes(reply[_FRAME.size + head_size:])
@@ -216,16 +221,9 @@ class Decoders:
             metrics.IMAGES.labels("refused").inc()
             raise ImageRefused(413 if head["status"] == 413 else 400, str(head.get("message", ""))[:300])
         try:
-            made = CanonicalImage(str(head["content_type"]), int(head["width"]), int(head["height"]),
-                                  payload.decode("ascii"))
-            expected = PNG if content_type == PNG else JPEG
-            size = canonical_header(b64decode(made.base64, CANONICAL_HEADER_BYTES), expected,
-                                    token_px=limits.token_px, min_pixels=limits.min_pixels,
-                                    max_pixels=limits.max_pixels)
-            if made.content_type != expected or size != (made.width, made.height):
-                raise ValueError("a reply that does not describe its image")
-        except (KeyError, TypeError, ValueError) as exc:
-            self._retire(worker, f"its reply is not a canonical image: {exc}", index)
+            made = _checked(head, payload, PNG if content_type == PNG else JPEG, limits)
+        except Exception as exc:  # whatever the reply holds, only a canonical image is forwarded
+            self._retire(worker, f"its reply is not a canonical image ({type(exc).__name__})", index)
             raise ImageRefused(400, "it could not be decoded") from None
         self._release(worker)
         metrics.IMAGES.labels("canonical").inc()
@@ -247,8 +245,9 @@ class Decoders:
         except (OSError, TimeoutError, EOFError, ValueError) as exc:
             if worker is not None:
                 worker.close()
-            log.error("an image decoder could not start (%s: %s): is Pillow installed (the gateway extra)?",
-                      type(exc).__name__, exc)
+            if times := _throttled("start"):
+                log.error("an image decoder could not start (%s: %s; %d times since last logged): is Pillow installed "
+                          "(the gateway extra)?", type(exc).__name__, exc, times)
             raise DecodingUnavailable from None
         return worker
 
@@ -277,6 +276,24 @@ class Decoders:
         self._threads.shutdown(wait=False, cancel_futures=True)
 
 
+_ENDS = {PNG: b"\0\0\0\0IEND\xaeB`\x82", JPEG: b"\xff\xd9"}  # a whole PNG ends with its end chunk, a JPEG with EOI
+
+
+def _checked(head: dict[str, Any], payload: bytes, content_type: str, limits: ImageLimits) -> CanonicalImage:
+    """The canonical image a worker's reply describes, checked: its media type the one expected, its base64 strict
+    (so the forwarded JSON needs no escaping), its form and size those its header gives, and whole. Raises
+    ValueError."""
+    width, height = head["width"], head["height"]
+    if head["content_type"] != content_type or type(width) is not int or type(height) is not int:
+        raise ValueError("a reply that does not describe an image")
+    data = b64decode(payload)
+    size = canonical_header(data, content_type, token_px=limits.token_px, min_pixels=limits.min_pixels,
+                            max_pixels=limits.max_pixels)
+    if size != (width, height) or not data.endswith(_ENDS[content_type]):
+        raise ValueError("a reply that does not describe its image")
+    return CanonicalImage(content_type, width, height, payload.decode("ascii"))
+
+
 # ---- the worker ----
 
 def _job(header: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
@@ -302,7 +319,7 @@ def serve(memory_bytes: int) -> None:
     """Take jobs from stdin until it closes, one at a time, under the resource limits (see the module)."""
     import resource
 
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    keep_out_of_dumps()
     from PIL import Image
 
     Image.init()  # the decoders are loaded before the address space is limited

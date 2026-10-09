@@ -271,19 +271,28 @@ def test_the_largest_request_an_image_model_takes_fits_a_sample_post() -> None:
 
 @pytest.mark.skipif(sys.platform != "linux", reason="reads the worker's state from /proc")
 def test_a_decoder_runs_apart_with_limits_and_none_of_the_gateways_secrets(monkeypatch) -> None:
+    import subprocess
+
+    spawned: dict = {}
+    popen = subprocess.Popen
+
+    def spawn(*args, **kwargs):
+        spawned.update(kwargs)
+        return popen(*args, **kwargs)
+
     monkeypatch.setenv("GATEWAY_SECRET", "hunter2")
+    monkeypatch.setattr(subprocess, "Popen", spawn)
     worker = _Worker(1 << 30)
     try:
         worker.ready(30)
+        assert "GATEWAY_SECRET" not in spawned["env"] and spawned["cwd"] == "/" and spawned["close_fds"]
         proc = f"/proc/{worker.process.pid}"
-        assert sorted(os.listdir(f"{proc}/fd")) == ["0", "1", "2"]
-        with open(f"{proc}/environ", "rb") as f:
-            assert b"GATEWAY_SECRET" not in f.read()
         with open(f"{proc}/limits") as f:
             limits = {line[:26].strip(): line[26:].split() for line in f.read().splitlines()[1:]}
         assert limits["Max core file size"][:2] == ["0", "0"]
         assert limits["Max address space"][:2] == [str(1 << 30)] * 2
-        assert os.readlink(f"{proc}/cwd") == "/"
+        with pytest.raises(PermissionError):  # not dumpable: its memory is closed to other processes
+            open(f"{proc}/environ", "rb").read()
     finally:
         worker.close()
 
@@ -336,20 +345,56 @@ def test_requests_beyond_the_decoders_in_flight_limit_are_told_they_are_busy() -
         decoders.close()
 
 
-def test_a_decoders_reply_is_checked_before_it_is_trusted() -> None:
+@pytest.mark.parametrize("lie", [
+    lambda head, data: ({**head, "width": head["width"] + 32}, data),  # not the size its image has
+    lambda head, data: ({**head, "width": float(head["width"])}, data),
+    lambda head, data: ({**head, "content_type": "image/jpeg"}, data),
+    # valid base64 first, then what would break out of the forwarded JSON
+    lambda head, data: (head, data + b'"},{"base64":"QUJD","content_type":"image/png'),
+    lambda head, data: (head, data[:-4]),
+])
+def test_a_decoders_reply_is_checked_before_it_is_trusted(lie) -> None:
     decoders = Decoders(1, 2, 5.0)
     worker = decoders._take()
     decoders._release(worker)
     real = worker.exchange
-
-    def lying(header, payload, timeout_s):  # a reply whose image is not the size it claims
-        head, data = real(header, payload, timeout_s)
-        return {**head, "width": head["width"] + 32}, data
-
-    worker.exchange = lying
+    worker.exchange = lambda header, payload, timeout_s: lie(*real(header, payload, timeout_s))
     try:
         with pytest.raises(ImageRefused, match="could not be decoded"):
             asyncio.run(decoders.canonical([("image/png", b64(encoded(256, 256)))], ImageLimits()))
         assert not worker.alive()  # replaced
     finally:
         decoders.close()
+
+
+def test_a_workers_reply_is_one_frame_of_strict_json() -> None:
+    import threading
+
+    from verathos.gateway.media import _FRAME
+
+    def answered(reply: bytes):
+        job_r, job_w = os.pipe()
+        reply_r, reply_w = os.pipe()
+        worker = object.__new__(_Worker)
+        worker._stdin, worker._stdout = job_w, reply_r
+        os.set_blocking(job_w, False)
+        os.set_blocking(reply_r, False)
+
+        def play():
+            os.read(job_r, 1 << 16)
+            os.write(reply_w, reply)
+
+        threading.Thread(target=play).start()
+        try:
+            return worker.exchange({"content_type": "image/png"}, b"QUJD", 5.0)
+        finally:
+            for fd in (job_r, job_w, reply_r, reply_w):
+                os.close(fd)
+
+    head = b'{"content_type": "image/png", "width": 256, "height": 256}'
+    assert answered(_FRAME.pack(len(head), 4) + head + b"QUJD") == (json.loads(head), b"QUJD")
+    for reply in (_FRAME.pack(55, 0) + b'{"content_type": "image/png", "width": Infinity, "x": 1}',
+                  _FRAME.pack(len(head), 0) + head + b"more",
+                  _FRAME.pack(1 << 30, 0)):
+        with pytest.raises(ValueError):
+            answered(reply)
