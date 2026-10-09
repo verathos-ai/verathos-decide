@@ -63,7 +63,10 @@ A full validator also needs:
   second, in a random order (`THROUGHPUT_AUDIT.md`).
 - A public IP of its own: behind most NATs a machine cannot reach other machines that share its public IP through
   that IP, so a validator next to miners on one NAT cannot send them canaries. Its requests to miners leave from the
-  addresses in `egress_ips`, which it publishes ([its commitment](#tls-and-the-validators-commitment)).
+  addresses in `egress_ips`, which it publishes ([its commitment](#tls-and-the-validators-commitment)). **Miners'
+  firewalls drop requests from any other address**: a full validator whose published addresses are wrong gets its
+  canaries dropped by every miner that enforces, and finds them all unreachable
+  ([Egress addresses](#egress-addresses-and-miners-firewalls)).
 
 ## References: resident or one at a time
 
@@ -319,6 +322,7 @@ stay). Wallets are never touched.
 | `epoch ...: no weights set: no results of the source verified by block ...` | light: the reason follows. The auditor's axon unreachable, or its results not out yet, cost that epoch only, and the weights set before stay on chain; `not signed within 300 s of this machine's clock`: sync the clock (NTP); `it lists no weights` or `it is not signed`: the auditor runs an older release; `names no TLS pin for the auditor`: the committed catalog does not name the auditor's certificate yet; `certificate pin ... is not the pinned ...`: the source serves another certificate than the catalog (or its commitment) names, as during a rotation; `commits no TLS pin`: the `source_hotkey` validator publishes no identity |
 | `catalog ... names ... as the auditor's TLS pin, but this service's certificate has pin ...` | the auditor: commit a catalog naming its pin, `commit-catalog` on its machine (`SUBNET_ADMIN.md`) |
 | `no egress_ips configured` | full: set the public addresses its requests to miners come from (`--egress-ip`, or `egress_ips` in `validator.json`) |
+| every endpoint `request failed: ConnectTimeout` | miners' firewalls drop this validator's requests: they leave from an address it does not publish ([Egress addresses](#egress-addresses-and-miners-firewalls)) |
 | `this is the subnet owner's hotkey: its validator is the auditor ... runs in full mode` | the owner's validator is never light: `install.sh validator --full` |
 | `miners refuse validators below validator_min_stake` | add stake to the hotkey until its `S` reaches the catalog's minimum; miners see it within 10 minutes |
 | `the kev-9b reference needs about 42 GiB ...; not enough is free` | free memory or add some; `--device` chooses between GPU and RAM |
@@ -432,7 +436,7 @@ of a full validator:
 | `dry_run` | false | compute weights without setting them (light: log the weights it would set) |
 | `auto_update` | false (the installer sets true, except for the subnet owner's validator) | install each new release by itself between epochs, then exit for the process manager to start it ([Update](#update)) |
 | `public_host`, `port` | -, 8091 | public IP and port of the validator's service (TLS, its certificate in `state_dir`); needed by the subnet owner and the auditor. A full validator that sets them serves its status and the weights it sets there, for light validators that name it in `source_hotkey` |
-| `egress_ips` | [] | full: the public IP addresses its requests to miners come from, published in its chain commitment (the installer detects the machine's); the auditor's are in the catalog |
+| `egress_ips` | [] | full: the public IP addresses its requests to miners come from, published in its chain commitment (the installer detects the machine's, and the validator publishes the one it detects at runtime when it is not among them, [Egress addresses](#egress-addresses-and-miners-firewalls)); the auditor's are in the catalog |
 | `catalog_mirrors` | [] | extra catalog sources, https URL templates with `{digest}`, tried after the owner's axon |
 | `catalog_dir` | `~/.verathos/catalog` | local catalog store; the owner's validator serves catalogs from it |
 
@@ -512,6 +516,36 @@ it changed, `verathos/validator/v1 <pin> <egress>`: its service's pin (`-` witho
 (`-` for none), the addresses miners can admit its requests from. Light validators commit nothing; the subnet owner's
 hotkey commits the catalog, which names the auditor's pin and addresses. A hotkey that commits a miner's manifest is
 not used for a validator.
+
+## Egress addresses and miners' firewalls
+
+Miners drop every connection to their port from an address that is not a caller's, before TLS
+(`MINING.md`, Firewall). A full validator is a caller from the addresses in its commitment, and from the addresses
+miners learned from its signed requests while they observed. So publish every address its requests to miners leave
+from, and only those:
+- `egress_ips` in `validator.json` (the installer detects the machine's public IPv4 address; `--egress-ip`, repeated,
+  sets them). Behind a NAT with several outside addresses (a cloud NAT gateway allocating more than one), list them
+  all, or give the machine one static address. A commitment holds 128 bytes: with a TLS pin, three IPv4 addresses, or
+  one IPv6 and one IPv4.
+- Every 5 minutes the validator detects its public IPv4 address, as the installer does; one it does not publish it
+  publishes at once, first, with the configured ones that fit, and logs:
+
+  ```
+  this validator's requests leave from 198.51.100.4, which it did not publish: it now publishes 198.51.100.4, 203.0.113.9; miners admit it from there within their next refresh (egress_ips in validator.json keeps it across restarts)
+  ```
+
+  Miners read commitments every 10 minutes; for the 20 minutes after such a change, the endpoints its requests did not
+  reach are held, not scored. IPv6 is not detected: publish an IPv6 address in `egress_ips` if requests leave over it.
+- A miner logs the validators that publish an identity without an address and have not reached it while it enforces:
+
+  ```
+  firewall: validators that publish no egress address and have not reached this miner, whose requests it drops: 5F... (UID 12)
+  ```
+
+A validator whose requests miners drop finds every endpoint unreachable (`request failed: ConnectTimeout`) and scores
+none of them. The auditor's addresses are the catalog's `auditor.egress`: when the auditor detects that its requests
+leave from another, it logs a CRITICAL line, and every enforcing miner drops its tests until the subnet owner commits a
+catalog naming it (`SUBNET_ADMIN.md`).
 
 ## Throughput audit
 

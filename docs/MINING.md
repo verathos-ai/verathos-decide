@@ -22,6 +22,7 @@ owner's UID, which the chain does not pay out (`SCORING.md`).
   the gateways reach each endpoint directly at its machine's IP and port, so the miner service must be reachable there
   (TLS only, with the machine's own certificate, which the manifest pins; requests and receipts are signed). A test
   sends every endpoint its declared rate for about 20 s: each machine's connection must carry its own endpoints' rates.
+  The miner's firewall lets only those callers and the hotkey's machines reach the port ([Firewall](#firewall)).
 - A hotkey registered on the subnet; every miner machine needs the hotkey and `coldkeypub.txt`, never the coldkey.
 
 ## Quick start (one command)
@@ -63,12 +64,14 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--worker`, `--name` | this machine serves its GPUs for the hotkey's primary machine; its endpoint ids start with `--name` (default: its IP address) ([One hotkey, several GPUs and machines](#one-hotkey-several-gpus-and-machines)) |
 | `--peers` | on the primary: every worker's public `ip:port`, comma-separated; replaces the list (`''` for none) |
 | `--no-auto-update` | the miner does not update its code by itself to each new release; `--auto-update` turns that on again ([Update](#update)) |
+| `--no-firewall` | the miner's port answers anyone; `--firewall` turns the firewall on again ([Firewall](#firewall)) |
 | `--no-service` | no root, no system packages and no services: set everything up in the user's home and print the commands to run under pm2 or another process manager you run; `git`, `curl` and a C compiler (`build-essential`) must be there ([Without root](VALIDATING.md#without-root-pm2-or-another-process-manager)) |
 | `--source`, `--ref`, `--dir` | the code from another git URL, git bundle or tarball; a branch, tag or commit; another directory than `~/verathos-decide`, which must be missing, empty or a checkout of this code (another checkout is never changed) |
 
 What it does:
-1. installs `git`, `curl`, `build-essential` (the engine compiles its GPU kernels on first use) and, in a container
-   without systemd, `supervisor` (with `--no-service`, nothing); then uv and Python 3.12 in the user's home;
+1. installs `git`, `curl`, `build-essential` (the engine compiles its GPU kernels on first use), `nftables` (the
+   firewall) and, in a container without systemd, `supervisor` (with `--no-service`, nothing); then uv and Python 3.12
+   in the user's home;
 2. puts the code in `~/verathos-decide` (an install from before in `~/verathos` stays there) with its Python
    environment, and `verathos-miner` and `verathos-validator` on the
    `PATH`;
@@ -77,7 +80,8 @@ What it does:
    at the catalog's `engine.revision` for Kev models, `verathos-engine` from this code for Clef models) and downloads
    the weights at `hf_revision` (and the base model at `base_revision`). The engines run offline from that copy, so
    they serve exactly the pinned revisions;
-5. writes the configuration, `~/.verathos/miner.json` ([4. Configure](#4-configure));
+5. writes the configuration, `~/.verathos/miner.json` ([4. Configure](#4-configure)), and sets up the kernel layer of
+   the firewall: a root-owned helper and the sudo rule that lets the miner's user run it ([Firewall](#firewall));
 6. starts one engine per GPU (`verathos-engine-gpu0`, ...) on `127.0.0.1` and the miner (`verathos-miner`) as
    services, waits for the engines to load, and shows the capacity measurement (a few minutes) until the miner
    serves.
@@ -86,9 +90,10 @@ What it does:
 |---|---|
 | `~/verathos-decide` | code and its Python environment |
 | `~/.verathos/miner.json` | configuration |
-| `~/.verathos/miner/` | capacity measurements and the caps tests set on them, the last published manifest and the endpoints this machine serves |
+| `~/.verathos/miner/` | capacity measurements and the caps tests set on them, the last published manifest and the endpoints this machine serves, the firewall's state and learned addresses |
 | `~/.verathos/engines/`, `~/.verathos/hf/` | engines (one per pinned Kev revision, one for Clef) and model weights |
 | `/etc/systemd/system/verathos-*.service` | services; in a container `/etc/supervisor/conf.d/verathos-*.conf`, with logs in `/var/log/verathos/` |
+| `/usr/local/sbin/verathos-firewall`, `/etc/sudoers.d/verathos-firewall` | the firewall's helper and its sudo rule |
 
 ### Models
 
@@ -171,8 +176,9 @@ and prints the commands for its services:
 The setup prints the machine's TLS pin and the command that checks it from another machine,
 `curl -sk --pinnedpubkey 'sha256//<pin, base64>' https://<public ip>:<port>/v1/manifest`, which returns the signed
 manifest with each endpoint's declared capacity and each machine's pin (`-k` skips the CA check; the pin is the
-check); requests without a permitted caller's signature get `403`. Once per epoch the miner logs what the
-validators saw ([Reading the log](#reading-the-log)).
+check); requests without a permitted caller's signature get `403`. Once the firewall enforces, only callers' machines
+get through, and the check times out anywhere else. The setup ends with one line on the firewall
+([Firewall](#firewall)). Once per epoch the miner logs what the validators saw ([Reading the log](#reading-the-log)).
 
 ### Update
 
@@ -205,8 +211,9 @@ code, says so, and running the installer again updates them.
 bash ~/verathos-decide/scripts/install.sh uninstall
 ```
 
-stops and removes the services, the code, the engines and the weights. The configuration and state in `~/.verathos`
-stay for a later install; `--purge` deletes them too (other files in `~/.verathos` stay). Wallets are never touched.
+stops and removes the services, the code, the engines and the weights, and the firewall's table, helper and sudo
+rule. The configuration and state in `~/.verathos` stay for a later install; `--purge` deletes them too (other files in
+`~/.verathos` stay). Wallets are never touched.
 
 ### Troubleshooting
 
@@ -218,7 +225,9 @@ stay for a later install; `--purge` deletes them too (other files in `~/.veratho
 | `no NVIDIA GPU found` | install the NVIDIA driver; in a container, start it with the GPUs passed through |
 | `the NVIDIA driver supports CUDA 12.x` | the engines need a driver for CUDA 12.8 or newer |
 | `port ... is in use` | choose another port with `--port` |
-| validators cannot reach the miner | the setup's check, `curl -sk --pinnedpubkey ... https://<public ip>:<port>/v1/manifest` (on a worker `/v1/endpoints`), from another machine must answer: open the port for inbound TCP (`ufw allow <port>/tcp`, the provider's firewall). Behind port forwarding, as in most rented containers, the outside port must be the same as the port inside: each machine is listed at one port |
+| validators cannot reach the miner | the setup's check, `curl -sk --pinnedpubkey ... https://<public ip>:<port>/v1/manifest` (on a worker `/v1/endpoints`), from another machine must answer while the firewall observes: open the port for inbound TCP (`ufw allow <port>/tcp`, the provider's firewall). Behind port forwarding, as in most rented containers, the outside port must be the same as the port inside: each machine is listed at one port. Once the firewall enforces, see `verathos-miner firewall status` |
+| `firewall observing: requests of ... arrive from 10.0.2.2, not a public address` | a proxy or port forwarding in front of the miner replaces the callers' addresses with its own (Docker's userland proxy, slirp in rootless containers): the firewall cannot tell callers apart there and only observes. Forward the port keeping the callers' addresses (Docker's default iptables forwarding does) |
+| `firewall: the kernel layer is off (...)` | the miner filters connections in its own process, which needs nothing; for the kernel layer too: `verathos-miner firewall install` once, as a user with sudo, then restart the miner |
 | `peer ...: endpoint ... left out` | endpoint ids must be unique across the hotkey's machines: give the worker another `--name` |
 | `peer ...: its TLS certificate (pin ...) is not the one it names` | the worker's port is served by another process, or its certificate changed while it ran: restart the worker's miner |
 | `status unavailable: ... names no TLS pin for the auditor` | the committed catalog does not name the auditor's certificate yet: the miner serves as usual and reads its status once the subnet owner commits one |
@@ -243,6 +252,9 @@ primary reads every minute over TLS, taking it only from a worker that presented
 names every machine's pin.
 Validators, the auditor and the gateways send each endpoint's traffic, the throughput test included, straight to its
 machine: each machine needs the bandwidth of its own endpoints only, and a machine that is down costs only its own.
+The firewall of each machine lets the hotkey's other machines through: a worker the primary at the hotkey's axon
+address, so the primary's requests must leave from its public IP address (on a primary whose requests leave from
+another, set `"firewall": false` on its workers).
 
 A worker is protected exactly like a single miner: it runs the same miner service, which answers only validators
 holding a permit and the catalog's minimum stake in the metagraph (read again every 10 minutes), the auditor, the
@@ -271,6 +283,80 @@ and leaves out an endpoint whose id another machine already lists (its log says 
 not answer in the manifest for an epoch, then withdraws its endpoints until it is back. While the primary itself is
 down, validators keep using the manifest it last served for up to 3 epochs, so the workers' endpoints keep their
 checks. Each machine logs the status of its own endpoints; `GET /v1/status/<hotkey>` on the auditor lists all.
+
+## Firewall
+
+The miner's port answers only the network's callers (the auditor, the gateways, the validators the miner serves) and
+the hotkey's own machines. A connection from any other address is dropped at its first packet, before TCP, TLS or any
+request is read, so scans and connection or handshake floods from the rest of the internet cost the miner nothing.
+Nothing needs configuring.
+
+### Who gets through
+
+- The addresses the callers publish: the auditor's and each gateway's in the catalog (`auditor.egress`, `gateways`),
+  each validator's with a permit and the catalog's `validator_min_stake` in its chain commitment (`VALIDATING.md`), and
+  those of the miner's own `gateways`.
+- The addresses the miner learned: where each request came from whose signature (or test session) verified for one of
+  those callers, kept for about a week after the caller's last request from there, while it stays a caller. A
+  validator whose requests leave from another address than it publishes keeps working this way.
+- This machine's own addresses and the hotkey's other machines: on a primary its `peers`, on a worker the hotkey's
+  axon (its primary).
+- Loopback.
+
+The miner reads the list from the chain every 10 minutes and when the catalog changes. An address that drops out stays
+for two more readings, and when the chain cannot be read the last list stays, across restarts too
+(`~/.verathos/miner/firewall.json`; the learned addresses are in `firewall-roster.json`).
+
+### Observe, then enforce
+
+A miner starts observing: it learns and reports, and drops nothing. It enforces once all of these hold, and observes
+again as soon as one does not:
+- the committed catalog's `firewall` is `enforce`: the subnet owner's switch, `observe` until validators publish their
+  addresses widely (`SUBNET_ADMIN.md`);
+- the list holds the auditor's address;
+- a request authenticated as an allowed caller came from a published address, and none came from an address that is
+  not public: a proxy or port forwarding in front of the miner that hides the callers' addresses (Docker's userland
+  proxy, slirp in rootless containers) keeps it observing;
+- the known addresses cover at least half of the stake of the validators that call miners: those that publish a
+  validator identity, or whose requests the miner verified (light validators never call miners).
+
+The log says each change once, and where the firewall stands once per epoch:
+
+```
+firewall observing: the catalog's firewall is observe: the subnet owner switches it to enforce once the validators publish their addresses; 23 addresses (19 published, 2 learned, 2 of this hotkey's machines); known addresses cover 100% of the stake of the 12 validators that call miners
+firewall enforcing: known addresses cover 100% of the stake of the validators that call miners; 23 addresses (...)
+firewall: validators that publish no egress address and have not reached this miner, whose requests it drops: 5F... (UID 12)
+```
+
+### Two layers
+
+- The kernel's: the nftables table `inet verathos_miner`, whose chain hooks prerouting at priority -300 (before
+  connection tracking and any port forwarding), accepts the allowed addresses on the miner's port and drops the rest
+  of that port. Other ports, SSH included, are untouched, and other firewalls (ufw) still apply. Each change replaces
+  the whole table in one transaction, and a table that went missing (restarting `nftables.service` flushes every
+  table) or was changed is put back within 10 minutes. The miner runs as a normal user: the installer adds a
+  root-owned helper, `/usr/local/sbin/verathos-firewall`, and a sudo rule that lets the miner's user run exactly its
+  `apply <port>`, `status` and `remove`, nothing else. A miner running as root applies the table itself.
+- The miner's own, always: a filter on its listening socket drops connections from other addresses before the TCP
+  handshake, which takes no privilege, and the service answers any request from another address 403 before reading
+  it. Without root (`--no-service`, pm2) or in a container without `NET_ADMIN`, this is the firewall, and the miner says
+  so once at start (`firewall: the kernel layer is off (...); connections are filtered in the miner process`).
+
+The kernel sets no per-address rate limits: a throughput test opens many connections at once from the auditor's
+address. Within the service a validator gets one request at once per endpoint, and gateways and tests are bounded by
+each endpoint's queue (HTTP 429 and 503 beyond; [5. Run](#5-run)). Keep `tcp_syncookies` on (the kernel's default; the
+miner warns at start if it is off). A flood that fills the machine's link is beyond any host's reach: only the
+provider can absorb it. An empty IPv6 list drops all IPv6 to the port.
+
+### Checking it, turning it off
+
+| | |
+|---|---|
+| where it stands | `verathos-miner firewall status`: the mode and why, the addresses, the kernel table |
+| the kernel table | `sudo nft list table inet verathos_miner` |
+| the kernel layer, set up later | `verathos-miner firewall install` once, as a user with sudo, then restart the miner |
+| turn it off | `install.sh miner --yes --no-firewall` (removes the table, the helper and the sudo rule, and writes `"firewall": false`), or `"firewall": false` in `miner.json` and a restart of the miner, which removes its table |
+| open the port at once | `sudo nft delete table inet verathos_miner`; an enforcing miner puts it back within 10 minutes, so turn the firewall off as well |
 
 ## Manual installation
 
@@ -375,7 +461,8 @@ reference.
 | `engine_url`, `engine_api_key` | the endpoint's engine and its bearer token, if it needs one: `http://127.0.0.1:<port>` on this machine, or `https://` elsewhere |
 | `engine_tls_pin` | an https engine's certificate pin (`DISCOVERY.md`); without one, a public CA's certificate for its hostname |
 | `max_concurrency` | highest concurrency the capacity measurement tries (default 256); the engine never gets more requests at once than the concurrency the measurement settles on |
-| `gateway_hotkeys` | callers allowed in addition to validators with a permit |
+| `gateways` | the miner's own gateways besides the catalog's, each `{"hotkey": ..., "egress": [...]}`: served like the catalog's gateways, from the public addresses their requests come from |
+| `firewall` | `true` (default): the port answers only the network's callers and the hotkey's machines once the catalog has miners enforce it; `false`: anyone ([Firewall](#firewall)) |
 | `catalog_mirrors` | extra catalog sources, https URL templates with `{digest}`, tried after the owner's axon |
 | `catalog_dir` | local catalog store (default `~/.verathos/catalog`) |
 | `state_dir` | capacity measurements and the caps tests set on them, the last published manifest, and the machine's TLS key and certificate (`tls.key`, `tls.crt`) (default `~/.verathos/miner`) |
@@ -417,9 +504,9 @@ On start the miner:
 Run it under a supervisor (systemd, pm2) so it restarts after updates and crashes. Requests are accepted from
 hotkeys holding a validator permit and at least the catalog's `scoring.validator_min_stake` of stake (the
 metagraph's `S`: alpha stake plus TAO stake weighted as for permits; both read every 10 minutes), from the auditor
-whatever its stake, from the subnet's gateways (the catalog's `gateways`) and the miner's own `gateway_hotkeys`, and
-as test traffic under a session the auditor signed. Other callers are refused before their
-request body is read; bodies are capped at 1 MiB and must arrive within 10 s, and a request's state, question ids,
+whatever its stake, from the subnet's gateways (the catalog's `gateways`) and the miner's own `gateways`, and
+as test traffic under a session the auditor signed; while the firewall enforces, only from their addresses
+([Firewall](#firewall)). Other callers are refused before their request body is read; bodies are capped at 1 MiB and must arrive within 10 s, and a request's state, question ids,
 instructions and criteria together may hold at most 4 characters per token of the model's `max_state_tokens`. A
 validator gets one request at once per endpoint (HTTP 429 beyond that), each no larger than the largest request of
 the model's request mix (HTTP 413), at most the catalog's `scoring.validator_requests_per_epoch` per endpoint and
@@ -571,7 +658,8 @@ new commitment by itself. Releases carry code changes, such as support for a new
 
 ## Checking a miner
 
-From another machine, with a hotkey the miner accepts (for example a gateway hotkey listed in `gateway_hotkeys`):
+From another machine, with a hotkey the miner accepts: a gateway listed in the miner's `gateways` with that
+machine's address as its `egress`, which the firewall then lets through too:
 
 ```bash
 .venv/bin/python scripts/probe_miner.py --network finney --netuid 96 --uid <uid> --endpoint gpu0 \

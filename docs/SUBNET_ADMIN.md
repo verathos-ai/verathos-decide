@@ -85,7 +85,20 @@ light validators and gateways reach the auditor only with the certificate the co
 Addresses are public unicast IP literals written as the chain writes axons (IPv6 in its shortest form), at most 16
 per entry. `commit-catalog` refuses a catalog without `auditor.tls` and `auditor.egress`, or with a gateway without
 `egress`. With the validators' published addresses they form the callers' allowlist
-(`protocol.callers.allowlist`).
+(`protocol.callers.allowlist`), which miners' firewalls let through. They must be every address the auditor's and the
+gateways' requests leave from: an enforcing miner drops the rest, the auditor's tests included. The auditor checks its
+own every 5 minutes and logs a CRITICAL line when its requests leave from an address the catalog does not name.
+
+`firewall` switches miners' firewalls (`MINING.md`, Firewall): `observe` (the default) has them learn and report
+and drop nothing; `enforce` has each miner drop connections from every address but the callers' once its own checks
+pass (the auditor's address known, callers seen arriving from their published addresses, the known addresses covering
+at least half of the stake of the validators that call miners). Switch to `enforce` once the full validators holding
+most of that stake publish their egress addresses (their commitments, `verathos/validator/v1 <pin> <addresses>`), and
+back to `observe` to have every miner stop dropping at its next catalog check.
+
+```json
+"firewall": "enforce"
+```
 
 `scoring.validator_min_stake` is the stake a validator needs for miners to answer it, in the unit of the
 metagraph's `S` (alpha stake plus TAO stake weighted as for validator permits); 0, or a catalog without it, means any

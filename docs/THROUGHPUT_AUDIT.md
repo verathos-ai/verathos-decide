@@ -158,7 +158,7 @@ test request is dropped once its session expires, or when the load generator has
 delays users. What an endpoint answers the subnet's gateway during the test's window counts as delivered (see
 Gateway answers); test requests beyond its spare capacity otherwise go undelivered, and the credit shows it.
 
-A caller other than a gateway (the catalog's `gateways`, or one in the miner's own `gateway_hotkeys`) needs only its
+A caller other than a gateway (the catalog's `gateways`, or one in the miner's own `gateways`) needs only its
 canaries, so it gets one request at once per endpoint, each no larger (as canonical JSON) than the largest request
 of the model's request mix (HTTP 413 beyond), at most the catalog's `scoring.validator_requests_per_epoch` per
 endpoint and epoch (by default 4 x `canary_pool_size`), and while the auditor's test traffic arrives at the miner
