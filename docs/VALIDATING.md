@@ -300,7 +300,10 @@ bash ~/verathos-decide/scripts/install.sh validator --yes
 
 updates the code, and the engines and weights when the catalog pins new revisions; it adds a reference when the
 catalog activates a model. References keep running unless their revision or settings changed (or, for
-`verathos-engine`, its code); the validator restarts.
+`verathos-engine`, its code); the validator restarts. Resident references keep their places while the setup runs the
+same ones. When those change (the catalog activates or retires a model, a reference machine takes models,
+`--candidates` on or off), it places each again in the memory free once its own references stop; a reference that
+moves, as from RAM to a GPU, restarts.
 
 It keeps the mode, and references one at a time stay so (`--references resident` makes them resident again). Resident
 references that no longer fit in the memory, as when the catalog activates another model, run one at a time from then
@@ -331,7 +334,15 @@ bash ~/verathos-decide/scripts/install.sh uninstall
 
 stops and removes the services, the code, the engines and the weights. The configuration and state in `~/.verathos`
 (with the canary secret and the score history) stay; `--purge` deletes them too (other files in `~/.verathos`
-stay). Wallets are never touched.
+stay). Wallets are never touched. Without `--purge` it ends with the installer's command that sets the validator up
+again with them, taking the network, the wallet and the other settings from `validator.json`:
+
+```
+install.sh validator --yes --source /root/verathos-decide.bundle
+```
+
+`--source` names where the code came from (a git URL, git bundle or tarball; run the installer from there), and the
+command has `--no-service`, `--config` or `--home` where the setup had them.
 
 ### Troubleshooting
 
@@ -384,7 +395,7 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--no-screens` | the references only (a validator other than the auditor uses no screens); `--screens` runs them again |
 | `--device` | where the references run: `auto` (on GPUs while they fit, the smallest engines first, else in RAM), `cpu` (in RAM, the GPUs left to the screens) or `gpu` (on GPUs, before the screens) |
 | `--public-ip`, `--port` | the address the validators reach it at (default: detected) and the front's TCP port (default 8443) |
-| `--network`, `--netuid` | the chain whose committed catalog pins the models: `finney` and 96 by default, `test` and 405 |
+| `--network`, `--netuid` | the chain whose committed catalog pins the models: `finney` and 96 by default, `test` and 405; `reference.json` keeps them for later runs |
 | `--no-service`, `--source`, `--ref`, `--dir` | as for validators |
 
 What it does:
@@ -409,8 +420,9 @@ What it does:
    TCP answers, which needs no root and no firewall rule (a container cannot set one), and the front refuses (403) one
    that gets through; the machine's own loopback always passes;
 5. checks each engine through the front, as a validator reaches it, and writes `~/.verathos/reference-engines.json`
-   (mode 600) and prints it: per model the URLs of its reference and screen, the front's TLS pin and the key, as
-   `validator.json` takes them (`references` and `audit_screens`).
+   (mode 600): per model the URLs of its reference and screen, the front's TLS pin and the key, as `validator.json`
+   takes them (`references` and `audit_screens`). It prints the URLs, the pin and the files that hold the key (that
+   file and `~/.verathos/reference/api.key`, both private), never the key.
 
 Copy the file to the validator machine (`scp root@<gpu machine>:.verathos/reference-engines.json .`) and run the
 validator's installer there with it:
@@ -431,11 +443,15 @@ that code (`verathos-engine`), the Kev engines the revision the catalog pins. Th
 each engine's revision and the engine code it names, against its own release's, and keeps them in
 `~/.verathos/install/reference.json`. Install the GPU machine from the release the validators run. It does not update
 itself: running `install.sh reference` again updates it in place (the same certificate, so the same pin, and key) to
-the newest release, and restarts the engines whose code or pinned revision changed. Run it after the validators
-update, as each logs one line per epoch while an engine on another machine runs other engine code than its own
-release, and when the catalog pins other weights; when the catalog activates a model, run it and then the validator's
-installer with the new file. `install.sh uninstall` removes the engines and the front; `--purge` also deletes the
-certificate, the key and the file.
+the newest release, and restarts the engines whose code or pinned revision changed. Each engine keeps its place while
+the setup runs the same engines; when the models or the screens change, it places each again in the memory free once
+its own engines stop, and an engine that moves, as a reference from RAM to a GPU, restarts. Run it after the
+validators update, as each logs one line per epoch while an engine on another machine runs other engine code than its
+own release, and when the catalog pins other weights; when the catalog activates a model, run it and then the
+validator's installer with the new file. `install.sh uninstall` removes the engines and the front, keeps
+`reference.json` (the network, the callers, the port), the certificate and the key, and ends with the installer's
+command that sets the machine up again with them, as for validators ([Uninstall](#uninstall)); `--purge` also deletes
+the certificate, the key and the file.
 
 ### When the GPU machine is gone
 

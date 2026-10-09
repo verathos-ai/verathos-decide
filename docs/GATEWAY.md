@@ -502,6 +502,7 @@ account unlimited service nor mint more than the hourly cap.
 | `GET /admin/v1/accounts/{name}/keys` | the keys: prefix, name, created, expires, revoked |
 | `DELETE /admin/v1/accounts/{name}/keys/{prefix}` | revokes the key (within the key cache's minute) |
 | `GET /admin/v1/accounts/{name}/usage?since=YYYY-MM-DD` | per day and model: answered and failed requests, input tokens, cost (micro-USD); default since the first of the month |
+| `GET /admin/v1/accounts/{name}/usage/series?days=30&bucket=day` | the account's usage per day or week and model, below |
 | `POST /admin/v1/accounts/{name}/credits` | `{"amount" (micro-USD), "kind", "reference", "note"}` -> 201 with the entry and the new balance; 200 if `reference` already records this entry; 409 if it records another |
 | `GET /admin/v1/accounts/{name}/credits?limit=100` | the balance and the ledger, newest first |
 | `GET /admin/v1/usage/totals` | the network's totals, below |
@@ -556,6 +557,20 @@ keeps the latest 400. Every bucket is listed, with every model answered in the r
   totals when it is recorded and here on the days it was spent, and a grant makes the earliest paid spending free,
   after the fact.
 - `topups_micros`: the top-ups recorded in the bucket.
+
+`GET /admin/v1/accounts/{name}/usage/series` gives one account's usage over the same buckets (`days`, `bucket`, at
+most 400), all time from the bucket of its first usage; 404 for an unknown account:
+
+```json
+{"as_of": "2026-10-08T17:42:10+00:00", "bucket": "day", "since": "2026-10-02", "first_day": "2026-08-20",
+ "models": ["kev-4b", "kev-9b"],
+ "buckets": [{"start": "2026-10-02", "requests": {"kev-4b": 310, "kev-9b": 44}, "failed": {"kev-4b": 1, "kev-9b": 0},
+              "input_tokens": {"kev-4b": 71003, "kev-9b": 12004}, "cost": {"kev-4b": 2840, "kev-9b": 1080}}]}
+```
+
+- `first_day`: the account's first UTC day with usage; null before any.
+- `models`: every model the account sent requests to in the range, answered or not.
+- `requests`, `failed`, `input_tokens`, `cost`: as `GET /admin/v1/accounts/{name}/usage` gives them, per model.
 
 ```bash
 curl -s http://127.0.0.1:8090/admin/v1/systemone -H "Authorization: Bearer $(cat ~/.verathos/gateway/admin.token)" \

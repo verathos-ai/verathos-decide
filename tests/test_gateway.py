@@ -1934,6 +1934,87 @@ def test_the_usage_series_gives_each_day_or_week_and_paid_usage_on_the_days_it_w
     assert len(call("").json()["buckets"]) >= 50  # all time, by day
 
 
+def test_an_accounts_usage_series_gives_its_own_usage_per_model_and_day_or_week(tmp_path) -> None:
+    from sqlalchemy import insert, select
+
+    from verathos.gateway.db import api_keys, usage_daily
+
+    s = admin_setup(tmp_path)
+    now = dt.datetime(2026, 10, 8, 12, 30, tzinfo=dt.UTC)  # a Thursday
+
+    async def account(name: str, usage: list[tuple[str, str, int, int, int, int]], keys: int = 1) -> None:
+        """Usage (model, day, answered, failed, input tokens, micro-USD) of a new account, on each of its keys."""
+        account_id = await s.accounts.create_account(name, rate_rps=1.0, burst=1, prepaid=True)
+        for n in range(keys):
+            await s.accounts.create_key(name, f"k{n}")
+        async with s.engine.begin() as conn:
+            key_ids = (await conn.execute(select(api_keys.c.id).where(api_keys.c.account_id == account_id))).scalars()
+            rows = [{"account_id": account_id, "key_id": key_id, "model_id": model, "day": dt.date.fromisoformat(day),
+                     "requests": n, "failed": failed, "input_tokens": tokens, "cost": cost}
+                    for key_id in key_ids for model, day, n, failed, tokens, cost in usage]
+            if rows:
+                await conn.execute(insert(usage_daily), rows)
+
+    asyncio.run(account("u_7", [("kev-4b", "2026-08-20", 4, 0, 400, 16), ("kev-4b", "2026-10-07", 10, 1, 1000, 40),
+                                ("kev-9b", "2026-10-07", 2, 0, 600, 54), ("kev-4b", "2026-10-08", 3, 0, 300, 12),
+                                ("clef-flash", "2026-10-06", 0, 2, 0, 0)], keys=2))
+    asyncio.run(account("u_8", [("kev-4b", "2026-10-08", 100, 0, 9000, 360)]))  # someone else's
+    asyncio.run(account("u_9", []))
+
+    def series(name: str, days: int | None, bucket: str = "day") -> dict:
+        return asyncio.run(s.accounts.account_series(name, days, bucket, now))
+
+    week = series("u_7", 7)
+    assert (week["bucket"], week["since"], week["first_day"]) == ("day", "2026-10-02", "2026-08-20")
+    assert week["models"] == ["clef-flash", "kev-4b", "kev-9b"]  # a model with failed requests only, too
+    days = {b["start"]: b for b in week["buckets"]}
+    assert list(days) == [f"2026-10-0{d}" for d in range(2, 9)]
+    assert days["2026-10-07"] == {"start": "2026-10-07", "requests": {"clef-flash": 0, "kev-4b": 20, "kev-9b": 4},
+                                  "failed": {"clef-flash": 0, "kev-4b": 2, "kev-9b": 0},
+                                  "input_tokens": {"clef-flash": 0, "kev-4b": 2000, "kev-9b": 1200},
+                                  "cost": {"clef-flash": 0, "kev-4b": 80, "kev-9b": 108}}  # both keys
+    assert days["2026-10-06"]["failed"] == {"clef-flash": 4, "kev-4b": 0, "kev-9b": 0}
+    assert days["2026-10-08"]["requests"]["kev-4b"] == 6 and days["2026-10-02"]["requests"] == dict.fromkeys(
+        week["models"], 0)
+
+    weeks = series("u_7", 30, "week")  # the weeks that hold the last 30 days, whole
+    assert [b["start"] for b in weeks["buckets"]] == ["2026-09-07", "2026-09-14", "2026-09-21", "2026-09-28",
+                                                      "2026-10-05"]
+    assert weeks["buckets"][-1]["cost"] == {"clef-flash": 0, "kev-4b": 104, "kev-9b": 108}
+    everything = series("u_7", None, "week")
+    assert everything["since"] == "2026-08-17" and len(everything["buckets"]) == 8  # from 08-20's week
+    assert everything["buckets"][0]["requests"]["kev-4b"] == 8
+    daily = series("u_7", None)
+    assert daily["since"] == "2026-08-20" and len(daily["buckets"]) == 50
+    rows = asyncio.run(s.accounts.usage("u_7", dt.date(2026, 1, 1)))
+    for what in ("requests", "failed", "input_tokens", "cost"):  # everything its usage rows hold, and only theirs
+        assert sum(sum(b[what].values()) for b in daily["buckets"]) == sum(r[what] for r in rows)
+
+    quiet = series("u_9", None)
+    assert (quiet["first_day"], quiet["since"], quiet["models"]) == (None, "2026-10-08", [])
+    assert quiet["buckets"] == [{"start": "2026-10-08", "requests": {}, "failed": {}, "input_tokens": {}, "cost": {}}]
+    assert series("u_nope", 7) is None
+    asyncio.run(account("u_old", [("kev-4b", "2024-01-03", 1, 0, 100, 4)]))
+    old = series("u_old", None)  # all time keeps the latest 400 days
+    assert len(old["buckets"]) == 400 and old["since"] == "2025-09-04" and old["first_day"] == "2024-01-03"
+
+    def call(path: str, token: str = ACCOUNTS_TOKEN) -> httpx.Response:
+        return asyncio.run(admin_call(s, "GET", path, token=token))
+
+    reached = call("/admin/v1/accounts/u_7/usage/series?days=30&bucket=week")
+    assert reached.status_code == 200 and reached.json()["bucket"] == "week"
+    assert len(call("/admin/v1/accounts/u_7/usage/series?days=400").json()["buckets"]) == 400
+    assert call("/admin/v1/accounts/u_7/usage/series").json()["first_day"] == "2026-08-20"  # all time, by day
+    assert call("/admin/v1/accounts/acme/usage/series").status_code == 403  # not the account service's
+    assert call("/admin/v1/accounts/acme/usage/series", token=ADMIN_TOKEN).status_code == 200
+    missing = call("/admin/v1/accounts/u_nope/usage/series")
+    assert missing.status_code == 404 and missing.json()["error"]["type"] == "not_found"
+    for refused in ("?days=401", "?days=0", "?days=-3", "?days=x", "?days=3.5", "?bucket=month",
+                    "?days=2801&bucket=week"):
+        response = call(f"/admin/v1/accounts/u_7/usage/series{refused}")
+        assert response.status_code == 400 and response.json()["error"]["type"] == "invalid_request", refused
+
+
 def test_usage_written_before_the_hourly_totals_enters_them_at_its_days_first_hour(tmp_path) -> None:
     from alembic import command
     from sqlalchemy import text

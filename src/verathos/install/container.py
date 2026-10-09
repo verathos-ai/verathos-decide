@@ -433,7 +433,7 @@ def miner(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> li
     try:
         MinerConfig.model_validate(config)
     except ValidationError as exc:
-        raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
+        raise common.invalid(config_path, exc) from None
     common.write_json(config_path, config)
     info(f"wrote {config_path}")
     identity = tls.identity(state_dir)
@@ -564,7 +564,7 @@ def validator(env: Mapping[str, str], data: Path = DATA, remote_dir: Path = REMO
     try:
         ValidatorConfig.model_validate(config)
     except ValidationError as exc:
-        raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
+        raise common.invalid(config_path, exc) from None
     keys = any(isinstance(e, dict) and e.get("api_key") for section in ("references", "audit_screens")
                for e in config.get(section, {}).values())
     common.write_json(config_path, config, private=keys)  # the keys of the engines on other machines
@@ -598,7 +598,7 @@ def reference(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -
     device = (value(env, "DEVICE") or "auto").lower()
 
     step("Catalog")
-    network, netuid = common.network_and_netuid(chain_options(env), record.options)
+    network, netuid = common.network_and_netuid(chain_options(env), existing)
     info(f"network {network}, netuid {netuid}")
     st = common.connect(network)
     try:
@@ -665,12 +665,13 @@ def reference(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -
         engines.download(engines.engine_for(home, models[model]).python("reference"), models[model], hf_home)
 
     step("Configuration")
-    config = force_data(setup.reference_config(existing, public_ip=public_ip, port=port, callers=callers, ports=ports,
-                                               home=data), data, setup.ROLE, catalog_dir=False)
+    config = force_data(setup.reference_config(existing, network=network, netuid=netuid, public_ip=public_ip, port=port,
+                                               callers=callers, ports=ports, home=data), data, setup.ROLE,
+                        catalog_dir=False)
     try:
         parsed = ReferenceConfig.model_validate(config)
     except ValidationError as exc:
-        raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
+        raise common.invalid(config_path, exc) from None
     common.write_json(config_path, config)
     info(f"wrote {config_path}")
     identity, key = tls.identity(parsed.state_dir), api_key(parsed.state_dir)
@@ -680,7 +681,7 @@ def reference(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -
     record.config, record.paths = str(config_path), []
     record.engines = {item: {"model": item.split("/", 1)[1], "kind": item.split("/", 1)[0],
                              "device": placement[item], "port": ports[item]} for item in placement}
-    record.options = {"network": network, "netuid": netuid, "screens": screens}
+    record.options = {"screens": screens}
     record.save(data)
 
     processes = []

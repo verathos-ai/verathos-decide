@@ -5,7 +5,8 @@ Per model, its float32 reference and its bfloat16 screen (the miners' engine), p
 references (``plan.place_engines``), each a service on this machine's loopback; and the front (``verathos.reference``),
 which serves them over TLS to the callers' addresses only, with a bearer key. The setup ends with the file a
 validator's setup takes (``verathos-validator init --remote-engines``): per model the engines' URLs, the front's pin
-and the key. Run it again to update: the front keeps its certificate (so its pin) and its key.
+and the key; it names the files that hold the key, never the key. Run it again to update: the front keeps its
+certificate (so its pin) and its key, and each engine keeps its place while the setup runs the same engines.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import asyncio
 import re
 import sys
 import time
+from collections.abc import Collection, Iterable
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -25,7 +27,15 @@ from verathos.install.common import ENGINES_FILE, Prompter, info, step, warn
 from verathos.install.services import Service
 from verathos.miner.engine import HttpEngine
 from verathos.protocol import tls
-from verathos.reference.config import REFERENCE, SCREEN, ReferenceConfig, api_key, caller_address, engines_document
+from verathos.reference.config import (
+    KEY_FILE,
+    REFERENCE,
+    SCREEN,
+    ReferenceConfig,
+    api_key,
+    caller_address,
+    engines_document,
+)
 from verathos.subnet.chain import current_catalog
 from verathos.validator.references import served_code, served_revisions
 
@@ -94,15 +104,36 @@ def choose_models(cat: catalog.Catalog, requested: list[str], before: list[str] 
     return list(dict.fromkeys(names))
 
 
-def reference_config(existing: dict, *, public_ip: str, port: int, callers: list[str], ports: dict[str, int],
-                     home: Path) -> dict:
-    """The configuration to write: ``existing`` with this setup's address, callers and engines (``plan.engine_key`` ->
-    port on this machine's loopback)."""
+def engine_set(models: Iterable[str], screens: bool) -> set[str]:
+    """The engines (``plan.engine_key``) the setup runs for ``models``: each one's reference and, with ``screens``, its
+    screen."""
+    kinds = (REFERENCE, SCREEN) if screens else (REFERENCE,)
+    return {plan.engine_key(kind, m) for m in models for kind in kinds}
+
+
+def place(parameters: dict[str, int], families: dict[str, str], screens: list[str], gpu_free: dict[int, int],
+          ram_free: int, device: str, before: dict[str, str], running: Collection[str], again: bool) -> dict[str, str]:
+    """Where each engine runs (``plan.place_engines``). The engines placed before (``before``: key -> place) keep their
+    place, their memory taken already; when the setup runs other engines than before (``again``), every engine is
+    placed again, in the memory free once the ones that run now (``running``) stop."""
+    if not again:
+        return plan.place_engines(parameters, families, screens, gpu_free, ram_free, device, before)
+    held = [(where, plan.engine_memory(key, where, parameters, families)) for key, where in before.items()
+            if key in running]
+    gpu, ram = plan.freed(gpu_free, ram_free, held)
+    return plan.place_engines(parameters, families, screens, gpu, ram, device, {})
+
+
+def reference_config(existing: dict, *, network: str, netuid: int, public_ip: str, port: int, callers: list[str],
+                     ports: dict[str, int], home: Path) -> dict:
+    """The configuration to write: ``existing`` with this setup's chain, address, callers and engines
+    (``plan.engine_key`` -> port on this machine's loopback)."""
     served: dict[str, dict[str, str]] = {}
     for item, engine_port in sorted(ports.items()):
         kind, model = item.split("/", 1)
         served.setdefault(model, {})[kind] = f"http://127.0.0.1:{engine_port}"
-    config = {**existing, "public_host": public_ip, "port": port, "allow": callers, "engines": served}
+    config = {**existing, "network": network, "netuid": netuid, "public_host": public_ip, "port": port,
+              "allow": callers, "engines": served}
     if any(":" in c for c in callers):  # an IPv6 caller: a socket for both families
         config["listen_host"] = "::"
     config.setdefault("state_dir", str(home / ROLE))
@@ -152,7 +183,7 @@ def init(argv: list[str]) -> None:
     manager = common.manager_for(args, record)
 
     step("Catalog")
-    network, netuid = common.network_and_netuid(args, record.options)
+    network, netuid = common.network_and_netuid(args, existing)
     info(f"network {network}, netuid {netuid}")
     st = common.connect(network)
     try:
@@ -167,8 +198,10 @@ def init(argv: list[str]) -> None:
     chosen = choose_models(cat, requested, record.options.get("models"))
     models = {m: cat.get(m) for m in chosen}
     screens = args.screens if args.screens is not None else bool(record.options.get("screens", True))
-    wanted = {plan.engine_key(REFERENCE, m) for m in models} | (
-        {plan.engine_key(SCREEN, m) for m in models} if screens else set())
+    wanted = engine_set(models, screens)
+    # the engines of the setup before: each model's reference (never left out) and, with screens, its screen
+    before = engine_set([i.split("/", 1)[1] for i in record.engines if i.startswith(f"{REFERENCE}/")],
+                        bool(record.options.get("screens", True)))
     stale = [item for item in record.engines if item not in wanted]
     if stale and manager is not None:
         manager.remove([engine_service(item) for item in stale])  # their memory is free for the others
@@ -182,11 +215,13 @@ def init(argv: list[str]) -> None:
          + "".join(f"; {g.describe()} ({g.memory_free / host.GiB:.0f} free)" for g in gpus))
     if not gpus:
         warn("no NVIDIA GPU found (nvidia-smi): the references run in RAM, and there are no screens")
+    again = wanted != before
+    placed = {i: e["device"] for i, e in record.engines.items() if i in wanted}
+    running = [i for i in placed if manager is None or manager.active(engine_service(i))] if again else []
     try:
         parameters = {m: engines.parameters(models[m]) for m in models}
-        placement = plan.place_engines(parameters, {m: models[m].engine.name for m in models},
-                                       list(models) if screens else [], {g.index: g.memory_free for g in gpus},
-                                       ram_free, args.device, {i: e["device"] for i, e in record.engines.items()})
+        placement = place(parameters, {m: models[m].engine.name for m in models}, list(models) if screens else [],
+                          {g.index: g.memory_free for g in gpus}, ram_free, args.device, placed, running, again)
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
 
@@ -230,8 +265,9 @@ def init(argv: list[str]) -> None:
         kind, model = item.split("/", 1)
         need = (plan.reference_memory(parameters[model], "cpu" if placement[item] == "cpu" else "gpu") if kind ==
                 REFERENCE else plan.miner_memory(parameters[model], models[model].engine.name))
+        moves = placed.get(item, placement[item]) != placement[item]
         info(f"{model} {kind}: {PRECISION[kind]} on {describe(placement[item])} (about {need / host.GiB:.0f} GiB), "
-             f"127.0.0.1:{ports[item]}")
+             f"127.0.0.1:{ports[item]}" + (f"; moves from {describe(placed[item])}" if moves else ""))
     for model in models:
         if screens and plan.engine_key(SCREEN, model) not in placement:
             info(f"{model} screen: no GPU has room left (it needs about "
@@ -263,16 +299,18 @@ def init(argv: list[str]) -> None:
         engines.download(engines.engine_for(home, models[model]).python("reference"), models[model], hf_home)
 
     step("Configuration")
-    config = reference_config(existing, public_ip=public_ip, port=port, callers=callers, ports=ports, home=home)
+    config = reference_config(existing, network=network, netuid=netuid, public_ip=public_ip, port=port,
+                              callers=callers, ports=ports, home=home)
     try:
         parsed = ReferenceConfig.model_validate(config)
     except ValidationError as exc:
-        raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
+        raise common.invalid(config_path, exc) from None
     common.write_json(config_path, config)
     info(f"wrote {config_path}")
     identity, key = tls.identity(parsed.state_dir), api_key(parsed.state_dir)
-    info(f"TLS certificate {identity.cert_path}, pin {identity.pin}; the callers' key in "
-         f"{parsed.state_dir.expanduser() / 'api.key'} (delete tls.key and tls.crt, or api.key, there to replace them)")
+    key_file = parsed.state_dir.expanduser() / KEY_FILE
+    info(f"TLS certificate {identity.cert_path}, pin {identity.pin}; the callers' key in {key_file} (delete tls.key "
+         f"and tls.crt, or {KEY_FILE}, there to replace them)")
     document = engines_document(parsed, identity.pin, key)
     engines_path = home / ENGINES_FILE
     common.write_json(engines_path, document, private=True)
@@ -303,7 +341,7 @@ def init(argv: list[str]) -> None:
         record.engines[item] = {"model": model, "kind": kind, "device": placement[item], "port": ports[item],
                                 "code": code}
     record.paths = sorted(str(d) for d in installs)
-    record.options = {"network": network, "netuid": netuid, "screens": screens, **({"models": named} if named else {})}
+    record.options = {"screens": screens, **({"models": named} if named else {})}
 
     if manager is None:
         previous = [s for s in record.services if s not in {r.name for r in run}]
@@ -312,12 +350,15 @@ def init(argv: list[str]) -> None:
         common.show_run("each engine and the front", run)
         if previous:
             info(f"stop the engines no longer run (pm2: pm2 delete {' '.join(previous)})")
-        handover(document, engines_path, identity.pin, key)
+        handover(document, engines_path, identity.pin, key_file)
         for line in common.script_commands(ROLE, home, " --no-service"):
             info(line)
         return
 
     step("Services")
+    if left_out := [s for s in record.services if s not in {r.name for r in run}]:
+        manager.remove(left_out)  # engines set up before that the plan leaves out: their memory is the others'
+        info(f"removed {', '.join(left_out)}, which the plan leaves out")
     for name in (s.name for s in run):
         manager.mark(name)
     record.manager, record.services = manager.name, [s.name for s in run]
@@ -334,18 +375,19 @@ def init(argv: list[str]) -> None:
         info(f"{model} {kind} through the front: {line}")
 
     step("Done")
-    handover(document, engines_path, identity.pin, key)
+    handover(document, engines_path, identity.pin, key_file)
     info(f"status:  {manager.status_command(record.services)}")
     info(f"logs:    {manager.log_command(FRONT)} (the front; each engine under its own name)")
     for line in common.script_commands(ROLE, home):
         info(line)
 
 
-def handover(document: dict, path: Path, pin: str, key: str) -> None:
-    """What the validator machine needs, and how it takes it."""
+def handover(document: dict, path: Path, pin: str, key_file: Path) -> None:
+    """What the validator machine needs, and how it takes it: the URLs, the pin and the files that hold the key (both
+    readable by their owner only), never the key, which a terminal's scrollback and a log of the output would keep."""
     for line in engines_lines(document):
         info(line)
-    info(f"TLS pin {pin}, key {key}")
-    info(f"all of it is in {path} (it holds the key: keep it private). Copy it to each validator machine, then run "
-         "the installer there with:")
+    info(f"TLS pin {pin}; the callers' key is in {key_file}")
+    info(f"{path} holds the URLs, the pin and the key (mode 600: keep it private). Copy it to each validator machine, "
+         "then run the installer there with:")
     print(f"      validator --full --remote-engines {path.name}", flush=True)

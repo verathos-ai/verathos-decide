@@ -14,6 +14,7 @@ import asyncio
 import json
 import re
 import sys
+from collections.abc import Collection
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -277,6 +278,7 @@ def init(argv: list[str]) -> None:
         parameters = {m: engines.parameters(models[m]) for m in models}
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
+    again = set(models) != set(record.engines)  # other references than the setup before: each placed again
     stale = [m for m in record.engines if m not in models]
     if stale and manager is not None:
         # Their memory is free for the other references.
@@ -291,9 +293,13 @@ def init(argv: list[str]) -> None:
     ram_total, ram_free = host.memory_available()
     info(f"RAM {ram_total / host.GiB:.0f} GiB ({ram_free / host.GiB:.0f} free)"
          + "".join(f"; {g.describe()} ({g.memory_free / host.GiB:.0f} free)" for g in gpus))
+    placed = {m: e["device"] for m, e in record.engines.items()}
+    running = None if manager is None else {m for m in placed if service_name(m) in record.services
+                                            and manager.active(service_name(m))}
     try:
         reference_mode, why_mode, placement = place(parameters, {g.index: g.memory_free for g in gpus}, ram_free,
-                                                    args, existing, record, owner, candidates) if parameters else (
+                                                    args, existing, record, owner, candidates, again=again,
+                                                    running=running) if parameters else (
             "resident", "every reference runs on another machine", {})
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
@@ -317,7 +323,8 @@ def init(argv: list[str]) -> None:
         need = plan.reference_memory(parameters[m], "cpu" if placement[m] == "cpu" else "gpu")
         info(f"{m}{' (' + plan.CANDIDATE + ')' if m in candidates else ''}: float32 reference on "
              f"{describe(placement[m])} (about {need / host.GiB:.0f} GiB), 127.0.0.1:{ports[m]}"
-             + (", started by the validator for its canaries" if sequential else ""))
+             + (", started by the validator for its canaries" if sequential else "")
+             + (f"; moves from {describe(placed[m])}" if placed.get(m, placement[m]) != placement[m] else ""))
     for m in left_out:
         info(f"{m} ({plan.CANDIDATE}): no reference, not enough memory left (it needs about "
              f"{plan.reference_memory(parameters[m], 'cpu') / host.GiB:.0f} GiB of RAM or "
@@ -382,7 +389,7 @@ def init(argv: list[str]) -> None:
     try:
         ValidatorConfig.model_validate(config)
     except ValidationError as exc:
-        raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
+        raise common.invalid(config_path, exc) from None
     keys = any(isinstance(e, dict) and e.get("api_key") for section in ("references", "audit_screens")
                for e in config.get(section, {}).values())
     common.write_json(config_path, config, private=keys)  # the keys of engines on other machines: the owner's only
@@ -419,13 +426,13 @@ def init(argv: list[str]) -> None:
         return
 
     step("Services")
-    if sequential and (resident := [service_name(m) for m in sorted(set(record.engines) | set(models))
-                                    if service_name(m) in record.services]):
-        manager.remove(resident)  # their memory is the references' one at a time
-        info(f"removed the reference services {', '.join(resident)}: the validator starts the references itself")
+    names = [s.name for s in reference_services.values()]
+    if gone := [s for s in record.services if s != VALIDATOR and s not in names]:
+        manager.remove(gone)  # their memory is the other references' (one at a time: each one's in turn)
+        info(f"removed the reference services {', '.join(gone)}: " + (
+            "the validator starts the references itself" if sequential else "the plan leaves them out"))
     if not sequential and existing.get("reference_mode") == "sequential" and VALIDATOR in record.services:
         manager.stop([VALIDATOR])  # with the reference it may run, before the resident ones take the memory
-    names = [s.name for s in reference_services.values()]
     for name in [*names, VALIDATOR]:
         manager.mark(name)
     record.manager, record.services = manager.name, [*names, VALIDATOR]
@@ -469,15 +476,20 @@ def init(argv: list[str]) -> None:
 
 
 def place(parameters: dict[str, int], gpu_free: dict[int, int], ram_free: int, args: argparse.Namespace,
-          existing: dict, record: common.Record, owner: bool,
-          candidates: list[str]) -> tuple[str, str, dict[str, str]]:
+          existing: dict, record: common.Record, owner: bool, candidates: list[str], *, again: bool = False,
+          running: Collection[str] | None = None) -> tuple[str, str, dict[str, str]]:
     """How the references run (``choose_reference_mode``), why, and where each runs. Resident references placed
-    before keep their place and memory; one at a time, the memory of the resident references that stop is free for
-    each in turn. Raises PlanError."""
+    before keep their place and memory while the setup runs the same references; when it runs others (``again``),
+    every reference is placed again, in the memory free once the resident ones that run (``running``; None: all of
+    them) stop. One at a time, that memory is free for each in turn. Raises PlanError."""
     resident_before = {m: e["device"] for m, e in record.engines.items() if service_name(m) in record.services}
+    gpu, ram = plan.freed(gpu_free, ram_free, [
+        (where, plan.reference_memory(parameters[m], "cpu" if where == "cpu" else "gpu"))
+        for m, where in resident_before.items() if m in parameters and (running is None or m in running)])
     try:
-        resident = plan.place_references(parameters, gpu_free, ram_free, args.device, resident_before,
-                                         optional=candidates)
+        resident = (plan.place_references(parameters, gpu, ram, args.device, {}, optional=candidates) if again else
+                    plan.place_references(parameters, gpu_free, ram_free, args.device, resident_before,
+                                          optional=candidates))
         error = None
     except plan.PlanError as exc:
         resident, error = None, str(exc)
@@ -486,17 +498,8 @@ def place(parameters: dict[str, int], gpu_free: dict[int, int], ram_free: int, a
         if resident is None:
             raise plan.PlanError(error)
         return reference_mode, why, resident
-    freed_gpu: dict[int, int] = {}
-    freed_ram = 0
-    for m, where in resident_before.items():
-        if m in parameters and where == "cpu":
-            freed_ram += plan.reference_memory(parameters[m], "cpu")
-        elif m in parameters and where.startswith("cuda:"):
-            index = int(where.split(":", 1)[1])
-            freed_gpu[index] = freed_gpu.get(index, 0) + plan.reference_memory(parameters[m], "gpu")
-    placement = plan.place_one_at_a_time(
-        parameters, {i: free + freed_gpu.get(i, 0) for i, free in gpu_free.items()}, ram_free + freed_ram,
-        args.device, {m: e["device"] for m, e in record.engines.items()}, optional=candidates)
+    placement = plan.place_one_at_a_time(parameters, gpu, ram, args.device,
+                                         {m: e["device"] for m, e in record.engines.items()}, optional=candidates)
     return reference_mode, why, placement
 
 
@@ -578,7 +581,7 @@ def init_light(ui: Prompter, manager: Manager | None, record: common.Record, exi
     try:
         ValidatorConfig.model_validate(config)
     except ValidationError as exc:
-        raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
+        raise common.invalid(config_path, exc) from None
     common.write_json(config_path, config)
     info(f"wrote {config_path}")
     validator = Service(name=VALIDATOR, description="Verathos validator (light)",

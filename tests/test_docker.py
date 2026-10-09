@@ -649,6 +649,8 @@ def test_a_reference_container_runs_each_engine_and_the_front_and_writes_the_val
     assert [p.name for p in without] == ["reference-kev-4b", "front"]
     again = json.loads((box.data / common.ENGINES_FILE).read_text())
     assert again["references"]["kev-4b"] == document["references"]["kev-4b"] and again["audit_screens"] == {}
+    config = ReferenceConfig.load(box.data / "reference.json")  # the network set before stays, as the installer's
+    assert (config.network, config.netuid) == ("test", 405)
 
 
 def test_the_engines_of_the_shipped_catalog_are_installed_for_references_and_miners(tmp_path, monkeypatch) -> None:

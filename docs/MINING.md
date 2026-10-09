@@ -225,8 +225,9 @@ bash ~/verathos-decide/scripts/install.sh uninstall
 ```
 
 stops and removes the services, the code, the engines and the weights, and the firewall's table, helper and sudo
-rule. The configuration and state in `~/.verathos` stay for a later install; `--purge` deletes them too (other files in
-`~/.verathos` stay). Wallets are never touched.
+rule. The configuration and state in `~/.verathos` stay for a later install, and it ends with the installer's command
+for it (`install.sh miner --yes`, with `--source` naming where the code came from: a git URL, git bundle or tarball);
+`--purge` deletes them too (other files in `~/.verathos` stay). Wallets are never touched.
 
 ### Troubleshooting
 

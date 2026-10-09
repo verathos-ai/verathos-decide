@@ -9,14 +9,17 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 import traceback
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from pydantic import ValidationError
 
 from verathos.install import host, services
 from verathos.protocol.tls import chain_network
@@ -26,6 +29,7 @@ ROLES = ("miner", "validator", "reference")
 TESTNET_NETUID = 405
 MAINNET_NETUID = 96
 INSTALLER = Path(__file__).resolve().parents[3] / "scripts" / "install.sh"  # the installer of this checkout
+SOURCE_FILE = ".install-source"  # in a checkout the installer made from a tarball: the tarball (scripts/install.sh)
 ENGINES_FILE = "reference-engines.json"  # a reference machine's engines, for its callers
 
 
@@ -170,6 +174,14 @@ def write_json(path: Path, value: dict, *, private: bool = False) -> None:
     tmp.replace(path)
 
 
+def invalid(path: Path, exc: ValidationError) -> SystemExit:
+    """The stop for a configuration that would not be valid: each problem's place and reason, never the values, which
+    may hold keys."""
+    problems = "\n".join(f"  {'.'.join(str(p) for p in e['loc']) or 'the configuration'}: {e['msg']}"
+                         for e in exc.errors(include_url=False, include_input=False))
+    return SystemExit(f"{path} would not be valid; fix or remove it:\n{problems}")
+
+
 # ---- wallet and chain ----
 
 def network_and_netuid(args: argparse.Namespace, existing: dict) -> tuple[str, int]:
@@ -295,6 +307,43 @@ def script_commands(role: str, home: Path, options: str = "") -> list[str]:
         return []
     extra = "" if home == DEFAULT_HOME.expanduser() else f" --home {shlex.quote(str(home))}"
     return [f"update:  bash {script} {role} --yes{options}{extra}", f"uninstall: bash {script} uninstall{extra}"]
+
+
+def without_credentials(url: str) -> str:
+    """An http(s) URL without the user name and password it may carry (``https://<token>@host/...``)."""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or "@" not in parts.netloc:
+        return url
+    return urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
+
+
+def code_source(checkout: Path = INSTALLER.parents[1]) -> str | None:
+    """Where the code of ``checkout`` came from, as the installer records it: the git origin (a URL, without its
+    credentials, or a git bundle), else the tarball; None if neither is recorded."""
+    if (checkout / ".git").exists():
+        try:
+            origin = subprocess.run(["git", "-C", str(checkout), "remote", "get-url", "origin"], capture_output=True,
+                                    text=True, timeout=30).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return without_credentials(origin) or None
+    try:
+        return (checkout / SOURCE_FILE).read_text().strip() or None
+    except OSError:
+        return None
+
+
+def reinstall_command(role: str, home: Path, config: Path, *, no_service: bool = False) -> str:
+    """The installer's command that sets ``role`` up again with the configuration (at ``config``) and state that
+    ``uninstall`` keeps, from the source the code came from."""
+    words = ["install.sh", role, "--yes", *(["--no-service"] if no_service else [])]
+    if source := code_source():
+        words += ["--source", source]
+    if config != home / f"{role}.json":
+        words += ["--config", str(config)]
+    if home != DEFAULT_HOME.expanduser():
+        words += ["--home", str(home)]
+    return shlex.join(words)
 
 
 def engine_state(why: str | None, served: set[str], pinned: str, codes: set[str] = frozenset()) -> str:
@@ -468,8 +517,8 @@ def uninstall(role: str, argv: list[str]) -> None:
             shutil.rmtree(home / name, ignore_errors=True)
         info(f"removed engines and model weights in {home}")
     Record.path(home, role).unlink(missing_ok=True)
+    config = Path(record.config) if record.config else home / f"{role}.json"
     if args.purge:
-        config = Path(record.config) if record.config else home / f"{role}.json"
         state = Path(read_json(config).get("state_dir", home / role)).expanduser()
         extra = [home / ENGINES_FILE] if role == "reference" else []  # it holds the callers' key
         for path in (config, state, *extra):
@@ -479,4 +528,7 @@ def uninstall(role: str, argv: list[str]) -> None:
                 path.unlink(missing_ok=True)
             info(f"removed {path}")
     else:
-        info(f"kept the configuration and state in {home} (--purge deletes them)")
+        info(f"kept the configuration and state in {home} (--purge deletes them); the installer sets the {role} up "
+             "again with them:")
+        no_service = record.manager is None and bool(record.services)
+        print(f"      {reinstall_command(role, home, config, no_service=no_service)}", flush=True)
