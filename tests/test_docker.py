@@ -14,9 +14,11 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Collection
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -472,6 +474,38 @@ def test_the_supervisor_starts_a_process_that_exits_again_and_stops_them_all(tmp
     assert "missing | did not start (" in log
 
 
+def test_the_supervisor_restarts_the_processes_an_update_changes_and_stops_the_ones_it_leaves_out(tmp_path) -> None:
+    """The engines of ``names`` as an update gives them: a changed one stops and starts as it is now, one left out
+    stops, a new one starts; the others (the service too) run on, the same processes."""
+    out = io.StringIO()
+    sleeping = python("import time; time.sleep(60)")
+    gpu0, gpu1 = (container.Process(f"engine-gpu{i}", sleeping, tmp_path, {"PIN": "a"}) for i in (0, 1))
+    service = container.Process("miner", sleeping, tmp_path)
+    supervisor = container.Supervisor([gpu0, gpu1, service], out=out)
+    for p in supervisor.processes:
+        supervisor.start(p)
+    before = dict(supervisor.children)
+    names = {"engine-gpu0", "engine-gpu1"}
+    try:
+        assert supervisor.update([replace(gpu0, environment={"PIN": "b"}), gpu1], names) == (["engine-gpu0"], [])
+        assert before["engine-gpu0"].returncode is not None and supervisor.children["engine-gpu0"] is not before[
+            "engine-gpu0"]
+        assert supervisor.children["engine-gpu1"] is before["engine-gpu1"] and supervisor.children["miner"] is before[
+            "miner"]
+        assert supervisor.snapshot()["engine-gpu0"].environment == {"PIN": "b"}
+        assert supervisor.update([replace(gpu0, environment={"PIN": "b"})], names) == ([], ["engine-gpu1"])
+        assert before["engine-gpu1"].wait(timeout=30) is not None and "engine-gpu1" not in supervisor.children
+        assert [p.name for p in supervisor.processes] == ["engine-gpu0", "miner"]
+        supervisor.round()  # what an update stopped stays stopped
+        assert "engine-gpu1" not in supervisor.children
+        assert supervisor.update([gpu1], {"engine-gpu1"}) == (["engine-gpu1"], [])
+        assert supervisor.children["engine-gpu1"].poll() is None
+    finally:
+        supervisor.stop()
+    assert supervisor.update([gpu0], names) == ([], [])  # once it stops, nothing starts again
+    assert all(child.returncode is not None for child in before.values())
+
+
 def test_a_setup_that_stops_says_why_and_waits_before_the_container_exits(tmp_path, monkeypatch, capsys) -> None:
     slept = []
 
@@ -518,7 +552,8 @@ def box(tmp_path, monkeypatch, lab_network):
     image_engines(home, catalog.load())
     state = SimpleNamespace(data=data, home=home, remote=tmp_path / "remote", gpus=[gpu(0, 80), gpu(1, 24)],
                             catalog=catalog.load(), registered={"5Miner": 7, "5Validator": 5}, owner="5Owner",
-                            hotkey="5Miner", downloads=[])
+                            hotkey="5Miner", downloads=[], weights=[], installs=[], install_fails=set(),
+                            download_fails=set())
     chain = SimpleNamespace(
         get_uid_for_hotkey_on_subnet=lambda hotkey, netuid: state.registered.get(hotkey),
         get_neuron_for_pubkey_and_subnet=lambda hotkey, netuid: SimpleNamespace(
@@ -528,14 +563,30 @@ def box(tmp_path, monkeypatch, lab_network):
     monkeypatch.setattr(common, "load_hotkey", lambda w, h: SimpleNamespace(
         hotkey=SimpleNamespace(ss58_address=state.hotkey)))
     monkeypatch.setattr("verathos.subnet.chain.current_catalog", lambda *args: state.catalog)
+    monkeypatch.setattr("verathos.subnet.chain.committed_catalog", lambda st, netuid: state.catalog.digest())
     monkeypatch.setattr(host, "gpus", lambda: state.gpus)
     monkeypatch.setattr(host, "driver_cuda_version", lambda: (12, 8))
     monkeypatch.setattr(host, "port_free", lambda port, address="0.0.0.0": True)
     monkeypatch.setattr(host, "detect_public_ip", lambda: "203.0.113.7")
     monkeypatch.setattr(host, "memory_available", lambda: (216 * GiB, 210 * GiB))
     monkeypatch.setattr(engines, "parameters", lambda m: PARAMETERS.get(m.model_id, KEV["kev-9b"]))
-    monkeypatch.setattr(engines, "download", lambda python, m, hf_home: state.downloads.append(
-        (Path(python), m.model_id, hf_home)))
+    def download(python: Path, m: catalog.CatalogModel, hf_home: Path) -> None:
+        if m.hf_revision in state.download_fails:
+            raise SystemExit(f"failed (1): {python} -c ... {m.hf_repo} {m.hf_revision}")
+        state.downloads.append((Path(python), m.model_id, hf_home))
+        state.weights.append((m.model_id, m.hf_revision))
+
+    def install(self: engines.KevEngine, purpose: str) -> None:  # as KevEngine.install leaves the engine
+        state.installs.append((self.directory, purpose))
+        if self.engine.revision in state.install_fails:
+            raise SystemExit(f"failed (128): git clone --quiet {self.engine.source} {self.directory}.partial")
+        self.python(purpose).parent.mkdir(parents=True, exist_ok=True)
+        self.python(purpose).touch()
+        (self.directory / ".git").mkdir(exist_ok=True)
+        (self.directory / ".git" / "HEAD").write_text(self.engine.revision + "\n")
+
+    monkeypatch.setattr(engines, "download", download)
+    monkeypatch.setattr(engines.KevEngine, "install", install)
     monkeypatch.setattr(miner_setup, "read_market", lambda *args, **kwargs: (None, "no network status"))
 
     async def remote_lines(references, screens, cat):
@@ -547,7 +598,7 @@ def box(tmp_path, monkeypatch, lab_network):
 
 def test_a_miner_container_runs_an_engine_per_gpu_and_the_miner_as_the_installer_sets_them_up(box, capsys) -> None:
     env = {"WALLET": "miner", "NETWORK": "test", "PORT": "20091", "MODEL": "kev-9b,kev-4b"}
-    processes = container.miner(env, box.data, box.home)
+    processes = container.miner(env, box.data, box.home).processes
     assert [p.name for p in processes] == ["engine-gpu0", "engine-gpu1", "miner"]
     kev9, kev4 = (engines.engine_for(box.home, box.catalog.get(m)) for m in ("kev-9b", "kev-4b"))
     gpu0, gpu1, miner = processes
@@ -576,7 +627,7 @@ def test_a_miner_container_runs_an_engine_per_gpu_and_the_miner_as_the_installer
     document["endpoints"][0]["max_concurrency"] = 64
     document["state_dir"] = "/root/.verathos/miner"  # anywhere outside the volume is lost on recreation
     common.write_json(box.data / "miner.json", document)
-    again = container.miner({**env, "FIREWALL": "off", "PEERS": "203.0.113.8:8091"}, box.data, box.home)
+    again = container.miner({**env, "FIREWALL": "off", "PEERS": "203.0.113.8:8091"}, box.data, box.home).processes
     config = MinerConfig.load(box.data / "miner.json")
     assert config.endpoints[0].max_concurrency == 64 and config.state_dir == box.data / "miner"
     assert config.firewall is False and config.peers == ["https://203.0.113.8:8091"]
@@ -592,12 +643,13 @@ def test_a_miner_container_tries_the_machine_unregistered_only_with_no_publish(b
     with pytest.raises(SystemExit, match=r"(?s)not registered on netuid 96.*set NO_PUBLISH=1"):
         container.miner({"WALLET": "miner"}, box.data, box.home)
     box.catalog = None  # the shipped catalog, not the chain's
-    processes = container.miner({"WALLET": "miner", "NO_PUBLISH": "1"}, box.data, box.home)
-    assert processes[-1].command[-1] == "--no-publish"
+    run = container.miner({"WALLET": "miner", "NO_PUBLISH": "1"}, box.data, box.home)
+    assert run.processes[-1].command[-1] == "--no-publish"
+    assert run.follower is None  # it serves the shipped catalog: nothing to follow
 
 
 def test_a_worker_container_and_the_variables_it_refuses(box) -> None:
-    worker = container.miner({"WALLET": "miner", "WORKER": "1", "NAME": "box-a"}, box.data, box.home)
+    worker = container.miner({"WALLET": "miner", "WORKER": "1", "NAME": "box-a"}, box.data, box.home).processes
     config = MinerConfig.load(box.data / "miner.json")
     assert config.role == "worker" and [e.endpoint_id for e in config.endpoints] == ["box-a-gpu0", "box-a-gpu1"]
     assert [p.name for p in worker] == ["engine-gpu0", "engine-gpu1", "miner"] and config.peers == []
@@ -610,6 +662,8 @@ def test_a_worker_container_and_the_variables_it_refuses(box) -> None:
                      ({"PEERS": "192.168.1.5:8091"}, "PEERS: 192.168.1.5:8091 is not a public address"),
                      ({"PUBLIC_IP": "192.168.1.5"}, "PUBLIC_IP: 192.168.1.5 is not a public IP address"),
                      ({"FIREWALL": "maybe"}, "FIREWALL='maybe'"), ({"PORT": "0"}, "PORT=0: a TCP port number"),
+                     ({"AUTO_RESTART": "later"}, "AUTO_RESTART='later'"),
+                     ({"ENGINE_AUTO_INSTALL": "x"}, "ENGINE_AUTO_INSTALL='x'"),
                      ({"WALLET": ""}, "WALLET is not set")):
         with pytest.raises(SystemExit, match=why):
             container.miner({"WALLET": "miner", **env}, box.data, box.home)
@@ -618,30 +672,225 @@ def test_a_worker_container_and_the_variables_it_refuses(box) -> None:
         container.miner({"WALLET": "miner"}, box.data, box.home)
 
 
-def test_an_engine_revision_the_image_lacks_is_served_with_the_one_it_carries_by_miners_only(box, capsys) -> None:
-    """Validators check a miner's answers, not its engine: a miner serves with the Kev engine the image carries until
-    the image of the release that ships the new revision runs. A reference machine serves exactly what the catalog
-    pins, and leaves the model out."""
-    document = catalog.load().document()
-    moved = [{**m, "engine": {**m["engine"], "revision": "f" * 40}} if m["model_id"] == "kev-4b" else m
-             for m in document["models"]]
-    new = {**moved[0], "model_id": "kev-14b", "engine": {**moved[0]["engine"], "revision": "e" * 40}}
-    box.catalog = catalog.Catalog.parse({**document, "models": [*moved, new]})
-    processes = container.miner({"WALLET": "miner", "MODEL": "kev-4b"}, box.data, box.home)
-    shipped = engines.engine_for(box.home, catalog.load().get("kev-4b"))
-    assert processes[0].command[0] == str(shipped.python("miner"))
-    out = capsys.readouterr().out
-    assert "kev-4b: the catalog pins the kev engine at ffffffffffff; this image carries 5e42a7a03f28" in out
-    assert "kev-14b runs on the kev engine at eeeeeeeeeeee, which this image does not carry" in out
-    with pytest.raises(SystemExit, match="kev-14b is not a catalog model this setup can install"):
-        container.miner({"WALLET": "miner", "MODEL": "kev-14b"}, box.data, box.home)
+def pinning(cat: catalog.Catalog, **pins: dict) -> catalog.Catalog:
+    """``cat`` with other pins for some models, ``kev_4b={"revision": ..., "hf_revision": ...}``: the engine's
+    revision and the weights' revision."""
+    document = cat.document()
+    models = []
+    for m in document["models"]:
+        changes = pins.get(m["model_id"].replace("-", "_"), {})
+        engine = {**m["engine"], **({"revision": changes["revision"]} if "revision" in changes else {})}
+        models.append({**m, "engine": engine, **({"hf_revision": changes["hf_revision"]}
+                                                  if "hf_revision" in changes else {})})
+    return catalog.Catalog.parse({**document, "models": models})
 
-    names = [p.name for p in container.reference({"ALLOW": "198.51.100.9"}, box.data, box.home)]
-    assert "reference-kev-4b" not in names and "reference-kev-9b" in names
+
+def test_with_engine_auto_install_off_a_miner_serves_with_the_images_revision_and_a_reference_leaves_it_out(
+        box, capsys) -> None:
+    """ENGINE_AUTO_INSTALL=0: only the image's engines run. Validators check a miner's answers, not its engine, so a
+    miner serves with the Kev engine the image carries and warns at each start; a reference machine runs exactly what
+    the catalog pins, and leaves the model out."""
+    moved = pinning(catalog.load(), kev_4b={"revision": "f" * 40})
+    new = {**moved.document()["models"][0], "model_id": "kev-14b",
+           "engine": {**moved.document()["models"][0]["engine"], "revision": "e" * 40}}
+    box.catalog = catalog.Catalog.parse({**moved.document(), "models": [*moved.document()["models"], new]})
+    off = {"ENGINE_AUTO_INSTALL": "0"}
+    processes = container.miner({"WALLET": "miner", "MODEL": "kev-4b", **off}, box.data, box.home).processes
+    shipped = engines.engine_for(box.home, catalog.load().get("kev-4b"))
+    assert processes[0].command[0] == str(shipped.python("miner")) and box.installs == []
+    out = capsys.readouterr().out
+    assert ("kev-4b: the catalog pins the kev engine at ffffffffffff; this image carries 5e42a7a03f28 and serves with "
+            "it (validators check answers, not engines); ENGINE_AUTO_INSTALL=1 installs the pinned one") in out
+    assert "kev-14b runs on the kev engine at eeeeeeeeeeee, which this image does not carry" in out
+    assert "ENGINE_AUTO_INSTALL off: only the engines this image carries run" in out
+    with pytest.raises(SystemExit, match="kev-14b is not a catalog model this setup can install"):
+        container.miner({"WALLET": "miner", "MODEL": "kev-14b", **off}, box.data, box.home)
+
+    names = [p.name for p in container.reference({"ALLOW": "198.51.100.9", **off}, box.data, box.home).processes]
+    assert "reference-kev-4b" not in names and "reference-kev-9b" in names and box.installs == []
     assert "kev-4b is not served: the catalog pins the kev engine at ffffffffffff" in capsys.readouterr().out
     assert container.carried(engines.engine_for(box.home, box.catalog.get("kev-9b")), "reference")
     (box.home / "engines" / "verathos-clef" / ".venv-reference" / "bin" / "python").unlink()
     assert not container.carried(engines.engine_for(box.home, box.catalog.get("clef-flash")), "reference")
+
+
+def test_a_kev_revision_the_image_lacks_is_installed_into_the_data_directory_and_served_from_there(box, capsys) -> None:
+    """ENGINE_AUTO_INSTALL (default): the container installs the revision the catalog pins with the installer's code
+    into the data directory, where it stays, and serves with it: a miner for its purpose, a reference machine for
+    both, so its references stay exact. Once the image carries the revision (or nothing runs from it), it goes."""
+    box.catalog = pinning(catalog.load(), kev_4b={"revision": "f" * 40})
+    (box.data / "cache" / "uv").mkdir(parents=True)  # uv's cache while it installs: gone afterwards
+    run = container.miner({"WALLET": "miner", "MODEL": "kev-4b"}, box.data, box.home)
+    here = box.data / "engines" / "kev-ffffffffffff"
+    assert box.installs == [(here, "miner")]
+    assert [p.command[0] for p in run.processes[:2]] == [str(here / ".venv" / "bin" / "python")] * 2
+    assert all(p.directory == here for p in run.processes[:2])
+    assert (here / container.INSTALLED).read_text().split() == ["miner"]
+    assert not (box.data / "cache" / "uv").exists()
+    out = capsys.readouterr().out
+    assert ("installing the kev engine at ffffffffffff, which this image does not carry, into "
+            f"{here} (ENGINE_AUTO_INSTALL=0 turns this off)") in out
+    assert "this image carries" not in out and "ENGINE_AUTO_INSTALL on: an engine revision the catalog pins" in out
+    container.miner({"WALLET": "miner", "MODEL": "kev-4b"}, box.data, box.home)
+    assert box.installs == [(here, "miner")]  # in place: the next start installs nothing
+
+    references = container.reference({"ALLOW": "198.51.100.9"}, box.data, box.home).processes
+    assert box.installs[1:] == [(here, "reference"), (here, "miner")]  # the reference first, as the installer
+    by_name = {p.name: p for p in references}
+    assert by_name["reference-kev-4b"].command[0] == str(here / ".venv-reference" / "bin" / "python")
+    assert by_name["screen-kev-4b"].command[0] == str(here / ".venv" / "bin" / "python")
+    assert by_name["reference-kev-9b"].directory == engines.engine_for(box.home, box.catalog.get("kev-9b")).directory
+
+    box.catalog = catalog.load()  # the image carries what the catalog pins again
+    capsys.readouterr()
+    container.miner({"WALLET": "miner", "MODEL": "kev-4b"}, box.data, box.home)
+    assert not here.exists() and f"removed {here}, which no engine runs from" in capsys.readouterr().out
+
+
+def test_an_engine_that_does_not_install_leaves_the_miner_on_the_images_revision_until_it_does(box, capsys) -> None:
+    box.catalog = pinning(catalog.load(), kev_4b={"revision": "f" * 40})
+    box.install_fails.add("f" * 40)
+    run = container.miner({"WALLET": "miner", "MODEL": "kev-4b"}, box.data, box.home)
+    shipped = engines.engine_for(box.home, catalog.load().get("kev-4b"))
+    assert run.processes[0].command[0] == str(shipped.python("miner"))
+    out = capsys.readouterr().out
+    assert "kev-4b: the kev engine at ffffffffffff did not install (failed (128): git clone" in out
+    assert "this image carries 5e42a7a03f28 and serves with it" in out
+    assert run.follower is not None and run.follower.retry_at is not None  # tried again while it runs
+
+
+class Watched:
+    """A supervisor as a follower sees it: the processes it runs, what it says and the updates it applies."""
+
+    def __init__(self, processes: list[container.Process]) -> None:
+        self.processes = {p.name: p for p in processes}
+        self.lines: list[str] = []
+        self.updates: list[tuple[list[str], list[str]]] = []
+        self.stopping = threading.Event()
+
+    def say(self, name: str, line: str) -> None:
+        self.lines.append(f"{name} | {line}")
+
+    def snapshot(self) -> dict[str, container.Process]:
+        return dict(self.processes)
+
+    def update(self, processes: list[container.Process], names: Collection[str]) -> tuple[list[str], list[str]]:
+        wanted = {p.name: p for p in processes}
+        started = [n for n, p in wanted.items() if self.processes.get(n) != p]
+        stopped = [n for n in self.processes if n in names and n not in wanted]
+        self.processes = {n: wanted.get(n, p) for n, p in self.processes.items() if n not in stopped} | wanted
+        self.updates.append((started, stopped))
+        return started, stopped
+
+
+def test_the_engines_follow_new_pins_restarting_only_the_ones_they_change(box) -> None:
+    """AUTO_RESTART (default): a catalog with new weights for a model served here downloads them, then restarts the
+    engines serving it while the others run on; a catalog changing only other models restarts nothing."""
+    run = container.miner({"WALLET": "miner", "MODEL": "kev-9b,kev-4b"}, box.data, box.home)
+    follower, watched, now = run.follower, Watched(run.processes), [0.0]
+    follower.clock = lambda: now[0]
+    assert (follower.models, follower.names) == (["kev-4b", "kev-9b"], {"engine-gpu0", "engine-gpu1"})
+    follower.round(watched)
+    assert watched.updates == [] and watched.lines == []  # the catalog it runs
+
+    box.catalog = pinning(box.catalog, clef_flash={"hf_revision": "c" * 40})  # not a model served here
+    follower.round(watched)
+    assert watched.updates == [] and follower.catalog.digest() == box.catalog.digest()
+
+    box.catalog = pinning(box.catalog, kev_4b={"hf_revision": "d" * 40})
+    follower.round(watched)
+    assert watched.updates == [(["engine-gpu1"], [])]  # GPU 1 serves kev-4b; GPU 0's kev-9b runs on
+    assert box.weights[-1] == ("kev-4b", "d" * 40)  # downloaded before the restart
+    assert watched.processes["engine-gpu1"].command[watched.processes["engine-gpu1"].command.index("--run") + 1] == (
+        f"jaredpalmer/kev-4b@{'d' * 40}")
+    assert any("pins other weights or engines for kev-4b: setting their engines up for it" in line
+               for line in watched.lines)
+    assert f"catalog | engine-gpu1 restarts with what catalog {box.catalog.digest()[:12]} pins" in watched.lines
+    follower.round(watched)
+    assert len(watched.updates) == 1  # done: nothing again
+
+
+def test_a_follower_that_cannot_set_the_engines_up_leaves_them_running_and_tries_again_later(box,
+                                                                                            monkeypatch) -> None:
+    run = container.miner({"WALLET": "miner", "MODEL": "kev-9b,kev-4b"}, box.data, box.home)
+    follower, watched, now = run.follower, Watched(run.processes), [0.0]
+    follower.clock = lambda: now[0]
+    box.catalog = pinning(box.catalog, kev_9b={"hf_revision": "d" * 40})
+    box.download_fails.add("d" * 40)
+    follower.round(watched)
+    assert watched.updates == [] and follower.retry_at == follower.RETRY_S
+    assert any("the engines run on as they are, and their setup is tried again in 10 minutes" in line
+               for line in watched.lines)
+    now[0] = follower.RETRY_S - 1
+    follower.round(watched)
+    assert watched.updates == []  # not before it is due
+    box.download_fails.clear()
+    now[0] = follower.RETRY_S
+    follower.round(watched)
+    assert watched.updates == [(["engine-gpu0"], [])] and follower.retry_at is None
+
+    # a new Kev revision: installed into the data directory meanwhile, then the engine moves onto it; the next one
+    # replaces it, and the one no engine runs from goes
+    first, second = box.data / "engines" / "kev-eeeeeeeeeeee", box.data / "engines" / "kev-ffffffffffff"
+    box.catalog = pinning(box.catalog, kev_9b={"revision": "e" * 40})
+    follower.round(watched)
+    assert watched.processes["engine-gpu0"].directory == first and box.installs == [(first, "miner")]
+    box.catalog = pinning(box.catalog, kev_9b={"revision": "f" * 40})
+    follower.round(watched)
+    assert watched.processes["engine-gpu0"].directory == second and not first.exists()
+    assert f"catalog | removed {first}, which no engine runs from" in watched.lines
+
+    def unreachable(st, netuid):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("verathos.subnet.chain.committed_catalog", unreachable)
+    follower.round(watched)
+    follower.round(watched)
+    assert sum("the committed catalog is not readable now (OSError: connection refused)" in line
+               for line in watched.lines) == 1  # said once while it lasts
+
+
+def test_a_reference_machine_stops_the_engines_of_a_model_it_cannot_run_exactly_and_follows_the_rest(box) -> None:
+    run = container.reference({"ALLOW": "198.51.100.9", "ENGINE_AUTO_INSTALL": "0"}, box.data, box.home)
+    follower, watched = run.follower, Watched(run.processes)
+    box.catalog = pinning(box.catalog, kev_4b={"revision": "f" * 40}, kev_9b={"hf_revision": "d" * 40})
+    follower.round(watched)
+    ((started, stopped),) = watched.updates
+    assert sorted(started) == ["reference-kev-9b", "screen-kev-9b"]  # its new weights
+    assert sorted(stopped) == ["reference-kev-4b", "screen-kev-4b"]  # references run exactly what the catalog pins
+    assert "front" in watched.processes and "reference-clef-flash" in watched.processes
+    assert any("kev-4b is not served: the catalog pins the kev engine at ffffffffffff" in line
+               for line in watched.lines)
+
+    run = container.reference({"ALLOW": "198.51.100.9"}, box.data, box.home)  # ENGINE_AUTO_INSTALL: installed
+    assert {p.name for p in run.processes} >= {"reference-kev-4b", "screen-kev-4b"}
+    assert box.installs == [(box.data / "engines" / "kev-ffffffffffff", purpose) for purpose in ("reference", "miner")]
+
+
+def test_auto_restart_off_leaves_new_pins_to_the_next_start(box, capsys) -> None:
+    assert container.miner({"WALLET": "miner", "AUTO_RESTART": "0"}, box.data, box.home).follower is None
+    assert container.reference({"ALLOW": "198.51.100.9", "AUTO_RESTART": "off"}, box.data, box.home).follower is None
+    assert "AUTO_RESTART off: a catalog pinning other weights or engines applies at the next start" in (
+        capsys.readouterr().out)
+
+
+def test_the_follower_keeps_following_after_a_round_fails_and_stops_with_the_supervisor(box, monkeypatch) -> None:
+    run = container.miner({"WALLET": "miner"}, box.data, box.home)
+    watched, rounds = Watched(run.processes), []
+
+    def round_(supervisor) -> None:
+        rounds.append(len(rounds))
+        if len(rounds) == 1:
+            raise RuntimeError("the chain answered nonsense")
+        if len(rounds) == 3:
+            supervisor.stopping.set()
+
+    monkeypatch.setattr(run.follower, "round", round_)
+    monkeypatch.setattr(run.follower, "WATCH_S", 0.01)
+    run.follower.run(watched)
+    assert rounds == [0, 1, 2]
+    assert "catalog | WARNING: following the catalog failed (RuntimeError: the chain answered nonsense)" in (
+        watched.lines[0])
 
 
 def test_a_light_validator_container_sets_the_auditors_weights_with_the_hotkey_alone(box) -> None:
@@ -760,7 +1009,8 @@ def test_a_reference_container_runs_each_engine_and_the_front_and_writes_the_val
     with pytest.raises(SystemExit, match="ALLOW: '10.0.0.300' is not an IP address"):
         container.reference({"ALLOW": "10.0.0.300"}, box.data, box.home)
     box.gpus = [gpu(0, 80)]
-    processes = container.reference({"ALLOW": "198.51.100.9", "NETWORK": "test", "PORT": "20004"}, box.data, box.home)
+    processes = container.reference({"ALLOW": "198.51.100.9", "NETWORK": "test", "PORT": "20004"}, box.data,
+                                    box.home).processes
     assert [p.name for p in processes] == ["reference-clef-flash", "reference-kev-4b", "reference-kev-9b",
                                            "screen-clef-flash", "screen-kev-4b", "screen-kev-9b", "front"]
     by_name = {p.name: p for p in processes}
@@ -777,7 +1027,8 @@ def test_a_reference_container_runs_each_engine_and_the_front_and_writes_the_val
                                                 "tls_pin": tls.stored_pin(box.data / "reference"),
                                                 "api_key": api_key(box.data / "reference")}
     assert "into the REMOTE_ENGINES_DIR of each validator machine" in capsys.readouterr().out
-    without = container.reference({"ALLOW": "198.51.100.9", "SCREENS": "off", "MODEL": "kev-4b"}, box.data, box.home)
+    without = container.reference({"ALLOW": "198.51.100.9", "SCREENS": "off", "MODEL": "kev-4b"}, box.data,
+                                  box.home).processes
     assert [p.name for p in without] == ["reference-kev-4b", "front"]
     again = json.loads((box.data / common.ENGINES_FILE).read_text())
     assert again["references"]["kev-4b"] == document["references"]["kev-4b"] and again["audit_screens"] == {}

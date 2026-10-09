@@ -23,6 +23,8 @@ services:
       MODEL: ${MODEL:-}
       SCREENS: ${SCREENS:-on}
       DEVICE: ${DEVICE:-auto}
+      ENGINE_AUTO_INSTALL: ${ENGINE_AUTO_INSTALL:-on}
+      AUTO_RESTART: ${AUTO_RESTART:-on}
       HF_TOKEN: ${HF_TOKEN:-}
     volumes:
       - ${DATA_DIR:-./data}:/data

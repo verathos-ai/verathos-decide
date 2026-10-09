@@ -140,6 +140,8 @@ the validator there. It keeps its certificate and key across restarts and update
 | `DRY_RUN` | | validator: `1` computes weights without setting them |
 | `REMOTE_ENGINES_DIR`, `EGRESS_IPS` | `./reference-engines`, detected | full validator: the reference machines' files; the addresses its requests leave from |
 | `ALLOW`, `SCREENS`, `DEVICE` | -, `on`, `auto` | reference machine: the callers' addresses; the screens; where the references run (`auto`, `cpu`, `gpu`) |
+| `ENGINE_AUTO_INSTALL` | `on` | miner, reference machine: install a Kev engine revision the catalog pins and the image does not carry into `DATA_DIR/engines`, and serve with it; `off`: only the image's engines run ([Updates](#updates)) |
+| `AUTO_RESTART` | `on` | miner, reference machine: when the catalog pins new weights or another engine for a model served here, set its engines up for it and restart them while the container runs; `off`: at the next start ([Updates](#updates)) |
 
 At each start a container sets up its role from these, as the installer does with `--yes`, and writes its
 configuration into `DATA_DIR`: `miner.json`, `validator.json` or `reference.json` (`MINING.md`, `VALIDATING.md`). What
@@ -161,6 +163,7 @@ coldkey, and `docker compose up` stops when either file is missing.
 | `validator/` | the canary secret, the score history, its TLS key and certificate with a service |
 | `reference/`, `reference-engines.json` | the front's TLS key and certificate and the callers' key; the file for the validators (mode 600) |
 | `hf/`, `catalog/`, `cache/` | model weights, catalogs, compiled GPU kernels |
+| `engines/` | the Kev engine revisions the container installed (`ENGINE_AUTO_INSTALL`), about 8 GB each; one goes once no engine runs from it, such as when the image carries it |
 | `install/` | what the next start keeps: each GPU's model and the engines' ports |
 
 The containers run as root, so these files are root's. A miner set up by the installer moves to Docker with its pin
@@ -207,13 +210,24 @@ This is the only way a container's image changes: the images carry version tags 
 
 The container starts on the new image and sets up its role again. A miner keeps its pin and reuses its measurement
 unless what it depends on changed: an engine's code or revision, or how the miner measures; then it measures again.
-The subnet owner's catalog changes need no new image, except:
 
-- new weights for a model (`hf_revision`): `docker compose restart` downloads them and restarts the engines;
-- another Kev engine revision: the image of the release that ships it. Until then a miner serves the model with the
-  revision its image carries and warns at each start (`... this image carries ...`; validators check answers, not
-  engines), and a reference machine leaves the model out (references run exactly what the catalog pins);
-- a model on a new engine: the image of a release that ships the engine.
+The subnet owner's catalog changes need no new image:
+
+- **New weights or another engine for a model served here.** By default (`AUTO_RESTART=on`) the container applies them
+  by itself while it runs: it reads the committed catalog every minute, downloads the new weights (and installs the
+  engine) while the engines run on, then restarts the engines of that model alone (`catalog | engine-gpu0 restarts
+  with what catalog ... pins`); the miner measures again where its rules say so. What fails is tried again 10 minutes
+  later, the engines running as they are meanwhile. With `AUTO_RESTART=off`, `docker compose restart` applies it.
+- **A Kev engine revision the image does not carry.** By default (`ENGINE_AUTO_INSTALL=on`) the container installs it
+  into `DATA_DIR/engines` with the installer's own code and serves with it, at the start and when it follows the
+  catalog; a reference machine does the same for its references and screens, so they stay exact. The image of a
+  release that carries the revision makes that copy unused, and it goes. With `ENGINE_AUTO_INSTALL=off` only the
+  image's engines run: a miner serves the model with the revision its image carries and warns at each start
+  (`... this image carries ...`; validators check answers, not engines), and a reference machine leaves the model out
+  (references run exactly what the catalog pins).
+- **A model the catalog retires.** The miner withdraws its endpoints at once; `docker compose restart` gives their GPUs
+  another model.
+- **A model on a new engine family.** It needs the image of a release that ships the engine.
 
 A validator whose release the subnet owner retires sets no weights (`this validator's release is too old`): update.
 Run a reference machine on the release its validators run.
@@ -223,7 +237,7 @@ Run a reference machine on the release its validators run.
 | | |
 |---|---|
 | status | `docker compose ps`: `healthy` once the role's service answers (a miner its `/health`, a reference machine every engine through its front, a full validator with a service its port); `starting` during a first start's downloads |
-| logs | `docker compose logs -f`; each line behind its process's name (`engine-gpu0 \|`, `miner \|`, `front \|`); rotated at 50 MB, five files |
+| logs | `docker compose logs -f`; each line behind its process's name (`engine-gpu0 \|`, `miner \|`, `front \|`), what following the catalog does behind `catalog \|`; rotated at 50 MB, five files |
 | restarts | Docker starts the container again when it exits and after a reboot (`restart: unless-stopped`); within it, an engine or the service that exits starts again 10 s later. A setup that stops (an unregistered hotkey, a model that does not fit) says why and tries again about once a minute |
 | firewall | `docker compose exec miner verathos-miner firewall status --config /data/miner.json` |
 | stop | `docker compose down`; `DATA_DIR` stays |
@@ -239,7 +253,8 @@ Run a reference machine on the release its validators run.
 | `port ... is in use on this machine` | another process holds `PORT`, such as a miner the installer set up: remove it (`install.sh uninstall`) or choose another port |
 | `hotkey ... is not registered` | register it; `NO_PUBLISH=1` tries the machine first |
 | `firewall observing: requests of ... arrive from 172.17.0.1` | a published port behind Docker's userland proxy: use the host's network |
-| `... this image carries ...` | the catalog pins another Kev engine revision: update to the release that ships it |
+| `... this image carries ...` | the catalog pins a Kev engine revision the image does not carry, and `ENGINE_AUTO_INSTALL` is off or its install failed (the line before says why): turn it on, or update to the release that ships it |
+| `... did not install (...)` | the engine's source, PyPI or the disk (`DATA_DIR` needs about 8 GB per revision): the container tries again 10 minutes later while it follows the catalog, else at the next start |
 | `docker: 'compose' is not a docker command` | install Docker's Compose plugin |
 | downloads slow or rate limited | set `HF_TOKEN` |
 

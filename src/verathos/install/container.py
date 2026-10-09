@@ -3,15 +3,20 @@
 A release is two images: ``verathos``, its code (a light validator; a full validator whose references run on a
 reference machine), and ``verathos-engines``, its code and the engines of its shipped catalog at their pinned
 revisions, installed by the installer's own code (``install_engines``, run when the image is built). The subnet owner's
-validator, the auditor, runs from the installer, never here. At each start the container sets its role up from its
-environment, which the compose file takes from the operator's ``.env``, as ``verathos-<role> init --yes`` sets up a
-machine: the catalog the subnet owner commits, the models and where their engines run, the pinned weights (downloaded
-once, into ``<data>/hf``) and the configuration (``<data>/<role>.json``, which keeps what the operator added to it).
-A miner or a reference machine then runs its engines and its service as children of this process (``Supervisor``):
-each started again ``RESTART_S`` after it exits, their output in the container's log behind their names. A validator
-replaces this process.
-Everything that persists is under ``<data>``: the configuration, the TLS identity (so the pin stays), measurements,
-scores and caches. The container never updates its code: a release is a new image.
+validator, the auditor, runs from the installer, never here.
+
+At each start the container sets its role up from its environment, which the compose file takes from the operator's
+``.env``, as ``verathos-<role> init --yes`` sets up a machine: the catalog the subnet owner commits, the models and
+where their engines run, the pinned weights (downloaded once, into ``<data>/hf``) and the configuration
+(``<data>/<role>.json``, which keeps what the operator added to it). An engine the catalog pins at a Kev revision the
+image does not carry is installed into ``<data>/engines`` by the installer's own code (``EngineSource``;
+``ENGINE_AUTO_INSTALL=0``: a miner serves with the image's revision, a reference machine leaves the model out). A miner
+or a reference machine then runs its engines and its service as children of this process (``Supervisor``), each
+started again ``RESTART_S`` after it exits, their output in the container's log behind their names, and its engines
+follow the pins of each catalog the subnet owner commits while they run (``Follower``; ``AUTO_RESTART=0``: from the
+next start). A validator replaces this process. Everything that persists is under ``<data>``: the configuration, the
+TLS identity (so the pin stays), measurements, scores, weights, caches and the engines installed there. The container
+never updates its code: a release is a new image.
 
     verathos-container miner | validator | reference   set the role up and run it
     verathos-container health miner | validator | reference
@@ -25,22 +30,25 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
-DATA = Path("/data")  # the volume: configuration, state, weights, caches
+DATA = Path("/data")  # the volume: configuration, state, weights, caches, engines installed while the container runs
 ENGINES = Path("/opt")  # the image's engines, under <ENGINES>/engines as under a setup's home
 REMOTE_ENGINES = Path("/etc/verathos/remote-engines")  # a full validator's files of reference machines (*.json)
 ROLES = ("miner", "validator", "reference")
 SETUP_RETRY_S = 60.0  # a setup that stops waits this long before the container exits and Docker starts it again
+INSTALLED = ".verathos-installed"  # in an engine installed into <data>/engines: the purposes its install completed
+MINER = ("miner",)  # the purpose of a miner's engines: bfloat16, with the fused kernels
 TRUE, FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
 # The installer's options in the messages of its code, as they are set here: variables of the .env. "--model x"
 # becomes MODEL=x where x is a value (a model, a list, <id> or auto).
@@ -129,10 +137,26 @@ class Process:
     environment: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class Notes:
+    """Where setting engines up says what it does: the setup's output at the start (``common.info``, ``common.warn``),
+    the log behind ``catalog`` when a ``Follower`` sets them up again."""
+
+    info: Callable[[str], None]
+    warn: Callable[[str], None]
+
+
+# How a role's engines are set up for a catalog, at the start and by its follower: (the catalog, where to say what it
+# does, the processes running now by name) -> the engine processes, and whether each runs what the catalog pins (False:
+# an engine did not install, and what runs meanwhile is set up again later).
+Build = Callable[[Any, Notes, Mapping[str, Process]], tuple[list[Process], bool]]
+
+
 class Supervisor:
     """Runs ``processes`` as children, each in a session of its own, their output to ``out`` line by line behind their
-    names, and starts each again ``RESTART_S`` after it exits, as systemd restarts the installer's services. On SIGTERM
-    or SIGINT it stops them (SIGTERM, then SIGKILL after ``STOP_S``) and returns."""
+    names, and starts each again ``RESTART_S`` after it exits, as systemd restarts the installer's services. ``update``
+    replaces some of them while the others run on (``Follower``). On SIGTERM or SIGINT it stops them (SIGTERM, then
+    SIGKILL after ``STOP_S``) and returns."""
 
     RESTART_S = 10.0
     STOP_S = 50.0  # within the compose files' stop_grace_period
@@ -140,15 +164,16 @@ class Supervisor:
 
     def __init__(self, processes: list[Process], out: IO[str] | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
-        self.processes, self.out, self.clock = processes, out or sys.stdout, clock
+        self.processes, self.out, self.clock = list(processes), out or sys.stdout, clock
         self.stopping = threading.Event()
         self.children: dict[str, subprocess.Popen] = {}
         self.due: dict[str, float] = {}  # name -> when it starts again
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # the processes: the main loop and a follower's updates
+        self._output = threading.Lock()
         self._copiers: list[threading.Thread] = []
 
     def say(self, name: str, line: str) -> None:
-        with self._lock:
+        with self._output:
             self.out.write(f"{name} | {line.rstrip()}\n")
             self.out.flush()
 
@@ -172,40 +197,77 @@ class Supervisor:
         copier.start()
         self._copiers = [c for c in self._copiers if c.is_alive()] + [copier]
 
-    def round(self) -> None:
-        """Note what exited, and start again what is due."""
-        now = self.clock()
-        for p in self.processes:
-            child = self.children.get(p.name)
-            if child is not None and child.poll() is not None:
-                del self.children[p.name]
-                self.say(p.name, f"exited with code {child.returncode}; starting it again in {self.RESTART_S:.0f} s")
-                self.due[p.name] = now + self.RESTART_S
-            elif child is None and now >= self.due.get(p.name, now):
-                self.start(p)
-
-    def stop(self) -> None:
-        for child in self.children.values():
+    def _halt(self, children: Mapping[str, subprocess.Popen]) -> None:
+        """Stop ``children`` together: SIGTERM, then SIGKILL to each still running ``STOP_S`` later."""
+        for child in children.values():
             _signal(child, signal.SIGTERM)
         deadline = self.clock() + self.STOP_S
-        for name, child in self.children.items():
+        for name, child in children.items():
             try:
                 child.wait(timeout=max(deadline - self.clock(), 0.1))
             except subprocess.TimeoutExpired:
                 self.say(name, f"did not stop within {self.STOP_S:.0f} s; killed")
                 _signal(child, signal.SIGKILL)
                 child.wait()
+
+    def snapshot(self) -> dict[str, Process]:
+        """The processes it runs, by name."""
+        with self._lock:
+            return {p.name: p for p in self.processes}
+
+    def round(self) -> None:
+        """Note what exited, and start again what is due."""
+        with self._lock:
+            now = self.clock()
+            for p in self.processes:
+                child = self.children.get(p.name)
+                if child is not None and child.poll() is not None:
+                    del self.children[p.name]
+                    self.say(p.name, f"exited with code {child.returncode}; starting it again in "
+                             f"{self.RESTART_S:.0f} s")
+                    self.due[p.name] = now + self.RESTART_S
+                elif child is None and now >= self.due.get(p.name, now):
+                    self.start(p)
+
+    def update(self, processes: list[Process], names: Collection[str]) -> tuple[list[str], list[str]]:
+        """Run ``processes`` as the ones of ``names``: each new one, or one whose command, directory or environment
+        changed, (re)starts as it is now, after the ones it replaces stopped; one of ``names`` missing from
+        ``processes`` stops; the others run on. -> the names started, and the names stopped."""
+        wanted = {p.name: p for p in processes}
+        with self._lock:
+            if self.stopping.is_set():
+                return [], []
+            current = {p.name: p for p in self.processes}
+            started = [name for name, p in wanted.items() if current.get(name) != p]
+            stopped = [name for name in current if name in names and name not in wanted]
+            self._halt({name: self.children.pop(name) for name in started + stopped if name in self.children})
+            for name in started + stopped:
+                self.due.pop(name, None)
+            self.processes = [wanted.get(p.name, p) for p in self.processes if p.name not in stopped]
+            self.processes += [p for name, p in wanted.items() if name not in current]
+            for name in started:
+                self.start(wanted[name])
+            return started, stopped
+
+    def stop(self) -> None:
+        with self._lock:
+            self.stopping.set()
+            children, self.children = dict(self.children), {}
+            self._halt(children)
         for copier in self._copiers:
             copier.join(timeout=5)
 
-    def run(self) -> int:
+    def run(self, follower: Follower | None = None) -> int:
         def stop(signum: int, frame: object) -> None:
             self.stopping.set()
 
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
-        for p in self.processes:
-            self.start(p)
+        with self._lock:
+            for p in self.processes:
+                self.start(p)
+        if follower is not None:
+            threading.Thread(target=follower.run, args=(self,), name="catalog", daemon=True).start()
         while not self.stopping.wait(self.TICK_S):
             self.round()
         self.stop()
@@ -220,7 +282,110 @@ def _signal(child: subprocess.Popen, signum: int) -> None:
         pass
 
 
-# ---- the engines in the image ----
+class Follower:
+    """``AUTO_RESTART``: a role's engines follow the pins of each catalog the subnet owner commits while they run.
+    Every ``WATCH_S`` it reads the committed catalog; when one pins other weights or another engine for a model whose
+    engines run here (``models``), ``build`` sets the engines up for it as the start does (installing an engine,
+    downloading the weights, while the engines run on) and the supervisor restarts the ones whose command changed; a
+    miner then measures again where its rules say so. A build that fails leaves the engines as they run and is tried
+    again ``RETRY_S`` later, as is one where an engine did not install."""
+
+    WATCH_S = 60.0  # as miners and validators read the commitment (throughput.policy.POLICY_WATCH_S)
+    RETRY_S = 600.0
+
+    def __init__(self, *, network: str, netuid: int, store: Path, mirrors: list[str], catalog: Any,
+                 models: Collection[str], names: Collection[str], build: Build,
+                 prune: Callable[[Iterable[Process], Notes], None], complete: bool = True,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.network, self.netuid, self.store, self.mirrors = network, netuid, store, list(mirrors)
+        self.catalog, self.models, self.names = catalog, sorted(models), set(names)  # catalog: what the engines run
+        self.build, self.prune, self.clock = build, prune, clock
+        self.seen = catalog.digest()  # the catalog last set up, or tried
+        self.retry_at = None if complete else clock() + self.RETRY_S
+        self.chain: Any = None
+        self._said: str | None = None
+
+    def pins(self, cat: Any) -> dict[str, tuple | None]:
+        """What ``cat`` pins for each of ``models``: its engine and its weights; None for a model it does not serve."""
+        from verathos.install import plan
+
+        out: dict[str, tuple | None] = {}
+        for model_id in self.models:
+            m = cat.get(model_id)
+            out[model_id] = None if m is None or m.status not in plan.SERVED else (
+                m.engine, m.hf_repo, m.hf_revision, m.base_repo, m.base_revision)
+        return out
+
+    def round(self, supervisor: Supervisor) -> None:
+        """Read the committed catalog and set the engines up for it if it pins other weights or engines for them (or
+        a retry is due)."""
+        from verathos import catalog
+        from verathos.install import common
+        from verathos.subnet.chain import CHAIN_ERRORS, committed_catalog, current_catalog, one_line
+
+        notes = Notes(lambda text: supervisor.say("catalog", text),
+                      lambda text: supervisor.say("catalog", f"WARNING: {text}"))
+        now = self.clock()
+        try:
+            self.chain = self.chain or common.connect(self.network)
+            digest = committed_catalog(self.chain, self.netuid)
+            if digest is None or (digest == self.seen and (self.retry_at is None or now < self.retry_at)):
+                return
+            cat = self.catalog if digest == self.catalog.digest() else current_catalog(
+                self.chain, self.netuid, catalog.CatalogStore(self.store), self.mirrors)
+        except (SystemExit, *CHAIN_ERRORS, catalog.CatalogUnavailable) as exc:
+            self.chain = None
+            why = f"the committed catalog is not readable now ({one_line(exc)}); trying again in a minute"
+            if why != self._said:
+                notes.warn(why)
+                self._said = why
+            return
+        self._said, self.seen = None, digest
+        before, after = self.pins(self.catalog), self.pins(cat)
+        changed = [m for m in self.models if after[m] != before[m]]
+        if not changed and self.retry_at is None:
+            self.catalog = cat  # nothing the engines here run changed
+            return
+        if repinned := [m for m in changed if after[m] is not None]:  # the build says what serves no longer
+            notes.info(f"catalog {cat.revision} ({digest[:12]}) pins other weights or engines for "
+                       f"{', '.join(repinned)}: setting their engines up for it")
+        elif not changed:
+            notes.info(f"setting the engines up again for catalog {cat.revision} ({digest[:12]})")
+        try:
+            processes, complete = self.build(cat, notes, supervisor.snapshot())
+        except (SystemExit, Exception) as exc:
+            why = str(exc.code) if isinstance(exc, SystemExit) else f"{type(exc).__name__}: {exc}"
+            notes.warn(f"{why.splitlines()[0] if why else 'failed'}; the engines run on as they are, and their setup "
+                       f"is tried again in {self.RETRY_S / 60:.0f} minutes")
+            self.retry_at = now + self.RETRY_S
+            return
+        started, stopped = supervisor.update(processes, self.names)
+        for name in started:
+            notes.info(f"{name} restarts with what catalog {digest[:12]} pins")
+        for name in stopped:
+            notes.warn(f"{name} stops: its engine cannot run what catalog {digest[:12]} pins")
+        self.catalog = cat
+        self.retry_at = None if complete else now + self.RETRY_S
+        self.prune(supervisor.snapshot().values(), notes)
+
+    def run(self, supervisor: Supervisor) -> None:
+        while not supervisor.stopping.wait(self.WATCH_S):
+            try:
+                self.round(supervisor)
+            except Exception as exc:  # the follower never stops the engines it follows
+                supervisor.say("catalog", f"WARNING: following the catalog failed ({type(exc).__name__}: {exc}); "
+                               "trying again in a minute")
+
+
+@dataclass
+class Run:
+    """A role set up: its processes, and (``AUTO_RESTART``) how its engines follow the catalog."""
+
+    processes: list[Process]
+    follower: Follower | None = None
+
+
+# ---- the engines ----
 
 def checked_out(directory: Path) -> str | None:
     """The commit of a checkout's detached HEAD, as ``KevEngine.install`` leaves it; read without git."""
@@ -231,7 +396,7 @@ def checked_out(directory: Path) -> str | None:
 
 
 def carried(engine, purpose: str) -> bool:
-    """Whether the image holds ``engine`` (``engines.engine_for``) for ``purpose`` ("miner" or "reference"): its
+    """Whether ``engine`` (``engines.engine_for``) is in place for ``purpose`` ("miner" or "reference"): its
     environment, and for the Kev engine its checkout at the revision it is for."""
     from verathos.install import engines
 
@@ -240,28 +405,207 @@ def carried(engine, purpose: str) -> bool:
     return not isinstance(engine, engines.KevEngine) or checked_out(engine.directory) == engine.engine.revision
 
 
-def miner_engine(home: Path, model, shipped) -> tuple[object | None, str]:
-    """The engine this image serves ``model`` with on a miner, and a line on it: the engine the catalog pins, if the
-    image holds it; else, for a model of the release's shipped catalog (``shipped``) on the same engine, the revision
-    that catalog pins, with a warning (a miner may serve any engine whose answers pass: validators check answers, not
-    engines); else none, and why."""
+@dataclass(frozen=True)
+class EngineSource:
+    """Where a role's engines come from: the image's, under ``image``; with ``auto_install`` (``ENGINE_AUTO_INSTALL``)
+    also the Kev engine at a revision the image does not carry, installed into ``<data>/engines`` by the installer's
+    own code (``engines.KevEngine.install``), as a machine's setup installs it. The image's engines are complete; one in
+    the data directory is for the purposes its install completed (``INSTALLED``)."""
+
+    image: Path
+    data: Path
+    auto_install: bool = True
+
+    def installed_here(self, engine) -> bool:
+        """Whether ``engine`` is one in the data directory."""
+        return engine.directory.parent == self.data / "engines"
+
+    def ready(self, engine, purposes: Iterable[str]) -> bool:
+        purposes = set(purposes)
+        if not all(carried(engine, p) for p in purposes):
+            return False
+        if not self.installed_here(engine):
+            return True
+        try:
+            return purposes <= set((engine.directory / INSTALLED).read_text().split())
+        except OSError:
+            return False
+
+    def pinned(self, model, purposes: Iterable[str]):
+        """The engine at the revision the catalog pins for ``model``, for ``purposes``: the image's if it carries it;
+        else, with ``auto_install``, the Kev engine in the data directory, installed or to install; else None."""
+        from verathos.install import engines, plan
+
+        purposes = tuple(purposes)
+        if not plan.installable(model):
+            return None
+        engine = engines.engine_for(self.image, model)
+        if self.ready(engine, purposes):
+            return engine
+        if self.auto_install and isinstance(engine, engines.KevEngine):
+            return engines.engine_for(self.data, model)
+        return None
+
+    def carried_instead(self, model, shipped, purposes: Iterable[str]):
+        """The image's engine for a model of the release's shipped catalog (``shipped``) on the same engine, at the
+        revision that catalog pins; None for another model or engine."""
+        from verathos.install import engines, plan
+
+        before = shipped.get(model.model_id)
+        if before is None or before.engine.name != model.engine.name or not plan.installable(before):
+            return None
+        engine = engines.engine_for(self.image, before)
+        return engine if self.ready(engine, purposes) else None
+
+    def install(self, engine, purposes: Iterable[str], notes: Notes) -> None:
+        """Install ``engine`` for ``purposes`` unless it is ready: one in the data directory, by the installer's code,
+        reference first as a reference machine's setup installs both. uv's cache (``UV_CACHE_DIR``, which ``run`` puts
+        in the data directory, so the environments share its files) goes once it is done. Raises SystemExit, the
+        installer's, naming what failed."""
+        purposes = sorted(set(purposes), reverse=True)  # reference, then miner
+        if self.ready(engine, purposes):
+            return
+        notes.info(f"installing the {engine.engine.name} engine at {engine.engine.revision[:12]}, which this image "
+                   f"does not carry, into {engine.directory} (ENGINE_AUTO_INSTALL=0 turns this off)")
+        marker = engine.directory / INSTALLED
+        try:
+            for purpose in purposes:
+                engine.install(purpose)
+                if not carried(engine, purpose):
+                    raise SystemExit(f"{engine.directory}: no {purpose} environment after its install")
+                done = set(marker.read_text().split()) if marker.exists() else set()
+                marker.write_text(" ".join(sorted(done | {purpose})) + "\n")
+        finally:
+            shutil.rmtree(self.data / "cache" / "uv", ignore_errors=True)
+        notes.info(f"installed the {engine.engine.name} engine at {engine.engine.revision[:12]} for "
+                   f"{', '.join(purposes)}")
+
+    def prune(self, keep: Iterable[Path], notes: Notes) -> None:
+        """Remove the engines in the data directory that nothing runs from (``keep``): revisions the catalog pins no
+        longer, or that the image now carries, and installs that did not complete."""
+        root, keep = self.data / "engines", set(keep)
+        if not root.is_dir():
+            return
+        for directory in sorted(root.iterdir()):
+            if directory not in keep:
+                shutil.rmtree(directory, ignore_errors=True)
+                notes.info(f"removed {directory}, which no engine runs from")
+
+
+def miner_engine(source: EngineSource, model, shipped, notes: Notes) -> tuple[Any, bool]:
+    """The engine a miner serves ``model`` with: the one the catalog pins, once it is in place (the image's, or with
+    ``ENGINE_AUTO_INSTALL`` installed into the data directory); else, for a model of the release's shipped catalog on
+    the same engine, the revision the image carries, with a warning (a miner may serve any engine whose answers pass:
+    validators check answers, not engines); else None, and why. -> it, and whether installing the pinned one failed."""
+    failed = False
+    if (pinned := source.pinned(model, MINER)) is not None:
+        try:
+            source.install(pinned, MINER, notes)
+            return pinned, False
+        except SystemExit as exc:
+            failed = True
+            notes.warn(f"{model.model_id}: the {model.engine.name} engine at {model.engine.revision[:12]} did not "
+                       f"install ({str(exc.code).splitlines()[0]}); it is tried again in "
+                       f"{Follower.RETRY_S / 60:.0f} minutes while the container follows the catalog, else at the next "
+                       "start")
+    if (instead := source.carried_instead(model, shipped, MINER)) is not None:
+        notes.warn(f"{model.model_id}: the catalog pins the {model.engine.name} engine at "
+                   f"{model.engine.revision[:12]}; this image carries {instead.engine.revision[:12]} and serves with "
+                   "it (validators check answers, not engines)"
+                   + ("" if failed or source.auto_install else "; ENGINE_AUTO_INSTALL=1 installs the pinned one"))
+        return instead, failed
+    notes.warn(f"{model.model_id} runs on the {model.engine.name} engine at {model.engine.revision[:12]}, which this "
+               "image does not carry" + ("" if failed or source.auto_install else
+                                         ": ENGINE_AUTO_INSTALL=1 installs it"))
+    return None, failed
+
+
+def reference_engine(source: EngineSource, model, purposes: Iterable[str], notes: Notes) -> tuple[Any, bool]:
+    """The engine a reference machine runs ``model`` with for ``purposes``: exactly the one the catalog pins (the
+    image's, or with ``ENGINE_AUTO_INSTALL`` installed into the data directory); else None, and why. -> it, and whether
+    installing it failed."""
+    purposes = tuple(purposes)
+    if (pinned := source.pinned(model, purposes)) is None:
+        notes.warn(f"{model.model_id} is not served: the catalog pins the {model.engine.name} engine at "
+                   f"{model.engine.revision[:12]}, which this image does not carry, and references run exactly what "
+                   "the catalog pins" + ("" if source.auto_install else " (ENGINE_AUTO_INSTALL=1 installs it)"))
+        return None, False
+    try:
+        source.install(pinned, purposes, notes)
+        return pinned, False
+    except SystemExit as exc:
+        notes.warn(f"{model.model_id}: the {model.engine.name} engine at {model.engine.revision[:12]} did not install "
+                   f"({str(exc.code).splitlines()[0]}); its engines wait for it, tried again in "
+                   f"{Follower.RETRY_S / 60:.0f} minutes while the container follows the catalog, else at the next "
+                   "start")
+        return None, True
+
+
+def miner_engines(source: EngineSource, shipped, gpus: list, chosen: Mapping[int, str], ports: Mapping[int, int],
+                  endpoint_ids: Mapping[int, str], hf_home: Path) -> Build:
+    """How a miner's engines are set up for a catalog: per GPU (``chosen``: its model), its model's engine
+    (``miner_engine``) and the model's pinned weights, then ``engine-gpu<index>`` serving it on its port."""
     from verathos.install import engines, plan
 
-    if not plan.installable(model):
-        return None, f"{model.model_id} runs on the {model.engine.name} engine, which this image does not carry"
-    engine = engines.engine_for(home, model)
-    if carried(engine, "miner"):
-        return engine, ""
-    before = shipped.get(model.model_id)
-    if before is not None and before.engine.name == model.engine.name and plan.installable(before):
-        fallback = engines.engine_for(home, before)
-        if carried(fallback, "miner"):
-            return fallback, (f"{model.model_id}: the catalog pins the {model.engine.name} engine at "
-                              f"{model.engine.revision[:12]}; this image carries {before.engine.revision[:12]} and "
-                              "serves with it (validators check answers, not engines); the image of the release that "
-                              "ships the new revision runs it")
-    return None, (f"{model.model_id} runs on the {model.engine.name} engine at {model.engine.revision[:12]}, which "
-                  "this image does not carry (the image of a newer release may)")
+    def build(cat, notes: Notes, running: Mapping[str, Process]) -> tuple[list[Process], bool]:
+        out: list[Process] = []
+        complete, serving = True, {}
+        for g in gpus:
+            name, model_id = f"engine-gpu{g.index}", chosen[g.index]
+            model = cat.get(model_id)
+            if model is None or model.status not in plan.SERVED:
+                notes.warn(f"catalog {cat.digest()[:12]} no longer serves {model_id}: the miner withdraws endpoint "
+                           f"{endpoint_ids[g.index]}, and the next start (docker compose restart) gives GPU "
+                           f"{g.index} another model")
+                out += [running[name]] if name in running else []
+                continue
+            if model_id not in serving:
+                engine, failed = miner_engine(source, model, shipped, notes)
+                if engine is not None:
+                    engines.download(engine.python("miner"), model, hf_home)
+                serving[model_id], complete = engine, complete and not failed
+            if (engine := serving[model_id]) is None:
+                out += [running[name]] if name in running else []
+                continue
+            out.append(Process(name, engine.command("miner", model, ports[g.index]), engine.directory,
+                               engine.environment_variables("miner", f"cuda:{g.index}", hf_home)))
+        return out, complete
+
+    return build
+
+
+def reference_engines(source: EngineSource, placement: Mapping[str, str], ports: Mapping[str, int],
+                      purposes: tuple[str, ...], hf_home: Path) -> Build:
+    """How a reference machine's engines are set up for a catalog: per model its engine at exactly what the catalog
+    pins (``reference_engine``, for ``purposes``) and the pinned weights, then each placed engine (``placement``:
+    ``plan.engine_key`` -> where it runs), ``<kind>-<model>`` on its port. A model whose engine cannot run what the
+    catalog pins runs no engine."""
+    from verathos.install import engines, plan
+    from verathos.install import reference as setup
+
+    def build(cat, notes: Notes, running: Mapping[str, Process]) -> tuple[list[Process], bool]:
+        out: list[Process] = []
+        complete, serving = True, {}
+        for item in sorted(placement):
+            kind, model_id = item.split("/", 1)
+            name, model = f"{kind}-{model_id}", cat.get(model_id)
+            if model is None or model.status not in plan.SERVED:
+                notes.warn(f"catalog {cat.digest()[:12]} no longer serves {model_id}: its engines run on until the "
+                           "next start (docker compose restart)")
+                out += [running[name]] if name in running else []
+                continue
+            if model_id not in serving:
+                engine, failed = reference_engine(source, model, purposes, notes)
+                if engine is not None:
+                    engines.download(engine.python("reference"), model, hf_home)
+                serving[model_id], complete = engine, complete and not failed
+            if (engine := serving[model_id]) is not None:
+                purpose = setup.PURPOSE[kind]
+                out.append(Process(name, engine.command(purpose, model, ports[item]), engine.directory,
+                                   engine.environment_variables(purpose, placement[item], hf_home)))
+        return out, complete
+
+    return build
 
 
 def install_engines(home: Path = ENGINES) -> None:
@@ -298,9 +642,22 @@ def force_data(config: dict, data: Path, state: str, catalog_dir: bool = True) -
     return config
 
 
-def miner(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> list[Process]:
+def engine_lines(source: EngineSource, follow: bool, data: Path) -> list[str]:
+    """The plan's lines on the engines: where an engine the image does not carry comes from, and whether they follow
+    the catalog while the container runs."""
+    return [("ENGINE_AUTO_INSTALL on: an engine revision the catalog pins and this image does not carry is installed "
+             f"into {data / 'engines'} by the installer's code" if source.auto_install else
+             "ENGINE_AUTO_INSTALL off: only the engines this image carries run"),
+            ("AUTO_RESTART on: when the subnet owner commits a catalog pinning other weights or engines for these "
+             "models, their engines are set up for it and restarted while the container runs" if follow else
+             "AUTO_RESTART off: a catalog pinning other weights or engines applies at the next start (docker compose "
+             "restart)")]
+
+
+def miner(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> Run:
     """Set the miner up as ``verathos-miner init --yes`` does, from ``env``; -> its engines, one per GPU, and the
-    miner."""
+    miner, and how the engines follow the catalog (``AUTO_RESTART``; not with ``NO_PUBLISH``, which serves the shipped
+    catalog)."""
     from pydantic import ValidationError
 
     from verathos import catalog
@@ -323,6 +680,9 @@ def miner(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> li
     if name and role != "worker":
         raise SystemExit("NAME names a worker's endpoints (WORKER=1)")
     firewall = flag(env, "FIREWALL", True)
+    source = EngineSource(home, data, flag(env, "ENGINE_AUTO_INSTALL", True))
+    follow = flag(env, "AUTO_RESTART", True) and not no_publish
+    notes = Notes(info, warn)
 
     step("Wallet and chain")
     network, netuid = common.network_and_netuid(chain_options(env), existing)
@@ -358,15 +718,15 @@ def miner(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> li
              f"{setup.MIN_DRIVER_CUDA[0]}.{setup.MIN_DRIVER_CUDA[1]} or newer: update the host's driver")
     for g in gpus:
         info(g.describe())
-    served = plan.servable_models(cat)
-    serving = {}
-    for m in served:
-        engine, line = miner_engine(home, m, shipped)
-        if engine is not None:
-            serving[m.model_id] = engine
-        if line:
-            (warn if engine is not None else info)(line)
-    models = {m.model_id: m for m in served if m.model_id in serving}
+    models = {}
+    for m in plan.servable_models(cat):
+        if not plan.installable(m):
+            info(f"{m.model_id} runs on the {m.engine.name} engine, which this image does not carry")
+        elif source.pinned(m, MINER) is None and source.carried_instead(m, shipped, MINER) is None:
+            info(f"{m.model_id} runs on the {m.engine.name} engine at {m.engine.revision[:12]}, which this image does "
+                 "not carry" + ("" if source.auto_install else " (ENGINE_AUTO_INSTALL=1 installs it)"))
+        else:
+            models[m.model_id] = m
     if not models:
         raise SystemExit("no catalog model this image serves: run the image of the newest release")
     scored = {m for m in models if models[m].status == "active"}
@@ -417,12 +777,15 @@ def miner(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> li
          "catalog has miners enforce it; the miner says at its start whether the kernel drops the others too (host "
          "network and NET_ADMIN) or its own process alone" if firewall else
          "firewall off: anyone reaches the miner's port (FIREWALL=on turns it on)")
+    for line in engine_lines(source, follow, data):
+        info(line)
     info("self-update off: a release is a new image")
 
-    step("Weights")
+    step("Engines and weights")
     hf_home = data / "hf"
-    for model_id in sorted(set(chosen.values())):
-        engines.download(serving[model_id].python("miner"), models[model_id], hf_home)
+    build = miner_engines(source, shipped, gpus, chosen, {g.index: engine_ports[endpoint_ids[g.index]] for g in gpus},
+                          endpoint_ids, hf_home)
+    engine_processes, complete = build(cat, notes, {})
 
     step("Configuration")
     config = setup.miner_config(existing, network=network, netuid=netuid, wallet_name=wallet_name,
@@ -444,15 +807,16 @@ def miner(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> li
     record.engines = {eid: {"gpu": g, "model": chosen[g], "port": engine_ports[eid],
                             "manual": choices[g].reason in plan.BY_HAND} for g, eid in endpoint_ids.items()}
     record.save(data)
+    source.prune({p.directory for p in engine_processes}, notes)
 
-    processes = []
-    for g in gpus:
-        model, engine = models[chosen[g.index]], serving[chosen[g.index]]
-        processes.append(Process(f"engine-gpu{g.index}",
-                                 engine.command("miner", model, engine_ports[endpoint_ids[g.index]]),
-                                 engine.directory, engine.environment_variables("miner", f"cuda:{g.index}", hf_home)))
-    processes.append(Process("miner", [str(Path(sys.prefix) / "bin" / "verathos-miner"), "--config", str(config_path)]
-                             + (["--no-publish"] if no_publish else []), data))
+    processes = [*engine_processes,
+                 Process("miner", [str(Path(sys.prefix) / "bin" / "verathos-miner"), "--config", str(config_path)]
+                         + (["--no-publish"] if no_publish else []), data)]
+    follower = Follower(network=network, netuid=netuid, store=data / "catalog",
+                        mirrors=config.get("catalog_mirrors", []), catalog=cat, models=set(chosen.values()),
+                        names=[f"engine-gpu{g.index}" for g in gpus], build=build,
+                        prune=lambda running, said: source.prune({p.directory for p in running}, said),
+                        complete=complete) if follow else None
 
     step("Running")
     address = axon_base(public_ip, port)
@@ -461,7 +825,7 @@ def miner(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> li
          + ("serves its endpoints to its primary" if role == "worker" else "publishes its manifest"))
     info(f"check from another machine: curl -sk --pinnedpubkey '{tls.curl_pin(identity.pin)}' {address}"
          + (ENDPOINTS_PATH if role == "worker" else "/v1/manifest"))
-    return processes
+    return Run(processes, follower)
 
 
 def validator(env: Mapping[str, str], data: Path = DATA, remote_dir: Path = REMOTE_ENGINES) -> Process:
@@ -568,10 +932,10 @@ def validator(env: Mapping[str, str], data: Path = DATA, remote_dir: Path = REMO
                    data)
 
 
-def reference(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> list[Process]:
+def reference(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> Run:
     """Set a reference machine up as ``verathos-reference init --yes`` does, from ``env``; -> its engines (each model's
-    float32 reference and bfloat16 screen) and the front. Writes ``<data>/reference-engines.json``, the validators'
-    file."""
+    float32 reference and bfloat16 screen) and the front, and how the engines follow the catalog (``AUTO_RESTART``).
+    Writes ``<data>/reference-engines.json``, the validators' file."""
     from pydantic import ValidationError
 
     from verathos import catalog
@@ -590,6 +954,10 @@ def reference(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -
     callers = from_options(lambda: setup.parse_callers(value(env, "ALLOW")))
     screens = flag(env, "SCREENS", True)
     device = (value(env, "DEVICE") or "auto").lower()
+    source = EngineSource(home, data, flag(env, "ENGINE_AUTO_INSTALL", True))
+    follow = flag(env, "AUTO_RESTART", True)
+    purposes = ("reference", "miner") if screens else ("reference",)  # a screen is the miners' engine
+    notes = Notes(info, warn)
 
     step("Catalog")
     network, netuid = common.network_and_netuid(chain_options(env), existing)
@@ -604,13 +972,10 @@ def reference(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -
     step("Models and memory")
     models = {}
     for m in from_options(lambda: setup.choose_models(cat, plan.parse_models(value(env, "MODEL")), None)):
-        engine = engines.engine_for(home, cat.get(m))
-        if all(carried(engine, purpose) for purpose in (("reference", "miner") if screens else ("reference",))):
+        if source.pinned(cat.get(m), purposes) is not None:  # references and screens run exactly what it pins
             models[m] = cat.get(m)
-        else:  # references and screens run exactly what the catalog pins
-            warn(f"{m} is not served: the catalog pins the {engine.engine.name} engine at "
-                 f"{engine.engine.revision[:12]}, which this image does not carry; run the image of the release that "
-                 "ships it")
+        else:
+            reference_engine(source, cat.get(m), purposes, notes)  # says why it is not served
     if not models:
         raise SystemExit("no model this image serves as the catalog pins it: run the image of the newest release")
     gpus = host.gpus()
@@ -652,11 +1017,13 @@ def reference(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -
             info(f"{model} screen: no GPU has room left; the reference recomputes every check of the model itself")
     info(f"front https://{'[' + public_ip + ']' if ':' in public_ip else public_ip}:{port} (TLS), answering only "
          f"{', '.join(callers)} (every other address is dropped) and only with the key")
+    for line in engine_lines(source, follow, data):
+        info(line)
 
-    step("Weights")
+    step("Engines and weights")
     hf_home = data / "hf"
-    for model in sorted(models):
-        engines.download(engines.engine_for(home, models[model]).python("reference"), models[model], hf_home)
+    build = reference_engines(source, placement, ports, purposes, hf_home)
+    engine_processes, complete = build(cat, notes, {})
 
     step("Configuration")
     config = force_data(setup.reference_config(existing, network=network, netuid=netuid, public_ip=public_ip, port=port,
@@ -677,15 +1044,14 @@ def reference(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -
                              "device": placement[item], "port": ports[item]} for item in placement}
     record.options = {"screens": screens}
     record.save(data)
+    source.prune({p.directory for p in engine_processes}, notes)
 
-    processes = []
-    for item in sorted(placement):
-        kind, model = item.split("/", 1)
-        engine, purpose = engines.engine_for(home, models[model]), setup.PURPOSE[kind]
-        processes.append(Process(f"{kind}-{model}", engine.command(purpose, models[model], ports[item]),
-                                 engine.directory, engine.environment_variables(purpose, placement[item], hf_home)))
-    processes.append(Process("front", [str(Path(sys.prefix) / "bin" / setup.FRONT), "--config", str(config_path)],
-                             data))
+    processes = [*engine_processes,
+                 Process("front", [str(Path(sys.prefix) / "bin" / setup.FRONT), "--config", str(config_path)], data)]
+    follower = Follower(network=network, netuid=netuid, store=data / "catalog", mirrors=[], catalog=cat,
+                        models=set(models), names=[f"{item.replace('/', '-', 1)}" for item in placement], build=build,
+                        prune=lambda running, said: source.prune({p.directory for p in running}, said),
+                        complete=complete) if follow else None
 
     step("For the validators")
     for line in setup.engines_lines(document):
@@ -693,7 +1059,7 @@ def reference(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -
     info(f"TLS pin {identity.pin}. {engines_path} holds the engines' URLs, the pin and the key (keep it private): copy "
          "it into the REMOTE_ENGINES_DIR of each validator machine, then start the validator there "
          "(compose.validator-full.yml)")
-    return processes
+    return Run(processes, follower)
 
 
 # ---- the health check ----
@@ -735,7 +1101,9 @@ def run(role: str, env: Mapping[str, str], data: Path, engines_home: Path, remot
             sys.stdout.flush()
             os.chdir(p.directory)
             os.execv(p.command[0], p.command)
-        processes = miner(env, data, engines_home) if role == "miner" else reference(env, data, engines_home)
+        # an engine installed while the container runs: uv's cache on the data volume, beside the environments
+        os.environ["UV_CACHE_DIR"] = str(data / "cache" / "uv")
+        role_run = miner(env, data, engines_home) if role == "miner" else reference(env, data, engines_home)
     except SystemExit as exc:
         if not isinstance(exc.code, str):
             raise
@@ -749,7 +1117,7 @@ def run(role: str, env: Mapping[str, str], data: Path, engines_home: Path, remot
         sleep(SETUP_RETRY_S)
         return 1
     sys.stdout.flush()
-    return Supervisor(processes).run()
+    return Supervisor(role_run.processes).run(role_run.follower)
 
 
 def main(argv: list[str] | None = None, environ: Mapping[str, str] | None = None) -> None:
