@@ -9,9 +9,9 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[chain,ops]"
 .venv/bin/verathos-subnet --network finney --netuid 96 status
 ```
 
-`status` shows the UID cap, the mechanisms and their emission split, the owner hotkey, the committed catalog digest
-and its mechanism, the digest of the catalog shipped with this code, the current epoch and the committed catalog's
-miner share in it, its usage pool with the current period, the subnet's weights version key and this release's
+`status` shows the UID cap, the mechanisms and their emission split, the owner hotkey, the committed catalog digest, its
+mechanism, auditor and gateways, the digest of the catalog shipped with this code, the current epoch and the committed
+catalog's miner share in it, its usage pool with the current period, the subnet's weights version key and this release's
 ([Releases](#releases-and-the-weights-version-key)).
 
 ## Mechanisms
@@ -69,9 +69,23 @@ values, on an H100 80GB, relative to kev-4b:
 The ratio differs by GPU: a larger model costs relatively less on a larger GPU. Re-measure on the reference GPU when
 an engine gets faster, and replace an estimate once the model's standard mix is measured.
 
-`gateways` lists the hotkeys of the subnet's gateways (`GATEWAY.md`): miners serve them like validators, without
-the per-caller limit, and the auditor checks a sample of their answers. Rotating a gateway hotkey is a catalog
-commit.
+`gateways` lists the subnet's gateways (`GATEWAY.md`), each a `hotkey` and its `egress` addresses, the public IP
+addresses its requests to miners come from: miners serve them like validators, without the per-caller limit, and the
+auditor checks a sample of their answers. Rotating a gateway hotkey or moving a gateway is a catalog commit.
+
+`auditor` names the auditor's service: `tls`, the pin of its TLS certificate (`DISCOVERY.md`), and `egress`, the
+public IP addresses its requests to miners come from (identity challenges, canaries, tests). Miners, validators,
+light validators and gateways reach the auditor only with the certificate the committed catalog names.
+
+```json
+"auditor": {"tls": "<pin, 64 hex digits>", "egress": ["<auditor ip>"]},
+"gateways": [{"hotkey": "<gateway hotkey>", "egress": ["<gateway ip>", "<gateway ipv6>"]}]
+```
+
+Addresses are public unicast IP literals written as the chain writes axons (IPv6 in its shortest form), at most 16
+per entry. `commit-catalog` refuses a catalog without `auditor.tls` and `auditor.egress`, or with a gateway without
+`egress`. With the validators' published addresses they form the callers' allowlist
+(`protocol.callers.allowlist`).
 
 `scoring.validator_min_stake` is the stake a validator needs for miners to answer it, in the unit of the
 metagraph's `S` (alpha stake plus TAO stake weighted as for validator permits); 0, or a catalog without it, means any
@@ -111,7 +125,10 @@ To publish a catalog:
    ```
 
    It validates the file (an unknown `throughput_audit` setting is an error, and so is a mechanism the subnet does
-   not have), stores it in `catalog_dir` and commits its digest. Mirrors (`catalog_mirrors` in miner and validator
+   not have), fills in `auditor.tls` and `auditor.egress` where the file names none, from the auditor's
+   configuration on this machine (`--validator-config`, default `~/.verathos/validator.json`: the certificate in
+   its `state_dir` and its `egress_ips`), refuses an `auditor.tls` other than that certificate's, stores the result
+   in `catalog_dir` and commits its digest. Mirrors (`catalog_mirrors` in miner and validator
    configs) can serve the same file; every copy is checked against the digest.
 
 Miners and validators check the commitment every minute: miners re-publish their manifests (measuring again if a
@@ -121,6 +138,17 @@ epoch. A changed request mix lowers declared capacities while miners measure aga
 announce it. Announce model changes before committing so validators can start a reference engine for a new model
 and miners can deploy it: a validator without a reference engine for an `active` model stops. A model family
 whose engine needs new code, or a protocol change, still goes out as a code release.
+
+## The auditor's certificate
+
+The auditor's validator creates its TLS key and certificate in its `state_dir` (`tls.key`, `tls.crt`) at first
+start, and logs at every start and catalog change whether the committed catalog names its pin; while it does not
+(`CRITICAL`), no node reaches the auditor. Catalogs are fetched from the auditor's axon accepting any certificate,
+since their digest proves them, so a catalog naming a new pin reaches every node.
+
+To rotate it: stop the auditor, delete `tls.key` and `tls.crt` in its `state_dir`, start it (it logs the new pin),
+and run `commit-catalog` on its machine with a catalog file without `auditor.tls`. Nodes follow the commitment
+within a minute; until then their requests to the auditor fail and are retried, and gateways keep their routes.
 
 ## Miner share
 

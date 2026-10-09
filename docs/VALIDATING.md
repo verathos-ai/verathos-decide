@@ -29,7 +29,8 @@ Both modes:
 - A hotkey registered on the subnet with a validator permit, which setting weights takes.
 
 A light validator needs nothing more: no GPU, no reference engine, no stake beyond the permit and no public IP. It
-reads the chain and the auditor's `GET /v1/network`, and keeps its clock within 5 minutes of the auditor's (NTP).
+reads the chain and the auditor's `GET /v1/network` (over TLS, with the pin the catalog names), and keeps its clock
+within 5 minutes of the auditor's (NTP).
 
 A full validator also needs:
 - The stake miners require of a validator's hotkey: at least the catalog's
@@ -61,7 +62,8 @@ A full validator also needs:
   test up to about 5,000 endpoints of the model. Beyond what fits, the checks run every endpoint's first before any
   second, in a random order (`THROUGHPUT_AUDIT.md`).
 - A public IP of its own: behind most NATs a machine cannot reach other machines that share its public IP through
-  that IP, so a validator next to miners on one NAT cannot send them canaries.
+  that IP, so a validator next to miners on one NAT cannot send them canaries. Its requests to miners leave from the
+  addresses in `egress_ips`, which it publishes ([its commitment](#tls-and-the-validators-commitment)).
 
 ## References: resident or one at a time
 
@@ -167,6 +169,7 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--references` | `resident` (every reference a service) or `sequential` (one at a time, started by the validator); default: as set up before, else resident while the active models' references all fit in the free memory ([References](#references-resident-or-one-at-a-time)) |
 | `--candidates` | also run references for the catalog's candidate models, in the memory the active ones leave; a later run keeps them, `--no-candidates` removes them |
 | `--dry-run` | compute weights without setting them; `--no-dry-run` sets them again |
+| `--egress-ip` | full: a public address its requests to miners come from (repeat for several); default: as configured, else the machine's detected public IPv4 address |
 | `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
 | `--no-auto-update` | the validator does not update its code by itself to each new release; `--auto-update` turns that on again (off for the subnet owner's validator) ([Update](#update)) |
 | `--no-service` | no root, no system packages and no services: print the commands to run under a process manager you run ([Without root](#without-root-pm2-or-another-process-manager)) |
@@ -197,8 +200,9 @@ What it does (a full validator; light, see below):
    repository's own inference code; then downloads the weights at `hf_revision` and the base model at
    `base_revision`; the references run offline from that copy;
 6. writes `~/.verathos/validator.json` ([3. Configure](#3-configure)) with the `references` (one at a time: with the
-   command that serves each), `reference_mode` and `state_dir` (`~/.verathos/validator`: the canary secret, the score
-   history and the last status; keep it);
+   command that serves each), `reference_mode`, `egress_ips` and `state_dir` (`~/.verathos/validator`: the canary
+   secret, the score history, the last status and, with a service, its TLS key and certificate; keep it); on the
+   subnet owner's machine it creates the TLS certificate and prints its pin for the catalog's `auditor.tls`;
 7. starts the references (`verathos-reference-kev-4b`, ...) on `127.0.0.1` and the validator
    (`verathos-validator`) as services, waits for the references to load, and shows the validator's start. One at a
    time, only the validator is a service: it starts each reference itself when it checks the model, on the same port.
@@ -312,7 +316,9 @@ stay). Wallets are never touched.
 | Problem | What to do |
 |---|---|
 | `UID ... has no validator permit yet` | the chain takes weights, and miners answer, only from validators with a permit, which follows the stake |
-| `epoch ...: no weights set: no results of the source verified by block ...` | light: the reason follows. The auditor's axon unreachable, or its results not out yet, cost that epoch only, and the weights set before stay on chain; `not signed within 300 s of this machine's clock`: sync the clock (NTP); `it lists no weights` or `it is not signed`: the auditor runs an older release |
+| `epoch ...: no weights set: no results of the source verified by block ...` | light: the reason follows. The auditor's axon unreachable, or its results not out yet, cost that epoch only, and the weights set before stay on chain; `not signed within 300 s of this machine's clock`: sync the clock (NTP); `it lists no weights` or `it is not signed`: the auditor runs an older release; `names no TLS pin for the auditor`: the committed catalog does not name the auditor's certificate yet; `certificate pin ... is not the pinned ...`: the source serves another certificate than the catalog (or its commitment) names, as during a rotation; `commits no TLS pin`: the `source_hotkey` validator publishes no identity |
+| `catalog ... names ... as the auditor's TLS pin, but this service's certificate has pin ...` | the auditor: commit a catalog naming its pin, `commit-catalog` on its machine (`SUBNET_ADMIN.md`) |
+| `no egress_ips configured` | full: set the public addresses its requests to miners come from (`--egress-ip`, or `egress_ips` in `validator.json`) |
 | `this is the subnet owner's hotkey: its validator is the auditor ... runs in full mode` | the owner's validator is never light: `install.sh validator --full` |
 | `miners refuse validators below validator_min_stake` | add stake to the hotkey until its `S` reaches the catalog's minimum; miners see it within 10 minutes |
 | `the kev-9b reference needs about 42 GiB ...; not enough is free` | free memory or add some; `--device` chooses between GPU and RAM |
@@ -419,14 +425,15 @@ of a full validator:
 | `mode` | `full` | `light` or `full` ([Two modes](#two-modes)); the subnet owner's validator does not start in light mode |
 | `source_hotkey` | the subnet owner's | light: the validator whose published weights to set; full with references one at a time: the validator whose results the models not checked take. Another validator must hold a validator permit and serve its results (a full validator with `public_host`) |
 | `mechid` | the catalog's | mechanism the weights are set on and manifests are accepted for, instead of the catalog's `mechanism`; leave it unset to follow the catalog |
-| `references` | {} | full: model id -> the model's fp32 reference engine: a URL, or `{"url", "api_key"}` for a remote engine behind https (the Kev server takes its key from `KEV_API_KEY`), or for references one at a time `{"url", "command", "directory", "environment"}`: the command that serves it at the URL on `127.0.0.1`, which the validator runs when it checks the model (the installer writes them; a reference without a command is taken as running). Every `active` model needs one: the validator does not start without, and stops when a new catalog activates a model it has none for; `candidate` models without one are not audited by this validator. Light validators ignore it |
+| `references` | {} | full: model id -> the model's fp32 reference engine: a URL (plain http on `127.0.0.1` only), or `{"url", "api_key", "tls_pin"}` for a remote engine over https, accepted by its certificate's pin or, without one, by a public CA's certificate for its hostname (the Kev server takes its key from `KEV_API_KEY`), or for references one at a time `{"url", "command", "directory", "environment"}`: the command that serves it at the URL on `127.0.0.1`, which the validator runs when it checks the model (the installer writes them; a reference without a command is taken as running). Every `active` model needs one: the validator does not start without, and stops when a new catalog activates a model it has none for; `candidate` models without one are not audited by this validator. Light validators ignore it |
 | `reference_mode` | `resident` | full: `resident` or `sequential` (one at a time, [References](#references-resident-or-one-at-a-time)); the subnet owner's validator does not start one at a time |
 | `audit_screens` | {} | auditor only: model id -> a bf16 engine (same forms) that screens the sampled test answers; an answer it flags counts as wrong only once the fp32 reference confirms it |
 | `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database; references one at a time: their times (`references.json`) and logs (`references/`); light: the last epoch whose weights it set |
 | `dry_run` | false | compute weights without setting them (light: log the weights it would set) |
 | `auto_update` | false (the installer sets true, except for the subnet owner's validator) | install each new release by itself between epochs, then exit for the process manager to start it ([Update](#update)) |
-| `public_host`, `port` | -, 8091 | public IP and port of the validator's service; needed by the subnet owner and the auditor. A full validator that sets them serves its status and the weights it sets there, for light validators that name it in `source_hotkey` |
-| `catalog_mirrors` | [] | extra catalog sources, URL templates with `{digest}`, tried after the owner's axon |
+| `public_host`, `port` | -, 8091 | public IP and port of the validator's service (TLS, its certificate in `state_dir`); needed by the subnet owner and the auditor. A full validator that sets them serves its status and the weights it sets there, for light validators that name it in `source_hotkey` |
+| `egress_ips` | [] | full: the public IP addresses its requests to miners come from, published in its chain commitment (the installer detects the machine's); the auditor's are in the catalog |
+| `catalog_mirrors` | [] | extra catalog sources, https URL templates with `{digest}`, tried after the owner's axon |
 | `catalog_dir` | `~/.verathos/catalog` | local catalog store; the owner's validator serves catalogs from it |
 
 Scoring settings (canaries, statistical window, EMA, probation) come from the catalog, so every validator applies
@@ -445,7 +452,9 @@ answer (at most 15 minutes), so references restarted with it can load their mode
 A light validator, each epoch (`epoch_blocks` from the catalog, default 180 blocks):
 1. waits until the source (the subnet owner's validator, or `source_hotkey`) can have scored the epoch: the source
    publishes its results after its canaries, from `canary_spread_fraction` (0.6) of the epoch on;
-2. then every 30 s fetches the source's `GET /v1/network` from the axon the chain lists for the source hotkey, and
+2. then every 30 s fetches the source's `GET /v1/network` from the axon the chain lists for the source hotkey, over
+   TLS accepting only the source's certificate (the auditor's by the catalog's `auditor.tls`, another validator's by
+   the pin in its commitment), and
    sets the weights in it only if the document is signed by the source hotkey under `verathos/network-status/v1` for
    this netuid, was signed within 5 minutes of the validator's clock (the source signs it again every 30 s), is for
    the current or the previous epoch and for a later epoch than the weights it set last;
@@ -465,11 +474,13 @@ Per epoch a full validator:
    applies a new audit policy at once; each epoch is scored under the catalog committed at its first block, so
    models, tolerances and the epoch length change for every validator at the same epoch;
 2. reads axons and commitments and accepts each miner's manifest if it is signed by the hotkey, matches the
-   committed digest, lists its endpoints at public addresses (the axon or the miner's other machines, `DISCOVERY.md`)
-   and was built for the current catalog (or, for one epoch after a change, the previous one) and for its mechanism.
+   committed digest, lists its endpoints at public https addresses (the axon or the miner's other machines,
+   `DISCOVERY.md`), names each machine's TLS pin, came from an axon presenting the pinned certificate, and was built
+   for the current catalog (or, for one epoch after a change, the previous one) and for its mechanism.
    While a hotkey's axon serves no acceptable manifest, the one it last served stands in for up to 3 epochs, as long
    as the commitment still names it, so the endpoints on the miner's other machines keep their checks;
 3. challenges each endpoint at its URL to sign a nonce with the listing hotkey, while it computes the references;
+   every request to a miner machine accepts only the certificate its manifest pins;
    a host that is not the hotkey's gets no more than one challenge per epoch;
 4. derives the epoch's canaries from its secret, computes the references (within 30% of the canaries' time; one at
    a time, those of the models that fit, [References](#references-resident-or-one-at-a-time)), sends each endpoint
@@ -491,10 +502,22 @@ restarts: it holds the canary secret, the score history (including the last epoc
 score an epoch twice) and the catalog followed (so manifests built for the previous catalog stay accepted for the
 rest of their epoch).
 
+## TLS and the validator's commitment
+
+A validator that runs a service (the subnet owner's, and full validators with `public_host`) serves TLS only, with
+a key and self-signed certificate it creates once in `state_dir` (`tls.key`, `tls.crt`) and logs with its pin;
+delete both to rotate them. Clients accept it by its pin (`DISCOVERY.md`): the auditor's from the catalog, another
+validator's from its chain commitment. A full validator other than the subnet owner's commits, at start and only when
+it changed, `verathos/validator/v1 <pin> <egress>`: its service's pin (`-` without a service) and its `egress_ips`
+(`-` for none), the addresses miners can admit its requests from. Light validators commit nothing; the subnet owner's
+hotkey commits the catalog, which names the auditor's pin and addresses. A hotkey that commits a miner's manifest is
+not used for a validator.
+
 ## Throughput audit
 
 Every full validator follows the test schedule from chain data and holds its canaries while a test's traffic runs. It
-fetches the auditor's verdicts for the epoch from the auditor's axon (`GET /v1/throughput/<epoch>`), checks they are
+fetches the auditor's verdicts for the epoch from the auditor's axon (`GET /v1/throughput/<epoch>`, over TLS with the
+catalog's `auditor.tls`), checks they are
 signed by the auditor hotkey, and scores each endpoint by the capacity credited there for the model it serves now.
 It applies a wrong answer proven in a test only after checking the miner's receipt in the evidence and, if it runs
 a reference engine for the model, recomputing the answer (if that engine does not answer, it applies the auditor's
@@ -530,7 +553,9 @@ at once. Behind a reverse proxy on the same host, the client's address comes fro
 service takes from loopback peers only.
 
 If the validator's hotkey is the auditor, it also:
-- serves the verdicts on `port` and points its axon at `public_host:port`, where miners and validators find it;
+- serves the verdicts on `port` and points its axon at `public_host:port`, where miners and validators find it, with
+  the certificate the catalog's `auditor.tls` pins (it logs a CRITICAL line when the committed catalog names another;
+  `SUBNET_ADMIN.md`);
 - re-discovers miners every 2 minutes, so new endpoints join the next test;
 - runs every scheduled test with the load generator, checks the sampled answers on its reference engines, and
   confirms tests once their selection block is final;

@@ -4,12 +4,16 @@ The gateway serves users from the miners' proven capacity. It runs next to the s
 the auditor: the auditor tells it which endpoints it may use, and checks a sample of the answers it receives.
 
 ```
- user ── HTTPS ──► reverse proxy ──► gateway ──── signed request ────► miner endpoint
+ user ── HTTPS ──► reverse proxy ──► gateway ── signed request, TLS ──► miner endpoint
                                        │   ◄── answers + signed receipt ──┘
                                        │
-                                       ├── GET /v1/routes ─────────────► owner validator (auditor)
+                                       ├── GET /v1/routes (TLS) ────────► owner validator (auditor)
                                        └── POST /v1/gateway/samples ───►   recomputes a sample
 ```
+
+Every connection the gateway makes is TLS. Miners and the auditor are reached by IP address with self-signed
+certificates, each accepted by its pin (`DISCOVERY.md`): a miner machine's from the route the auditor signed, the
+auditor's from the committed catalog (`auditor.tls`), which the gateway follows on chain.
 
 | | Code |
 |---|---|
@@ -116,12 +120,10 @@ answer to a user carries only the receipt. Validators check that the miner answe
 auditor's word for the wrongness, as they take it for capacity; test evidence, whose requests are synthetic, stays
 fully checkable by every validator.
 
-Between the gateway and the miners, requests and answers travel over plain HTTP: a route's URL is the machine that
-serves the endpoint (`http://ip:port/e/<id>`), as the protocol has it. So do the sampled exchanges to the auditor, unless `auditor_url`
-points elsewhere. The signatures keep anyone from altering them, not from reading them: whoever is on the path
-between the gateway and a miner, or the auditor, can read the users' requests and answers. When the gateway runs next
-to the auditor, set `auditor_url` to its loopback or private address (for example `http://127.0.0.1:8091`), so the
-samples never leave the host or the private network.
+Between the gateway and the miners, and to the auditor, requests and answers travel over TLS, each certificate
+accepted by its pin only: whoever is on the path reads nothing, and a machine presenting another certificate gets no
+request. When the gateway runs next to the auditor, `auditor_url` can name its loopback or private address
+(`https://127.0.0.1:<port>`); the auditor's service is reached there with the same pin.
 
 ## Routes
 
@@ -129,8 +131,9 @@ samples never leave the host or the private network.
 their URL (`DISCOVERY.md`), credited in the current verdicts (the previous epoch's while the current ones wait for a
 test to settle; qualified, not drifted), of `active` models, whose hotkey has no wrong answer proven there or since,
 and is not on probation at the owner's validator; with their URL (the machine serving the endpoint, which need not be
-the axon), credited capacity and test latency. The gateway uses a route only at a URL a manifest may list, on a
-public address; any other is logged and left out, so not even a signed table can send it into a private network. While the verdicts cover no confirmed test (the auditor missed the
+the axon), the pin of that machine's certificate, credited capacity and test latency. The gateway uses a route only at
+an https URL a manifest may list, on a public address; any other is logged and left out, so not even a signed table
+can send it into a private network. While the verdicts cover no confirmed test (the auditor missed the
 tests or they were void), the credits come from the latest confirmed test the auditor holds, whatever its age. The
 table is signed by the auditor hotkey. The gateway polls it every 30 s, uses only tables signed by the subnet owner's
 hotkey, newer than its own and issued at most 5 minutes ahead of its clock, and keeps the last good one on disk. A new
@@ -144,8 +147,8 @@ view of the miners does not take a model off the gateway. Once the current table
 
 1. A hotkey for the gateway (no registration needed): `btcli wallet new_hotkey`, or a dedicated wallet holding only
    the hotkey. It is the most exposed key of the subnet, so it is not the owner hotkey.
-2. List it in the catalog's `gateways` and commit the catalog (`SUBNET_ADMIN.md`). Miners serve it from their next
-   catalog check.
+2. List it in the catalog's `gateways` with the public addresses its requests to miners come from (`{"hotkey": ...,
+   "egress": [...]}`) and commit the catalog (`SUBNET_ADMIN.md`). Miners serve it from their next catalog check.
 3. Install: `VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway]"`.
 4. PostgreSQL (SQLite only for development):
 
@@ -169,9 +172,10 @@ view of the miners does not take a model off the gateway. Once the current table
 
    | Field | Default | Meaning |
    |---|---|---|
-   | `listen_host`, `port` | 127.0.0.1, 8080 | where the gateway listens, behind the TLS reverse proxy |
+   | `listen_host`, `port` | 127.0.0.1, 8080 | where the gateway listens, behind the TLS reverse proxy; an address off loopback only with `tls_cert_file` |
+   | `tls_cert_file`, `tls_key_file` | -, - | a certificate (PEM, with its chain) and key the gateway serves its listeners with, admin API included; needed for any listener off loopback |
    | `metrics_port` | - | Prometheus metrics on 127.0.0.1 |
-   | `auditor_url` | owner's axon | the owner validator's service; its loopback or private address when it runs next to the gateway (see privacy) |
+   | `auditor_url` | owner's axon | the owner validator's service, `https://ip:port`, reached with the catalog's auditor pin; its loopback or private address when it runs next to the gateway (see privacy) |
    | `instances` | 1 | gateway processes sharing the miners' capacity |
    | `trusted_proxies` | localhost | networks whose `X-Forwarded-For` is believed |
    | `request_timeout_s`, `attempt_timeout_s`, `max_attempts` | 10, 4, 3 | the miners' deadline per request, per attempt, attempts |
@@ -358,8 +362,8 @@ that remainder is positive, so a balance ends below zero by at most one request'
 For the operators and the service that signs users up: inspection, requests sent past the router or to one chosen
 endpoint, and accounts, keys, usage and credit. Off unless
 `admin_port` is set. It listens on a socket of its own, `admin_host:admin_port` (loopback by default; a private
-address at most, never `0.0.0.0`), so the reverse proxy never reaches it, and on the public port its routes answer
-404. Every call needs `Authorization: Bearer <token>`, the token read from `admin_token_file` at start:
+address at most, never `0.0.0.0`, and only with `tls_cert_file`), so the reverse proxy never reaches it, and on the
+public port its routes answer 404. Every call needs `Authorization: Bearer <token>`, the token read from `admin_token_file` at start:
 
 ```bash
 umask 077; openssl rand -hex 32 > ~/.verathos/gateway/admin.token   # at least 32 characters, mode 600

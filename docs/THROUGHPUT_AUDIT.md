@@ -106,12 +106,15 @@ Everyone derives the test from the chain, and nobody knows it before its selecti
    and expiry, sent as `X-Verathos-Session` (base64 of the canonical JSON) and `X-Verathos-Session-Signature`.
    Every request carries a fresh `X-Verathos-Request-Id`. The miner checks the session once and refuses a request id
    it has seen; its receipts name the auditor as caller and the request id as nonce.
-3. **Traffic.** At the start block the load generator sends each endpoint its rate, open loop (sending never waits
-   for answers): the warmup, then the measured window. Delivered = replies (HTTP 200, a JSON object of at most
-   64 KiB) that arrive inside the window to requests sent no earlier than `max_latency_s` before it opened, per
-   second of the window. An endpoint can answer inside the window only what it serves while the window is open, so
-   declaring more than it serves gains nothing; an honest endpoint whose latency stays within `max_latency_s` has
-   every reply counted. The miner cannot know when the window opens, so it cannot time held-back answers to it.
+3. **Traffic.** At the start block the load generator sends each endpoint its rate, open loop (sending never waits for
+   answers): the warmup, then the measured window. It reaches each endpoint over TLS at its manifest's https URL,
+   accepting exactly the certificate whose pin the manifest names for its machine (the plan gives each target its pin; a
+   handshake with another certificate counts as a `tls` error), and keeps connections alive: the endpoints of one
+   machine share them, and connections opened in the warmup carry the window. Delivered = replies (HTTP 200, a JSON
+   object of at most 64 KiB) that arrive inside the window to requests sent no earlier than `max_latency_s` before it
+   opened, per second of the window. An endpoint can answer inside the window only what it serves while the window is
+   open, so declaring more than it serves gains nothing; an honest endpoint whose latency stays within `max_latency_s`
+   has every reply counted. The miner cannot know when the window opens, so it cannot time held-back answers to it.
    Requests time out after `request_timeout_s`.
 4. **Samples.** For `samples_per_test` (10) random delivered responses per endpoint the auditor checks the receipt:
    signed by the miner, binding the request and the answers, naming the auditor and the request id. Delivered is
@@ -311,13 +314,18 @@ Per model: `workload` (the request mix) and `first_test_rps`.
 ## Running the auditor
 
 The auditor needs:
-- the load generator: `verathos-build-loadgen` (Rust) builds `native/loadgen` and installs it next to the code;
+- the load generator: `verathos-build-loadgen` (Rust) builds `native/loadgen` and installs it next to the code.
+  TLS (rustls) costs little next to the answers: against one local miner service at 200 to 3,200 requests/s, the load
+  generator's CPU time grew by 5-7% and the service's by 3-10%, with the same delivered rate and median latency; at
+  4,800 requests/s on one service process, by about 40% and 30% (about 15 and 25 microseconds a request), the p95
+  latency from 0.9 to 2.7 ms. A handshake happens only per new connection;
 - the answer recomputes: `answer_checks_per_test` per endpoint and test, within 15 minutes of the traffic. On an
   A100 with Kev-4B's request mix, fp32 recomputes about 2 per second and bf16 about 6, so a bf16 screen covers
   1,000 endpoints in about 6 minutes, with the fp32 reference (CPU is enough) confirming only what it flags. The
-  screen can run on another machine behind https with a key; while it is unreachable, recomputes are skipped and
-  receipts are still checked;
-- a public IP and port for its service, and an uplink for the whole network's test traffic in one burst: about
+  screen can run on another machine over https (its `tls_pin`, or a public CA's certificate) with a key; while it
+  is unreachable, recomputes are skipped and receipts are still checked;
+- a public IP and port for its service, which serves TLS with the certificate the catalog's `auditor.tls` pins
+  (`SUBNET_ADMIN.md`), and an uplink for the whole network's test traffic in one burst: about
   6 KB per request, so 1,000 endpoints at 20,000 requests/s take about 1 Gbit/s, and 2-3 CPU cores;
 - with a usage pool in `burned` mode, a node that holds the state of the last 200 blocks: the auditor reads every
   block's events as it is finalized, over a connection of its own; blocks it falls further behind on are recorded as

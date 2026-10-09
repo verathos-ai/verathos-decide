@@ -8,7 +8,8 @@ the same moment, so endpoints score by the capacity they prove and one machine c
 gateway serves users from that proven capacity, and a sample of the answers users get is recomputed too.
 
 Discovery, the model catalog and the audit policy live in native chain state (axons and commitments); there is no
-EVM and no central registry.
+EVM and no central registry. Every connection between machines is TLS: miners and validators serve self-signed
+certificates whose pins the chain-authenticated documents name (manifests, the catalog, validator commitments).
 
 ## Run a miner or a validator
 
@@ -16,7 +17,7 @@ On Ubuntu 22.04 or 24.04, with a registered wallet's hotkey on the machine (`hot
 under `~/.bittensor/wallets/<wallet>/`; the coldkey stays elsewhere):
 
 ```bash
-# a miner: NVIDIA GPUs, a public IP address and one open TCP port
+# a miner: NVIDIA GPUs, a public IP address and one open TCP port (TLS)
 curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
 
 # a light validator: a hotkey with a validator permit, no GPU; it sets the weights the auditor publishes
@@ -65,14 +66,14 @@ memory for the largest only; `--candidates` adds the candidates' references wher
 | [Scoring](docs/SCORING.md) | how answers are verified and scored |
 | [Throughput audit](docs/THROUGHPUT_AUDIT.md) | declared capacity, the network-wide tests, verdicts, policy |
 | [Gateway](docs/GATEWAY.md) | user traffic: keys, limits, routing, answer checks, running it |
-| [Discovery](docs/DISCOVERY.md) | manifests, commitments and the catalog on chain |
+| [Discovery](docs/DISCOVERY.md) | manifests, commitments and the catalog on chain; TLS and certificate pins |
 | [Subnet administration](docs/SUBNET_ADMIN.md) | mechanisms, catalog releases, audit rollout, code releases and the weights version key |
 
 ## Layout
 
 ```
 src/verathos/
-  protocol/    wire types: SystemOne API, signed manifests, receipts, request signing
+  protocol/    wire types: SystemOne API, signed manifests, receipts, request signing, TLS pins, callers
   catalog/     the model catalog and audit policy committed by the owner
   miner/       miner service: manifest and endpoints behind one public port
   validator/   discovery, canaries, answer comparison, scoring, weights; light mode

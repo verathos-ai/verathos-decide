@@ -19,9 +19,9 @@ owner's UID, which the chain does not pay out (`SCORING.md`).
 - One GPU per endpoint. Any GPU that runs the model's engine works; a GPU shared by several endpoints is credited
   once, split between them.
 - A public IP address and one open TCP port for the miner service, on every machine. Validators, the auditor and
-  the gateways reach each endpoint directly at its machine's IP and port, so the miner service must be reachable
-  there (plain HTTP; requests and receipts are signed). A test sends every endpoint its declared rate for about
-  20 s: each machine's connection must carry its own endpoints' rates.
+  the gateways reach each endpoint directly at its machine's IP and port, so the miner service must be reachable there
+  (TLS only, with the machine's own certificate, which the manifest pins; requests and receipts are signed). A test
+  sends every endpoint its declared rate for about 20 s: each machine's connection must carry its own endpoints' rates.
 - A hotkey registered on the subnet; every miner machine needs the hotkey and `coldkeypub.txt`, never the coldkey.
 
 ## Quick start (one command)
@@ -168,8 +168,10 @@ and prints the commands for its services:
 | engine log | `journalctl -u verathos-engine-gpu0 -f` | `tail -f /var/log/verathos/verathos-engine-gpu0.log` |
 | restart after editing `miner.json` | `systemctl restart verathos-miner` | `supervisorctl restart verathos-miner` |
 
-From another machine, `curl http://<public ip>:<port>/v1/manifest` returns the signed manifest with each endpoint's
-declared capacity; requests without a permitted caller's signature get `403`. Once per epoch the miner logs what the
+The setup prints the machine's TLS pin and the command that checks it from another machine,
+`curl -sk --pinnedpubkey 'sha256//<pin, base64>' https://<public ip>:<port>/v1/manifest`, which returns the signed
+manifest with each endpoint's declared capacity and each machine's pin (`-k` skips the CA check; the pin is the
+check); requests without a permitted caller's signature get `403`. Once per epoch the miner logs what the
 validators saw ([Reading the log](#reading-the-log)).
 
 ### Update
@@ -216,8 +218,10 @@ stay for a later install; `--purge` deletes them too (other files in `~/.veratho
 | `no NVIDIA GPU found` | install the NVIDIA driver; in a container, start it with the GPUs passed through |
 | `the NVIDIA driver supports CUDA 12.x` | the engines need a driver for CUDA 12.8 or newer |
 | `port ... is in use` | choose another port with `--port` |
-| validators cannot reach the miner | `curl http://<public ip>:<port>/v1/manifest` (on a worker `/v1/endpoints`) from another machine must answer: open the port for inbound TCP (`ufw allow <port>/tcp`, the provider's firewall). Behind port forwarding, as in most rented containers, the outside port must be the same as the port inside: each machine is listed at one port |
+| validators cannot reach the miner | the setup's check, `curl -sk --pinnedpubkey ... https://<public ip>:<port>/v1/manifest` (on a worker `/v1/endpoints`), from another machine must answer: open the port for inbound TCP (`ufw allow <port>/tcp`, the provider's firewall). Behind port forwarding, as in most rented containers, the outside port must be the same as the port inside: each machine is listed at one port |
 | `peer ...: endpoint ... left out` | endpoint ids must be unique across the hotkey's machines: give the worker another `--name` |
+| `peer ...: its TLS certificate (pin ...) is not the one it names` | the worker's port is served by another process, or its certificate changed while it ran: restart the worker's miner |
+| `status unavailable: ... names no TLS pin for the auditor` | the committed catalog does not name the auditor's certificate yet: the miner serves as usual and reads its status once the subnet owner commits one |
 | an engine keeps stopping | its log says why; out of GPU memory: another model, or a GPU free of other work |
 | `no endpoint could be measured` | the engine logs: the measurement needs the engines answering |
 | no services after a container restart | containers start no services by themselves: run the command again, or `supervisord -c /etc/supervisor/supervisord.conf` |
@@ -234,7 +238,9 @@ On several machines, one is the primary and the others are its workers. Every ma
 GPUs and `verathos-miner`, which measures its endpoints and serves them at its own public IP and port: each machine
 needs that port open for inbound TCP, and the hotkey and `coldkeypub.txt` (never the coldkey). The primary publishes
 the hotkey's manifest, listing every endpoint at its own machine's address; a worker writes nothing on chain and
-serves what it measured, signed by the hotkey, at `GET /v1/endpoints`, which the primary reads every minute.
+serves what it measured and the pin of its own certificate, signed by the hotkey, at `GET /v1/endpoints`, which the
+primary reads every minute over TLS, taking it only from a worker that presented that certificate; the manifest
+names every machine's pin.
 Validators, the auditor and the gateways send each endpoint's traffic, the throughput test included, straight to its
 machine: each machine needs the bandwidth of its own endpoints only, and a machine that is down costs only its own.
 
@@ -366,12 +372,13 @@ reference.
 | `peers` | primary only: the workers' `ip:port`, whose endpoints the manifest lists |
 | `endpoint_id` | 1-32 characters of `a-z`, `0-9`, `-`; unique per miner |
 | `model_id` | a catalog model |
-| `engine_url`, `engine_api_key` | the endpoint's engine and its bearer token, if it needs one |
+| `engine_url`, `engine_api_key` | the endpoint's engine and its bearer token, if it needs one: `http://127.0.0.1:<port>` on this machine, or `https://` elsewhere |
+| `engine_tls_pin` | an https engine's certificate pin (`DISCOVERY.md`); without one, a public CA's certificate for its hostname |
 | `max_concurrency` | highest concurrency the capacity measurement tries (default 256); the engine never gets more requests at once than the concurrency the measurement settles on |
 | `gateway_hotkeys` | callers allowed in addition to validators with a permit |
-| `catalog_mirrors` | extra catalog sources, URL templates with `{digest}`, tried after the owner's axon |
+| `catalog_mirrors` | extra catalog sources, https URL templates with `{digest}`, tried after the owner's axon |
 | `catalog_dir` | local catalog store (default `~/.verathos/catalog`) |
-| `state_dir` | capacity measurements and the caps tests set on them, and the last published manifest (default `~/.verathos/miner`) |
+| `state_dir` | capacity measurements and the caps tests set on them, the last published manifest, and the machine's TLS key and certificate (`tls.key`, `tls.crt`) (default `~/.verathos/miner`) |
 | `auto_update` | install each new release by itself outside throughput tests, then exit for the process manager to start it (default false; the installer sets true) ([Update](#update)) |
 
 ### 5. Run
@@ -384,15 +391,18 @@ On start the miner:
 1. finds the catalog the subnet owner commits on chain (the shipped copy, its local store, the owner's axon or a
    configured mirror; any copy is checked against the committed digest); endpoints whose model the catalog does not
    serve (unknown or `retired`) are left out, and it exits if none remain;
-2. starts its service: the manifest (`GET /v1/manifest`, on a worker its endpoints, `GET /v1/endpoints`) and the
-   endpoints (`/e/<endpoint_id>/v1/...`) on one port;
-3. waits until every engine answers, then measures the endpoints' capacity through its own service, all at once (a
+2. starts its service over TLS: the manifest (`GET /v1/manifest`, on a worker its endpoints, `GET /v1/endpoints`)
+   and the endpoints (`/e/<endpoint_id>/v1/...`) on one port, with the machine's certificate (`state_dir/tls.key`,
+   `tls.crt`, created at first start and logged with its pin; delete both to rotate it, and the next manifest names
+   the new pin);
+3. waits until every engine answers, then measures the endpoints' capacity through its own TLS service, as tests
+   reach it, all at once (a
    few minutes; see `THROUGHPUT_AUDIT.md`), or reuses the stored measurements if nothing they depend on changed. A
    machine that served endpoints before waits for a throughput test already selected
    ([When the miner measures](#when-the-miner-measures)). Meanwhile it serves the manifest it last published. An
    endpoint that cannot be measured is withdrawn, and the miner stops only if none is left;
-4. signs a manifest for the catalog's mechanism listing its endpoints and their declared capacity (on a primary with
-   `peers`, the workers' too), points its axon at `public_host:port` (`serve_axon`) and commits the manifest digest
+4. signs a manifest for the catalog's mechanism listing its endpoints, their declared capacity and its pin (on a
+   primary with `peers`, the workers' endpoints and pins too), points its axon at `public_host:port` (`serve_axon`) and commits the manifest digest
    (`set_commitment`); both are free and only sent when they change, so a restart with the same configuration and
    measurements writes nothing. A worker signs only its own endpoints and serves them to its primary at
    `GET /v1/endpoints`;
@@ -425,7 +435,8 @@ set each model's share of the emission, so signing more or fewer than the refere
 ## Reading the log
 
 The miner logs its setup once, then what happens to its endpoints. Every two minutes each machine reads the hotkey's
-status from the auditor's validator (`GET /v1/status/<hotkey>` on its axon, that validator's view of the last epoch,
+status from the auditor's validator (`GET /v1/status/<hotkey>` on its axon over TLS, accepting the certificate the
+catalog's `auditor.tls` names; that validator's view of the last epoch,
 with the hotkey's results in the auditor's last 10 throughput tests) and logs it once per epoch, plus every
 throughput test of its endpoints once it is final (after a start, the latest of each endpoint):
 
