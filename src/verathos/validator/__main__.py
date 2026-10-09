@@ -290,7 +290,8 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                                         per_endpoint=sc.canaries_per_endpoint,
                                         budget_s=blocks_left * BLOCK_TIME_S * sc.canary_spread_fraction,
                                         holding=throughput.holding, request_timeout_s=policy.request_timeout_s,
-                                        identities=throughput.identities, one_at_a_time=sequence)
+                                        identities=throughput.identities, one_at_a_time=sequence,
+                                        images={m.model_id: m.images for m in cat.models if m.reads_images()})
             verdicts = None if policy.mode == "observe" else await throughput.verdicts(client, epoch)
             if verdicts is not None:
                 fresh = new_evidence(state, [f"{e.test_id}/{e.hotkey}/{e.endpoint_id}" for e in verdicts.invalid],

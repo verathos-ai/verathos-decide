@@ -7,6 +7,7 @@ uses the reference engine's model; the cheater uses a different one behind the s
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 
@@ -22,6 +23,7 @@ from verathos import catalog
 from verathos.miner.app import caller_request_bytes, create_app
 from verathos.miner.config import MinerConfig
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest, commitment_value
+from verathos.protocol.media import ImageLimits
 from verathos.validator.audit import audit_epoch
 from verathos.validator.canaries import assignment, canary_pool
 from verathos.validator.compare import Tolerance, Verdict
@@ -39,20 +41,24 @@ def kp() -> Keypair:
     return Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
 
 
-def miner(host: str, keypair: Keypair, validator: Keypair, engine: MockEngine):
+def miner(host: str, keypair: Keypair, validator: Keypair, engine: MockEngine, model_id: str = "kev-4b",
+          images: ImageLimits | None = None):
+    """A miner serving ``model_id`` on endpoint gpu0, with the caller limits of the catalog's model; ``images``: the
+    limits of the images it reads (none: text only)."""
     config = MinerConfig.model_validate({
         "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": 80,
-        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1",
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": model_id, "engine_url": "http://127.0.0.1:1",
                        "max_concurrency": 8}]})
     digest = catalog.load().digest()
     signed = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest=digest,
-        endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
+        endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id=model_id,
                             capacity_rps=40.0)], tls={config.base_url: pin(host)}), keypair)
-    kev = catalog.load().get("kev-4b")
+    model = catalog.load().get(model_id)
     app = create_app(config=config, keypair=keypair, manifest=lambda: signed, engines={"gpu0": engine},
                      authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set(),
-                     max_caller_request=lambda m: caller_request_bytes(m, kev.workload))
+                     max_caller_request=lambda m: caller_request_bytes(m, model.workload, images),
+                     image_limits=lambda m: images)
     return app, commitment_value(signed.manifest.digest())
 
 
@@ -63,6 +69,109 @@ def test_canary_pool_is_deterministic_and_assignment_rotates() -> None:
     assert canary_pool(secret, 7, "kev-4b", 5) != canary_pool(b"t" * 32, 7, "kev-4b", 5)
     a = assignment(secret, 7, "hk/gpu0", 20, 6)
     assert len(a) == 6 and a != assignment(secret, 8, "hk/gpu0", 20, 6)
+
+
+# ---- image canaries ----
+
+IMAGE_QUESTIONS = {"background", "shape", "count", "largest", "tallest", "word"}
+
+
+def test_a_share_of_the_canaries_of_a_model_that_reads_images_carries_one_drawn_canonical_image() -> None:
+    """canary_share of the pool (by default a quarter), at places drawn from the secret and the epoch, carries one PNG
+    the validator drew, canonical for the model (sides multiples of its image token, from 256 to 512 px), asked two or
+    three questions about it, with an ordinary canary state; the other canaries are the text canaries a model without
+    images gets. The pool is the same each time it is drawn."""
+    from verathos.protocol.api import SystemOneRequest
+    from verathos.protocol.media import canonical_sizes, request_image_tokens
+    from verathos.validator import canaries
+
+    secret, limits = b"s" * 32, ImageLimits()
+    places = set()
+    for epoch in range(40):
+        pool = canary_pool(secret, epoch, "clef-flash", 16, limits)
+        assert pool == canary_pool(secret, epoch, "clef-flash", 16, limits)
+        text = canary_pool(secret, epoch, "clef-flash", 16)
+        drawn = [i for i, c in enumerate(pool) if "images" in c]
+        assert len(drawn) == 4 and all(pool[i] == text[i] for i in range(16) if i not in drawn)
+        places.add(tuple(drawn))
+        for i in drawn:
+            canary = pool[i]
+            SystemOneRequest.model_validate(canary)
+            assert canaries.canary_like(canary["state"]) and canary["state"] == text[i]["state"]
+            assert 2 <= len(canary["questions"]) <= 3 and set(canary["questions"]) <= IMAGE_QUESTIONS
+            (image,) = canary["images"]
+            assert image["content_type"] == "image/png" and len(image["base64"]) <= 4 * -(-canaries.IMAGE_BYTES // 3)
+            ((width, height),) = canonical_sizes(canary["images"], token_px=32, min_pixels=limits.min_pixels,
+                                                max_pixels=limits.max_pixels)
+            assert 256 <= min(width, height) and max(width, height) <= 512
+            assert request_image_tokens([(width, height)], 32) <= 16 * 16 + 3
+    assert len(places) > 30  # where the images are changes with the epoch
+    assert canary_pool(b"t" * 32, 1, "clef-flash", 16, limits) != canary_pool(secret, 1, "clef-flash", 16, limits)
+    assert not any("images" in c for c in canary_pool(secret, 1, "clef-flash", 16, ImageLimits(canary_share=0)))
+    assert all("images" in c for c in canary_pool(secret, 1, "clef-flash", 16, ImageLimits(canary_share=1)))
+
+
+def test_image_canaries_fit_the_models_limits_and_the_requests_miners_take_from_validators(monkeypatch) -> None:
+    """An image canary is canonical within any limits a model's catalog entry sets, and every canary fits the size
+    miners allow callers other than gateways (``caller_request_bytes``) and the model's request limit; a canary drawn
+    beyond ``IMAGE_BYTES`` carries no image instead."""
+    from verathos.protocol.canonical import canonical_json
+    from verathos.protocol.media import canonical_sizes
+    from verathos.validator import canaries
+
+    clef = catalog.load().get("clef-flash")
+    for limits in (ImageLimits(), ImageLimits(min_pixels=147_456), ImageLimits(max_pixels=147_456)):
+        bound = caller_request_bytes("clef-flash", clef.workload, limits)
+        largest = 0
+        for epoch in range(100):
+            for canary in canary_pool(b"k" * 32, epoch, "clef-flash", 16, limits):
+                largest = max(largest, len(canonical_json(canary)))
+                if "images" in canary:
+                    canonical_sizes(canary["images"], token_px=limits.token_px, min_pixels=limits.min_pixels,
+                                    max_pixels=limits.max_pixels)
+        assert largest <= canaries.max_request_bytes("clef-flash", limits) <= bound <= limits.max_request_bytes
+    monkeypatch.setattr(canaries, "IMAGE_BYTES", 100)
+    assert not any("images" in c for c in canary_pool(b"k" * 32, 1, "clef-flash", 16, ImageLimits()))
+
+
+class ImageReading(MockEngine):
+    """The mock engine whose answers depend on a request's images too; ``blind`` answers as if it had none."""
+
+    def __init__(self, model: str, blind: bool = False) -> None:
+        super().__init__(model)
+        self.blind = blind
+
+    async def answer(self, request):
+        images = [] if self.blind else request.get("images") or []
+        self.salt = hashlib.sha256(json.dumps(images, sort_keys=True).encode()).hexdigest() if images else ""
+        return await super().answer(request)
+
+
+def test_image_canaries_fail_an_endpoint_that_does_not_read_the_images() -> None:
+    """Miners take a validator's image canaries; an endpoint answering as if the images were not there passes the
+    text canaries and fails the image canaries outright."""
+    validator, honest_kp, blind_kp = kp(), kp(), kp()
+    limits = ImageLimits()
+    apps, neurons = {}, []
+    for uid, (host, keypair, engine) in enumerate((("10.0.4.1", honest_kp, ImageReading("clef-flash")),
+                                                   ("10.0.4.2", blind_kp, ImageReading("clef-flash", blind=True)))):
+        apps[host], commit = miner(host, keypair, validator, engine, "clef-flash", limits)
+        neurons.append(Neuron(uid, keypair.ss58_address, host, 80, commit))
+
+    async def run():
+        async with httpx.AsyncClient(transport=HostRouter(apps)) as client:
+            endpoints = [e for m in await discover(neurons, 405, client, {catalog.load().digest(): 1})
+                         for e in m.endpoints()]
+            return await audit_epoch(endpoints, epoch=3, secret=b"k" * 32, keypair=validator,
+                                     references={"clef-flash": ImageReading("clef-flash")},
+                                     tolerances={"clef-flash": Tolerance(min_probabilities=20)}, client=client,
+                                     netuid=405, pool_size=16, per_endpoint=16, images={"clef-flash": limits})
+
+    results = asyncio.run(run())
+    honest, blind = results[f"{honest_kp.ss58_address}/gpu0"], results[f"{blind_kp.ss58_address}/gpu0"]
+    assert honest.answered == honest.sent == 16 and not honest.errors and honest.tally.verdict() is Verdict.PASS
+    assert blind.answered == blind.sent == 16 and blind.tally.verdict() is Verdict.FAIL_HARD
+    assert len(blind.tally.hard_failures) == 4  # the image canaries, and only they
 
 
 def test_a_slow_reference_shrinks_the_canary_pool_instead_of_delaying_the_epoch() -> None:

@@ -15,10 +15,11 @@ With the firewall (``miner.firewall``), the source address of each request authe
 (``on_verified``), and while it enforces, a connection from an address it does not allow is refused before its request
 is read (``SourceGate``).
 
-Callers other than gateways (validators) need only their canaries: one request at once per endpoint, at most the size
-of the model's largest standard request (``caller_request_bytes``), at most the catalog's budget of requests per
-endpoint and epoch (``admission.RequestBudget``), and while test traffic arrives their requests wait behind it
-(``admission``). More would crowd out a test, or serve a validator as a free inference service.
+Callers other than gateways (validators) need only their canaries: one request at once per endpoint, at most the size of
+the model's largest standard request or canary (``caller_request_bytes``; for a model that reads images, an image canary
+is the largest), at most the catalog's budget of requests per endpoint and epoch (``admission.RequestBudget``), and
+while test traffic arrives their requests wait behind it (``admission``). More would crowd out a test, or serve a
+validator as a free inference service.
 
 A request's body is at most ``MAX_REQUEST_BYTES``, or for a model whose catalog entry lists image its
 ``images.max_request_bytes``. Images reach only such a model, at most ``images.max_count`` of them, each canonical as
@@ -84,10 +85,11 @@ def identity_payload(endpoint_id: str, challenge: str, caller: str) -> dict[str,
     return {"endpoint_id": endpoint_id, "challenge": challenge, "caller": caller}
 
 
-def caller_request_bytes(model_id: str, workload: Workload) -> int:
+def caller_request_bytes(model_id: str, workload: Workload, images: ImageLimits | None = None) -> int:
     """The largest request (canonical JSON) a caller other than a gateway may send an endpoint of the model: the
-    largest of the model's request mix, or of the validators' canaries if that is larger."""
-    return max(workload.max_request_bytes(model_id), canaries.max_request_bytes(model_id))
+    largest of the model's request mix, or of the validators' canaries if that is larger (for a model that reads
+    images, ``images``, their image canaries among them)."""
+    return max(workload.max_request_bytes(model_id), canaries.max_request_bytes(model_id, images))
 
 
 class SourceGate:

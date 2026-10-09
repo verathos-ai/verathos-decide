@@ -29,6 +29,7 @@ from bittensor_wallet import Keypair
 from verathos.miner.engine import Engine, EngineError
 from verathos.protocol.api import distributions
 from verathos.protocol.http import request_json
+from verathos.protocol.media import ImageLimits
 from verathos.protocol.receipts import SignedReceipt
 from verathos.protocol.requests import HDR_NONCE, sign_request
 from verathos.throughput.policy import AuditPolicy
@@ -197,19 +198,21 @@ async def audit_epoch(
     request_timeout_s: float = AuditPolicy.request_timeout_s,
     identities: Identities | None = None,
     one_at_a_time: OneAtATime | None = None,
+    images: Mapping[str, ImageLimits] | None = None,
 ) -> dict[str, EndpointResult]:
     """Audit every endpoint whose model has a reference engine, within ``budget_s`` (None: references unbounded,
     canaries at once), each canary within ``request_timeout_s`` as test requests are. Returns results keyed by
     endpoint key; endpoints without a usable canary this epoch (no reference engine, or no reference answer) have no
     result. ``identities``: the validator's record of who proved control where (default: a new one).
-    ``one_at_a_time``: the references run one after the other, as it plans, instead of side by side."""
+    ``one_at_a_time``: the references run one after the other, as it plans, instead of side by side. ``images``: the
+    limits of the models that read images, whose canaries carry images too (``canaries.canary_pool``)."""
     start = time.monotonic()
     identities = identities or Identities()
     deadline = None if budget_s is None else start + REFERENCE_SHARE * budget_s
     models = [m for m in sorted({e.endpoint.model_id for e in endpoints}) if m in references]
     for model_id in sorted({e.endpoint.model_id for e in endpoints} - set(models)):
         log.info("no reference engine for %s; its endpoints are not audited this epoch", model_id)
-    canaries = {m: canary_pool(secret, epoch, m, pool_size) for m in models}
+    canaries = {m: canary_pool(secret, epoch, m, pool_size, (images or {}).get(m)) for m in models}
     if one_at_a_time is None:
         challenged, computing = set(models), _side_by_side(canaries, references, deadline)
     else:

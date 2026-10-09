@@ -87,6 +87,8 @@ class ImageLimits(BaseModel):
                           "size times its merge size")
     max_request_bytes: int = Field(13 << 20, ge=MAX_REQUEST_BYTES, le=MAX_IMAGE_REQUEST_BYTES,
                                    description="A request's body, as the gateway receives it and as miners do")
+    canary_share: float = Field(0.25, ge=0, le=1, description="Share of the validators' canaries of the model that "
+                                "carry an image (validator.canaries)")
 
     @model_validator(mode="after")
     def _consistent(self) -> ImageLimits:
@@ -103,8 +105,9 @@ class ImageLimits(BaseModel):
         return self.max_count * (self.max_pixels // self.token_px ** 2 + 2) + 1
 
     def document(self) -> dict[str, Any]:
-        """The limits as users read them (``GET /v1/models``)."""
-        return {"formats": list(USER_TYPES), **self.model_dump(), "max_aspect_ratio": MAX_ASPECT}
+        """The limits as users read them (``GET /v1/models``); the validators' canary share is not one."""
+        limits = self.model_dump(exclude={"canary_share"})
+        return {"formats": list(USER_TYPES), **limits, "max_aspect_ratio": MAX_ASPECT}
 
 
 class ImageRefused(ValueError):
