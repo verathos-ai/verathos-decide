@@ -472,13 +472,13 @@ def build_app(config: MinerConfig, keypair, publisher: Publisher, authorizer: Pe
         model = publisher.catalog.get(model_id)
         return model.max_state_tokens if model is not None else None
 
-    def max_caller_request(model_id: str) -> int | None:
-        model = publisher.catalog.get(model_id)
-        return caller_request_bytes(model_id, model.workload) if model is not None else None
-
     def image_limits(model_id: str) -> ImageLimits | None:
         model = publisher.catalog.get(model_id)
         return model.images if model is not None and model.reads_images() else None
+
+    def max_caller_request(model_id: str) -> int | None:
+        model = publisher.catalog.get(model_id)
+        return caller_request_bytes(model_id, model.workload, image_limits(model_id)) if model is not None else None
 
     return create_app(config=config, keypair=keypair, manifest=lambda: publisher.signed,
                       host_endpoints=lambda: publisher.local, engines=engines, authorized=authorizer,

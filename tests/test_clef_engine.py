@@ -23,6 +23,7 @@ BOUNDS = {"token_px": 32, "min_pixels": 65_536, "max_pixels": 16_777_216}  # the
 
 FIXTURE = Path(__file__).parent / "fixtures" / "drift" / "drift-clef-flash-CPUfp32.json"
 IMAGES_FIXTURE = FIXTURE.with_name("drift-clef-flash-images-CPUfp32.json")  # requests with images, their answers
+CANARIES_FIXTURE = FIXTURE.with_name("drift-clef-flash-canaries-CPUfp32.json")  # validators' image canaries, answers
 
 
 def prepared(length: int, images: bool = False) -> Prepared:
@@ -665,13 +666,13 @@ def test_a_float32_reference_on_a_gpu_computes_without_tf32(monkeypatch) -> None
 
 def test_fast_engine_answers_stay_within_the_catalog_tolerances_of_the_float32_reference(monkeypatch,
                                                                                           caplog) -> None:
-    """The 30 tickets ``scripts/probe_miner.py`` sends and requests with images of every kind the gateway forwards
-    (shapes, a chart, a screenshot, a receipt, a photo, a drawing; one to three images), against the release's own code
-    in float32 on CPU without flash-linear-attention (as validators run it), answered together and one at a time; text
-    and images each within the model's mean, and the images' input tokens as the reference counts them. The vision
-    tower runs in float16; with an activation beyond float16's range forced in its last block, each request with images
-    runs its tower again in bfloat16 and stays within the tolerances, and the next passes answer in float16 as
-    before."""
+    """The 30 tickets ``scripts/probe_miner.py`` sends, requests with images of every kind the gateway forwards (shapes,
+    a chart, a screenshot, a receipt, a photo, a drawing; one to three images) and validators' image canaries, against
+    the release's own code in float32 on CPU without flash-linear-attention (as validators run it), answered together
+    and one at a time; text and images each within the model's mean, and the images' input tokens as the reference
+    counts them. The vision tower runs in float16; with an activation beyond float16's range forced in its last block,
+    each request with images runs its tower again in bfloat16 and stays within the tolerances, and the next passes
+    answer in float16 as before."""
     import logging
 
     torch = pytest.importorskip("torch")
@@ -681,7 +682,8 @@ def test_fast_engine_answers_stay_within_the_catalog_tolerances_of_the_float32_r
     from verathos.gateway.logs import Throttle
 
     model = catalog.load().get("clef-flash")
-    tickets, images = json.loads(FIXTURE.read_text()), json.loads(IMAGES_FIXTURE.read_text())
+    tickets = json.loads(FIXTURE.read_text())
+    images = json.loads(IMAGES_FIXTURE.read_text()) + json.loads(CANARIES_FIXTURE.read_text())
     assert all(list(r["answers"]) == list(model.workload.questions) for r in tickets)
     bodies = [{"model": model.model_id, "state": r["state"], "questions": model.workload.questions} for r in tickets]
     bodies += [{"model": model.model_id, "state": r["state"], "images": r["images"], "questions": r["questions"]}

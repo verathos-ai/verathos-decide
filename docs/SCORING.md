@@ -17,19 +17,21 @@ The validator therefore recomputes a sample of requests itself, in fp32, and com
 
 ## Canaries
 
-Each epoch the validator derives a pool of `canary_pool_size` (16) requests per model from a private secret, the
-epoch and the model (support tickets and code-review requests with generated details and a varying subset of questions). Miners
-cannot predict them. Canaries are signed by the validator's hotkey, so a miner can tell validator traffic from
+Each epoch the validator derives a pool of `canary_pool_size` (16) requests per model from a private secret, the epoch
+and the model (support tickets and code-review requests with generated details and a varying subset of questions).
+Miners cannot predict them. Canaries are signed by the validator's hotkey, so a miner can tell validator traffic from
 gateway traffic; the checks here cover what validators are served, and the throughput auditor checks a sample of the
-answers the subnet's gateway receives (`GATEWAY.md`). Canaries carry no images: answers to requests with images are
-checked in the auditor's samples of the gateway's answers (`THROUGHPUT_AUDIT.md`).
-The reference engine answers each canary once; every endpoint of that model receives its own random subset of
-`canaries_per_endpoint` (10) canaries, spread over the first `canary_spread_fraction` (0.6) of the epoch. Canaries
-wait while a throughput test runs (`THROUGHPUT_AUDIT.md`). If the reference engine cannot answer, the model's
-endpoints are not audited that epoch and keep their score, for at most 3 epochs in a row. A validator running its
-references one at a time checks the models whose references fit in the epoch's reference time, drawn from its secret
-so that each of `k` models is checked at least once every `2k` epochs, and takes the others' results from its source
-(`VALIDATING.md`).
+answers the subnet's gateway receives (`GATEWAY.md`). For a model that reads images, the catalog's `images.canary_share`
+(a quarter) of the pool carries an image the validator draws: one to six shapes in named colours, or a small bar chart,
+sometimes with a word or number, as a canonical PNG of 256 to 512 px a side, asked two or three questions about what it
+shows (a shape of a colour, how many, the largest or the tallest, the background, a word); its state is an ordinary
+canary's. An endpoint that answers without reading the images fails them. The reference engine answers each canary once;
+every endpoint of that model receives its own random subset of `canaries_per_endpoint` (10) canaries, spread over the
+first `canary_spread_fraction` (0.6) of the epoch. Canaries wait while a throughput test runs (`THROUGHPUT_AUDIT.md`).
+If the reference engine cannot answer, the model's endpoints are not audited that epoch and keep their score, for at
+most 3 epochs in a row. A validator running its references one at a time checks the models whose references fit in the
+epoch's reference time, drawn from its secret so that each of `k` models is checked at least once every `2k` epochs, and
+takes the others' results from its source (`VALIDATING.md`).
 
 Every request is signed by the validator and bound to the miner and a nonce. Every answer comes with a receipt signed
 by the miner hotkey that binds the request, the answers, the endpoint, the model, the caller, the nonce and the

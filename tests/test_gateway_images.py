@@ -303,7 +303,7 @@ def test_the_models_list_says_what_each_model_reads(tmp_path, setups) -> None:
     assert listed["kev-4b"]["input_modalities"] == ["text"] and listed["kev-4b"]["images"] is None
     clef = listed["clef-flash"]
     assert clef["input_modalities"] == ["text", "image"]
-    assert clef["images"] == {**ImageLimits(max_count=2).model_dump(), "max_aspect_ratio": 200,
+    assert clef["images"] == {**ImageLimits(max_count=2).model_dump(exclude={"canary_share"}), "max_aspect_ratio": 200,
                               "formats": ["image/png", "image/jpeg", "image/webp"]}
 
 

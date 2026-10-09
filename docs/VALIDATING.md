@@ -51,8 +51,12 @@ A full validator also needs:
   3.4 s and Kev-9B 6.6 s per request; on 12 cores shared with other work Kev-9B took 16-29 s, which still computes 16
   canaries alone and 8 next to Kev-4B. Clef-flash in fp32 on a CPU is slower: 20-32 s per request of the standard
   mix on 24 cores shared with Kev-9B's reference (Kev-9B 12-25 s there), so on a CPU it computes only part of its
-  pool within the time; give its reference a GPU where one has room (about 47 GiB). The fp32 weights alone take about
-  16 GB and 36 GB of RAM for the Kev models. A GPU in fp32 is faster. Rechecking the auditor's evidence on the references takes at most a tenth of the epoch; what is not rechecked
+  pool within the time; give its reference a GPU where one has room (about 47 GiB). For a model that reads images, a
+  quarter of its canaries carry an image of 256 to 512 px a side (`SCORING.md`), and a CPU reference computes them in
+  about the time of a text canary: Clef-flash's took 6.5 s with an image and 5.3 s without (medians; at most 8.9 s and
+  6.6 s), 85 to 90 s for a pool of 16, on 20 cores of a Xeon Platinum 8468 alone; a CPU of half that float32
+  throughput takes about twice as long (estimate). The fp32 weights alone take about 16 GB and 36 GB of RAM for the
+  Kev models. A GPU in fp32 is faster. Rechecking the auditor's evidence on the references takes at most a tenth of the epoch; what is not rechecked
   by then is taken on the auditor's word, as when a reference is down.
 - The auditor additionally needs Rust (rustup) and `build-essential` for the load generator, a public IP and one
   open TCP port with an uplink for the network's test traffic, and fast recomputes: 2 answers per endpoint and

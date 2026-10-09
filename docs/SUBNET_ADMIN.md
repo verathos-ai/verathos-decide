@@ -61,19 +61,22 @@ others keep these defaults:
 ```json
 "input_modalities": ["text", "image"],
 "images": {"max_count": 4, "max_bytes": 4194304, "max_total_bytes": 8388608, "max_input_pixels": 16777216,
-           "max_pixels": 1048576, "min_pixels": 65536, "token_px": 32, "max_request_bytes": 13631488}
+           "max_pixels": 1048576, "min_pixels": 65536, "token_px": 32, "max_request_bytes": 13631488,
+           "canary_share": 0.25}
 ```
 
 `max_count` images per request, `max_bytes` per image and `max_total_bytes` per request as sent, `max_input_pixels` per
 image as sent, `max_pixels` the pixel budget an image is resized into (at least `min_pixels`), `token_px` the side of
-one image token, as the model's processor has it, and `max_request_bytes` the body of a request with images. Every node
+one image token, as the model's processor has it, `max_request_bytes` the body of a request with images, and
+`canary_share` the share of each validator's canaries of the model that carry an image (`SCORING.md`). Every node
 refuses limits that do not hold together (`token_px` squared <= `min_pixels` <= `max_pixels` <= `max_input_pixels`,
 `max_bytes` <= `max_total_bytes`, `max_request_bytes` from 1 MiB to 15 MiB, at most 1,048,576 image tokens per request);
 `commit-catalog` refuses a modality this code does not serve (`video` among them), `image` for a model whose engine
 reads no images (the Kev engine), a `token_px` other than its engine's (32 for Clef), and a pixel budget beyond what its
 engine takes as it is (65,536 to 16,777,216 pixels for Clef). Older nodes ignore both fields, and the catalog's digest
 covers them, so every node agrees on the catalog. Open a model to images once the gateway, the auditor and the model's
-miners run a release that reads them, with engines that serve them (`MINING.md`), and the auditor's reference of the
+miners run a release that reads them, with engines that serve them (`MINING.md`; a miner of an earlier release may
+refuse a validator's image canary as larger than it takes from validators), and the auditor's reference of the
 model runs on a GPU (`VALIDATING.md`).
 
 `relative_speed` is the model's speed relative to the other models: the requests/s of its standard mix one GPU
