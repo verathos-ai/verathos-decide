@@ -288,7 +288,11 @@ def test_a_decoder_runs_apart_with_limits_and_none_of_the_gateways_secrets(monke
         worker.close()
 
 
-def test_a_decoder_is_replaced_when_an_image_takes_too_long_or_too_much_memory() -> None:
+def test_a_decoder_is_replaced_when_an_image_takes_too_long_or_too_much_memory(caplog, monkeypatch) -> None:
+    from verathos.gateway import media
+    from verathos.gateway.logs import Throttle
+
+    monkeypatch.setattr(media, "_throttled", Throttle())
     limits, big = ImageLimits(), b64(encoded(4096, 4096, mode="RGBA"))
 
     async def canonical(decoders: Decoders, data: str):
@@ -304,6 +308,9 @@ def test_a_decoder_is_replaced_when_an_image_takes_too_long_or_too_much_memory()
             assert (made.width, made.height) == (256, 256)
         finally:
             decoders.close()
+    replaced = [r.getMessage() for r in caplog.records if "decoder is replaced" in r.getMessage()]
+    assert len(replaced) == 2 and all("images.0 of a request" in m for m in replaced)
+    assert not any(big[1000:1100] in r.getMessage() for r in caplog.records)  # no image data in a log line
     decoders = Decoders(1, 2, 10.0)  # the defaults decode the largest image they take
     try:
         (made,) = asyncio.run(canonical(decoders, big))

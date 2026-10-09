@@ -180,9 +180,10 @@ class Decoders:
         self._in_flight += 1
         try:
             loop = asyncio.get_running_loop()
-            results = await asyncio.gather(*(loop.run_in_executor(self._threads, self._decode, content_type, data,
-                                                                  limits)
-                                             for content_type, data in images), return_exceptions=True)
+            results = await asyncio.gather(*(loop.run_in_executor(self._threads, self._decode, index, content_type,
+                                                                  data, limits)
+                                             for index, (content_type, data) in enumerate(images)),
+                                           return_exceptions=True)
         finally:
             self._in_flight -= 1
         for result in results:
@@ -195,21 +196,21 @@ class Decoders:
                 raise result
         return results
 
-    def _decode(self, content_type: str, data: str, limits: ImageLimits) -> CanonicalImage:
+    def _decode(self, index: int, content_type: str, data: str, limits: ImageLimits) -> CanonicalImage:
         worker = self._take()
         started = time.monotonic()
         try:
             head, payload = worker.exchange({"content_type": content_type, "limits": limits.model_dump()},
                                             data.encode("ascii"), self.timeout_s)
         except TimeoutError:
-            self._retire(worker, f"an image took it longer than {self.timeout_s:g} s")
+            self._retire(worker, f"an image took it longer than {self.timeout_s:g} s", index)
             raise ImageRefused(413, "it takes too long to decode") from None
         except Exception as exc:  # the worker is gone, or its reply is not one frame
-            self._retire(worker, f"it failed on an image ({type(exc).__name__})")
+            self._retire(worker, f"it failed on an image ({type(exc).__name__})", index)
             raise ImageRefused(400, "it could not be decoded") from None
         if "status" in head:
             if head.get("retire"):
-                self._retire(worker, "it ran out of memory on an image")
+                self._retire(worker, "it ran out of memory on an image", index)
             else:
                 self._release(worker)
             metrics.IMAGES.labels("refused").inc()
@@ -224,7 +225,7 @@ class Decoders:
             if made.content_type != expected or size != (made.width, made.height):
                 raise ValueError("a reply that does not describe its image")
         except (KeyError, TypeError, ValueError) as exc:
-            self._retire(worker, f"its reply is not a canonical image: {exc}")
+            self._retire(worker, f"its reply is not a canonical image: {exc}", index)
             raise ImageRefused(400, "it could not be decoded") from None
         self._release(worker)
         metrics.IMAGES.labels("canonical").inc()
@@ -259,10 +260,12 @@ class Decoders:
                 return
         worker.close()
 
-    def _retire(self, worker: _Worker, why: str) -> None:
+    def _retire(self, worker: _Worker, why: str, index: int) -> None:
+        """Replace a worker that failed on a request's image ``index``."""
         metrics.IMAGES.labels("failed").inc()
         if times := _throttled(why):
-            log.warning("an image decoder is replaced: %s (%d times since last logged)", why, times)
+            log.warning("an image decoder is replaced: %s (images.%d of a request; %d times since last logged)", why,
+                        index, times)
         worker.close()
 
     def close(self) -> None:
