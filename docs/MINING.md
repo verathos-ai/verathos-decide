@@ -526,19 +526,19 @@ refused before their request body is read; bodies are capped at 1 MiB (for a mod
 its `images.max_request_bytes`, 13 MiB by default) and must arrive within 10 s, and a request's state, question ids,
 instructions and criteria together may hold at most 4 characters per token of the model's `max_state_tokens`. Images
 reach an engine only for a model that reads them, at most its `images.max_count`, each canonical as the gateway makes it
-(an object of `image/png` or `image/jpeg` in base64, 8-bit RGB without metadata, its sides multiples of
-`images.token_px` and its pixels within the model's budget); anything else gets 422 before the engine sees it. A
-validator gets one request at once per endpoint (HTTP 429 beyond that), each no larger than the largest request of the
-model's request mix (HTTP 413), at most the catalog's `scoring.validator_requests_per_epoch` per endpoint and epoch
-(default 4 x `canary_pool_size`, 64; beyond, HTTP 429 with `Retry-After` until the next epoch), and while the auditor's
-test traffic arrives its requests wait behind the test's; gateways and test traffic are not limited. The miner signs
-only well-formed answers (one distribution per question over its options, with the `noul`, `choice` and `score` derived
-from it; fields other than an answer type's own are dropped before signing): an engine that returns anything else gets
-an error back to the caller, never a signed receipt. The auditor recomputes a sample of the answers given to the
-subnet's gateway, as it does test answers: serve users the same model, at the same precision. The input tokens a receipt
-signs are checked against the reference's count too: users are billed for them and they set each model's share of the
-emission, so signing more or fewer than the reference counts is a wrong answer. A request's images count as the release
-counts them: (width / 32) x (height / 32) + 2 tokens each, and one more for the request.
+(an object of `image/png` or `image/jpeg` in base64, 8-bit RGB with nothing but its header and tables before its pixels,
+its sides multiples of `images.token_px` and its pixels within the model's budget); anything else gets 422 before the
+engine sees it. A validator gets one request at once per endpoint (HTTP 429 beyond that), each no larger than the
+largest request of the model's request mix (HTTP 413), at most the catalog's `scoring.validator_requests_per_epoch` per
+endpoint and epoch (default 4 x `canary_pool_size`, 64; beyond, HTTP 429 with `Retry-After` until the next epoch), and
+while the auditor's test traffic arrives its requests wait behind the test's; gateways and test traffic are not limited.
+The miner signs only well-formed answers (one distribution per question over its options, with the `noul`, `choice` and
+`score` derived from it; fields other than an answer type's own are dropped before signing): an engine that returns
+anything else gets an error back to the caller, never a signed receipt. The auditor recomputes a sample of the answers
+given to the subnet's gateway, as it does test answers: serve users the same model, at the same precision. The input
+tokens a receipt signs are checked against the reference's count too: users are billed for them and they set each
+model's share of the emission, so signing more or fewer than the reference counts is a wrong answer. A request's images
+count as the release counts them: (width / 32) x (height / 32) + 2 tokens each, and one more for the request.
 
 ## Reading the log
 

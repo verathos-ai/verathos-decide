@@ -32,7 +32,7 @@ from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_valid
 from verathos.protocol.callers import egress_addresses
 from verathos.protocol.canonical import digest
 from verathos.protocol.http import get_json
-from verathos.protocol.media import ENGINE_TOKEN_PX, ImageLimits
+from verathos.protocol.media import ENGINE_IMAGES, ImageLimits
 from verathos.protocol.tls import PIN_PATTERN, authenticated
 from verathos.throughput.policy import AuditPolicy, policy_from
 from verathos.throughput.workload import Workload
@@ -309,18 +309,25 @@ class Catalog(BaseModel):
 
     def input_problems(self) -> list[str]:
         """What the models' input settings ask that this code does not serve: a modality it does not know (videos
-        among them), images for a model whose engine reads none, or image tokens of another size than its engine's."""
+        among them), images for a model whose engine reads none, or images its engine does not take as they are
+        (image tokens of another size, a pixel budget beyond its range)."""
         problems = []
         for m in self.models:
             problems += [f"models.{m.model_id}.input_modalities: {modality} is not served"
                          for modality in m.input_modalities if modality not in MODALITIES]
-            if m.reads_images():
-                token_px = ENGINE_TOKEN_PX.get(m.engine.name)
-                if token_px is None:
-                    problems.append(f"models.{m.model_id}: its {m.engine.name} engine reads no images")
-                elif m.images.token_px != token_px:
-                    problems.append(f"models.{m.model_id}.images.token_px: the {m.engine.name} engine's image tokens "
-                                    f"are {token_px} pixels square, not {m.images.token_px}")
+            if not m.reads_images():
+                continue
+            engine = ENGINE_IMAGES.get(m.engine.name)
+            if engine is None:
+                problems.append(f"models.{m.model_id}: its {m.engine.name} engine reads no images")
+                continue
+            if m.images.token_px != engine.token_px:
+                problems.append(f"models.{m.model_id}.images.token_px: the {m.engine.name} engine's image tokens are "
+                                f"{engine.token_px} pixels square, not {m.images.token_px}")
+            if not engine.min_pixels <= m.images.min_pixels <= m.images.max_pixels <= engine.max_pixels:
+                problems.append(f"models.{m.model_id}.images: the {m.engine.name} engine takes images of "
+                                f"{engine.min_pixels} to {engine.max_pixels} pixels, not {m.images.min_pixels} to "
+                                f"{m.images.max_pixels}")
         return problems
 
     def anchor_shares(self, *, strict: bool = False) -> dict[str, float]:

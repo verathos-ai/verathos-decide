@@ -261,6 +261,9 @@ def test_miners_take_canonical_images_only() -> None:
             canonical_sizes([good[0], image], **BUDGET)
         with pytest.raises(ValueError, match=r"images\.1: "):
             canonical_pixels([good[0], image], **BUDGET)
+    jpeg = b64decode(canonical(256, 256, "JPEG")["base64"])
+    assert jpeg[2:4] == b"\xff\xe0" and header(jpeg).canonical
+    assert not header(jpeg[:2] + jpeg[20:]).canonical  # without its JFIF header
     truncated = canonical(256, 256)
     truncated["base64"] = b64(b64decode(truncated["base64"])[:400])
     assert canonical_sizes([truncated], **BUDGET) == [(256, 256)]  # its header is whole

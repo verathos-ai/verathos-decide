@@ -379,9 +379,8 @@ def test_no_string_and_no_processor_argument_of_a_request_reaches_the_processor(
 
 
 def test_canonical_images_need_no_resizing_and_some_could_not_take_it(tiny) -> None:
-    """The plan's check: the processor leaves a canonical image's pixels as they are with resizing on or off; and a
-    canonical image whose aspect ratio rounds past 200:1 is refused by the processor's resizing, so engines pass
-    ``do_resize=False``."""
+    """The processor leaves a canonical image's pixels as they are with resizing on or off; and a canonical image whose
+    aspect ratio rounds past 200:1 is refused by the processor's resizing, so engines pass ``do_resize=False``."""
     import torch
 
     from tests.images import encoded
@@ -405,15 +404,17 @@ def test_canonical_images_need_no_resizing_and_some_could_not_take_it(tiny) -> N
 
 
 def test_the_catalog_restates_the_clef_processors_image_tokens() -> None:
-    from verathos.protocol.media import ENGINE_TOKEN_PX, ImageLimits
+    from verathos.protocol.media import ENGINE_IMAGES, ImageLimits
 
     path = release_code()
     if path is None:
         pytest.skip("needs the pinned clef-flash release config in the Hugging Face cache")
     images = json.loads((path.parent / "processor_config.json").read_text())["image_processor"]
-    assert images["patch_size"] * images["merge_size"] == ENGINE_TOKEN_PX["clef"] == ImageLimits().token_px
-    assert images["size"] == {"shortest_edge": ImageLimits().min_pixels, "longest_edge": BOUNDS["max_pixels"]}
-    assert ImageLimits().max_input_pixels == images["size"]["longest_edge"]
+    clef = ENGINE_IMAGES["clef"]
+    assert images["patch_size"] * images["merge_size"] == clef.token_px == ImageLimits().token_px
+    assert images["size"] == {"shortest_edge": clef.min_pixels, "longest_edge": clef.max_pixels}
+    assert ImageLimits().min_pixels == clef.min_pixels and ImageLimits().max_input_pixels == clef.max_pixels
+    assert BOUNDS == {"token_px": clef.token_px, "min_pixels": clef.min_pixels, "max_pixels": clef.max_pixels}
 
 
 def test_a_float32_reference_on_a_gpu_computes_without_tf32(monkeypatch) -> None:

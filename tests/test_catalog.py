@@ -219,6 +219,10 @@ def test_input_this_code_does_not_serve_is_found_before_publishing() -> None:
                         "models.kev-9b.input_modalities: video is not served",
                         "models.clef-flash.images.token_px: the clef engine's image tokens are 32 pixels square, not "
                         "16"]
+    below = catalog.Catalog.parse(with_models(**{"clef-flash": {"input_modalities": ["text", "image"],
+                                                                 "images": {"min_pixels": 16_384}}}))
+    assert below.input_problems() == ["models.clef-flash.images: the clef engine takes images of 65536 to 16777216 "
+                                      "pixels, not 16384 to 1048576"]
     mistyped = catalog.Catalog.parse(with_models(**{"clef-flash": {"images": {"max_images": 2}}}))
     assert mistyped.unknown_settings() == ["models.clef-flash.images.max_images"]
     for modalities in (["image"], ["text", "text"], []):

@@ -48,9 +48,17 @@ CANONICAL_HEADER_BYTES = 4 << 10  # the start of a canonical image read for its 
 MAX_IMAGE_REQUEST_BYTES = 15 << 20  # an image model's max_request_bytes at most: a sample of such a request fits a
 # post of sampled exchanges to the auditor (protocol.gateway.MAX_SAMPLES_BYTES)
 MAX_IMAGE_TOKENS = 1 << 20  # the image tokens of one request an image model's limits may allow, at most
-# Engine families whose models read images -> the side in pixels of one image token: their processors' patch size
-# times merge size.
-ENGINE_TOKEN_PX = {"clef": 32}
+@dataclass(frozen=True)
+class EngineImages:
+    """The images an engine family's processor takes as they are: each side a multiple of ``token_px`` (its patch
+    size times its merge size), its pixels within [``min_pixels``, ``max_pixels``]."""
+
+    token_px: int
+    min_pixels: int
+    max_pixels: int
+
+
+ENGINE_IMAGES = {"clef": EngineImages(32, 65_536, 16_777_216)}  # the engine families whose models read images
 _ORIENTATION = 0x0112  # the EXIF orientation tag; 5 to 8 swap width and height
 _DATA_URL = re.compile(r"data:(image/[a-z]+);base64,", re.IGNORECASE)
 _HEADER_STEPS = 1024  # markers and fill bytes a JPEG header is read through, at most
@@ -232,7 +240,7 @@ _TABLES = {0xC4, 0xDB, 0xDD}  # Huffman and quantization tables, restart interva
 
 def _jpeg(data: bytes) -> tuple[int, int, bool]:
     """Read through the segments to the frame header, and while the image may be canonical on to the scan."""
-    pos, canonical, size = 2, True, None
+    pos, canonical, jfif, size = 2, True, False, None
     for _ in range(_HEADER_STEPS):
         if pos + 4 > len(data):
             raise Incomplete("the JPEG ends inside its header")
@@ -248,7 +256,7 @@ def _jpeg(data: bytes) -> tuple[int, int, bool]:
         if marker in (0xD9, 0xDA):
             if size is None:
                 raise ValueError("a JPEG without a frame header before its scan")
-            return size[0], size[1], canonical and marker == 0xDA
+            return size[0], size[1], canonical and jfif and marker == 0xDA
         (length,) = struct.unpack_from(">H", data, pos + 2)
         if length < 2:
             raise ValueError("a JPEG segment shorter than its length field")
@@ -266,7 +274,8 @@ def _jpeg(data: bytes) -> tuple[int, int, bool]:
             if not canonical:
                 return width, height, False
         elif marker == 0xE0:  # a JFIF header of 16 bytes holds no thumbnail; it comes first
-            canonical = canonical and pos == 2 and length == 16 and data[pos + 4:pos + 9] == b"JFIF\0"
+            jfif = pos == 2 and length == 16 and data[pos + 4:pos + 9] == b"JFIF\0"
+            canonical = canonical and jfif
         elif marker not in _TABLES:
             canonical = False
         pos += 2 + length
@@ -408,7 +417,7 @@ def canonical_header(data: bytes, content_type: str, *, token_px: int, min_pixel
     if found.content_type != content_type:
         raise ValueError(f"its bytes are {found.content_type}, not {content_type}")
     if not found.canonical:
-        raise ValueError("not in the canonical form (8-bit RGB without metadata)")
+        raise ValueError("not in the canonical form (8-bit RGB, nothing but its header and tables before its pixels)")
     if found.width % token_px or found.height % token_px:
         raise ValueError(f"{found.width} x {found.height} pixels: sides not multiples of {token_px}")
     if not min_pixels <= found.width * found.height <= max_pixels:
