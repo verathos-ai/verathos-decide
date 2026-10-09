@@ -297,6 +297,7 @@ How credits and wrong answers enter the score is in `SCORING.md`.
 | Flooding a competitor's endpoint with validator traffic during its test | one request at once per validator and endpoint, no larger than the model's standard requests, and behind the test's requests while they arrive |
 | Flooding it with gateway traffic during its test, or a miner refusing users then | what an endpoint answers the gateway inside the test's window counts as delivered, and displaces the test's requests one for one; refused users count as asked |
 | Caching or sharing answers | every request is unique |
+| Answering a test's requests with images without reading their images, or refusing them | each image is drawn for its request and the request asks what colour its background is: a recomputed answer proves it wrong; a refused request is not delivered |
 | A staker using miners as a free inference service through validator requests | miners answer only validators with the catalog's `validator_min_stake`, each within a budget of requests per endpoint and epoch that canaries and identity challenges need |
 | Listing someone else's server as an endpoint, to aim the test's traffic at it | only endpoints that signed the auditor's challenge at their URL are tested; that server gets one challenge per epoch |
 
