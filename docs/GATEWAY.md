@@ -11,9 +11,10 @@ the auditor: the auditor tells it which endpoints it may use, and checks a sampl
                                        └── POST /v1/gateway/samples ───►   recomputes a sample
 ```
 
-Every connection the gateway makes is TLS. Miners and the auditor are reached by IP address with self-signed
+Every connection the gateway makes to miners and the auditor is TLS. They are reached by IP address with self-signed
 certificates, each accepted by its pin (`DISCOVERY.md`): a miner machine's from the route the auditor signed, the
-auditor's from the committed catalog (`auditor.tls`), which the gateway follows on chain.
+auditor's from the committed catalog (`auditor.tls`), which the gateway follows on chain. Catalogs, which their
+digest proves, are fetched accepting any certificate.
 
 | | Code |
 |---|---|
@@ -49,7 +50,8 @@ auditor's from the committed catalog (`auditor.tls`), which the gateway follows 
 5. **Miner.** The request is signed with the gateway's hotkey for that miner. The answer counts only if the miner's
    receipt binds this request and these answers and names the gateway as caller, and the answers are well formed:
    one distribution per question over its options, the `noul`, `choice` and `score` users read derived from it (p(true),
-   the most likely option, the expected level, within the engines' rounding to 4 decimals), and no fields beyond an
+   the most likely option, the expected level, within 0.001, a score also within the 4-decimal rounding of the
+   probabilities it sums), and no fields beyond an
    answer type's own (`protocol/api.py`).
 6. **Retries.** A failed attempt is retried on another miner, up to `max_attempts` within `request_timeout_s`;
    decision requests have no side effects. A failure that is the miner's (no connection, a response without a valid
@@ -113,7 +115,8 @@ had free credit is unpaid, one that bought credit is paid once its grants are us
 
 ## Privacy of user requests
 
-A user's request is seen by the gateway, by the miner that answers it, and, for the few sampled ones, by the auditor
+A user's request is seen by the gateway, by each miner it is sent to (the one that answers it, and any that failed
+before it, up to `max_attempts`), and, for the few sampled ones, by the auditor
 until their check: the auditor then deletes the request and the answers and keeps only the miner's receipt (hashes of
 the request and the answers) and the differences it measured. Nothing a user sent is published: evidence of a wrong
 answer to a user carries only the receipt. Validators check that the miner answered the gateway and take the
@@ -193,8 +196,8 @@ view of the miners does not take a model off the gateway. Once the current table
 7. Run `verathos-gateway --config gateway.json serve` under a supervisor, behind a reverse proxy that terminates
    TLS, as an active and a standby process (below). `GET /ready` answers 200 once the gateway has routes and finds
    its hotkey among the catalog's gateways. Every request holds a connection from the proxy and one to a miner: at
-   start the gateway raises its soft open-file limit to the hard one, keeps its connections to miners within what
-   `max_in_flight` leaves of it, and warns when that is too little. systemd's default soft limit is 1024, so give the
+   start the gateway raises its soft open-file limit to the hard one, keeps its connections to each miner machine
+   within what `max_in_flight` leaves of it, and warns when that is too little. systemd's default soft limit is 1024, so give the
    unit a higher one:
 
    ```ini
@@ -275,7 +278,7 @@ curl -s https://<gateway>/v1/systemone -H "Authorization: Bearer $KEY" -H "Conte
 {"id": "6f1c...", "model": "kev-4b",
  "answers": {"team": {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.97, "technical": 0.03}},
              "churn": {"type": "noul", "noul": 0.91}},
- "usage": {"input_tokens": 41, "output_tokens": 0},
+ "usage": {"input_tokens": 41},
  "receipt": {"receipt": {"miner_hotkey": "5F...", "endpoint_id": "gpu0", "caller_hotkey": "5D...", "...": "..."},
              "signature": "..."}}
 ```
@@ -301,8 +304,8 @@ this gateway process:
   last 15 minutes' user requests were answered (of those not refused for want of capacity) or more than half the
   endpoints are failing; else `operational`.
 - `latency_ms`: p50 and p95 of the answers to users, retries included, over `window_s`: the last 15 minutes, or,
-  with fewer than 20 answers there, the fewest whole hours that hold 20 (the last 24 hours when they hold fewer);
-  null without answers in the last 24 hours.
+  when the latest 20 answers (all of the last 24 hours' when fewer) go back further, the fewest whole hours that
+  hold them; null without answers in the last 24 hours.
 - `success_rate_1h`: answered among answered and failed user requests of the last hour (null under 20 of them);
   `busy_rate_1h`: the share of the hour's user requests refused for want of free capacity (503 `busy`; null under 20
   requests); `requests_1h`: answered, failed and busy.
@@ -359,8 +362,8 @@ that remainder is positive, so a balance ends below zero by at most one request'
 
 ## Admin API
 
-For the operators and the service that signs users up: inspection, requests sent past the router or to one chosen
-endpoint, and accounts, keys, usage and credit. Off unless
+For the operators and the service that signs users up: inspection, requests routed as users' are or sent to one
+chosen endpoint, and accounts, keys, usage and credit. Off unless
 `admin_port` is set. It listens on a socket of its own, `admin_host:admin_port` (loopback by default; a private
 address at most, never `0.0.0.0`, and only with `tls_cert_file`), so the reverse proxy never reaches it, and on the
 public port its routes answer 404. Every call needs `Authorization: Bearer <token>`, the token read from `admin_token_file` at start:
@@ -382,7 +385,7 @@ account unlimited service nor mint more than the hourly cap.
 
 | Call | Returns |
 |---|---|
-| `GET /admin/v1/state` | the routes in use (epoch, age, endpoints, catalog), active models, limits, and what waits to be written or sent (usage rows, samples, served counts) |
+| `GET /admin/v1/state` | the routes in use (epoch, age, endpoints, catalog), the models routed, limits, and what waits to be written or sent (usage rows, samples, served counts) |
 | `GET /admin/v1/routes` | every routable endpoint as the router sees it: credited rate, latency, cap, in flight, busy time, breaker, its latest failure |
 | `POST /admin/v1/systemone` | a SystemOne request, served as described below |
 | `POST /admin/v1/accounts` | `{"name", "rate_rps", "burst", "monthly_quota", "prepaid"}` -> 201 and the account; 409 if the name is taken. Names: `[A-Za-z0-9_.:@-]{1,128}` |
@@ -442,8 +445,9 @@ keeps the latest 400. Every bucket is listed, with every model answered in the r
 - `requests`, `input_tokens`: as in the totals, per model.
 - `paid_usage_micros`: per account, its usage cost in day order: the first part, as much as its grants, is free; the
   next, as much as its top-ups, is paid, on the days it was spent. The days add up to the totals' all-time paid
-  usage, and to their last 30 days' unless a grant was recorded after paid spending: such a grant makes the earliest
-  paid spending free, after the fact.
+  usage, and to their last 30 days' unless credit was recorded after the spending it covers: a top-up counts in the
+  totals when it is recorded and here on the days it was spent, and a grant makes the earliest paid spending free,
+  after the fact.
 - `topups_micros`: the top-ups recorded in the bucket.
 
 ```bash
@@ -469,5 +473,6 @@ curl -s http://127.0.0.1:8090/admin/v1/systemone -H "Authorization: Bearer $(cat
 `gateway_samples_total{outcome}`.
 
 The log says when an endpoint's breaker opens (with its latest failure: the kind and a status or exception class)
-and closes, and each kind of failed attempt per endpoint at most once a minute, with how often it happened; it never
+and closes, and each kind of failed attempt per endpoint at most once a minute, with how often it happened (an
+unexpected error each time, with its traceback); it never
 holds a key or what a user sent.
