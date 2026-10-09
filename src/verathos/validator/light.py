@@ -55,6 +55,10 @@ class Refused(ValueError):
     """Why no weights are set from the source's document now."""
 
 
+class NotTaken(Refused):
+    """The source's document is verified, but its weights cannot be set on chain now."""
+
+
 def check(document: Any, *, source: str, netuid: int, epoch: int, epoch_blocks: int, done_block: int | None,
           now_ms: int) -> NetworkStatus:
     """``document`` (as received) as a network status, if its weights may be set now: in ``epoch`` of
@@ -127,6 +131,7 @@ class LightValidator:
         self.set_weights, self.state_path, self.fetch, self.clock = set_weights, state_path, fetch, clock
         self.done_block = self._load()  # the first block of the epoch whose weights were set last
         self.why: str | None = None  # why the current window's results are not set yet
+        self.verified = False  # whether they are verified, so that the chain or this hotkey is why
         self._window: int | None = None
 
     def _load(self) -> int | None:
@@ -186,16 +191,21 @@ class LightValidator:
         cat = self.current.catalog
         epoch_blocks, offset, window = cat.epoch_blocks, self.offset(cat), self.due(block)
         if self._window is not None and window > self._window and not self.covers(self._window, epoch_blocks):
-            log.warning("epoch %d: no weights set: no results of the source verified by block %d (%s)",
-                        self._window, (self._window + 1) * epoch_blocks + offset, self.why or "not asked")
+            deadline = (self._window + 1) * epoch_blocks + offset
+            if self.verified:
+                log.warning("epoch %d: no weights set by block %d: the source's results are verified, but %s",
+                            self._window, deadline, self.why)
+            else:
+                log.warning("epoch %d: no weights set: no results of the source verified by block %d (%s)",
+                            self._window, deadline, self.why or "not asked")
         if window != self._window:
-            self._window, self.why = window, None
+            self._window, self.why, self.verified = window, None, False
         if self.covers(window, epoch_blocks):
             return max((window + 1) * epoch_blocks + offset - block, 1) * BLOCK_TIME_S
         try:
             self.attempt(block)
         except Refused as exc:
-            self.why = str(exc)
+            self.why, self.verified = str(exc), isinstance(exc, NotTaken)
             return POLL_S
         return BLOCK_TIME_S
 
@@ -218,9 +228,9 @@ class LightValidator:
             raise Refused(f"the source has not published the results of epoch {window} yet (its latest are for "
                           f"epoch {network.epoch})")
         if why := self.permit():
-            raise Refused(why)
+            raise NotTaken(why)
         if not self.set_weights(network.weights, mechanism_of(self.current.catalog, self.cfg.mechid)):
-            raise Refused("setting them on chain failed")
+            raise NotTaken("setting them on chain failed")
         self._save(network.epoch, epoch_blocks)
         if network.weights:
             log.info("epoch %d: set the weights of %s: %s", network.epoch, self.label(source),

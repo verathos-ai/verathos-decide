@@ -259,6 +259,31 @@ def test_without_a_fresh_verified_document_a_light_validator_sets_nothing_and_sa
                      "connection refused")
 
 
+def test_verified_results_the_chain_does_not_take_are_not_reported_as_unverified(tmp_path, monkeypatch,
+                                                                                 caplog) -> None:
+    """The chain holds as many unrevealed commits of this hotkey as it keeps: the source's results verify, the commit
+    is not sent, and the epoch's warning says the results are verified and why they are not set."""
+    from verathos.validator import __main__ as validator_main
+
+    monkeypatch.setattr(validator_main, "_SAID_UNREVEALED", set())
+    caplog.set_level(logging.WARNING, logger="verathos.validator")
+    owner, own = kp(), kp()
+    chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET)
+    chain.unrevealed = {(CAT.mechanism, chain.epoch_index + 1): [(own.ss58_address, chain.block - 100, "0x00", 1)] * 10}
+    served: list = [document(owner, 100)]
+    v = validator(tmp_path, chain, own, served)
+    assert v.step() == light.POLL_S and chain.set == []
+    assert v.verified and v.why == "setting them on chain failed"
+    served.append(document(owner, 101))
+    chain.block = 101 * BLOCKS + OFFSET
+    v.step()
+    assert chain.set == [] and caplog.messages == [
+        f"weights not set: the chain holds 10 unrevealed weight commits of this hotkey on mechanism {CAT.mechanism}, "
+        "the most it keeps, until it runs the subnet's epoch that reveals them",
+        f"epoch 100: no weights set by block {101 * BLOCKS + OFFSET}: the source's results are verified, but setting "
+        "them on chain failed"]
+
+
 def test_a_source_other_than_the_owner_needs_a_permit_an_axon_and_a_committed_pin(tmp_path) -> None:
     owner, other, own = kp(), kp(), kp()
     chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET)
