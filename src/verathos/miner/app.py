@@ -282,7 +282,7 @@ def create_app(
         try:
             raw = json.loads(body)
             parsed = SystemOneRequest.model_validate(raw)
-        except (ValueError, ValidationError) as e:
+        except (ValueError, ValidationError, RecursionError) as e:
             return error(422, f"invalid request: {e}")
         if parsed.model != endpoint.model_id:
             return error(422, f"endpoint serves {endpoint.model_id}, not {parsed.model}")

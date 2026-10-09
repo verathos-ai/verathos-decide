@@ -6,6 +6,7 @@ import asyncio
 import functools
 import json
 import logging
+import math
 import threading
 import time
 from types import SimpleNamespace
@@ -430,7 +431,7 @@ def test_users_are_served_while_an_endpoint_that_fell_short_is_measured_again(tm
     try:
         assert publisher.adopt(CATALOG)
         rate = declared(publisher)["gpu0"]
-        publisher.note_tests([outcome(45417, delivered=round(0.5 * rate, 2), rate=rate),
+        publisher.note_tests([outcome(45417, delivered=math.ceil(50 * rate) / 100, rate=rate),  # half: no outage
                               outcome(45418, delivered=round(0.4 * rate, 2), rate=rate)])
         calls = {e: engine.calls for e, engine in engines.items()}
         measuring = threading.Thread(target=publisher.measure_shortfalls)

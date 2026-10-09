@@ -118,7 +118,7 @@ def create_app(engine: Engine, served_models: list[dict[str, Any]] | None = None
             body = json.loads(raw)
             SystemOneRequest.model_validate(body)
             item = await asyncio.to_thread(engine.prepare, body)
-        except (ValueError, ValidationError) as exc:
+        except (ValueError, ValidationError, RecursionError) as exc:
             return JSONResponse({"error": f"invalid request: {exc}"}, status_code=422)
         try:
             return JSONResponse(await asyncio.wrap_future(batcher.submit(item)))

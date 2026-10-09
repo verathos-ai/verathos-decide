@@ -52,6 +52,8 @@ def test_a_body_beyond_the_largest_request_a_model_may_take_is_refused_unread() 
     big = {**REQUEST, "state": "x" * MAX_BODY_BYTES}
     assert client.post("/v1/systemone", json=big).status_code == 413
     assert client.post("/v1/systemone", content=b"[" * 10).status_code == 422
+    nested = b'{"model": "kev-4b", "state": ' + b"[" * 100_000 + b"]" * 100_000 + b', "questions": {}}'
+    assert client.post("/v1/systemone", content=nested).status_code == 422  # deeper than the parser goes: not a 500
     assert engine.batches == []
 
 

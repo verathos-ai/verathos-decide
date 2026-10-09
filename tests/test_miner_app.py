@@ -98,6 +98,15 @@ def test_unsigned_and_unpermitted_callers_are_refused(setup) -> None:
     assert post(client, validator, miner, "/e/gpu0/v1/systemone", big).status_code == 413
 
 
+def test_a_body_nested_deeper_than_the_parser_goes_is_an_invalid_request(setup) -> None:
+    client, miner, validator, *_ = setup
+    path = "/e/gpu0/v1/systemone"
+    body = b'{"model": "kev-4b", "state": ' + b"[" * 100_000 + b"]" * 100_000 + b', "questions": {}}'
+    r = client.post(path, content=body, headers={"Content-Type": "application/json",
+                                                 **sign_request(validator, "POST", path, body, miner.ss58_address)})
+    assert r.status_code == 422, r.text
+
+
 def test_wrong_model_and_unknown_endpoint(setup) -> None:
     client, miner, validator, *_ = setup
     assert post(client, validator, miner, "/e/gpu0/v1/systemone", {**REQUEST, "model": "kev-9b"}).status_code == 422
