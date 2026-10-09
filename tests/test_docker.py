@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,6 +46,7 @@ COMPOSE = {"miner": "compose.miner.yml", "validator": "compose.validator.yml",
 PARAMETERS = {**KEV, "clef-flash": CLEF}
 WALLET_TARGETS = ("/root/.bittensor/wallets/${WALLET}/hotkeys/${HOTKEY:-default}",
                   "/root/.bittensor/wallets/${WALLET}/coldkeypub.txt")
+REGISTRY = "ghcr.io/verathos-ai"
 
 
 def compose(name: str) -> dict:
@@ -198,8 +200,7 @@ def test_a_hotkey_loads_from_the_read_only_files_the_containers_mount(tmp_path, 
 def test_each_compose_file_runs_its_role_from_the_image_that_carries_it(role, image, gpus, network, caps) -> None:
     s = service(COMPOSE[role])
     command = role.removesuffix("-full")
-    assert s["image"] == (f"${{IMAGE_REGISTRY:?set IMAGE_REGISTRY in .env}}/{image}:"
-                          "${VERATHOS_VERSION:?set VERATHOS_VERSION in .env}")
+    assert s["image"] == f"${{IMAGE_REGISTRY:-{REGISTRY}}}/{image}:${{VERATHOS_VERSION:?set VERATHOS_VERSION in .env}}"
     assert s["command"] == [command] and s["restart"] == "unless-stopped"
     assert s.get("network_mode") == network and "ports" not in s
     assert s.get("cap_add") == caps and s["cap_drop"] == ["NET_RAW"]
@@ -221,6 +222,8 @@ def test_the_example_env_names_every_variable_of_the_compose_files_and_this_rele
     example = example_env()
     assert used == set(example) - {"COMPOSE_FILE"}
     assert example["VERATHOS_VERSION"] == verathos.__version__  # the images of this release
+    assert example["IMAGE_REGISTRY"] == REGISTRY
+    assert f'REGISTRY="{REGISTRY}"' in (DOCKER / "build.sh").read_text()  # where the build script pushes
     assert example["COMPOSE_FILE"] in COMPOSE.values()
     assert all(example[k] == "" for k in ("WALLET", "HF_TOKEN", "ALLOW", "PEERS", "NO_PUBLISH", "DRY_RUN"))
 
@@ -254,7 +257,7 @@ def test_docker_compose_renders_each_file_with_the_example_env(tmp_path) -> None
                                 capture_output=True, text=True, timeout=60, env=home)
         assert result.returncode == 0, result.stderr
         (s,) = json.loads(result.stdout)["services"].values()
-        assert s["image"].endswith(f":{verathos.__version__}")
+        assert s["image"].startswith(f"{REGISTRY}/verathos") and s["image"].endswith(f":{verathos.__version__}")
         binds = {v["target"]: v for v in s["volumes"]}
         assert binds["/data"]["source"] == str(tmp_path / "data")
         wallets = {t: v for t, v in binds.items() if t.startswith("/root/.bittensor")}
@@ -265,6 +268,10 @@ def test_docker_compose_renders_each_file_with_the_example_env(tmp_path) -> None
     missing = subprocess.run(["docker", "compose", "-f", COMPOSE["miner"], "config"], cwd=tmp_path, text=True,
                              capture_output=True, env={**home, "WALLET": ""}, timeout=60)
     assert missing.returncode != 0 and "set WALLET in .env" in missing.stderr
+    local = subprocess.run(["docker", "compose", "-f", COMPOSE["miner"], "config", "--format", "json"], cwd=tmp_path,
+                           text=True, capture_output=True, env={**home, "IMAGE_REGISTRY": "local"}, timeout=60)
+    (s,) = json.loads(local.stdout)["services"].values()  # the images docker/build.sh built on this machine
+    assert s["image"] == f"local/verathos-engines:{verathos.__version__}"
 
 
 # ---- the build script ----
@@ -277,8 +284,9 @@ def test_the_build_script_builds_both_images_of_this_checkout_tagged_with_its_ve
     assert subprocess.run(["bash", "-n", str(DOCKER / "build.sh")]).returncode == 0
     usage = build("--help")
     assert usage.returncode == 0
-    for option in ("--registry", "--push", "--latest", "--only", "--jobs", "--dry-run", "--working-tree"):
+    for option in ("--registry", "--push", "--only", "--jobs", "--dry-run", "--working-tree"):
         assert option in usage.stdout
+    assert build("--working-tree", "--latest", "--dry-run").returncode == 2  # version tags only
     dry = build("--working-tree", "--dry-run", "--jobs", "2")
     assert dry.returncode == 0, dry.stderr
     for target, name in (("node", "verathos"), ("engines", "verathos-engines")):
@@ -287,8 +295,8 @@ def test_the_build_script_builds_both_images_of_this_checkout_tagged_with_its_ve
     assert dry.stdout.count("--build-arg JOBS=2") == 2
     only = build("--working-tree", "--dry-run", "--only", "engines", "--registry", "ghcr.io/owner")
     assert "--target node" not in only.stdout and "-t ghcr.io/owner/verathos-engines:" in only.stdout
-    for args, why in ((("--working-tree", "--push", "--dry-run"), "--push needs the registry"),
-                      (("--working-tree", "--latest", "--dry-run"), "--latest is for a release"),
+    for args, why in ((("--working-tree", "--push", "--dry-run"), "--push is for a release"),
+                      (("--working-tree", "--push", "--registry", "local", "--dry-run"), "--push needs a registry"),
                       (("--working-tree", "--only", "gpu", "--dry-run"), "--only takes node or engines"),
                       (("--working-tree", "--registry", "ghcr.io/<org>", "--dry-run"), "--registry: a registry"),
                       (("v9.9.9", "--dry-run"), "no such tag, branch or commit")):
@@ -296,23 +304,33 @@ def test_the_build_script_builds_both_images_of_this_checkout_tagged_with_its_ve
         assert refused.returncode != 0 and why in refused.stderr, (args, refused.stderr)
 
 
-def test_the_build_script_builds_a_commit_as_it_is_and_a_release_only_when_its_tag_verifies(tmp_path) -> None:
+def release_repo(tmp_path: Path, signers: str | None = None) -> tuple[Path, Callable[..., str]]:
+    """A repository holding the build script and the Dockerfile at version 1.2.3, its release keys ``signers`` (default:
+    the shipped placeholder), committed; -> the repository and its git."""
     repo = tmp_path / "repo"
     for path in ("docker/build.sh", "docker/Dockerfile", "release/allowed_signers"):
         (repo / path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / path, repo / path)
+    if signers is not None:
+        (repo / "release" / "allowed_signers").write_text(signers)
     (repo / "src" / "verathos").mkdir(parents=True)
     (repo / "src" / "verathos" / "__init__.py").write_text('__version__ = "1.2.3"  # the release\n')
 
     def git(*args: str) -> str:
         return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.org",
                                "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false",
-                               "-c", "core.hooksPath=/dev/null", *args],
-                              check=True, capture_output=True, text=True).stdout.strip()
+                               "-c", "core.hooksPath=/dev/null", *args], check=True, capture_output=True, text=True,
+                              env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+                              ).stdout.strip()
 
     git("init", "--quiet")
     git("add", ".")
     git("commit", "--quiet", "-m", "release")
+    return repo, git
+
+
+def test_the_build_script_builds_a_commit_as_it_is_and_a_release_only_when_its_tag_verifies(tmp_path) -> None:
+    repo, git = release_repo(tmp_path)
     commit = git("rev-parse", "HEAD")
     script = repo / "docker" / "build.sh"
     built = build(commit, "--dry-run", script=script)
@@ -325,6 +343,33 @@ def test_the_build_script_builds_a_commit_as_it_is_and_a_release_only_when_its_t
     assert refused.returncode != 0 and "lists no release signing key yet" in refused.stderr
     git("tag", "v1.2.4")
     assert "lists no release signing key yet" in build("v1.2.4", "--dry-run", script=script).stderr
+
+
+def test_a_release_builds_images_for_this_machine_and_only_push_publishes_them(tmp_path) -> None:
+    """A release whose tag a release key signed: version tags only, local by default; --push tags them for the
+    registry and pushes them."""
+    found = re.search(r"(\d+)\.(\d+)", subprocess.run(["git", "--version"], capture_output=True, text=True).stdout)
+    if shutil.which("ssh-keygen") is None or found is None or (int(found[1]), int(found[2])) < (2, 34):
+        pytest.skip("git here cannot sign or verify SSH signatures (git 2.34 and ssh-keygen needed)")
+    key = tmp_path / "release-key"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "release", "-f", str(key)], check=True)
+    public = " ".join(key.with_name("release-key.pub").read_text().split()[:2])
+    repo, git = release_repo(tmp_path, f'verathos-release namespaces="git" {public}\n')
+    git("-c", "gpg.format=ssh", "-c", "gpg.ssh.program=ssh-keygen", "-c", f"user.signingkey={key}", "tag", "-s",
+        "-m", "v1.2.3", "v1.2.3")
+    script = repo / "docker" / "build.sh"
+    local = build("v1.2.3", "--dry-run", script=script)
+    assert local.returncode == 0, local.stderr
+    assert 'v1.2.3: Good "git" signature for verathos-release' in local.stdout
+    assert "-t local/verathos:1.2.3 " in local.stdout and "-t local/verathos-engines:1.2.3 " in local.stdout
+    assert "docker push" not in local.stdout
+    pushed = build("v1.2.3", "--dry-run", "--push", script=script)
+    assert pushed.returncode == 0, pushed.stderr
+    for name in ("verathos", "verathos-engines"):
+        assert f"-t {REGISTRY}/{name}:1.2.3 " in pushed.stdout
+    assert [line for line in pushed.stdout.splitlines() if line.startswith("docker push")] == [
+        f"docker push {REGISTRY}/verathos:1.2.3", f"docker push {REGISTRY}/verathos-engines:1.2.3"]
+    assert "latest" not in local.stdout + pushed.stdout
 
 
 # ---- verathos-container: the environment ----

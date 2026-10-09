@@ -6,7 +6,7 @@ name: verathos-reference
 
 services:
   reference:
-    image: ${IMAGE_REGISTRY:?set IMAGE_REGISTRY in .env}/verathos-engines:${VERATHOS_VERSION:?set VERATHOS_VERSION in .env}
+    image: ${IMAGE_REGISTRY:-ghcr.io/verathos-ai}/verathos-engines:${VERATHOS_VERSION:?set VERATHOS_VERSION in .env}
     command: ["reference"]
     restart: unless-stopped
     stop_grace_period: 60s

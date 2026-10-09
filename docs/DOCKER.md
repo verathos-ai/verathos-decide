@@ -21,11 +21,12 @@ to serve more requests per GPU for one, installs with the installer.
 
 | Image | Holds | Runs |
 |---|---|---|
-| `ghcr.io/<org>/verathos:<version>` | the release's code, with the auditor's load generator | a light validator; a full validator or the auditor whose engines run on reference machines |
-| `ghcr.io/<org>/verathos-engines:<version>` | the code and the engines its shipped catalog pins: the Kev engine at its pinned revision and `verathos-engine` for Clef models, each for miners (bfloat16, with the fused kernels) and for references (float32), installed as the installer installs them | a miner; a reference machine |
+| `ghcr.io/verathos-ai/verathos:<version>` | the release's code, with the auditor's load generator | a light validator; a full validator or the auditor whose engines run on reference machines |
+| `ghcr.io/verathos-ai/verathos-engines:<version>` | the code and the engines its shipped catalog pins: the Kev engine at its pinned revision and `verathos-engine` for Clef models, each for miners (bfloat16, with the fused kernels) and for references (float32), installed as the installer installs them | a miner; a reference machine |
 
-Each release is a tag, its version (`1.0.0` for `v1.0.0`). The images hold no weights: a container downloads the
-pinned weights at its first start into its data directory. The engines image is several GB.
+Each image is tagged with its release's version (`1.0.0` for `v1.0.0`) and nothing else: there is no `latest` tag. The
+images hold no weights: a container downloads the pinned weights at its first start into its data directory. The
+engines image is several GB.
 
 ## Quick start
 
@@ -101,7 +102,7 @@ the validator there. It keeps its certificate and key across restarts and update
 | Variable | Default | Meaning |
 |---|---|---|
 | `COMPOSE_FILE` | | the role's compose file |
-| `IMAGE_REGISTRY`, `VERATHOS_VERSION` | | the images: registry and owner, and the release |
+| `IMAGE_REGISTRY`, `VERATHOS_VERSION` | `ghcr.io/verathos-ai`, - | the images: registry and owner (`local`: the ones `docker/build.sh` built on this machine), and the release |
 | `DATA_DIR` | `./data` | configuration, state and weights |
 | `NETWORK`, `NETUID` | `finney`, 96 | `test` (405), or a `wss://` subtensor node |
 | `WALLETS_DIR`, `WALLET`, `HOTKEY` | `~/.bittensor/wallets`, -, `default` | the wallet whose hotkey and `coldkeypub.txt` the container reads |
@@ -177,6 +178,9 @@ A release is a new image tag. To update, set `VERATHOS_VERSION` in `.env` to it,
 docker compose pull && docker compose up -d
 ```
 
+This is the only way a container's image changes: the images carry version tags only, so a container runs the release
+`VERATHOS_VERSION` names until it is changed, and an image updater such as watchtower has nothing to follow.
+
 The container starts on the new image and sets up its role again. A miner keeps its pin and reuses its measurement
 unless what it depends on changed: an engine's code or revision, or how the miner measures; then it measures again.
 The subnet owner's catalog changes need no new image, except:
@@ -222,14 +226,15 @@ Others are as for the installer ([Mining](MINING.md#troubleshooting), [Validatin
 The subnet owner builds and publishes each release's images from its signed tag:
 
 ```bash
-bash docker/build.sh v1.2.0 --registry ghcr.io/<org> --push
+bash docker/build.sh v1.2.0           # local/verathos:1.2.0 and local/verathos-engines:1.2.0
+bash docker/build.sh v1.2.0 --push    # ghcr.io/verathos-ai/verathos:1.2.0 and .../verathos-engines:1.2.0, pushed
 ```
 
 `docker/build.sh` exports the tag (only once a key in `release/allowed_signers` verifies it, as the installer checks
-releases), builds `verathos` and `verathos-engines` from `docker/Dockerfile` and tags both with the version; `--latest`
-also tags `latest`. A branch or commit builds as it is, tagged `<version>-<commit>`; `--working-tree` builds the
-checkout, tagged `<version>-dev`. Without `--registry` the images are `local/...`, for the machine that built them
-(`IMAGE_REGISTRY=local`).
+releases), builds `verathos` and `verathos-engines` from `docker/Dockerfile` and tags both with the version, as
+`local/...` for the machine that built them (`IMAGE_REGISTRY=local`). Only `--push` tags them for the registry and
+pushes them, and only for a release. A branch or commit builds as it is, tagged `<version>-<commit>`;
+`--working-tree` builds the checkout, tagged `<version>-dev`.
 
 The engines' environments are a layer of their own, keyed by the Kev revisions the catalog pins and
 `verathos-engine`'s requirements: a release that changes neither, built where the previous one was, leaves that layer
