@@ -166,7 +166,8 @@ view of the miners does not take a model off the gateway. Once the current table
    "egress": [...]}`) and commit the catalog (`SUBNET_ADMIN.md`). Miners serve it from their next catalog check.
    Miners' firewalls drop connections from any other address once they enforce (`MINING.md`, Firewall): list every
    address the gateway's requests leave from, and commit a catalog with the new ones before moving it.
-3. Install: `VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway]"`.
+3. Install: `VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway]"`. Images are decoded only on Linux
+   5.13 or later with Landlock enabled ([Images](#images)).
 4. PostgreSQL (SQLite only for development):
 
    ```bash
@@ -413,10 +414,13 @@ gateway, the auditor and validators can check its `request_sha256`; a client hol
 
 Users' image files are decoded only in the gateway's decode workers: `media_workers` processes, each a fresh
 interpreter without the gateway's memory, descriptors or environment, with a 1 GiB address space and no core dumps.
-The size an image's header gives is checked before a pixel is decoded, and a worker's result again before it is
-forwarded. An image that takes a worker longer than `media_timeout_s` (2 s) gets 413 and the worker is replaced, as it
-is after 256 images. At most `max_media_in_flight` requests are decoded or wait for a worker at once; more get 503
-`busy`.
+Before it reads an image, a worker is confined for good: it opens and executes no file (Landlock), so it reads none of
+the gateway's keys or configuration, and it creates no socket and signals no process (seccomp). Images are decoded
+only on Linux 5.13 or later with Landlock among its security modules (`/sys/kernel/security/lsm` lists `landlock`);
+elsewhere requests with images get 503 `unavailable`, which the gateway logs as it starts. The size an image's header
+gives is checked before a pixel is decoded, and a worker's result again before it is forwarded. An image that takes a
+worker longer than `media_timeout_s` (2 s) gets 413 and the worker is replaced, as it is after 256 images. At most
+`max_media_in_flight` requests are decoded or wait for a worker at once; more get 503 `busy`.
 
 Behind nginx, `client_max_body_size 14m` lets image bodies through and `proxy_request_buffering off` passes a body on
 as it arrives ([Restarts without downtime](#restarts-without-downtime)): nginx then holds no body whole, in memory or

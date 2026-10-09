@@ -48,6 +48,7 @@ from verathos.gateway.app import (
 )
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
+from verathos.gateway.media import landlock_abi
 from verathos.gateway.router import Router
 from verathos.gateway.routes import Refused, RouteTable, dropped_models, stale_after_s
 from verathos.gateway.sampler import Sampler, TestFollower
@@ -75,6 +76,9 @@ async def serve(config: GatewayConfig) -> None:
     if importlib.util.find_spec("PIL") is None:
         raise SystemExit("Pillow is missing: the gateway decodes users' images with it (install the gateway extra)")
     keep_out_of_dumps()
+    if landlock_abi() < 1:
+        log.error("the kernel offers no Landlock (Linux 5.13 or later, with landlock among its security modules): "
+                  "this gateway decodes no image, and requests with images get 503")
     engine = db.create_engine(config.database_url)
     if await db.schema_revision(engine) != db.head_revision():
         raise SystemExit("the database schema is not current: run `verathos-gateway db upgrade` first")

@@ -3,9 +3,11 @@
 Users' image files are decoded only here, each by a worker process: a fresh interpreter (no copy of the gateway's
 memory, its hotkey included, and none of its descriptors) whose address space is ``WORKER_MEMORY_BYTES``, that writes no
 core dump, is killed and replaced when an image takes it longer than ``timeout_s``, and is replaced after
-``WORKER_IMAGES`` images. Workers start with the first image. A request's images are decoded at once, each by a
-worker of its own as one is free; at most ``max_in_flight`` requests are decoded or wait for a worker at a time, and
-more are told the decoders are busy.
+``WORKER_IMAGES`` images. Once its decoders are loaded, and before it reads an image, a worker is confined for good
+(``confine``): it opens and executes no file, so it reads none of the gateway's keys or configuration, creates no
+socket and signals no process. Where the kernel offers no Landlock, no worker starts and no image is decoded. Workers
+start with the first image. A request's images are decoded at once, each by a worker of its own as one is free; at
+most ``max_in_flight`` requests are decoded or wait for a worker at a time, and more are told the decoders are busy.
 
 A worker's reply is data, never code: a length-prefixed JSON header and the canonical image's base64, which the
 gateway decodes strictly and whose form and size it checks again (``protocol.media.canonical_header``) before it
@@ -18,9 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import binascii
+import ctypes
+import errno
+import importlib
 import json
 import logging
 import os
+import platform
 import selectors
 import struct
 import subprocess
@@ -246,8 +252,8 @@ class Decoders:
             if worker is not None:
                 worker.close()
             if times := _throttled("start"):
-                log.error("an image decoder could not start (%s: %s; %d times since last logged): is Pillow installed "
-                          "(the gateway extra)?", type(exc).__name__, exc, times)
+                log.error("an image decoder could not start (%s: %s; %d times since last logged): it needs Pillow "
+                          "(the gateway extra) and a kernel with Landlock", type(exc).__name__, exc, times)
             raise DecodingUnavailable from None
         return worker
 
@@ -296,6 +302,91 @@ def _checked(head: dict[str, Any], payload: bytes, content_type: str, limits: Im
 
 # ---- the worker ----
 
+_SYS_LANDLOCK_CREATE_RULESET, _SYS_LANDLOCK_RESTRICT_SELF = 444, 446  # the same on every architecture
+_LANDLOCK_CREATE_RULESET_VERSION = 1
+# the rights a Landlock ruleset handles, by the ABI version that added them: every access to files, and TCP's bind and
+# connect (4); a ruleset without rules refuses all of them
+_LANDLOCK_FS = {1: (1 << 13) - 1, 2: 1 << 13, 3: 1 << 14, 5: 1 << 15}
+_LANDLOCK_NET = {4: 0b11}
+_PR_SET_NO_NEW_PRIVS, _PR_SET_SECCOMP, _SECCOMP_MODE_FILTER = 38, 22, 2
+_SECCOMP_RET_KILL_PROCESS, _SECCOMP_RET_ERRNO, _SECCOMP_RET_ALLOW = 0x80000000, 0x00050000, 0x7FFF0000
+# per architecture: its audit identifier and the system calls a worker is refused (socket, socketpair, io_uring_setup,
+# and those that signal a process: kill, tkill, tgkill, rt_sigqueueinfo, rt_tgsigqueueinfo, pidfd_send_signal)
+_REFUSED_CALLS = {"x86_64": (0xC000003E, (41, 53, 425, 62, 200, 234, 129, 297, 424)),
+                  "aarch64": (0xC00000B7, (198, 199, 425, 129, 130, 131, 138, 240, 424))}
+_X32_CALLS = 0x40000000  # x86_64's x32 numbering, refused whole
+
+
+class _RulesetAttr(ctypes.Structure):
+    _fields_ = [("handled_access_fs", ctypes.c_uint64), ("handled_access_net", ctypes.c_uint64)]
+
+
+class _SockFilter(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint16), ("jt", ctypes.c_uint8), ("jf", ctypes.c_uint8), ("k", ctypes.c_uint32)]
+
+
+class _SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(_SockFilter))]
+
+
+def _libc() -> ctypes.CDLL:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    return libc
+
+
+def landlock_abi() -> int:
+    """The version of Landlock the kernel offers; 0 for none."""
+    if sys.platform != "linux":
+        return 0
+    return max(0, _libc().syscall(ctypes.c_long(_SYS_LANDLOCK_CREATE_RULESET), ctypes.c_void_p(None),
+                                  ctypes.c_size_t(0), ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION)))
+
+
+def confine() -> None:
+    """Confine this process for good: it opens and executes no file (Landlock), nor binds or connects a TCP port where
+    Landlock handles them (Linux 6.7 and later), and it creates no socket and signals no process (seccomp; a system
+    call of another architecture ends it). Raises OSError where the kernel offers no Landlock or the architecture is
+    not one of ``_REFUSED_CALLS``."""
+    abi, machine = landlock_abi(), platform.machine()
+    if abi < 1:
+        raise OSError("the kernel offers no Landlock (Linux 5.13 or later, with landlock among its security modules)")
+    if machine not in _REFUSED_CALLS:
+        raise OSError(f"no system call filter for {machine}")
+    libc = _libc()
+    attr = _RulesetAttr(sum(bits for version, bits in _LANDLOCK_FS.items() if version <= abi),
+                        sum(bits for version, bits in _LANDLOCK_NET.items() if version <= abi))
+    ruleset = libc.syscall(ctypes.c_long(_SYS_LANDLOCK_CREATE_RULESET), ctypes.byref(attr),
+                           ctypes.c_size_t(ctypes.sizeof(attr)), ctypes.c_uint32(0))
+    if ruleset < 0:
+        raise OSError(ctypes.get_errno(), "landlock_create_ruleset failed")
+    try:
+        if libc.prctl(_PR_SET_NO_NEW_PRIVS, ctypes.c_ulong(1), ctypes.c_ulong(0), ctypes.c_ulong(0),
+                      ctypes.c_ulong(0)) != 0:
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS) failed")
+        filters = _filters(*_REFUSED_CALLS[machine])
+        program = _SockFprog(len(filters), ctypes.cast(filters, ctypes.POINTER(_SockFilter)))
+        if libc.prctl(_PR_SET_SECCOMP, ctypes.c_ulong(_SECCOMP_MODE_FILTER), ctypes.byref(program), ctypes.c_ulong(0),
+                      ctypes.c_ulong(0)) != 0:
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_SECCOMP) failed")
+        if libc.syscall(ctypes.c_long(_SYS_LANDLOCK_RESTRICT_SELF), ctypes.c_long(ruleset), ctypes.c_uint32(0)) != 0:
+            raise OSError(ctypes.get_errno(), "landlock_restrict_self failed")
+    finally:
+        os.close(ruleset)
+
+
+def _filters(arch: int, refused: tuple[int, ...]) -> ctypes.Array:
+    """The seccomp program: a system call of another architecture ends the process, the refused ones and x32's fail
+    with EPERM, any other is allowed."""
+    # BPF_LD|BPF_W|BPF_ABS, BPF_JMP|BPF_JEQ|BPF_K, BPF_JMP|BPF_JGE|BPF_K, BPF_RET|BPF_K
+    load, equal, at_least, ret = 0x20, 0x15, 0x35, 0x06
+    checks =[(at_least, _X32_CALLS), *((equal, number) for number in refused)]
+    program = [(load, 0, 0, 4), (equal, 1, 0, arch), (ret, 0, 0, _SECCOMP_RET_KILL_PROCESS), (load, 0, 0, 0)]
+    program += [(code, len(checks) - i, 0, k) for i, (code, k) in enumerate(checks)]  # a match: to the refusal
+    program += [(ret, 0, 0, _SECCOMP_RET_ALLOW), (ret, 0, 0, _SECCOMP_RET_ERRNO | errno.EPERM)]
+    return (_SockFilter * len(program))(*(_SockFilter(*instruction) for instruction in program))
+
+
 def _job(header: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]:
     """One image: (reply header, the canonical image's base64). ``retire`` in the header: the worker exits after."""
     limits = ImageLimits.model_validate(header["limits"])
@@ -316,14 +407,21 @@ def _job(header: dict[str, Any], payload: bytes) -> tuple[dict[str, Any], bytes]
 
 
 def serve(memory_bytes: int) -> None:
-    """Take jobs from stdin until it closes, one at a time, under the resource limits (see the module)."""
+    """Take jobs from stdin until it closes, one at a time, confined and under the resource limits (see the module).
+    Where it cannot be confined, it returns without its ready mark."""
     import resource
 
     keep_out_of_dumps()
     from PIL import Image
 
-    Image.init()  # the decoders are loaded before the address space is limited
+    importlib.import_module("PIL.ImageOps")  # what canonical_image imports, loaded while modules may still be opened
+    Image.init()  # every decoder, loaded before the address space is limited and the worker confined
     resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+    try:
+        confine()
+    except OSError as exc:
+        sys.stderr.write(f"an image decoder cannot be confined: {exc}\n")
+        return
     jobs, replies = sys.stdin.buffer, sys.stdout.buffer
     replies.write(READY)
     replies.flush()

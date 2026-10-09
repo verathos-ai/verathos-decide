@@ -19,7 +19,7 @@ from tests.test_gateway import Setup
 from tests.test_throughput import kp
 from verathos import catalog
 from verathos.gateway.app import Rejected, check_request, with_images
-from verathos.gateway.media import CanonicalImage, Decoders, DecodersBusy, _Worker
+from verathos.gateway.media import CanonicalImage, Decoders, DecodersBusy, _Worker, landlock_abi
 from verathos.gateway.sampler import BATCH_BYTES, Sampler, batches
 from verathos.gateway.upstream import Exchange
 from verathos.protocol.api import MAX_RESPONSE_BYTES
@@ -35,7 +35,9 @@ from verathos.protocol.media import (
 )
 from verathos.protocol.receipts import SignedReceipt
 
-pytestmark = pytest.mark.usefixtures("lab_network")
+pytestmark = [pytest.mark.usefixtures("lab_network"),
+              pytest.mark.skipif(landlock_abi() < 1, reason="the gateway decodes images only where the kernel offers "
+                                                            "Landlock (Linux 5.13 or later)")]
 
 QUESTIONS = {"corner": {"type": "noul", "instructions": "Is there a green corner?"},
              "kind": {"type": "choice", "criteria": {"photo": "A photo", "drawing": "A drawing"}}}
@@ -386,8 +388,104 @@ def test_a_decoder_runs_apart_with_limits_and_none_of_the_gateways_secrets(monke
         assert limits["Max address space"][:2] == [str(1 << 30)] * 2
         with pytest.raises(PermissionError):  # not dumpable: its memory is closed to other processes
             open(f"{proc}/environ", "rb").read()
+        with open(f"{proc}/status") as f:
+            status = dict(line.split(":", 1) for line in f.read().splitlines())
+        assert status["NoNewPrivs"].strip() == "1" and status["Seccomp"].strip() == "2"  # confined before it is ready
     finally:
         worker.close()
+
+
+def test_a_confined_worker_reads_no_file_makes_no_socket_signals_no_process_and_runs_nothing(tmp_path) -> None:
+    import socket
+    import subprocess
+
+    config = tmp_path / "gateway.json"
+    config.write_text('{"database_url": "postgresql+asyncpg://gateway:hunter2@db/gateway"}')
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    code = f"""
+import os, socket, sys
+from verathos.gateway.media import confine
+tcp = socket.socket()  # made before: where Landlock handles TCP, it still connects nowhere
+confine()
+for name, attempt in (("read", lambda: open({str(config)!r}).read()),
+                      ("socket", lambda: socket.socket(socket.AF_INET, socket.SOCK_DGRAM)),
+                      ("signal", lambda: os.kill(os.getppid(), 0)),
+                      ("run", lambda: os.execv(sys.executable, [sys.executable, "-c", "print('ran')"])),
+                      ("connect", lambda: tcp.connect(("127.0.0.1", {listener.getsockname()[1]})))):
+    try:
+        attempt()
+        print(name, "done")
+    except PermissionError:
+        print(name, "refused")
+"""
+    try:
+        run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    finally:
+        listener.close()
+    assert run.returncode == 0, run.stderr
+    assert dict(line.split() for line in run.stdout.splitlines()) == {
+        "read": "refused", "socket": "refused", "signal": "refused", "run": "refused",
+        "connect": "refused" if landlock_abi() >= 4 else "done"}
+
+
+@pytest.mark.parametrize(("unconfinable", "why"), [
+    ("media.landlock_abi = lambda: 0", "the kernel offers no Landlock"),
+    ("media.platform.machine = lambda: 'riscv64'", "no system call filter for riscv64"),
+])
+def test_a_worker_that_cannot_be_confined_reads_no_image(unconfinable, why) -> None:
+    import subprocess
+
+    from verathos.gateway.media import _frame
+
+    job = _frame({"content_type": "image/png", "limits": ImageLimits().model_dump()}, b64(encoded(64, 64)).encode())
+    run = subprocess.run([sys.executable, "-c", f"import verathos.gateway.media as media\n{unconfinable}\n"
+                                                "media.serve(1 << 30)\n"], input=job, capture_output=True, timeout=60)
+    assert run.stdout == b""  # neither its ready mark nor a reply
+    assert f"an image decoder cannot be confined: {why}".encode() in run.stderr
+
+
+def test_confined_workers_make_every_kind_of_image_canonical_as_the_gateway_itself_would() -> None:
+    """All a worker decodes with is loaded before it is confined."""
+    import binascii
+    import io
+
+    from PIL import Image
+
+    from tests.images import drawn
+    from verathos.protocol.media import JPEG, PNG, WEBP, canonical_image
+
+    def saved(image, fmt: str, **params) -> bytes:
+        out = io.BytesIO()
+        image.save(out, fmt, **params)
+        return out.getvalue()
+
+    field, frames = drawn(320, 200), [drawn(96, 64), drawn(96, 64).transpose(Image.Transpose.ROTATE_180)]
+    turned = Image.Exif()
+    turned[0x0112] = 6
+    images = {
+        "png rgba": (PNG, saved(field.convert("RGBA"), "PNG")),
+        "png palette, transparent": (PNG, saved(field.convert("P"), "PNG", transparency=0)),
+        "png 16-bit grey": (PNG, saved(field.convert("I;16"), "PNG")),
+        "png grey and alpha": (PNG, saved(field.convert("LA"), "PNG")),
+        "png animated": (PNG, saved(frames[0], "PNG", save_all=True, append_images=frames[1:])),
+        "jpeg turned by exif": (JPEG, saved(field, "JPEG", exif=turned)),
+        "jpeg cmyk": (JPEG, saved(field.convert("CMYK"), "JPEG")),
+        "jpeg grey, progressive": (JPEG, saved(field.convert("L"), "JPEG", progressive=True)),
+        "jpeg decoded at a smaller scale": (JPEG, saved(drawn(3000, 2000), "JPEG")),
+        "webp lossless rgba": (WEBP, saved(field.convert("RGBA"), "WEBP", lossless=True)),
+        "webp animated": (WEBP, saved(frames[0], "WEBP", save_all=True, append_images=frames[1:])),
+    }
+    limits, decoders = ImageLimits(), Decoders(2, 4, 10.0)
+    try:
+        for name, (content_type, data) in images.items():
+            (made,) = asyncio.run(decoders.canonical([(content_type, b64(data))], limits))
+            here = canonical_image(data, content_type, limits)
+            assert (made.content_type, made.width, made.height) == (here.content_type, here.width, here.height), name
+            assert binascii.a2b_base64(made.base64) == here.data, name
+    finally:
+        decoders.close()
 
 
 def test_a_decoder_is_replaced_when_an_image_takes_too_long_or_too_much_memory(caplog, monkeypatch) -> None:
