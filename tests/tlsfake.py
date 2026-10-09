@@ -4,7 +4,7 @@ Tests reach miner and validator apps over in-memory transports (``httpx.ASGITran
 ``Presenting`` stands in for one: requests must be https, and must accept the host's certificate (its pin, or any
 certificate); the response carries the certificate in its ``network_stream`` extension, as a TLS connection's does,
 so ``tls.peer_pin`` reads it. Certificates are real (``tls.identity``'s kind), one per name. ``serving`` runs an app
-over real TLS on a loopback port.
+over real TLS on a loopback port, or over plain http as an engine serves.
 """
 
 from __future__ import annotations

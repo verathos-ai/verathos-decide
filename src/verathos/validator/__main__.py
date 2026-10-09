@@ -31,6 +31,7 @@ import httpx
 
 from verathos import __version__, catalog, release
 from verathos import update as self_update
+from verathos.engine import code_version
 from verathos.protocol import tls
 from verathos.protocol.callers import ValidatorIdentity
 from verathos.throughput.feed import Credit, Verdicts, published_shares
@@ -44,7 +45,7 @@ from verathos.validator.discovery import DiscoveredEndpoint, Neuron, discover
 from verathos.validator.fallback import Taken, source_results, take
 from verathos.validator.follow import CatalogFollower
 from verathos.validator.light import Refused
-from verathos.validator.references import transitioning, wrong_revision
+from verathos.validator.references import served_code, transitioning, wrong_revision
 from verathos.validator.scoring import (
     ScoreState,
     epoch_scores,
@@ -185,27 +186,36 @@ async def references_down(references: dict[str, ReferenceEngine]) -> list[str]:
     return sorted(m for m in await asyncio.gather(*(down(m, r) for m, r in references.items())) if m)
 
 
-async def remote_engines_down(engines: Mapping[str, ReferenceEngine]) -> list[str]:
-    """The engines on other machines among ``engines`` (name -> engine) that do not serve now, each with why."""
-    async def check(name: str, spec: ReferenceEngine) -> str | None:
+async def remote_engines(engines: Mapping[str, ReferenceEngine]) -> tuple[list[str], list[str]]:
+    """The engines on other machines among ``engines`` (name -> engine): those that do not serve now, each with why,
+    and those that run other engine code than this validator's release (``verathos.engine.code_version``), each with
+    the code it runs."""
+    own = code_version()
+
+    async def check(name: str, spec: ReferenceEngine) -> tuple[str | None, str | None]:
         engine = spec.engine(timeout_s=REMOTE_CHECK_S)
         try:
             why = await engine.problem()
+            codes = served_code(await engine.info()) if why is None else set()
         finally:
             await engine.close()
-        return None if why is None else f"{name} at {spec.url}: {why}"
+        if why is not None:
+            return f"{name} at {spec.url}: {why}", None
+        return None, (f"{name} at {spec.url} runs {', '.join(sorted(codes))}" if codes and own not in codes else None)
 
     remote = [(name, spec) for name, spec in sorted(engines.items()) if spec.remote()]
-    return [line for line in await asyncio.gather(*(check(n, s) for n, s in remote)) if line]
+    found = await asyncio.gather(*(check(n, s) for n, s in remote))
+    return [down for down, _ in found if down], [other for _, other in found if other]
 
 
 async def check_remote_engines(cfg: ValidatorConfig, epoch: int, auditor: bool) -> None:
     """One line per epoch while an engine on another machine (a reference, or the auditor's screen) does not serve:
-    what it checks stays unchecked, not penalized, as when a local reference is down."""
+    what it checks stays unchecked, not penalized, as when a local reference is down; and one while such an engine runs
+    other engine code than this validator's release, which its machine's installer updates."""
     engines = {f"the {m} reference": r for m, r in cfg.references.items()}
     if auditor:
         engines |= {f"the {m} screen": s for m, s in cfg.audit_screens.items()}
-    down = await remote_engines_down(engines)
+    down, other = await remote_engines(engines)
     if down:
         log.warning("epoch %d: engines on other machines not serving: %s; what they check stays unchecked, not "
                     "penalized, until they serve again (docs/VALIDATING.md, When the GPU machine is gone)", epoch,
@@ -213,6 +223,10 @@ async def check_remote_engines(cfg: ValidatorConfig, epoch: int, auditor: bool) 
     elif _REMOTE_DOWN:
         log.info("epoch %d: the engines on other machines serve again", epoch)
     _REMOTE_DOWN[:] = down
+    if other:
+        log.warning("epoch %d: engines on other machines run other engine code than this validator's release (%s): "
+                    "%s; update their machine to this release (install.sh reference --yes there)", epoch,
+                    code_version(), "; ".join(other))
 
 
 def wait_for_references(references: dict[str, ReferenceEngine], timeout_s: float = REFERENCE_WAIT_S,

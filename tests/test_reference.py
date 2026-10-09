@@ -22,7 +22,8 @@ from tests.mock_engine import MockEngine
 from tests.test_install import CLEF, KEV, ServiceManager, gpu
 from tests.tlsfake import free_port, running, serving
 from verathos import catalog
-from verathos.install import common, engines, host, plan
+from verathos.engine import code_version
+from verathos.install import common, engines, host, plan, services
 from verathos.install import reference as setup
 from verathos.install import validator as validator_setup
 from verathos.install.host import GiB
@@ -41,14 +42,16 @@ REQUEST = {"model": "kev-4b", "state": "Hi team, we were billed twice for March.
                                         "criteria": {"billing": "Charges", "technical": "Bugs"}}}}
 
 
-def engine_app(model: str, salt: str, asked: list[str]) -> FastAPI:
-    """An engine as it serves on its machine's loopback: deterministic answers, its revision, every request noted."""
+def engine_app(model: str, salt: str, asked: list[str], codes: dict[str, str] | None = None) -> FastAPI:
+    """An engine as it serves on its machine's loopback: deterministic answers, its revision and the engine code it
+    runs (``codes[salt]``, if any), every request noted."""
     app, engine = FastAPI(), MockEngine(model, salt)
 
     @app.get("/v1/models")
     async def models():
         asked.append(f"{salt} models")
-        return {"data": [{"id": model, "revision": f"{salt}-revision"}]}
+        code = {"code": codes[salt]} if codes and salt in codes else {}
+        return {"data": [{"id": model, "revision": f"{salt}-revision", **code}]}
 
     @app.post("/v1/systemone")
     async def systemone(request: Request):
@@ -59,12 +62,14 @@ def engine_app(model: str, salt: str, asked: list[str]) -> FastAPI:
 
 
 @contextlib.contextmanager
-def machine(tmp_path: Path, allow: list[str], listen: str = "127.0.0.1") -> Iterator[SimpleNamespace]:
+def machine(tmp_path: Path, allow: list[str], listen: str = "127.0.0.1",
+            codes: dict[str, str] | None = None) -> Iterator[SimpleNamespace]:
     """A reference machine on this host: kev-4b's reference and screen and kev-9b's reference, each an engine over
-    plain http on loopback, behind the front over real TLS on a loopback port, its socket filtered to ``allow``."""
+    plain http on loopback (``codes``: the engine code each names, by salt), behind the front over real TLS on a
+    loopback port, its socket filtered to ``allow``."""
     asked: list[str] = []
     with contextlib.ExitStack() as stack:
-        urls = {key: stack.enter_context(serving(engine_app(key[1], salt, asked), None))
+        urls = {key: stack.enter_context(serving(engine_app(key[1], salt, asked, codes), None))
                 for key, salt in ((("reference", "kev-4b"), "fp32"), (("screen", "kev-4b"), "bf16"),
                                   (("reference", "kev-9b"), "fp32-9b"))}
         served: dict[str, dict[str, str]] = {}
@@ -332,13 +337,17 @@ def test_the_reference_setup_runs_each_engine_and_the_front_and_writes_the_file_
     assert names == ["verathos-reference-clef-flash", "verathos-reference-kev-4b", "verathos-reference-kev-9b",
                      "verathos-screen-clef-flash", "verathos-screen-kev-4b", "verathos-screen-kev-9b",
                      "verathos-reference"]
-    services = {s.name: s for s in done.manager.applied}
-    fp32, bf16, front_service = (services["verathos-reference-kev-4b"], services["verathos-screen-kev-4b"],
-                                 services["verathos-reference"])
+    applied = {s.name: s for s in done.manager.applied}
+    fp32, bf16, front_service = (applied["verathos-reference-kev-4b"], applied["verathos-screen-kev-4b"],
+                                 applied["verathos-reference"])
     assert fp32.environment["KEV_DTYPE"] == "fp32" and fp32.environment["CUDA_VISIBLE_DEVICES"] == ""  # in RAM
     assert "KEV_DTYPE" not in bf16.environment and bf16.environment["CUDA_VISIBLE_DEVICES"] == "0"
     assert fp32.command[0].endswith(".venv-reference/bin/python") and bf16.command[0].endswith(".venv/bin/python")
-    assert services["verathos-screen-clef-flash"].command[-4:] == ["--device", "cuda", "--dtype", "bfloat16"]
+    assert applied["verathos-screen-clef-flash"].command[-4:] == ["--device", "cuda", "--dtype", "bfloat16"]
+    # the code each engine runs: verathos-engine this release's, the Kev engine the revision the catalog pins
+    assert applied["verathos-screen-clef-flash"].environment["VERATHOS_ENGINE_CODE"] == code_version()
+    assert done.record.engines["screen/clef-flash"]["code"] == code_version()
+    assert done.record.engines["reference/kev-4b"]["code"] == f"kev {catalog.load().get('kev-4b').engine.revision}"
     assert front_service.command[-2:] == ["--config", str(box.home / "reference.json")]
     assert set(front_service.after) == set(names[:-1])
     assert sorted(box.installed) == [("clef", "miner"), ("clef", "reference"), ("kev", "miner"), ("kev", "reference")]
@@ -378,6 +387,20 @@ def test_the_reference_setup_runs_each_engine_and_the_front_and_writes_the_file_
     assert kept.record.options == {"network": "test", "netuid": 405, "screens": False, "models": ["kev-4b"]}
     assert list(box.run().config.engines) == ["kev-4b"]  # kept
     assert set(box.run("--model", "auto").config.engines) == {"kev-4b", "kev-9b", "clef-flash"}
+
+
+def test_an_update_restarts_the_engines_whose_code_changed(reference_machine, monkeypatch) -> None:
+    """verathos-engine runs this release's code: a release that changes it changes its services, which the service
+    manager restarts; the Kev engines run the revision the catalog pins and stay as they are."""
+    box = reference_machine
+    before = {s.name: services.Systemd.render(s) for s in box.run("--allow", "198.51.100.9").manager.applied}
+    monkeypatch.setattr(engines, "code_version", lambda: "0123456789ab")
+    box.managers.append(Boxes())
+    again = box.run()
+    after = {s.name: services.Systemd.render(s) for s in again.manager.applied}
+    assert sorted(n for n in after if after[n] != before[n]) == ["verathos-reference-clef-flash",
+                                                                 "verathos-screen-clef-flash"]
+    assert again.record.engines["reference/clef-flash"]["code"] == "0123456789ab"
 
 
 def test_the_reference_setup_refuses_a_machine_that_runs_a_validator_and_unknown_models(reference_machine) -> None:
@@ -556,6 +579,30 @@ def test_a_validator_with_part_of_its_references_elsewhere_runs_the_others_itsel
     assert [s.name for s in manager.applied] == ["verathos-reference-kev-4b", validator_setup.VALIDATOR]
 
 
+def test_the_validator_setup_shows_what_each_remote_engine_serves_as_the_validator_reaches_it(tmp_path) -> None:
+    """Its revision against the catalog's pin (the stand-in engines name other revisions), and the engine code it
+    runs against this release's."""
+    codes = {"fp32": code_version(), "bf16": "0123456789ab"}
+    pinned = catalog.load().get("kev-4b").hf_revision[:12]
+    with machine(tmp_path, ["198.51.100.9"], codes=codes) as box:
+        def entry(kind: str, key: str = box.key) -> dict:
+            return {"url": f"{box.base}/{kind}/kev-4b", "tls_pin": box.pin, "api_key": key}
+
+        lines = asyncio.run(validator_setup.remote_lines({"kev-4b": entry("reference")}, {"kev-4b": entry("screen")},
+                                                         catalog.load()))
+        down = asyncio.run(validator_setup.remote_lines({"kev-4b": entry("reference", "wrong")}, {}, catalog.load()))
+    assert lines == [
+        f"kev-4b: float32 reference on another machine, {box.base}/reference/kev-4b (pin {box.pin[:12]}...): serves "
+        f"revision fp32-revisio, the catalog pins {pinned}: not used until it serves the pinned one, engine code "
+        f"{code_version()} (this release's)",
+        f"kev-4b: bfloat16 screen on another machine, {box.base}/screen/kev-4b (pin {box.pin[:12]}...): serves "
+        f"revision bf16-revisio, the catalog pins {pinned}: not used until it serves the pinned one, engine code "
+        f"0123456789ab, not this release's {code_version()}: update its machine"]
+    assert down == [f"kev-4b: float32 reference on another machine, {box.base}/reference/kev-4b (pin "
+                    f"{box.pin[:12]}...): it does not serve now, refuses the key (HTTP 401); the validator waits for "
+                    "it at its start (15 minutes at most) and checks it each epoch"]
+
+
 def test_a_validator_setup_refuses_a_reference_machine(validator_machine) -> None:
     common.Record(role="reference", manager="supervisor", services=["verathos-reference"]).save(validator_machine.home)
     with pytest.raises(SystemExit, match="this machine is a reference machine"):
@@ -567,7 +614,13 @@ def test_a_validator_setup_refuses_a_reference_machine(validator_machine) -> Non
 def test_the_validator_warns_once_per_epoch_while_an_engine_on_another_machine_does_not_serve(tmp_path,
                                                                                               caplog) -> None:
     caplog.set_level(logging.INFO, logger="verathos.validator")
-    with machine(tmp_path, ["198.51.100.9"]) as box:
+    codes = {"fp32": code_version(), "bf16": code_version()}  # verathos-engine names its code; Kev's names none
+
+    def warnings() -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                and r.name == "verathos.validator"]
+
+    with machine(tmp_path, ["198.51.100.9"], codes=codes) as box:
         def cfg(key: str, screen_port: int) -> ValidatorConfig:
             return ValidatorConfig.model_validate({
                 "netuid": 405, "wallet_name": "w", "hotkey_name": "h",
@@ -577,19 +630,28 @@ def test_the_validator_warns_once_per_epoch_while_an_engine_on_another_machine_d
                                              "tls_pin": box.pin, "api_key": key}}})
 
         asyncio.run(validator_main.check_remote_engines(cfg(box.key, box.port), 41, auditor=True))
-        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]  # all of them serve
+        assert warnings() == []  # all of them serve, on this release's engine code
         gone = free_port()
         asyncio.run(validator_main.check_remote_engines(cfg("wrong", gone), 42, auditor=True))
         asyncio.run(validator_main.check_remote_engines(cfg("wrong", gone), 43, auditor=False))
         asyncio.run(validator_main.check_remote_engines(cfg(box.key, box.port), 44, auditor=True))
-    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
-                and r.name == "verathos.validator"]
-    assert len(warnings) == 2 and all("stays unchecked, not penalized" in w for w in warnings)
-    assert warnings[0].startswith("epoch 42: engines on other machines not serving: the kev-4b reference at "
+        down = warnings()
+        assert len(down) == 2 and all("stays unchecked, not penalized" in w for w in down)
+        assert down[0].startswith("epoch 42: engines on other machines not serving: the kev-4b reference at "
                                   f"{box.base}/reference/kev-4b: refuses the key (HTTP 401); the kev-4b screen at "
                                   f"https://127.0.0.1:{gone}/screen/kev-4b: unreachable (ConnectError")
-    assert "screen" not in warnings[1]  # only the auditor uses screens
-    assert "epoch 44: the engines on other machines serve again" in caplog.messages
+        assert "screen" not in down[1]  # only the auditor uses screens
+        assert "epoch 44: the engines on other machines serve again" in caplog.messages
+
+        codes["bf16"] = "0123456789ab"  # the screen runs another release's engine code
+        caplog.clear()
+        asyncio.run(validator_main.check_remote_engines(cfg(box.key, box.port), 45, auditor=False))
+        assert warnings() == []  # the screen is the auditor's
+        asyncio.run(validator_main.check_remote_engines(cfg(box.key, box.port), 46, auditor=True))
+        assert warnings() == [
+            f"epoch 46: engines on other machines run other engine code than this validator's release "
+            f"({code_version()}): the kev-4b screen at https://127.0.0.1:{box.port}/screen/kev-4b runs 0123456789ab; "
+            "update their machine to this release (install.sh reference --yes there)"]
 
 
 def test_install_script_offers_the_reference_role() -> None:

@@ -297,17 +297,26 @@ def script_commands(role: str, home: Path, options: str = "") -> list[str]:
     return [f"update:  bash {script} {role} --yes{options}{extra}", f"uninstall: bash {script} uninstall{extra}"]
 
 
-def engine_state(why: str | None, served: set[str], pinned: str) -> str:
+def engine_state(why: str | None, served: set[str], pinned: str, codes: set[str] = frozenset()) -> str:
     """What an engine serves, for a setup's output: why it does not serve (``why``), else the revisions it names
-    (``served``) against the one the catalog pins."""
+    (``served``) against the one the catalog pins, and the engine code it names (``codes``, ``verathos-engine``'s)
+    against this release's."""
+    from verathos.engine import code_version
+
     if why is not None:
         return why
     if pinned in served:
-        return f"serves the pinned revision {pinned[:12]}"
-    if served:
-        return (f"serves revision {', '.join(r[:12] for r in sorted(served))}, the catalog pins {pinned[:12]}: "
-                "not used until it serves the pinned one")
-    return "names no revision"
+        line = f"serves the pinned revision {pinned[:12]}"
+    elif served:
+        line = (f"serves revision {', '.join(r[:12] for r in sorted(served))}, the catalog pins {pinned[:12]}: not "
+                "used until it serves the pinned one")
+    else:
+        line = "names no revision"
+    if codes:
+        own = code_version()
+        line += (f", engine code {own} (this release's)" if own in codes else
+                 f", engine code {', '.join(sorted(codes))}, not this release's {own}: update its machine")
+    return line
 
 
 def engine_ready(port: int) -> bool:

@@ -27,7 +27,7 @@ from verathos.miner.engine import HttpEngine
 from verathos.protocol import tls
 from verathos.reference.config import REFERENCE, SCREEN, ReferenceConfig, api_key, caller_address, engines_document
 from verathos.subnet.chain import current_catalog
-from verathos.validator.references import served_revisions
+from verathos.validator.references import served_code, served_revisions
 
 ROLE = "reference"
 FRONT = "verathos-reference"
@@ -102,8 +102,9 @@ def reference_config(existing: dict, *, public_ip: str, port: int, callers: list
     for key, engine_port in sorted(ports.items()):
         kind, model = key.split("/", 1)
         served.setdefault(model, {})[kind] = f"http://127.0.0.1:{engine_port}"
-    config = {**existing, "public_host": public_ip, "port": port, "allow": callers, "engines": served,
-              "listen_host": "::" if any(":" in c for c in callers) else "0.0.0.0"}
+    config = {**existing, "public_host": public_ip, "port": port, "allow": callers, "engines": served}
+    if any(":" in c for c in callers):  # an IPv6 caller: a socket for both families
+        config["listen_host"] = "::"
     config.setdefault("state_dir", str(home / ROLE))
     return config
 
@@ -120,11 +121,12 @@ async def through_front(config: ReferenceConfig, pin: str, key: str, cat: catalo
         try:
             while (why := await engine.problem()) is not None and time.monotonic() < deadline:
                 await asyncio.sleep(2.0)
-            served = served_revisions(await engine.info()) if why is None else set()
+            info = await engine.info() if why is None else None
         finally:
             await engine.close()
         pinned = cat.get(model).hf_revision if cat.get(model) is not None else ""
-        out[plan.engine_key(kind, model)] = common.engine_state(why, served, pinned)
+        out[plan.engine_key(kind, model)] = common.engine_state(why, served_revisions(info), pinned,
+                                                                served_code(info))
     return out
 
 
@@ -292,8 +294,14 @@ def init(argv: list[str]) -> None:
                     after=tuple(s.name for s in engine_services.values()))
     run = [*engine_services.values(), front]
     record.config = str(config_path)
-    record.engines = {item: {"model": item.split("/", 1)[1], "kind": item.split("/", 1)[0],
-                             "device": placement[item], "port": ports[item]} for item in sorted(placement)}
+    record.engines = {}
+    for item, service in engine_services.items():
+        kind, model = item.split("/", 1)
+        # the code it runs: verathos-engine this release's (its service restarts when that changes), the Kev engine
+        # the revision the catalog pins
+        code = service.environment.get("VERATHOS_ENGINE_CODE") or f"kev {models[model].engine.revision}"
+        record.engines[item] = {"model": model, "kind": kind, "device": placement[item], "port": ports[item],
+                                "code": code}
     record.paths = sorted(str(d) for d in installs)
     record.options = {"network": network, "netuid": netuid, "screens": screens, **({"models": named} if named else {})}
 
