@@ -1,6 +1,7 @@
 """HTTP server around a decision engine: ``POST /v1/systemone`` and ``GET /v1/models``.
 
-A request's body is at most ``MAX_BODY_BYTES`` (413 beyond), the largest request a catalog model may take.
+A request's body is at most ``MAX_BODY_BYTES`` (413 beyond): the largest request a catalog model may take, with room
+for the miner's encoding of it, which may escape characters its canonical JSON does not.
 Requests are prepared (validated and tokenized) in worker threads as they arrive, then queued for one device thread,
 which takes everything waiting, up to ``max_batch`` requests, lets the engine split it into passes and runs them one
 after the other, answering each pass's requests when it ends. A request that arrives while passes run joins the next
@@ -26,7 +27,7 @@ from verathos.protocol.api import SystemOneRequest
 from verathos.protocol.media import MAX_IMAGE_REQUEST_BYTES
 
 log = logging.getLogger(__name__)
-MAX_BODY_BYTES = MAX_IMAGE_REQUEST_BYTES
+MAX_BODY_BYTES = 2 * MAX_IMAGE_REQUEST_BYTES
 
 
 class Engine(Protocol):
