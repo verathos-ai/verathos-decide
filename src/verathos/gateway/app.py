@@ -2,8 +2,8 @@
 
     POST /v1/systemone   a SystemOne request with ``Authorization: Bearer <key>`` -> the answers, the usage, the
                          miner's signed receipt and the request id
-    GET  /v1/models      the catalog's active models: state limit, accepted input, price, weights, whether
-                         available now, state and latency
+    GET  /v1/models      the catalog's active models: state limit, the input each reads (and its image limits),
+                         price, weights, whether available now, state and latency
     GET  /v1/status      per model: operational, degraded or unavailable; endpoints, capacity, latency, success
     GET  /health         the process is up
     GET  /ready          routes are loaded and the gateway is in the catalog (503 otherwise), and how old they are
@@ -60,7 +60,6 @@ from verathos.gateway.stats import DEGRADED_SUCCESS, ModelStats
 from verathos.gateway.upstream import Exchange, Upstream, UpstreamFailure
 from verathos.gateway.usage import UsageMeter, month_start
 from verathos.protocol.api import (
-    INPUT_MODALITIES,
     MAX_RESPONSE_BYTES,
     STATE_CHARS_PER_TOKEN,
     Choice,
@@ -430,7 +429,7 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         cat, states = g.catalog(), mark_states(g)
         return {"object": "list", "data": [] if cat is None else [{
             "id": m.model_id, "object": "model", "max_state_tokens": m.max_state_tokens,
-            "input_modalities": list(INPUT_MODALITIES),
+            "input_modalities": m.modalities(), "images": m.images.document() if m.reads_images() else None,
             "price": {"usd_per_million_input_tokens": m.price, "usd_per_million_output_tokens": 0},
             "available": states.get(m.model_id, "unavailable") != "unavailable",
             "state": states.get(m.model_id, "unavailable"), "latency_ms": g.stats.latency(m.model_id),

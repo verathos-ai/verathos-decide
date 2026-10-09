@@ -12,6 +12,9 @@ auditor's service, and the addresses the auditor and each gateway send their req
 
 Only ``active`` models are scored. ``candidate`` models may be served and checked on the network but are not scored;
 ``retired`` models are ignored.
+
+A model reads what its ``input_modalities`` list: text always, and images where they list ``image``, within its
+``images`` limits (``protocol.media``).
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_valid
 from verathos.protocol.callers import egress_addresses
 from verathos.protocol.canonical import digest
 from verathos.protocol.http import get_json
+from verathos.protocol.media import ENGINE_TOKEN_PX, ImageLimits
 from verathos.protocol.tls import PIN_PATTERN, authenticated
 from verathos.throughput.policy import AuditPolicy, policy_from
 from verathos.throughput.workload import Workload
@@ -43,6 +47,7 @@ MAX_CATALOG_BYTES = 1 << 20
 SHARE_DIGITS = 6  # decimals of the miners' and the usage pool's shares an epoch's weights are formed with
 DEFAULT_MECHANISM = 1  # of a catalog that names none
 MAX_PERIOD_EPOCHS = 400
+MODALITIES = ("text", "image")  # the input this code serves; a model reads what its input_modalities list of them
 
 
 class Engine(BaseModel):
@@ -75,6 +80,24 @@ class CatalogModel(BaseModel):
                                   "relative to the other models, measured on one reference GPU; miners' setups "
                                   "estimate what each model pays on a GPU from it")
     tolerance: Tolerance = Tolerance()
+    input_modalities: list[str] = Field(default_factory=lambda: ["text"], description="What a request to the model "
+                                        "carries: text (its state and questions), and image for images")
+    images: ImageLimits = Field(default_factory=ImageLimits, description="Limits of the images a request carries, "
+                                "for a model whose input_modalities list image")
+
+    @field_validator("input_modalities")
+    @classmethod
+    def _modalities(cls, value: list[str]) -> list[str]:
+        if "text" not in value or len(set(value)) != len(value):
+            raise ValueError("input_modalities lists text, and each modality once")
+        return value
+
+    def reads_images(self) -> bool:
+        return "image" in self.input_modalities
+
+    def modalities(self) -> list[str]:
+        """The input the model reads that this code serves."""
+        return [m for m in self.input_modalities if m in MODALITIES]
 
 
 class MinerShareChange(BaseModel):
@@ -284,6 +307,22 @@ class Catalog(BaseModel):
         problems += [f"gateways: the egress addresses of {g.hotkey}" for g in self.gateways if not g.egress]
         return problems
 
+    def input_problems(self) -> list[str]:
+        """What the models' input settings ask that this code does not serve: a modality it does not know (videos
+        among them), images for a model whose engine reads none, or image tokens of another size than its engine's."""
+        problems = []
+        for m in self.models:
+            problems += [f"models.{m.model_id}.input_modalities: {modality} is not served"
+                         for modality in m.input_modalities if modality not in MODALITIES]
+            if m.reads_images():
+                token_px = ENGINE_TOKEN_PX.get(m.engine.name)
+                if token_px is None:
+                    problems.append(f"models.{m.model_id}: its {m.engine.name} engine reads no images")
+                elif m.images.token_px != token_px:
+                    problems.append(f"models.{m.model_id}.images.token_px: the {m.engine.name} engine's image tokens "
+                                    f"are {token_px} pixels square, not {m.images.token_px}")
+        return problems
+
     def anchor_shares(self, *, strict: bool = False) -> dict[str, float]:
         """The active models' anchor shares, summing to 1 (equal if none is set). ``strict``: they must sum to 1 as
         written, as when publishing a catalog."""
@@ -309,6 +348,9 @@ class Catalog(BaseModel):
             unknown += [f"scoring.usage_pool.{k}" for k in scoring["usage_pool"] if k not in UsagePool.model_fields]
         for m in doc.get("models") or []:
             unknown += [f"models.{m.get('model_id', '?')}.{k}" for k in m if k not in CatalogModel.model_fields]
+            if isinstance(m.get("images"), dict):
+                unknown += [f"models.{m.get('model_id', '?')}.images.{k}" for k in m["images"]
+                            if k not in ImageLimits.model_fields]
         if isinstance(doc.get("auditor"), dict):
             unknown += [f"auditor.{k}" for k in doc["auditor"] if k not in AuditorIdentity.model_fields]
         for g in doc.get("gateways") or []:

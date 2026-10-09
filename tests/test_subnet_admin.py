@@ -179,3 +179,29 @@ def test_commit_catalog_needs_the_catalogs_mechanism_on_chain_and_says_when_the_
     assert "the network moves from mechanism 0 to 1" in out and len(chain.commitments) == 2
     commit(chain, catalog_file(tmp_path, mechanism=1, miner_share=0.8), tmp_path)
     assert "moves" not in capsys.readouterr().out
+
+
+def test_commit_catalog_publishes_images_only_for_models_whose_engine_reads_them(tmp_path) -> None:
+    chain = Chain()
+
+    def with_input(model_id: str, **fields) -> object:
+        path = catalog_file(tmp_path)
+        document = json.loads(path.read_text())
+        document["models"] = [{**m, **fields} if m["model_id"] == model_id else m for m in document["models"]]
+        path.write_text(json.dumps(document))
+        return path
+
+    for model_id, fields, why in (
+            ("kev-4b", {"input_modalities": ["text", "image"]}, "kev-4b: its kev engine reads no images"),
+            ("clef-flash", {"input_modalities": ["text", "video"]}, "video is not served"),
+            ("clef-flash", {"input_modalities": ["text", "image"], "images": {"token_px": 64, "min_pixels": 65_536}},
+             "images.token_px"),
+            ("clef-flash", {"input_modalities": ["text", "image"], "images": {"max_count": 4, "canary": 1}},
+             "models.clef-flash.images.canary")):
+        with pytest.raises(SystemExit, match=why):
+            commit(chain, with_input(model_id, **fields), tmp_path)
+    assert chain.commitments == []
+    path = with_input("clef-flash", input_modalities=["text", "image"])
+    commit(chain, path, tmp_path)
+    assert chain.commitments == [catalog.commitment_value(catalog.load(path).digest())]
+    assert catalog.load(path).get("clef-flash").reads_images()

@@ -3,7 +3,8 @@
 The same wire format is served by TypeSafe Jev, Cloudflare Clef and the open Kev models, so existing clients
 switch by changing their base URL.
 
-Request: a state (text or JSON) and named typed questions.
+Request: a state (text or JSON) and named typed questions; to a model whose catalog entry lists ``image``, also images,
+placed before the state in their order (Clef's ``images``, see ``protocol.media``).
   choice: ``criteria`` maps option name -> description; answer is a distribution over the names.
   score:  ``criteria`` is an ordered list of levels; answer is a distribution over level indices.
   noul:   yes/no; answer is the probability of yes.
@@ -26,10 +27,11 @@ from verathos.protocol.canonical import canonical_json
 JSONContent = str | dict | list | int | float | bool | None
 MAX_OPTIONS = 255
 MAX_RESPONSE_BYTES = 64 << 10  # a response (answers and receipt) larger than this is not a valid answer
+MAX_REQUEST_BYTES = 1 << 20  # a request without its images (its canonical JSON), at most
 STATE_CHARS_PER_TOKEN = 4  # a generous bound: tokens of these models average fewer characters
-# What a state carries, for every model: text, plain or JSON. Images and video are not in the protocol; one that
-# carries them would list them per model.
-INPUT_MODALITIES = ("text",)
+# Fields a request is refused for: no model is served videos, and engines set their own processor arguments.
+REFUSED_FIELDS = {"videos": "videos are not supported",
+                  "media_kwargs": "media_kwargs is not accepted: engines set their own processor arguments"}
 ANSWER_FIELDS = {"noul": {"type", "noul", "probabilities", "confidence"},
                  "choice": {"type", "choice", "probabilities", "confidence"},
                  "score": {"type", "score", "probabilities", "confidence", "legend"}}
@@ -64,10 +66,31 @@ class Score(BaseModel):
 Question = Annotated[Noul | Choice | Score, Field(discriminator="type")]
 
 
+class ImageObject(BaseModel):
+    """An image as its media type and its bytes in base64."""
+
+    content_type: str
+    base64: str
+
+
+# An image a request embeds: a base64 data URL (data:image/png;base64,...) or an ImageObject (``protocol.media``).
+ImageInput = str | ImageObject
+
+
 class SystemOneRequest(BaseModel):
     model: str
     state: JSONContent
     questions: dict[str, Question] = Field(min_length=1)
+    images: list[ImageInput] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refused_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for field, why in REFUSED_FIELDS.items():
+                if field in data:
+                    raise ValueError(why)
+        return data
 
 
 def text(value: JSONContent) -> str:
