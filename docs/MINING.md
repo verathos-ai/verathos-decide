@@ -442,10 +442,29 @@ cards accumulate bfloat16 in fp32 at half their fp16 rate. Answers from all of t
 reference.
 
 A model whose catalog entry lists `image` in its `input_modalities` also gets requests with images, which the gateway
-has made canonical (`GATEWAY.md`, Images); no model of the shipped catalog does. The bfloat16 engine serves text
-requests only and answers a request with images 422; the float32 engine (`--dtype float32`) runs the release's own
-code on them. Either engine gives the release only a request's model, state and questions, and images only as decoded
-pixels: nothing fetches a URL or opens a path.
+has made canonical (`GATEWAY.md`, Images); no model of the shipped catalog does yet. The bfloat16 engine runs them in
+passes of their own, without CUDA graphs: their images through the release's vision tower, whose features take the
+image tokens' places, and the rest as for text, with image tokens counted in a pass's token budget. The float32 engine
+(`--dtype float32`) runs the release's own code on them. Either engine gives the release only a request's model, state
+and questions, and images only as decoded pixels: nothing fetches a URL or opens a path.
+
+Clef-flash with images on an H100 80 GB, requests of 500 to 580 tokens of text with four or five questions and square
+images, 64 at once:
+
+| Images per request | Image tokens | Requests per second | One request alone |
+|---|---|---|---|
+| one of 256 x 256 px | 67 | 45 | 62 ms |
+| four of 256 x 256 px | 265 | 33 | 64 ms |
+| one of 512 x 512 px | 259 | 36 | 60 ms |
+| four of 512 x 512 px | 1,033 | 16 | 75 ms |
+| one of 1024 x 1024 px | 1,027 | 15 | 79 ms |
+| four of 1024 x 1024 px | 4,105 | 4.1 | 240 ms |
+
+An image token takes about twice the GPU time of a text token (1.7 to 2.0 times for images of 512 px a side or more;
+an image of 256 px adds about 2 ms besides). The vision tower adds 0.9 GB of weights: PyTorch's memory peaked at 21.4
+GB allocated and 22.9 GB reserved with images (21.2 GB and 22.9 GB with text alone), and at 22.5 GB and 23.8 GB for one
+request at the 16,384-token limit, with or without images. Answers with images stay within 0.067 of the float32
+reference, with a mean difference of 0.002.
 
 ### 4. Configure
 

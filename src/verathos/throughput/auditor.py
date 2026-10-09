@@ -210,8 +210,8 @@ class BoundedEngine:
 @dataclass(frozen=True)
 class Checks:
     """Answer checks per model: the fp32 reference, and optionally a faster screen whose flags the reference must
-    confirm before an answer counts as wrong. A screen (the miners' bfloat16 engine) serves text requests: answers to
-    requests with images are recomputed on the reference alone."""
+    confirm before an answer counts as wrong. Answers to requests with images are recomputed on the reference
+    alone."""
 
     references: dict[str, Engine]
     screens: dict[str, Engine]
