@@ -144,13 +144,18 @@ def setup_mechanisms(st: bt.Subtensor, kp: Keypair, netuid: int, split: str) -> 
 def with_auditor(document: dict, validator_config: Path | None) -> dict:
     """``document`` with the auditor's pin and egress addresses filled in where it names none, from the auditor's
     configuration on this machine (``validator_config``: its ``egress_ips`` and the certificate in its
-    ``state_dir``). Refuses a pin that differs from the certificate's."""
+    ``state_dir``, created there if the auditor has not yet, so the service then serves it). Refuses a pin that differs
+    from the certificate's, and a catalog that ends up without the auditor's pin."""
     config: dict = {}
     if validator_config is not None and validator_config.expanduser().exists():
         config = json.loads(validator_config.expanduser().read_text())
     state_dir = Path(config.get("state_dir", "~/.verathos/validator"))
     served = tls.stored_pin(state_dir) if config else None
     auditor = dict(document.get("auditor") or {})
+    if config and served is None and "tls" not in auditor:
+        served = tls.identity(state_dir.expanduser()).pin
+        print(f"created the auditor's TLS certificate in {state_dir} (the auditor serves it from its next start)",
+              flush=True)
     if served is not None and auditor.get("tls") not in (None, served):
         raise SystemExit(f"the catalog names {auditor['tls']} as the auditor's TLS pin, but the auditor's certificate "
                          f"in {state_dir} has pin {served}: name the pin the auditor serves (or leave auditor.tls out "
@@ -164,7 +169,11 @@ def with_auditor(document: dict, validator_config: Path | None) -> dict:
         filled.append(f"auditor.egress {', '.join(auditor['egress'])} (from {validator_config})")
     for line in filled:
         print(f"filled in {line}", flush=True)
-    return {**document, "auditor": auditor} if auditor else document
+    if not auditor.get("tls"):
+        raise SystemExit("the catalog names no auditor.tls, the auditor's TLS pin, and no auditor configuration was "
+                         "found to fill it in: run commit-catalog on the auditor's machine (--validator-config) or "
+                         "name the pin")
+    return {**document, "auditor": auditor}
 
 
 def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path | None, store_dir: Path,

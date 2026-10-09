@@ -101,6 +101,24 @@ def test_commit_catalog_on_the_auditors_machine_fills_in_its_pin_and_egress(tmp_
         chain.commitments[-1].rsplit(":", 1)[1]).auditor.egress == ["9.9.9.9"]  # the file's own egress stays
 
 
+def test_commit_catalog_creates_the_auditors_certificate_when_the_auditor_has_not_yet(tmp_path, capsys) -> None:
+    """A catalog change the running auditor cannot read stops it before its service creates a certificate: run on the
+    auditor's machine, commit-catalog creates it where the service then finds it."""
+    from verathos.protocol import tls
+
+    chain = Chain()
+    state = tmp_path / "validator"
+    config = tmp_path / "validator.json"
+    config.write_text(json.dumps({"state_dir": str(state), "egress_ips": ["9.9.9.9"]}))
+    assert tls.stored_pin(state) is None
+    commit(chain, catalog_file(tmp_path, auditor=None), tmp_path, config)
+    pin = tls.stored_pin(state)
+    assert pin is not None and tls.identity(state).pin == pin  # the service reuses it
+    stored = catalog.CatalogStore(tmp_path / "store").get(chain.commitments[-1].rsplit(":", 1)[1])
+    assert stored.auditor.tls == pin
+    assert f"created the auditor's TLS certificate in {state}" in capsys.readouterr().out
+
+
 def test_commit_catalog_states_the_miner_share_now_and_how_it_changes(tmp_path, capsys) -> None:
     chain = Chain()
     commit(chain, catalog_file(tmp_path), tmp_path)
