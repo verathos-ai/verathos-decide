@@ -94,7 +94,7 @@ class HttpEngine:
         try:
             r = await self._client.post(self._url, json=request, headers=self._headers, extensions=self._extensions)
         except httpx.HTTPError as e:
-            raise EngineError(f"engine unreachable: {e}") from e
+            raise EngineError(f"engine unreachable: {type(e).__name__}{': ' + str(e) if str(e) else ''}") from e
         if r.status_code != 200:
             raise EngineError(f"engine returned {r.status_code}: {r.text[:200]}")
         try:

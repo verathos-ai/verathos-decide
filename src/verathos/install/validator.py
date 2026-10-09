@@ -383,7 +383,9 @@ def init(argv: list[str]) -> None:
         ValidatorConfig.model_validate(config)
     except ValidationError as exc:
         raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
-    common.write_json(config_path, config)
+    keys = any(isinstance(e, dict) and e.get("api_key") for section in ("references", "audit_screens")
+               for e in config.get(section, {}).values())
+    common.write_json(config_path, config, private=keys)  # the keys of engines on other machines: the owner's only
     info(f"wrote {config_path}")
     if owner or config.get("public_host"):  # its service presents this certificate
         identity = tls.identity(Path(config["state_dir"]))
@@ -408,7 +410,8 @@ def init(argv: list[str]) -> None:
         record.manager, record.services = None, [s.name for s in run]
         record.save(home)
         common.show_run("each reference engine and the validator, which waits for them" if reference_services else
-                        "the validator (it starts the references itself)", run, auto_update and not owner)
+                        "the validator (it starts the references itself)" if sequential else "the validator", run,
+                        auto_update and not owner)
         if previous:
             info(f"stop the references no longer run as their own process (pm2: pm2 delete {' '.join(previous)})")
         for line in common.script_commands("validator", home, " --no-service"):

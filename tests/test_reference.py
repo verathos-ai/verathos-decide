@@ -550,6 +550,7 @@ def test_a_full_validator_on_a_cpu_machine_takes_its_engines_from_the_file_and_i
         m: (f"https://203.0.113.7:20004/reference/{m}", "ab" * 32, "k" * 43) for m in ("kev-4b", "kev-9b",
                                                                                        "clef-flash")}
     assert parsed.audit_screens == {} and parsed.reference_mode == "resident"
+    assert (v.home / "validator.json").stat().st_mode & 0o777 == 0o600  # it holds the key
     out = capsys.readouterr().out
     assert "kev-4b: checked" in out and "kev-4b screen: checked" not in out
     assert "the screens of kev-4b are the auditor's: not configured here" in out
