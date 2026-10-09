@@ -64,6 +64,7 @@ from verathos.miner.engine import Engine
 from verathos.protocol.api import MAX_RESPONSE_BYTES
 from verathos.protocol.gateway import (
     GatewaySample,
+    ReferralReport,
     Route,
     Routes,
     ServedCount,
@@ -74,7 +75,7 @@ from verathos.protocol.manifest import MAX_ENDPOINTS
 from verathos.protocol.media import keep_out_of_dumps
 from verathos.protocol.receipts import parse_response, signed_answers
 from verathos.protocol.status import STATUS_TESTS, ThroughputOutcome
-from verathos.throughput import loadgen
+from verathos.throughput import loadgen, referral
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.feed import (
     GATEWAY_EVIDENCE,
@@ -126,7 +127,7 @@ MIN_TEST_SHARE = 0.1  # a test sends at least this share of the tested rate itse
 USERS_BEFORE_S = (80.0, 20.0)  # an endpoint's usual user rate: [window start - 80 s, window start - 20 s)
 SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30  # at least STATUS_TESTS: with a test every epoch, the tests a status lists are all kept
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 USAGE_POLL_S = 12.0  # how often the usage pool's burns are read and its periods closed
 USAGE_SCAN_S = 30.0  # the most one round reads blocks for
 SCAN_REACH_BLOCKS = 200  # blocks a node keeps the state of (a pruned node about 256): older ones are not read
@@ -164,11 +165,25 @@ CREATE TABLE unscanned (first_block INTEGER NOT NULL, end_block INTEGER NOT NULL
 CREATE TABLE usage (first_block INTEGER NOT NULL, end_block INTEGER NOT NULL, document TEXT NOT NULL,
     PRIMARY KEY (first_block, end_block));
 """
+# the referral pool: the codes' signed registrations (the first per code) and moves, numbered in one order as they
+# arrive (seq), each with the block it arrived at; where each code is (at_hotkey, coldkey) and what became of each move
+# (outcome) once a period after it was closed; the entries the gateways reported, each once; each period's record
+_REFERRAL_SCHEMA = """
+CREATE TABLE referral_codes (code TEXT PRIMARY KEY, hotkey TEXT NOT NULL, seq INTEGER NOT NULL,
+    block INTEGER NOT NULL, gateway TEXT NOT NULL, signed TEXT NOT NULL, at_hotkey TEXT, coldkey TEXT);
+CREATE TABLE referral_moves (seq INTEGER PRIMARY KEY, signature TEXT NOT NULL UNIQUE, from_hotkey TEXT NOT NULL,
+    to_hotkey TEXT NOT NULL, block INTEGER NOT NULL, gateway TEXT NOT NULL, signed TEXT NOT NULL, outcome TEXT);
+CREATE TABLE referral_entries (id TEXT PRIMARY KEY, code TEXT NOT NULL, amount INTEGER NOT NULL,
+    credited_ms INTEGER NOT NULL, block INTEGER NOT NULL, gateway TEXT NOT NULL);
+CREATE INDEX referral_entries_by_block ON referral_entries (block);
+CREATE TABLE referral (first_block INTEGER NOT NULL, end_block INTEGER NOT NULL, window_periods INTEGER NOT NULL,
+    document TEXT NOT NULL, PRIMARY KEY (first_block, end_block));
+"""
 # from version -> the statements that bring it one version up
 _MIGRATIONS = {4: _DEMAND_SCHEMA, 5: _USERS_SCHEMA, 6: _RESULTS_INDEX,
                7: "ALTER TABLE samples ADD COLUMN test_id TEXT; " + _SAMPLES_BY_TEST, 8: _META_SCHEMA,
                9: _SHARES_SCHEMA, 10: _PAID_SCHEMA, 11: _USAGE_SCHEMA,
-               12: "ALTER TABLE samples ADD COLUMN media INTEGER NOT NULL DEFAULT 0;"}
+               12: "ALTER TABLE samples ADD COLUMN media INTEGER NOT NULL DEFAULT 0;", 13: _REFERRAL_SCHEMA}
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
 
 
@@ -402,7 +417,7 @@ CREATE INDEX samples_by_state ON samples (state, epoch);
 CREATE INDEX samples_by_endpoint ON samples (hotkey, endpoint_id, epoch);
 CREATE TABLE verdicts (epoch INTEGER PRIMARY KEY, document TEXT NOT NULL);
 """ + (_DEMAND_SCHEMA + _USERS_SCHEMA + _RESULTS_INDEX + _SAMPLES_BY_TEST + _META_SCHEMA + _SHARES_SCHEMA + _PAID_SCHEMA
-       + _USAGE_SCHEMA)
+       + _USAGE_SCHEMA + _REFERRAL_SCHEMA)
 # test states: running -> unconfirmed -> confirmed | void
 _SCRUB = "request = '{}', response = ''"  # a user's request and answers are kept only until their check
 # sample states: pending -> checked | skipped (its endpoint's checks for the epoch were done) | unchecked (no
@@ -437,7 +452,9 @@ class Store:
                                    "DROP TABLE IF EXISTS demand; DROP TABLE IF EXISTS users; "
                                    "DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS shares; "
                                    "DROP TABLE IF EXISTS paid; DROP TABLE IF EXISTS burns; "
-                                   "DROP TABLE IF EXISTS unscanned; DROP TABLE IF EXISTS usage;" + _SCHEMA
+                                   "DROP TABLE IF EXISTS unscanned; DROP TABLE IF EXISTS usage; "
+                                   "DROP TABLE IF EXISTS referral_codes; DROP TABLE IF EXISTS referral_moves; "
+                                   "DROP TABLE IF EXISTS referral_entries; DROP TABLE IF EXISTS referral;" + _SCHEMA
                                    + f"PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;")
             log.info("auditor database %s started for schema %d", path, SCHEMA_VERSION)
         self._query("UPDATE tests SET state = 'void', reason = 'the auditor restarted during the test' "
@@ -885,6 +902,95 @@ class Store:
         """Keep a period's record; once kept it does not change."""
         self._query("INSERT OR IGNORE INTO usage VALUES (?, ?, ?)", (first_block, end_block, document))
 
+    # ---- the referral pool ----
+
+    def add_referrals(self, gateway: str, block: int, codes: list[tuple[str, str, str]],
+                      moves: list[tuple[str, str, str, str]], entries: list[tuple[str, str, int, int]]
+                      ) -> tuple[int, int, int, list[str]]:
+        """Keep what a gateway reported, at ``block``, or at the end of the last period recorded or the block of the
+        last item taken if either is later (a period once recorded takes nothing more, and what arrives later never
+        has an earlier block): registrations (code, hotkey, signed), the first per code, then
+        moves (signature, from, to, signed), each numbered in the order taken, and entries (id, code, micro-USD,
+        credited ms) of codes registered, each once. -> (registrations, moves and entries new, the codes of entries
+        not registered)."""
+        with self._lock:
+            self._db.execute("BEGIN")
+            block = max(block, *(int(self._db.execute(query).fetchone()[0] or 0) for query in (
+                "SELECT MAX(end_block) FROM referral", "SELECT MAX(block) FROM referral_codes",
+                "SELECT MAX(block) FROM referral_moves", "SELECT MAX(block) FROM referral_entries")))
+            seq = 1 + max(int(self._db.execute(f"SELECT MAX(seq) FROM {table}").fetchone()[0] or 0)
+                          for table in ("referral_codes", "referral_moves"))
+            new_codes = new_moves = 0
+            for code, hotkey, signed in codes:
+                if self._db.execute("INSERT OR IGNORE INTO referral_codes (code, hotkey, seq, block, gateway, signed) "
+                                    "VALUES (?, ?, ?, ?, ?, ?)", (code, hotkey, seq, block, gateway, signed)).rowcount:
+                    seq, new_codes = seq + 1, new_codes + 1
+            for signature, source, target, signed in moves:
+                if self._db.execute("INSERT OR IGNORE INTO referral_moves (seq, signature, from_hotkey, to_hotkey, "
+                                    "block, gateway, signed) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                    (seq, signature, source, target, block, gateway, signed)).rowcount:
+                    seq, new_moves = seq + 1, new_moves + 1
+            named = sorted({code for _, code, _, _ in entries})
+            known = {code for code in named
+                     if self._db.execute("SELECT 1 FROM referral_codes WHERE code = ?", (code,)).fetchone()}
+            new_entries = sum(self._db.execute("INSERT OR IGNORE INTO referral_entries VALUES (?, ?, ?, ?, ?, ?)",
+                                               (entry_id, code, amount, credited_ms, block, gateway)).rowcount
+                              for entry_id, code, amount, credited_ms in entries if code in known)
+            self._db.execute("COMMIT")
+        return new_codes, new_moves, new_entries, [code for code in named if code not in known]
+
+    def referral_registry(self, end_block: int) -> tuple[list[referral.CodeState], list[referral.Move]]:
+        """Every code taken, as the auditor holds it, and the moves taken before ``end_block`` not decided yet, in
+        the order taken."""
+        codes = [referral.CodeState(*row) for row in self._query(
+            "SELECT code, hotkey, seq, block, at_hotkey, coldkey FROM referral_codes")]
+        moves = [referral.Move(*row) for row in self._query(
+            "SELECT seq, from_hotkey, to_hotkey FROM referral_moves WHERE outcome IS NULL AND block < ? ORDER BY seq",
+            (end_block,))]
+        return codes, moves
+
+    def referral_entries(self, first_block: int, end_block: int) -> list[tuple[str, int, int]]:
+        """(code, block, micro-USD) of the entries that arrived in blocks ``first_block`` up to ``end_block``."""
+        rows = self._query("SELECT code, block, amount FROM referral_entries WHERE block >= ? AND block < ? "
+                           "ORDER BY block, id", (first_block, end_block))
+        return [(code, block, amount) for code, block, amount in rows]
+
+    def referral_record(self, first_block: int, end_block: int) -> str | None:
+        """The record of the period of these blocks."""
+        rows = self._query("SELECT document FROM referral WHERE first_block = ? AND end_block = ?",
+                           (first_block, end_block))
+        return rows[0][0] if rows else None
+
+    def referral_recorded_through(self) -> int:
+        """The last end block of the periods recorded."""
+        return int(self._query("SELECT MAX(end_block) FROM referral")[0][0] or 0)
+
+    def referral_since(self, period_blocks: int, window_periods: int) -> int:
+        """The block from which entries count in windows of periods of ``period_blocks`` blocks and
+        ``window_periods`` periods: the end of the last period recorded with another length or window, so no entry
+        counts in more windows than one window's periods (0 if there is none)."""
+        rows = self._query("SELECT MAX(end_block) FROM referral WHERE end_block - first_block != ? OR "
+                           "window_periods != ?", (period_blocks, window_periods))
+        return int(rows[0][0] or 0)
+
+    def put_referral_record(self, first_block: int, end_block: int, window_periods: int, document: str,
+                            codes: dict[str, tuple[str, str | None]], outcomes: dict[int, str],
+                            prune_before: int) -> None:
+        """Keep a period's record, which does not change once kept, with where each code is (``codes``: code ->
+        (hotkey, coldkey)) and what became of the moves decided (``outcomes``: seq -> outcome), all at once; forget
+        the entries that arrived before ``prune_before`` and the records of periods ending by then."""
+        with self._lock:
+            self._db.execute("BEGIN")
+            self._db.execute("INSERT OR IGNORE INTO referral VALUES (?, ?, ?, ?)", (first_block, end_block,
+                                                                                  window_periods, document))
+            self._db.executemany("UPDATE referral_codes SET at_hotkey = ?, coldkey = ? WHERE code = ?",
+                                 [(at, coldkey, code) for code, (at, coldkey) in codes.items()])
+            self._db.executemany("UPDATE referral_moves SET outcome = ? WHERE seq = ?",
+                                 [(outcome, seq) for seq, outcome in outcomes.items()])
+            self._db.execute("DELETE FROM referral_entries WHERE block < ?", (prune_before,))
+            self._db.execute("DELETE FROM referral WHERE end_block <= ?", (prune_before,))
+            self._db.execute("COMMIT")
+
     # ---- served verdicts ----
 
     def served_verdicts(self, epoch: int) -> str | None:
@@ -999,6 +1105,9 @@ class Auditor:
         self.netuid, self.keypair, self.chain = netuid, keypair, chain
         self.usage_chain, self.tao_usd = usage_chain or chain, tao_usd
         self._usage_skipped: int | None = None  # the period last found not closable (logged once)
+        self._referral_skipped: int | None = None  # the same, of the referral pool
+        self._referral_floor = 0  # no referral item is taken at a block before it: the end of a period being closed
+        self._referral_lock = threading.Lock()  # a report is taken whole before or after a period's close reads
         self.hotkey = keypair.ss58_address
         self.policy, self.catalog, self.runner = policy, catalog, runner
         self.reference_specs, self.screen_specs = references, screens or {}
@@ -1081,12 +1190,13 @@ class Auditor:
             await asyncio.sleep(POLL_S)
 
     async def usage_forever(self) -> None:
-        """The usage pool's chain reads run apart from the tests' schedule, never holding it up."""
+        """The usage and referral pools' chain reads run apart from the tests' schedule, never holding it up."""
         while True:
-            try:
-                await asyncio.to_thread(self.step_usage)
-            except Exception:
-                log.exception("usage pool step failed")
+            for step, what in ((self.step_usage, "usage pool"), (self.step_referrals, "referrals")):
+                try:
+                    await asyncio.to_thread(step)
+                except Exception:
+                    log.exception("%s step failed", what)
             await asyncio.sleep(USAGE_POLL_S)
 
     async def _usable(self, checks: Checks) -> Checks:
@@ -1624,6 +1734,92 @@ class Auditor:
         log.info("usage pool: period %d closed (%s): basis %.6f alpha of %.6f, share %.6f, %d hotkeys served paying "
                  "users", period, record.mode, record.basis, record.period_emission, record.share, len(record.served))
 
+    # ---- the referral pool ----
+
+    def accept_referrals(self, gateway: str, report: ReferralReport) -> dict[str, Any] | None:
+        """Take what a catalog gateway reported (``protocol.gateway.ReferralReport``): the registrations and moves
+        its hotkeys signed for this netuid, and the entries of codes registered, each once, all in the period the
+        chain head is in now, or a later one if that period's close has begun. -> how many were new of each, how many
+        were refused, and the codes of entries not registered (``unknown_codes``: the gateway sends its registrations
+        again); None, taking nothing, while the chain head is not known yet."""
+        if self.follower.head <= 0:
+            return None
+        codes, moves, refused = [], [], 0
+        for signed in report.codes:
+            r = signed.registration
+            if r.netuid != self.netuid or not signed.verify():
+                refused += 1
+                continue
+            codes.append((r.code, r.hotkey, signed.model_dump_json()))
+        for signed in report.moves:
+            m = signed.move
+            if m.netuid != self.netuid or m.from_hotkey == m.to_hotkey or not signed.verify():
+                refused += 1
+                continue
+            moves.append((signed.signature, m.from_hotkey, m.to_hotkey, signed.model_dump_json()))
+        entries = [(e.id, e.code, e.amount_micros, e.credited_ms) for e in report.entries]
+        with self._referral_lock:
+            taken = self.store.add_referrals(gateway, max(self.follower.head, self._referral_floor), codes, moves,
+                                             entries)
+        if refused or taken[3]:
+            log.warning("referrals: %s reported %d registrations or moves whose signature does not verify for netuid "
+                        "%d, and entries of %d codes not registered", gateway, refused, self.netuid, len(taken[3]))
+        return {"codes": taken[0], "moves": taken[1], "entries": taken[2], "refused": refused,
+                "unknown_codes": taken[3]}
+
+    def step_referrals(self) -> None:
+        """With the catalog's referral pool: close the latest period whose end is final (``throughput.referral``)."""
+        cat = self.catalog()
+        pool = cat.scoring.referral_pool
+        if pool is None or self.follower.head <= 0:
+            return
+        self.close_referrals(self.usage_chain.finalized_block(), pool, cat, self.policy.epoch_blocks)
+
+    def close_referrals(self, final: int, pool: catalog_module.ReferralPool, cat: catalog_module.Catalog,
+                        epoch_blocks: int) -> None:
+        """Close the latest period whose end block is final into its record, once: the entries that arrived in its
+        window, its codes' hotkeys, and the chain at its end block."""
+        period = final // (pool.period_epochs * epoch_blocks) - 1
+        first, end = period_blocks(pool, epoch_blocks, period)
+        if period < 0 or self.store.referral_record(first, end) is not None:
+            return
+        if first < self.store.referral_recorded_through():  # periods of another length: those blocks are paid
+            if self._referral_skipped != period:
+                log.info("referrals: period %d overlaps one recorded before; it has no record", period)
+                self._referral_skipped = period
+            return
+        length, window = end - first, pool.window_periods
+        since = self.store.referral_since(length, window)
+        with self._referral_lock:  # from here on, what arrives counts in a later period
+            self._referral_floor = max(self._referral_floor, end)
+            entries = self.store.referral_entries(max(end - window * length, since), end)
+            codes, moves = self.store.referral_registry(end)
+        try:
+            hotkeys = ({c.at for c in codes if c.at} | {c.hotkey for c in codes if not c.at and c.block < end} |
+                       {hotkey for m in moves for hotkey in (m.source, m.target)})
+            coldkeys = self.usage_chain.coldkeys(sorted(hotkeys), end)
+            owner = self.usage_chain.owner(end, self.netuid)
+            emission = self.usage_chain.emission(end, self.netuid, cat.mechanism)
+            alpha = self.usage_chain.alpha_price(end, self.netuid)
+            price = self.tao_usd() if entries else None
+        except Exception as exc:
+            log.warning("referrals: period %d not closed yet (tried again): %s", period, exc)
+            return
+        states, outcomes = referral.follow(codes, moves, coldkeys, end)
+        record = referral.close(period, pool=pool, epoch_blocks=epoch_blocks, entries=entries,
+                                hotkeys={code: at for code, (at, _) in states.items()}, coldkeys=coldkeys,
+                                owner=owner, emission=emission, tao_usd=price, alpha_tao=alpha, since_block=since)
+        with self._referral_lock:
+            self.store.put_referral_record(first, end, window, record.model_dump_json(), states, outcomes,
+                                           end - (window + 1) * length)
+        for m in moves:
+            if outcomes.get(m.seq) == "refused":
+                log.error("referrals: the move of %s's codes to %s is refused: %s belongs to another coldkey than "
+                          "the codes (or to none) at block %d", m.source, m.target, m.target, end)
+        log.info("referrals: period %d closed: %d referrers, %.2f USD referred over %d periods, share %.6f of %.6f",
+                 period, len(record.referrers), sum(r.referred_micros for r in record.referrers) / referral.MICROS,
+                 window, record.share, record.max_share)
+
     # ---- outputs ----
 
     def verdicts(self, epoch: int) -> SignedVerdicts | None:
@@ -1650,14 +1846,15 @@ class Auditor:
         if self.store.pending(first, epoch - 1):
             return None
         stated: dict[str, Any] = {}
-        pool = cat.scoring.usage_pool
-        if pool is not None and (period := pool.period(epoch) - 1) >= 0:
-            blocks = period_blocks(pool, policy.epoch_blocks, period)
-            document = self.store.usage_record(*blocks)
-            if document is not None:
-                stated["usage"] = json.loads(document)
-            elif self.follower.head < blocks[1] + USAGE_WAIT_BLOCKS:
-                return None  # the period before's record is closed within blocks of its end
+        for name, pool, record in (("usage", cat.scoring.usage_pool, self.store.usage_record),
+                                   ("referral", cat.scoring.referral_pool, self.store.referral_record)):
+            if pool is not None and (period := pool.period(epoch) - 1) >= 0:
+                blocks = period_blocks(pool, policy.epoch_blocks, period)
+                document = record(*blocks)
+                if document is not None:
+                    stated[name] = json.loads(document)
+                elif self.follower.head < blocks[1] + USAGE_WAIT_BLOCKS:
+                    return None  # the period before's record is closed within blocks of its end
         self.close_epoch(current)
 
         users = self.store.users(epoch - 1)

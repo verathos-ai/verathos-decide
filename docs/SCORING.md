@@ -117,13 +117,14 @@ endpoints is on probation inherits the remaining probation, so renaming an endpo
 
 A UID's value is the sum of its endpoints' EMAs, normalised over all UIDs. Endpoints whose UID now belongs to another
 hotkey are ignored. The miners' values are then scaled to sum to the epoch's miner share, the catalog's
-`scoring.miner_share` (0.59 in the shipped catalog), the [usage pool](#usage-pool)'s weights are added, and the subnet
-owner's UID gets the rest; the weights are set on the catalog's mechanism (`SUBNET_ADMIN.md`) once per epoch. The
-chain pays the subnet owner hotkey no incentive: it burns it, or recycles it under the subnet's `RecycleOrBurn`
-setting (`SUBNET_ADMIN.md`). The share is a constant or moves linearly from one value to another over a number of
-epochs; each epoch's comes from the catalog and the epoch number alone, rounded to 6 decimals, so every validator
-sets the same split. If no endpoint has a positive average and the usage pool pays nobody, all weight goes to the
-subnet owner's UID. If the owner hotkey holds no UID, the miners' and the usage pool's weights are scaled to sum to 1.
+`scoring.miner_share` (0.59 in the shipped catalog), the weights of the [usage pool](#usage-pool) and of
+[referrals](#referrals) are added, and the subnet owner's UID gets the rest; the weights are set on the catalog's
+mechanism (`SUBNET_ADMIN.md`) once per epoch. The chain pays the subnet owner hotkey no incentive: it burns it, or
+recycles it under the subnet's `RecycleOrBurn` setting (`SUBNET_ADMIN.md`). The share is a constant or moves linearly
+from one value to another over a number of epochs; each epoch's comes from the catalog and the epoch number alone,
+rounded to 6 decimals, so every validator sets the same split. If no endpoint has a positive average and neither pool
+pays anybody, all weight goes to the subnet owner's UID. If the owner hotkey holds no UID, the miners' weights take
+what the pools leave (the pools' are never scaled up), and with no miner weight no weights are set.
 
 Everything above is what a full validator does. A full validator running its references one at a time scores the
 endpoints of the models it does not check in an epoch with the source's published results for them: the score the
@@ -167,3 +168,56 @@ node keeps about 256 blocks; the rest it takes on the auditor's word, as it take
 pays nothing at that validator for the period. A light validator sets the weights its source publishes, usage weights
 included. The network document states the epoch's `usage_share`, the share the usage weights sum to, and each hotkey's
 status its `usage_weight`.
+
+## Referrals
+
+The catalog's `scoring.referral_pool` (absent in the shipped catalog: off) pays referrers, hotkeys whose referral codes
+brought accounts that buy credit (`GATEWAY.md`, [Referrals](GATEWAY.md#referrals)), on top of their scores, out of what
+the miner share leaves. It does not run together with a usage pool. Time runs in periods of `period_epochs` epochs
+(default 40, about a day); a period's record is closed when it ends and paid over the epochs of the next.
+
+- **What counts.** The top-ups of a code's referred accounts, at the USD they were credited at, less their refunds,
+  each in the period it reaches the auditor: from the referral on, for `term_days`, up to `account_cap_usd` of one
+  account's top-ups within any window's length, and not once the code is revoked. Grants, adjustments and spending
+  never count, nor a top-up credited while the catalog has no referral pool.
+- **Window.** A referrer's sum `R` is its codes' over the last `window_periods` periods (the period closed included),
+  at least 0: a refund offsets its other referred top-ups in the window.
+- **Cap.** `payout_per_usd x R / (window_periods x p x E)`: the share of a period's miner emission that pays
+  `payout_per_usd / window_periods` of `R`, with `E` the mechanism's miner emission over a period in alpha and `p` the
+  alpha's price in USD (TAO in USD when the period closed, times the subnet's moving alpha price at its end).
+- **Share.** The caps' sum, at most `share`: each referrer gets its cap, or, when the caps exceed `share`, its part of
+  `share` in proportion to its cap. Each epoch of the next period pays it, at most what the epoch's miner share leaves
+  (every referrer scaled down alike).
+- **Who is paid.** Any hotkey that holds a UID, serving or not, except the subnet owner's (its hotkey, and the hotkeys
+  of its coldkey) and those the catalog's `excluded` names by hotkey or coldkey (owner-run miners); with
+  `serving_only`, only hotkeys with a positive score weight in the epoch. A referrer without a UID is not paid; its
+  codes keep counting, and pay resumes once it holds a UID again or its codes move to a registered hotkey of its
+  coldkey.
+
+A referred USD counts in at most `window_periods` periods, at most `payout_per_usd / window_periods` of it in each: it
+earns at most `payout_per_usd` USD of emission over its window, whatever its timing, the pool's fill, or how it is
+split over accounts and codes. A referrer topping up its own account with its own code gets back at most that per
+dollar, while the credit it bought can be neither withdrawn nor transferred. The pool is a ceiling, not a spend: the
+subnet owner's UID keeps what it does not pay, and the parts of referrers not paid.
+
+| Setting | Default | Range | Meaning |
+|---|---|---|---|
+| `share` | 0.10 | (0, 0.5] | at most this share of the mechanism's miner emission per period |
+| `payout_per_usd` | 0.3 | (0, 0.9] | at most this many USD of emission per referred USD, over its window |
+| `window_periods` | 30 | 1 to 90 | periods a top-up counts in |
+| `period_epochs` | 40 | 1 to 400 | epochs per period |
+| `term_days` | 365 | 30 to 1,095, or null | days after its referral an account's top-ups count; null: for life |
+| `account_cap_usd` | 10,000 | 1,000 to 100,000, or null | at most this much of one account's top-ups counts within a window's length |
+| `serving_only` | false | | pay only referrers with a positive score weight in the epoch |
+| `excluded` | [] | at most 256 | hotkeys and coldkeys paid nothing |
+
+The auditor records each period (`THROUGHPUT_AUDIT.md`) and states the record, signed, with every verdicts document of
+the next period. A full validator recomputes the record's figures, checks that it states the catalog's
+`payout_per_usd`, `share` and `window_periods`, and checks what its own node holds of the period's end block (the
+emission, the moving alpha price, the subnet owner, each referrer's coldkey). It also compares the record with the
+last one it accepted, while their windows overlap: every code's sums in the periods both hold must be as stated there,
+and a code now on another hotkey must not have left a hotkey that belongs, at the record's end block, to another
+coldkey than its new one. A record that fails pays nothing at that validator for the period. A light validator sets the
+weights its source publishes, referral weights included. The network document states the epoch's `referral_share` and
+the record it pays (`referral`), each hotkey's `serving_weight`, `usage_weight` and `referral_weight`, and lists
+referrers without endpoints too, with their codes' sums (`VALIDATING.md`).

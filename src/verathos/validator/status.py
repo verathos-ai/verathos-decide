@@ -1,10 +1,12 @@
-"""Where each endpoint stands, as a validator saw it in its last epoch.
+"""Where each endpoint and referrer stands, as a validator saw it in its last epoch.
 
 Validators that run a service (the subnet owner, which is the throughput auditor, and full validators with a
 ``public_host``) serve it read-only and signed at ``GET /v1/status/{hotkey}``, together with the hotkey's results in
 the auditor's last ``STATUS_TESTS`` throughput tests (``protocol.status``), and every hotkey's at ``GET /v1/network``
 with the weights the validator set (for network dashboards and light validators; see ``validator.service``). Miners
-poll it and log it. It is that validator's own view; every validator scores the same way from the same rules.
+poll it and log it. It is that validator's own view; every validator scores the same way from the same rules. A hotkey
+is listed for its endpoints and for its codes in the referral record the epoch pays, and its weight comes with its
+parts: from its scores, the usage pool and the referral pool.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import threading
 from collections.abc import Collection, Mapping
 from pathlib import Path
 
-from verathos.protocol.status import EndpointStatus, HotkeyStatus, NetworkStatus
+from verathos.protocol.status import EndpointStatus, HotkeyStatus, NetworkStatus, ReferralPeriod, ReferrerStatus
 from verathos.validator.audit import EndpointResult
 from verathos.validator.discovery import DiscoveredEndpoint
 from verathos.validator.scoring import ScoreState, windowed_verdict
@@ -31,11 +33,26 @@ def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint],
           latency_factors: Mapping[str, float] | None = None,
           taken: Mapping[str, EndpointStatus] | None = None,
           miner_share: float | None = None, usage_share: float | None = None,
-          usage_weights: Mapping[int, float] | None = None) -> dict[str, HotkeyStatus]:
+          parts: Mapping[str, Mapping[int, float]] | None = None, referral_share: float | None = None,
+          referrers: Mapping[str, ReferrerStatus] | None = None,
+          hotkey_of_uid: Mapping[int, str] | None = None) -> dict[str, HotkeyStatus]:
     """Status per hotkey after ``update`` has folded the epoch into ``state``; ``weights``: per UID, as set, and
-    ``usage_weights`` the usage pool's part of them; ``drifted``, ``user_availability`` and ``latency_factors`` per
-    endpoint key, as scored; ``taken``: the source's status of the endpoints whose results it gave
-    (``validator.fallback``), whose checks and state they show."""
+    ``parts`` what makes them up (``serving``, ``usage``, ``referral``: per UID); ``drifted``, ``user_availability``
+    and ``latency_factors`` per endpoint key, as scored; ``taken``: the source's status of the endpoints whose results
+    it gave (``validator.fallback``), whose checks and state they show; ``referrers``: per hotkey of the referral
+    record, its figures, listed whether or not it has endpoints, on the UID ``hotkey_of_uid`` gives it."""
+    parts = parts or {}
+
+    def hotkey_status(hotkey: str, uid: int | None) -> HotkeyStatus:
+        def part(name: str) -> float:
+            return round(parts.get(name, {}).get(uid, 0.0), 6) if uid is not None else 0.0
+        return HotkeyStatus(
+            hotkey=hotkey, uid=uid, weight=round((weights or {}).get(uid, 0.0), 6) if uid is not None else 0.0,
+            epoch=epoch, epoch_blocks=epoch_blocks, endpoints=[], model_shares=model_shares or {},
+            miner_share=miner_share, usage_share=usage_share, referral_share=referral_share,
+            serving_weight=part("serving"), usage_weight=part("usage"), referral_weight=part("referral"),
+            referral=(referrers or {}).get(hotkey))
+
     out: dict[str, HotkeyStatus] = {}
     for ep in endpoints:
         key, r = ep.key, results.get(ep.key)
@@ -70,11 +87,12 @@ def build(*, epoch: int, epoch_blocks: int, endpoints: list[DiscoveredEndpoint],
             status.state = "candidate"
         elif not r.identity_ok or not r.answered:
             status.state = "unanswered"
-        out.setdefault(ep.hotkey, HotkeyStatus(
-            hotkey=ep.hotkey, uid=ep.uid, weight=round((weights or {}).get(ep.uid, 0.0), 6), epoch=epoch,
-            epoch_blocks=epoch_blocks, endpoints=[], model_shares=model_shares or {}, miner_share=miner_share,
-            usage_share=usage_share, usage_weight=round((usage_weights or {}).get(ep.uid, 0.0), 6),
-        )).endpoints.append(status)
+        if ep.hotkey not in out:
+            out[ep.hotkey] = hotkey_status(ep.hotkey, ep.uid)
+        out[ep.hotkey].endpoints.append(status)
+    uid_of = {hotkey: uid for uid, hotkey in (hotkey_of_uid or {}).items()}
+    for hotkey in sorted(set(referrers or {}) - set(out)):
+        out[hotkey] = hotkey_status(hotkey, uid_of.get(hotkey))
     return out
 
 
@@ -101,13 +119,15 @@ class StatusBoard:
     def publish(self, by_hotkey: dict[str, HotkeyStatus], *, epoch: int | None = None, epoch_blocks: int | None = None,
                 model_shares: dict[str, float] | None = None, weights: dict[int, float] | None = None,
                 miner_share: float | None = None, mechanism: int | None = None,
-                usage_share: float | None = None) -> None:
+                usage_share: float | None = None, referral_share: float | None = None,
+                referral: ReferralPeriod | None = None) -> None:
         """Replace the status with ``by_hotkey``. The network's document also states ``weights`` (per UID, as set)
-        and the ``mechanism`` they are set on, and the epoch, its length, the emission shares, the miner share and the
-        usage share (by default the first hotkey's)."""
+        and the ``mechanism`` they are set on, the referral record the epoch pays (``referral``), and the epoch, its
+        length, the emission shares, the miner share and the usage and referral shares (by default the first
+        hotkey's)."""
         network = _network(by_hotkey, epoch=epoch, epoch_blocks=epoch_blocks, model_shares=model_shares,
-                           weights=weights, miner_share=miner_share, mechanism=mechanism,
-                           usage_share=usage_share).model_dump_json().encode()
+                           weights=weights, miner_share=miner_share, mechanism=mechanism, usage_share=usage_share,
+                           referral_share=referral_share, referral=referral).model_dump_json().encode()
         with self._lock:
             self._by_hotkey, self._network = by_hotkey, network
             self.revision += 1
@@ -140,6 +160,7 @@ def _network(by_hotkey: dict[str, HotkeyStatus], **given) -> NetworkStatus:
     fields = {}
     if first is not None:
         fields = {"epoch": first.epoch, "epoch_blocks": first.epoch_blocks, "model_shares": first.model_shares,
-                  "miner_share": first.miner_share, "usage_share": first.usage_share}
+                  "miner_share": first.miner_share, "usage_share": first.usage_share,
+                  "referral_share": first.referral_share}
     fields.update({k: v for k, v in given.items() if v is not None})
     return NetworkStatus(**fields, hotkeys=hotkeys)

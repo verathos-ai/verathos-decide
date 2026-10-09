@@ -1,6 +1,6 @@
 """Chain access for the throughput audit (bittensor SDK 10.x): head blocks, block hashes, finality and the
-auditor's axon; and for the usage pool, the subnet's burns, its miners' emission, its alpha price and hotkeys' owners
-at a block (``throughput.usage``)."""
+auditor's axon; and for the usage and referral pools, the subnet's burns, its miners' emission, its alpha price, its
+owner and hotkeys' owners at a block (``throughput.usage``, ``throughput.referral``)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Any
 import bittensor as bt
 
 from verathos.protocol.manifest import axon_base
-from verathos.throughput import usage
+from verathos.throughput import referral, usage
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +93,10 @@ class SubtensorChainView:
 
     def coldkeys(self, hotkeys: Iterable[str], block: int) -> dict[str, str | None]:
         return self._read(usage.coldkeys_at, list(hotkeys), block)
+
+    def owner(self, block: int, netuid: int) -> tuple[str | None, str | None]:
+        """The subnet owner's hotkey and coldkey at ``block``."""
+        return self._read(referral.owner_at, block, netuid)
 
     def block_hash(self, block_number: int) -> bytes | None:
         return _hash_bytes(self._rpc("chain_getBlockHash", [int(block_number)]))

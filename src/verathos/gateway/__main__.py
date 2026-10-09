@@ -11,7 +11,10 @@
     verathos-gateway keys revoke --account acme --prefix vd_1a2b3c4d5e6f7
     verathos-gateway usage --account acme [--since 2026-10-01]
     verathos-gateway credits add --account acme --usd 5 --kind topup --reference <payment id> [--note N]
+    verathos-gateway credits add --account acme --usd -5 --kind refund --reference <refund id> --refund-of <payment id>
     verathos-gateway credits list --account acme
+    verathos-gateway referrals show --code alice
+    verathos-gateway referrals revoke --code alice
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ from verathos.gateway.app import (
 from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.media import landlock_abi
+from verathos.gateway.referrals import ReferralReporter, Referrals
 from verathos.gateway.router import Router
 from verathos.gateway.routes import Refused, RouteTable, dropped_models, stale_after_s
 from verathos.gateway.sampler import Sampler, TestFollower
@@ -152,6 +156,8 @@ async def serve(config: GatewayConfig) -> None:
                       meter=meter, router=router, sampler=sampler, served=served, routes=lambda: routes.table,
                       upstream=Upstream(keypair, client, netuid=config.netuid),
                       limiter=RateLimiter())
+    reporter = ReferralReporter(gateway.referrals, keypair, client, auditor=auditor, auditor_hotkey=auditor_hotkey,
+                                catalog=lambda: current[0])
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Any) -> AsyncIterator[None]:
@@ -163,7 +169,8 @@ async def serve(config: GatewayConfig) -> None:
         except Exception as exc:
             log.warning("keys not loaded, every key is looked up until they are: %s: %s", type(exc).__name__, exc)
         tasks = [asyncio.create_task(t) for t in (routes.run(), meter.run(), sampler.run(), served.run(),
-                                                     accounts.run(), tests.run(), mark_states_forever(gateway))]
+                                                     accounts.run(), tests.run(), mark_states_forever(gateway),
+                                                     reporter.run())]
         log.info("gateway %s on %s:%d (auditor %s, %d instance(s))", keypair.ss58_address, config.listen_host,
                  config.port, auditor_hotkey, config.instances)
         try:
@@ -243,12 +250,19 @@ async def admin(config: GatewayConfig, args: argparse.Namespace) -> Any:
         if args.command == "credits":
             if args.action == "add":
                 new = NewCredit(amount=round(args.usd * 1_000_000), kind=args.kind, reference=args.reference,
-                                note=args.note)
+                                note=args.note, refund_of=args.refund_of)
                 entry, created = await accounts.add_credit(args.account, new.amount, kind=new.kind,
-                                                           reference=new.reference, note=new.note)
+                                                           reference=new.reference, note=new.note,
+                                                           refund_of=new.refund_of)
                 return {"credit": entry, "created": created}
             return {"balance": (await accounts.account(args.account) or {}).get("balance"),
                     "credits": await accounts.credits(args.account)}
+        if args.command == "referrals":
+            referrals = Referrals(engine, netuid=config.netuid, site=config.referral_site)
+            found = await (referrals.revoke if args.action == "revoke" else referrals.code)(args.code)
+            if found is None:
+                raise LookupError(f"no referral code {args.code!r}")
+            return found
         since = dt.date.fromisoformat(args.since) if args.since else dt.datetime.now(dt.UTC).date().replace(day=1)
         return await accounts.usage(args.account, since)
     finally:
@@ -285,9 +299,13 @@ def main() -> None:
     credit.add_argument("action", choices=["add", "list"])
     credit.add_argument("--account", required=True)
     credit.add_argument("--usd", type=float)
-    credit.add_argument("--kind", choices=["grant", "topup", "adjust"])
+    credit.add_argument("--kind", choices=["grant", "topup", "adjust", "refund"])
     credit.add_argument("--reference", help="the payment or grant it records; recorded once")
     credit.add_argument("--note")
+    credit.add_argument("--refund-of", help="a refund (negative --usd): the reference of the top-up it returns")
+    referral = commands.add_parser("referrals")
+    referral.add_argument("action", choices=["show", "revoke"])
+    referral.add_argument("--code", required=True)
     args = parser.parse_args()
     config = GatewayConfig.load(args.config)
     if args.command == "serve":
