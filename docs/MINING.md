@@ -63,12 +63,13 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--worker`, `--name` | this machine serves its GPUs for the hotkey's primary machine; its endpoint ids start with `--name` (default: its IP address) ([One hotkey, several GPUs and machines](#one-hotkey-several-gpus-and-machines)) |
 | `--peers` | on the primary: every worker's public `ip:port`, comma-separated; replaces the list (`''` for none) |
 | `--no-auto-update` | the miner does not update its code by itself to each new release; `--auto-update` turns that on again ([Update](#update)) |
-| `--no-service` | no root, no system packages and no services: set everything up in the user's home and print the commands to run under pm2 or another process manager you run; `git`, `curl` and a C compiler (`build-essential`) must be there ([Without root](VALIDATING.md#without-root-pm2-or-another-process-manager)) |
-| `--source`, `--ref`, `--dir` | the code from another git URL, git bundle or tarball; a branch, tag or commit; another directory than `~/verathos-decide`, which must be missing, empty or a checkout of this code (another checkout is never changed) |
+| `--no-service` | no root, no system packages and no services: set everything up in the user's home and print the commands to run under pm2 or another process manager you run; `git`, `ssh-keygen` (`openssh-client`), `curl` and a C compiler (`build-essential`) must be there ([Without root](VALIDATING.md#without-root-pm2-or-another-process-manager)) |
+| `--source`, `--ref`, `--dir` | the code from another git URL, git bundle or tarball; a branch, tag or commit (default: the newest release; a tag is installed only signed by a release key, a branch, commit or tarball as given: [Update](#update)); another directory than `~/verathos-decide`, which must be missing, empty or a checkout of this code (another checkout is never changed) |
 
 What it does:
-1. installs `git`, `curl`, `build-essential` (the engine compiles its GPU kernels on first use) and, in a container
-   without systemd, `supervisor` (with `--no-service`, nothing); then uv and Python 3.12 in the user's home;
+1. installs `git`, `openssh-client` (it checks release signatures), `curl`, `build-essential` (the engine compiles
+   its GPU kernels on first use) and, in a container without systemd, `supervisor` (with `--no-service`, nothing);
+   then uv and Python 3.12 in the user's home;
 2. puts the code in `~/verathos-decide` (an install from before in `~/verathos` stays there) with its Python
    environment, and `verathos-miner` and `verathos-validator` on the
    `PATH`;
@@ -188,16 +189,23 @@ A GPU whose model the setup chose moves to another model only if that pays at le
 engine restarts only when its revision or settings changed, or for `verathos-engine` (Clef models) its code, which
 the miner then measures again.
 
+A release is a tag `v<version>` signed by a release key, one that `release/allowed_signers` lists. The installer
+checks the tag it installs (`--ref`, by default the newest release) against its own copy of the file and stops at one
+that is not signed so (`v... is not signed ...: not installing it`); while its copy lists no key, it installs the
+default branch. A branch, a commit (`--ref`) or a tarball (`--source`) it installs as given: checking those is yours.
+
 A miner set up by the installer also updates its code by itself (`auto_update` in `miner.json`; `--no-auto-update`
 turns it off, `--auto-update` on again). About every hour it reads the release tags (`v<version>`) of the repository
-its code came from. A newer release is installed at a random time within the next hour, so miners do not all
-restart at once, and never while a throughput test is selected or its traffic runs, nor while a measurement runs or
-waits for a test: the miner checks out the tagged commit, installs it into its Python environment and exits, and its
-process manager starts the new release (systemd, supervisord and pm2 restart a process that exits). The restarted
-miner reuses its capacity measurement; its engines keep running. It does not update a checkout with local changes
-(`self-update: local changes in ...`) or to a tag whose code names another version; a failed install puts the
-previous code back. Engines and services stay as they are: a release that changes them, such as `verathos-engine`'s
-code, says so, and running the installer again updates them.
+its code came from. The newest release whose tag is signed by a key that `release/allowed_signers` of the running
+code lists is installed at a random time within the next hour, so miners do not all restart at once, and never while
+a throughput test is selected or its traffic runs, nor while a measurement runs or waits for a test: the miner checks
+out the tagged commit, installs it into its Python environment and exits, and its process manager starts the new
+release (systemd, supervisord and pm2 restart a process that exits). The restarted miner reuses its capacity
+measurement; its engines keep running. It does not update a checkout with local changes (`self-update: local changes
+in ...`), to a tag that is not signed by such a key (`self-update: v... is not signed ...`, logged once per tag) or to
+a tag whose code names another version; a failed install puts the previous code back. While the file lists no key (`... lists no release signing key`), it installs nothing: run the installer again.
+Engines and services stay as they are: a release that changes them, such as `verathos-engine`'s code, says so, and
+running the installer again updates them.
 
 ### Uninstall
 
@@ -226,6 +234,7 @@ stay for a later install; `--purge` deletes them too (other files in `~/.veratho
 | `no endpoint could be measured` | the engine logs: the measurement needs the engines answering |
 | no services after a container restart | containers start no services by themselves: run the command again, or `supervisord -c /etc/supervisor/supervisord.conf` |
 | `local changes in ... stop the update` | the installer manages `~/verathos-decide`: see `git -C ~/verathos-decide status` and discard the changes |
+| `v... is not signed ...: not installing it` | the tag is not signed by a release key this installer holds: install another release (`--ref v<version>`), or get the current installer if the subnet owner changed the key ([Update](#update)) |
 | `... is a checkout of other code` | the directory holds another repository, such as an earlier Verathos release: the installer leaves it as it is; keep the default `~/verathos-decide` or choose another `--dir` |
 | downloads slow or rate limited | use a Hugging Face token: `export HF_TOKEN=<token>` before the command |
 
