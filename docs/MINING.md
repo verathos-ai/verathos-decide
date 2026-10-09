@@ -101,7 +101,7 @@ What it does:
 | Model | Status | GPU memory (bfloat16) | Engine | Relative speed |
 |---|---|---|---|---|
 | `kev-4b` | active | about 15 GiB | Kev | 1.0 |
-| `kev-9b` | active | about 26 GiB | Kev | 0.92 |
+| `kev-9b` | active | about 26 GiB | Kev | 0.81 |
 | `clef-flash` | active | about 21 GiB | `verathos-engine` (Clef) | 0.72 |
 
 These are the shipped catalog's models; the installer reads the catalog on chain and lists its models with the memory
@@ -110,7 +110,7 @@ each needs. All three are active from the start and share the miners' emission e
 validators but scores zero until the subnet owner activates it: serving one helps measure it and earns nothing yet. The
 relative speed is the catalog's `relative_speed`: the requests/s of the model's standard mix one GPU serves, relative to
 the other models, as the subnet owner measured them on one reference GPU (`SUBNET_ADMIN.md`). How the models compare
-differs by GPU: kev-9b serves 0.92 times kev-4b's requests on an H100, and clef-flash 0.72 times (its mix with
+differs by GPU: kev-9b serves 0.81 times kev-4b's requests on an H100, and clef-flash 0.72 times (its mix with
 images; 0.79 times the same mix without them); on an A100 kev-9b serves 0.68-0.82 times and clef-flash 0.65 times
 without images, on an RTX 5090 kev-9b 0.55 times.
 
@@ -134,7 +134,7 @@ active model that adds most, and the GPUs after it count it, so a machine with s
 where that pays more. For example, with each model at a third of the scores (0.197 of the emission at the shipped
 miner share of 0.59) and 300, 120 and 400 requests/s proven on kev-4b, kev-9b and clef-flash, an A100 whose
 measurement declares 13.9 requests/s of kev-4b adds about `0.197 x 13.9 / 313.9 = 0.87%` there,
-`0.197 x 12.8 / 132.8 = 1.9%` on kev-9b (12.8 = 13.9 x 0.92) and `0.197 x 10.0 / 410.0 = 0.48%` on clef-flash
+`0.197 x 11.3 / 131.3 = 1.7%` on kev-9b (11.3 = 13.9 x 0.81) and `0.197 x 10.0 / 410.0 = 0.48%` on clef-flash
 (10.0 = 13.9 x 0.72): it serves kev-9b.
 
 On an update, a GPU keeps the model it serves unless another pays at least 1.2 times as much: a switch downloads the
@@ -142,9 +142,9 @@ model and measures again, and the numbers move with every epoch. When another pa
 plan says so and how to switch:
 
 ```
-the network in the auditor's epoch 45412: kev-4b 19.7% of the emission, 300.0 requests/s proven; kev-9b 19.7% of the emission, 240.0 requests/s proven; clef-flash 19.7% of the emission, 400.0 requests/s proven; the median endpoint 14.6 requests/s at relative speed 1
+the network in the auditor's epoch 45412: kev-4b 19.7% of the emission, 300.0 requests/s proven; kev-9b 19.7% of the emission, 210.0 requests/s proven; clef-flash 19.7% of the emission, 400.0 requests/s proven; the median endpoint 14.6 requests/s at relative speed 1
 GPU 0 (NVIDIA A100 80GB PCIe, 80 GiB): kev-4b, endpoint gpu0, engine on 127.0.0.1:8008
-GPU 0: kev-4b, as set up before: about 0.87% of the emission (its share 19.7%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 0.99%, clef-flash 0.48%. kev-9b would pay about 1.14x as much on GPU 0: --model kev-9b to switch
+GPU 0: kev-4b, as set up before: about 0.87% of the emission (its share 19.7%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 1.00%, clef-flash 0.48%. kev-9b would pay about 1.15x as much on GPU 0: --model kev-9b to switch
 another choice: --model <id> for every GPU, or one per GPU in order, as in --model kev-9b
 ```
 
@@ -195,7 +195,7 @@ It updates the code from where it was installed, and the engines and weights whe
 A GPU whose model the setup chose moves to another model only if that pays at least 1.2 times as much
 ([Models](#models)). The miner restarts and reuses its capacity measurement while nothing it depends on changed; an
 engine restarts only when its revision or settings changed, or for `verathos-engine` (Clef models) its code, which
-the miner then measures again.
+the miner then measures again. A release that changes how the miner measures makes it measure once more.
 
 A release is a tag `v<version>` signed by a release key, one that `release/allowed_signers` lists. The installer
 checks the tag it installs (`--ref`, by default the newest release) against its own copy of the file and stops at one
@@ -643,8 +643,8 @@ most 2 s before the window opened, so an endpoint whose latency stays within 2 s
 needs to be done by hand, but:
 - keep the engines warm and their GPUs free of other work: a test delivers what the hardware has at that moment;
 - run `--remeasure` after changing an endpoint's hardware; the miner measures again by itself when the engine's
-  identity, the endpoint's configuration, the request mix or `max_latency_s` changes, and when the endpoint fell
-  short in two tests ([Falling short](#falling-short));
+  identity, the endpoint's configuration, the request mix, `max_latency_s` or the way it measures changes, and when
+  the endpoint fell short in two tests ([Falling short](#falling-short));
 - serve the catalog's precision: the auditor recomputes test answers, and an endpoint whose answers drift from the
   reference over several tests loses its credit;
 - for a model whose request mix carries images (the catalog's `workload.images`; in the shipped catalog a quarter of

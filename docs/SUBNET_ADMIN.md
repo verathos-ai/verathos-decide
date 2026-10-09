@@ -108,16 +108,20 @@ serves within `max_latency_s`, measured for every model on the same reference GP
 positive, 1.0 when absent). Miners' setups choose each GPU's model by what it would pay there (`MINING.md`), and
 estimate a GPU's rate on a model it has not served from its rate on the one it served and this ratio. Measure a new
 model on the reference GPU through the miner's own measurement, as miners do, before activating it. The shipped
-values, on an H100 80GB, relative to kev-4b:
+values, on an H100 80GB, relative to kev-4b, from one session on 2026-10-09: each model measured three times,
+interleaved, each right after its engine started, and kev-4b once more at the end; the medians:
 
 | Model | `relative_speed` | Measured |
 |---|---|---|
-| `kev-4b` | 1.0 | 28.1 requests/s of the standard mix within 2 s on 2026-10-08 (28-30 in earlier runs); 31.8 on 2026-10-09 (31.6-32.0 in four measurements) |
-| `kev-9b` | 0.92 | 25.8 requests/s in kev-4b's session of 2026-10-08 (24.5-27 before); 0.82 on an A100 80GB SXM4, 0.68 on an A100 80GB PCIe, 0.55 on an RTX 5090 |
-| `clef-flash` | 0.72 | measured: 23.0 requests/s of its mix with images (22.6-23.3 in three measurements) in kev-4b's session of 2026-10-09, and 25.0 of the same mix without images (24.8-25.8), which keeps its `first_test_rps` at 40 (45, its rate without images, times 23.0 / 25.0, to a multiple of 5); without images 0.65 on an A100 80GB SXM4 (9.5 against kev-4b's 14.2-15.1) |
+| `kev-4b` | 1.0 | 32.0 requests/s of the standard mix within 2 s (30.9-32.0, at concurrency 16-32; 29.8 at the end) |
+| `kev-9b` | 0.81 | 25.9 requests/s (23.6-26.0, at concurrency 8-32); 0.82 on an A100 80GB SXM4, 0.68 on an A100 80GB PCIe, 0.55 on an RTX 5090 |
+| `clef-flash` | 0.72 | 23.1 requests/s of its mix with images (22.1-23.2, at concurrency 32); 25.0 of the same mix without images in an earlier session that day (24.8-25.8, kev-4b 31.6-32.0 there); without images 0.65 on an A100 80GB SXM4 (9.5 against kev-4b's 14.2-15.1) |
 
-The ratio differs by GPU: a larger model costs relatively less on a larger GPU. Re-measure on the reference GPU when
-an engine gets faster, and replace an estimate once the model's standard mix is measured.
+A single measurement can settle a step below a model's best (kev-9b's 23.6 above, at concurrency 8): take the median
+of several. Each model's `first_test_rps` is about 1.7 times its rate on the reference GPU, to a multiple of 5 (55,
+45 and 40), so a first test can ask a faster GPU for more than the reference serves. The ratio differs by GPU: a
+larger model costs relatively less on a larger GPU. Re-measure on the reference GPU when an engine gets faster, and
+replace an estimate once the model's standard mix is measured.
 
 `gateways` lists the subnet's gateways (`GATEWAY.md`), each a `hotkey` and its `egress` addresses, the public IP
 addresses its requests to miners come from: miners serve them like validators, without the per-caller limit, and the

@@ -64,7 +64,7 @@
           }
         }
       },
-      "first_test_rps": 50.0,
+      "first_test_rps": 55.0,
       "relative_speed": 1.0,
       "price": 0.04,
       "anchor_share": 0.333334
@@ -130,7 +130,7 @@
         }
       },
       "first_test_rps": 45.0,
-      "relative_speed": 0.92,
+      "relative_speed": 0.81,
       "price": 0.09,
       "anchor_share": 0.333333
     },

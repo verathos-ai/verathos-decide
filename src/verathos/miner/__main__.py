@@ -1,13 +1,13 @@
 """Run a miner: ``verathos-miner --config miner.json``, on every machine of a hotkey.
 
-The miner starts its service, measures the capacity of its endpoints through it with each model's standard request
-mix (all endpoints at once), and declares it. Measurements are stored and reused until an endpoint's engine,
-configuration, model revision or request mix changes, or ``--remeasure`` is given. An endpoint whose last two
-throughput tests fell short is measured again and declares at most what it delivered in them (``shortfall``). A
-measurement waits for a selected test (``timing``). An endpoint that cannot be measured is withdrawn; the others are
-served. The primary (``role``) signs the hotkey's manifest, its own endpoints and its peers' (``miner.peers``), and
-publishes it; a worker serves its endpoints and what it declares (``GET /v1/endpoints``) and publishes nothing. Until
-the first measurement is done, a machine serves what it last served.
+The miner starts its service, measures the capacity of its endpoints through it with each model's standard request mix
+(all endpoints at once), and declares it. Measurements are stored and reused until an endpoint's engine, configuration,
+model revision, request mix or measurement method (``measure.METHOD``) changes, or ``--remeasure`` is given. An endpoint
+whose last two throughput tests fell short is measured again and declares at most what it delivered in them
+(``shortfall``). A measurement waits for a selected test (``timing``). An endpoint that cannot be measured is withdrawn;
+the others are served. The primary (``role``) signs the hotkey's manifest, its own endpoints and its peers'
+(``miner.peers``), and publishes it; a worker serves its endpoints and what it declares (``GET /v1/endpoints``) and
+publishes nothing. Until the first measurement is done, a machine serves what it last served.
 
 The service speaks TLS only, with the machine's certificate (``protocol.tls``, kept in ``state_dir``), whose pin the
 manifest names; the measurement reaches the endpoints through it as tests do. Before it starts, the firewall

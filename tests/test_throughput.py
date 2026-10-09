@@ -335,6 +335,20 @@ def test_fingerprint_ignores_engine_counters() -> None:
     assert fingerprint(config, None, KEV.workload) == fingerprint(config, "not a document", KEV.workload)
 
 
+def test_a_new_measurement_method_makes_every_endpoint_measure_again(tmp_path, monkeypatch) -> None:
+    from verathos.throughput import measure
+
+    config = {"model_id": "kev-4b", "engine_url": "http://127.0.0.1:8008"}
+    target = Target("gpu0", "kev-4b", MockEngine("kev-4b"), KEV.workload, 8,
+                    measure.fingerprint(config, None, KEV.workload))
+    store = MeasurementStore(tmp_path / "capacity.json")
+    store.save({"gpu0": measure.Measurement("gpu0", target.fingerprint, 30.0, 32, (30.0,) * 5, 0.0, "kev-4b")})
+    assert stored([target], store) is not None
+    monkeypatch.setattr(measure, "METHOD", measure.METHOD + 1)
+    assert stored([dataclasses.replace(target, fingerprint=measure.fingerprint(config, None, KEV.workload))],
+                  store) is None
+
+
 def test_an_endpoint_that_cannot_be_measured_is_left_out() -> None:
     from verathos.miner.engine import EngineError
     from verathos.throughput import measure
@@ -365,6 +379,99 @@ def test_declared_capacity_stays_within_the_latency_bound() -> None:
     m = measured["gpu0"]
     assert 8 <= m.concurrency <= 16 and m.measured_rps == pytest.approx(160, rel=0.15)
     assert knee([(4, 80.0), (8, 158.0), (16, 161.0), (32, 160.0)]) == (8, 158.0)
+
+
+class Scripted:
+    """An endpoint whose runs give the requests/s scripted for their concurrency, in turn (the last one repeats);
+    ``taken`` lists the concurrency of each run, one per round."""
+
+    def __init__(self, runs: dict[int, list[float]]) -> None:
+        self.runs, self.taken = {c: list(r) for c, r in runs.items()}, []
+
+    async def answer(self, request):
+        return {}
+
+    def run(self, concurrency: int) -> float:
+        self.taken.append(concurrency)
+        runs = self.runs[concurrency]
+        return runs.pop(0) if len(runs) > 1 else runs[0]
+
+
+def measure_scripted(monkeypatch, engines: dict[str, Scripted], max_latency_s: float = 2.0,
+                     max_concurrency: dict[str, int] | None = None):
+    """``measure_all`` over ``engines`` (endpoint id: its script, ``max_concurrency`` 64 unless given), each run
+    taking its scripted rate."""
+    from verathos.throughput import measure
+
+    async def run_load(target, concurrency, run_s, stop):
+        return target.engine.run(concurrency)
+
+    monkeypatch.setattr(measure, "run_load", run_load)
+    targets = [Target(e, "kev-4b", engine, KEV.workload, (max_concurrency or {}).get(e, 64), "f")
+               for e, engine in engines.items()]
+    measured, failures = asyncio.run(measure_all(targets, max_latency_s))
+    assert failures == {}
+    return measured
+
+
+def test_one_slow_run_does_not_end_the_climb(monkeypatch) -> None:
+    """The first run at concurrency 8 falls below 90% of the best before it (noise, or the engine preparing a new
+    batch size): alone it ended the climb there and the endpoint declared what it serves at concurrency 4 (26). The
+    step runs once more, counts the better run and the climb goes on to the knee; a run beyond the latency bound
+    still ends it at once."""
+    from verathos.throughput.measure import FINAL_RUNS, PAST_BEST_SHARE
+
+    engine = Scripted({1: [10.0], 2: [18.0], 4: [26.0], 8: [22.0, 29.0], 16: [31.0], 32: [32.0], 64: [30.0]})
+    assert 22.0 < PAST_BEST_SHARE * 26.0
+    m = measure_scripted(monkeypatch, {"gpu0": engine})["gpu0"]
+    # warm-up at 16 (two runs agree), the ladder with 8 twice, 64 once (64 / 30 s over the bound), the finals
+    assert engine.taken == [16, 16, 1, 2, 4, 8, 8, 16, 32, 64] + [32] * FINAL_RUNS
+    assert (m.concurrency, m.measured_rps, m.runs) == (32, 32.0, (32.0,) * FINAL_RUNS)
+
+
+def test_an_engine_past_its_best_still_stops_climbing(monkeypatch) -> None:
+    from verathos.throughput.measure import FINAL_RUNS
+
+    engine = Scripted({1: [10.0], 2: [18.0], 4: [26.0], 8: [30.0], 16: [31.0], 32: [24.0, 25.0], 64: [18.0]})
+    m = measure_scripted(monkeypatch, {"gpu0": engine})["gpu0"]
+    assert engine.taken == [16, 16, 1, 2, 4, 8, 16, 32, 32] + [16] * FINAL_RUNS  # both runs at 32 below: no 64
+    assert (m.concurrency, m.measured_rps) == (16, 31.0)
+
+
+def test_each_step_runs_at_most_twice_and_as_one_round(monkeypatch) -> None:
+    """Endpoints measured together run a step again together, each at the concurrency of its first run (one whose
+    ladder ended held at its knee), and each counts the better of its two runs: however many endpoints run slow, a
+    measurement takes at most one more round per step."""
+    from verathos.throughput.measure import FINAL_RUNS, MAX_WARMUP_RUNS
+
+    ladder = [1, 2, 4, 8, 16, 32, 64]
+    # from concurrency 2 on, every first run is slow and every second one beats the best (16 after the warm-up)
+    slow = Scripted({1: [11.0], **{c: [1.0, 10.0 + c] for c in ladder[1:]}, 16: [20.0, 20.0, 1.0, 26.0]})
+    # slow at alternate steps; at 64 its second run is the better one, though its first did not fall below
+    other = Scripted({1: [9.0], 2: [4.0, 9.5], 4: [9.8], 8: [4.0, 10.0], 16: [21.0, 21.0, 10.2], 32: [4.0, 10.4],
+                      64: [10.0, 11.0]})
+    short = Scripted({1: [6.0], 2: [7.0], 4: [8.0]})  # its ladder ends at 4
+    measured = measure_scripted(monkeypatch, {"slow": slow, "other": other, "short": short}, max_latency_s=100.0,
+                                max_concurrency={"short": 4})
+    assert slow.taken == other.taken
+    assert slow.taken[2:-FINAL_RUNS] == [1] + [c for c in ladder[1:] for _ in range(2)]  # never a third run
+    assert short.taken == [4, 4, 1, 2, 2] + [4] * (2 * 5 + FINAL_RUNS)  # held at its knee in both runs of a step
+    assert len(slow.taken) == 2 + 2 * len(ladder) - 1 + FINAL_RUNS < 1 + MAX_WARMUP_RUNS + 2 * len(ladder) + FINAL_RUNS
+    assert (measured["slow"].concurrency, measured["slow"].measured_rps) == (64, 74.0)
+    # with its first run at 64 (10.0), its best would be 10.4 at 32 and its knee 16
+    assert (measured["other"].concurrency, measured["other"].measured_rps) == (64, 11.0)
+    assert measured["short"].concurrency == 4
+
+
+def test_the_declared_rate_is_the_median_of_the_final_runs(monkeypatch) -> None:
+    """The better of two runs only places the knee; what is declared is the median of the final runs there."""
+    engine = Scripted({1: [10.0], 2: [18.0], 4: [26.0], 8: [29.5],
+                       16: [31.0, 31.0, 25.0, 36.0, 30.0, 35.0, 28.0, 33.0, 31.0], 32: [30.0]})
+    m = measure_scripted(monkeypatch, {"gpu0": engine})["gpu0"]
+    # 16 below 90% of 29.5, then 36 counted; 32 below 90% of 36 twice: the knee is 16
+    assert engine.taken == [16, 16, 1, 2, 4, 8, 16, 16, 32, 32] + [16] * 5
+    assert m.concurrency == 16 and m.runs == (30.0, 35.0, 28.0, 33.0, 31.0)
+    assert m.measured_rps == 31.0 and m.declared(0.95) == 29.45
 
 
 # ---- the auditor end to end ----
@@ -826,17 +933,18 @@ def test_a_hostile_response_voids_nothing_but_its_own_endpoint(tmp_path) -> None
 def test_a_hotkey_cannot_reset_its_test_rate_by_renaming_endpoints(tmp_path) -> None:
     from verathos.throughput.auditor import Result, Target
 
+    first = catalog.load().get("kev-4b").first_test_rps
     auditor = _auditor(tmp_path)
-    old = Slot("hk", "gpu0", "https://x/e/gpu0", "kev-4b", 50.0, tls=PIN)
+    old = Slot("hk", "gpu0", "https://x/e/gpu0", "kev-4b", first, tls=PIN)
     test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
     auditor.store.add_test(test)
-    auditor.store.add_results(test.test_id, [Result(Target(old, 50.0), "partial", "", 2.0, 0.16)])
+    auditor.store.add_results(test.test_id, [Result(Target(old, first), "partial", "", 2.0, 0.16)])
     # the old endpoint delivered 2 requests/s; eight renamed endpoints are tested at 2 x 2 in total
-    auditor.update_slots([Slot("hk", f"new{i}", f"https://x/e/new{i}", "kev-4b", 50.0, tls=PIN) for i in range(8)])
+    auditor.update_slots([Slot("hk", f"new{i}", f"https://x/e/new{i}", "kev-4b", first, tls=PIN) for i in range(8)])
     rates = [t.tested_rps for t in auditor.targets(auditor.policy)]
-    assert sum(rates) == pytest.approx(50.0, abs=0.1)  # at least one first test's worth, never 8 x 50
-    auditor.update_slots([Slot("fresh", f"g{i}", f"https://y/e/g{i}", "kev-4b", 50.0, tls=PIN) for i in range(8)])
-    assert sum(t.tested_rps for t in auditor.targets(auditor.policy)) == pytest.approx(50.0, abs=0.1)
+    assert sum(rates) == pytest.approx(first, abs=0.1)  # at least one first test's worth, never 8 of them
+    auditor.update_slots([Slot("fresh", f"g{i}", f"https://y/e/g{i}", "kev-4b", first, tls=PIN) for i in range(8)])
+    assert sum(t.tested_rps for t in auditor.targets(auditor.policy)) == pytest.approx(first, abs=0.1)
 
 
 def test_an_endpoint_that_switches_model_starts_from_the_new_models_first_test(tmp_path) -> None:
