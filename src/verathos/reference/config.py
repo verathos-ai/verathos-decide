@@ -38,6 +38,9 @@ def caller_address(value: str) -> str:
 class ReferenceConfig(BaseModel):
     """``reference.json``: the engines this machine runs on its loopback, and the front that serves them."""
 
+    network: str = Field("finney", description="The chain whose subnet catalog pins the engines' models (the setup's "
+                         "default on its next run)")
+    netuid: int | None = Field(None, description="That subnet")
     public_host: str = Field(description="IP address the callers reach this machine at")
     port: int = Field(ge=1, le=65535, description="Port of the front (TLS)")
     listen_host: str = "0.0.0.0"

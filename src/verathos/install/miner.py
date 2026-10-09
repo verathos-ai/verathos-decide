@@ -389,7 +389,7 @@ def init(argv: list[str]) -> None:
     try:
         MinerConfig.model_validate(config)
     except ValidationError as exc:
-        raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
+        raise common.invalid(config_path, exc) from None
     common.write_json(config_path, config)
     info(f"wrote {config_path}")
     identity = tls.identity(Path(config["state_dir"]))

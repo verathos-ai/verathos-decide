@@ -390,8 +390,8 @@ def place_engines(parameters: dict[str, int], families: Mapping[str, str], scree
 
     As ``place_references``, smallest first, on the GPU with the most free memory while one has room: a reference
     that fits no GPU runs in RAM (``device`` "auto"), or only in RAM ("cpu") or only on a GPU ("gpu", the references
-    placed before the screens); a screen runs on a GPU only and is left out where none has room. Engines placed
-    before keep their place. Raises PlanError if a reference fits nowhere."""
+    placed before the screens); a screen runs on a GPU only and is left out where none has room. The engines in
+    ``keep`` stay where they run. Raises PlanError if a reference fits nowhere."""
     if device not in ("auto", "cpu", "gpu"):
         raise PlanError(f"unknown device {device!r}")
     needs = {engine_key(REFERENCE, m): reference_need(p, device) for m, p in parameters.items()}
@@ -437,6 +437,26 @@ def place_one_at_a_time(parameters: dict[str, int], gpu_free: dict[int, int], ra
                         f"{ram_free / GiB:.0f} GiB" + "".join(f", GPU {i} {f / GiB:.0f} GiB"
                                                            for i, f in sorted(gpu_free.items())) + ")")
     return placement
+
+
+def freed(gpu_free: Mapping[int, int], ram_free: int, held: Iterable[tuple[str, int]]) -> tuple[dict[int, int], int]:
+    """The free memory once engines stop: ``held`` gives each one's place ("cpu" or "cuda:<index>") and the memory it
+    takes there. A GPU that is gone frees nothing."""
+    gpus, ram = dict(gpu_free), ram_free
+    for where, size in held:
+        if where == "cpu":
+            ram += size
+        elif where.startswith("cuda:") and (index := int(where.split(":", 1)[1])) in gpus:
+            gpus[index] += size
+    return gpus, ram
+
+
+def engine_memory(key: str, where: str, parameters: Mapping[str, int], families: Mapping[str, str]) -> int:
+    """The memory a reference machine's engine (``engine_key``) takes where it runs ("cpu" or "cuda:<index>")."""
+    kind, model = key.split("/", 1)
+    if kind == SCREEN:
+        return miner_memory(parameters[model], families[model])
+    return reference_memory(parameters[model], "cpu" if where == "cpu" else "gpu")
 
 
 def reference_needs(placement: dict[str, str], parameters: dict[str, int]) -> dict[str, list[tuple[str, int]]]:

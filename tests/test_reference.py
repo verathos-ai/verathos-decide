@@ -276,18 +276,6 @@ class Boxes(ServiceManager):
 
     def __init__(self) -> None:
         super().__init__([])
-        self.running: set[str] = set()
-
-    def apply(self, applied, restart):
-        self.running |= {s.name for s in applied}
-        return super().apply(applied, restart)
-
-    def remove(self, names):
-        self.running -= set(names)
-        super().remove(names)
-
-    def active(self, name: str) -> bool:
-        return name in self.running
 
     def log_command(self, name: str) -> str:
         return f"journalctl -u {name} -f"
@@ -299,8 +287,9 @@ def reference_machine(tmp_path, monkeypatch):
     stood in for."""
     managers: list[Boxes] = [Boxes()]
     installed: list[tuple[str, str]] = []
+    connected: list[str] = []
     monkeypatch.setattr(common, "manager_for", lambda args, record: managers[-1])
-    monkeypatch.setattr(common, "connect", lambda network: SimpleNamespace())
+    monkeypatch.setattr(common, "connect", lambda network: connected.append(network) or SimpleNamespace())
     monkeypatch.setattr(setup, "current_catalog", lambda *args: catalog.load())
     monkeypatch.setattr(host, "gpus", lambda: [gpu(0, 80)])
     monkeypatch.setattr(host, "memory_available", lambda: (216 * GiB, 210 * GiB))
@@ -317,14 +306,14 @@ def reference_machine(tmp_path, monkeypatch):
 
     monkeypatch.setattr(setup, "through_front", through_front)
 
-    def run(*extra: str) -> SimpleNamespace:
-        setup.init(["--yes", "--network", "test", "--home", str(tmp_path), *extra])
+    def run(*extra: str, network: str | None = "test") -> SimpleNamespace:
+        setup.init(["--yes", *(["--network", network] if network else []), "--home", str(tmp_path), *extra])
         record = common.Record.load(tmp_path, "reference")
         return SimpleNamespace(manager=managers[-1], record=record,
                                config=ReferenceConfig.load(tmp_path / "reference.json"),
                                document=json.loads((tmp_path / common.ENGINES_FILE).read_text()))
 
-    return SimpleNamespace(run=run, managers=managers, installed=installed, home=tmp_path)
+    return SimpleNamespace(run=run, managers=managers, installed=installed, connected=connected, home=tmp_path)
 
 
 def test_the_reference_setup_runs_each_engine_and_the_front_and_writes_the_file_validators_take(
@@ -365,8 +354,11 @@ def test_the_reference_setup_runs_each_engine_and_the_front_and_writes_the_file_
         ValidatorConfig.model_validate({"netuid": 405, "wallet_name": "w", "hotkey_name": "h",
                                         "references": document["references"], section: document[section]})
     out = capsys.readouterr().out
-    assert f"TLS pin {pin}, key {key}" in out and "--remote-engines reference-engines.json" in out
+    assert f"TLS pin {pin}; the callers' key is in {config.state_dir / 'api.key'}" in out
+    assert f"{box.home / common.ENGINES_FILE} holds the URLs, the pin and the key (mode 600: keep it private)" in out
+    assert "--remote-engines reference-engines.json" in out and key not in out
     assert "kev-4b: reference https://203.0.113.7:20004/reference/kev-4b, screen " in out
+    assert (config.network, config.netuid) == ("test", 405)
 
     # again: the same certificate, key and ports; --allow replaces the callers; --no-screens stops the screens
     ports = {k: e["port"] for k, e in done.record.engines.items()}
@@ -379,12 +371,14 @@ def test_the_reference_setup_runs_each_engine_and_the_front_and_writes_the_file_
     assert again.manager.removed == ["verathos-screen-clef-flash", "verathos-screen-kev-4b", "verathos-screen-kev-9b"]
     assert {k: e["port"] for k, e in again.record.engines.items()} == {k: p for k, p in ports.items()
                                                                        if k.startswith("reference/")}
-    # the references now have the GPU: placed before in RAM, they stay there
-    assert {e["device"] for e in again.record.engines.values()} == {"cpu"}
+    # other engines: placed again, the references take the GPU the screens leave, the largest stays in RAM
+    assert {k: e["device"] for k, e in again.record.engines.items()} == {
+        "reference/kev-4b": "cuda:0", "reference/clef-flash": "cuda:0", "reference/kev-9b": "cpu"}
+    assert "kev-4b reference: float32 on GPU 0 (about 27 GiB), 127.0.0.1:" in capsys.readouterr().out
     box.managers.append(Boxes())
     kept = box.run("--model", "kev-4b")
     assert kept.config.allow == ["203.0.113.50", "2001:db8::5"] and list(kept.config.engines) == ["kev-4b"]
-    assert kept.record.options == {"network": "test", "netuid": 405, "screens": False, "models": ["kev-4b"]}
+    assert kept.record.options == {"screens": False, "models": ["kev-4b"]}
     assert list(box.run().config.engines) == ["kev-4b"]  # kept
     assert set(box.run("--model", "auto").config.engines) == {"kev-4b", "kev-9b", "clef-flash"}
 
@@ -401,6 +395,67 @@ def test_an_update_restarts_the_engines_whose_code_changed(reference_machine, mo
     assert sorted(n for n in after if after[n] != before[n]) == ["verathos-reference-clef-flash",
                                                                  "verathos-screen-clef-flash"]
     assert again.record.engines["reference/clef-flash"]["code"] == "0123456789ab"
+
+
+def test_the_reference_setup_never_prints_the_callers_key(reference_machine, monkeypatch, capsys) -> None:
+    """A terminal's scrollback and a log of the output keep what the setup prints: it names the files that hold the
+    key, with services, on an update and without services, and never the key."""
+    box = reference_machine
+    first = box.run("--allow", "198.51.100.9")
+    key, key_file = api_key(first.config.state_dir), first.config.state_dir / "api.key"
+    box.run()
+    monkeypatch.setattr(common, "manager_for", lambda args, record: None)  # --no-service
+    box.run()
+    printed = capsys.readouterr()
+    assert key not in printed.out and key not in printed.err
+    assert printed.out.count(f"the callers' key is in {key_file}") == 3
+    assert printed.out.count(f"{box.home / common.ENGINES_FILE} holds the URLs, the pin and the key (mode 600: keep "
+                             "it private)") == 3
+    assert key_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_an_update_keeps_each_engine_where_it_runs_and_places_other_engines_again(reference_machine, monkeypatch,
+                                                                                   capsys) -> None:
+    """Three models: their screens fill the A100, so the references run in RAM. --model kev-4b,kev-9b runs other
+    engines, so each is placed again in the memory free once the setup's own engines stop: kev-4b's reference moves to
+    the GPU clef-flash's screen leaves, and its service changes, which restarts it. A later run of the same engines
+    keeps each where it runs, though a second GPU would spread them anew."""
+    box = reference_machine
+
+    def free(ram: int, *gpus_free: int) -> None:
+        monkeypatch.setattr(host, "gpus", lambda: [gpu(i, 80, free=f / GiB) for i, f in enumerate(gpus_free)])
+        monkeypatch.setattr(host, "memory_available", lambda: (216 * GiB, ram))
+
+    def places(done: SimpleNamespace) -> dict[str, str]:
+        return {k: e["device"] for k, e in done.record.engines.items()}
+
+    first = box.run("--allow", "198.51.100.9")
+    assert {k: w for k, w in places(first).items() if k.startswith("reference/")} == dict.fromkeys(
+        ["reference/clef-flash", "reference/kev-4b", "reference/kev-9b"], "cpu")
+    before = {s.name: services.Systemd.render(s) for s in first.manager.applied}
+    # what is free while kev-4b's and kev-9b's engines run (the setup removes clef-flash's first)
+    screens = plan.miner_memory(KEV["kev-4b"]) + plan.miner_memory(KEV["kev-9b"])
+    references = plan.reference_memory(KEV["kev-4b"], "cpu") + plan.reference_memory(KEV["kev-9b"], "cpu")
+    free(210 * GiB - references, 80 * GiB - screens)
+    box.managers.append(Boxes())
+    box.managers[-1].running = set(before)
+    two = box.run("--model", "kev-4b,kev-9b")
+    assert two.manager.removed == ["verathos-reference-clef-flash", "verathos-screen-clef-flash"]
+    placed = {"reference/kev-4b": "cuda:0", "reference/kev-9b": "cpu", "screen/kev-4b": "cuda:0",
+              "screen/kev-9b": "cuda:0"}
+    assert places(two) == placed
+    after = {s.name: services.Systemd.render(s) for s in two.manager.applied}
+    assert [n for n in sorted(after) if n != setup.FRONT and after[n] != before[n]] == ["verathos-reference-kev-4b"]
+    out = capsys.readouterr().out
+    assert "kev-4b reference: float32 on GPU 0 (about 27 GiB), 127.0.0.1:" in out and "; moves from CPU" in out
+
+    free(120 * GiB, 80 * GiB - screens - plan.reference_memory(KEV["kev-4b"], "gpu"), 80 * GiB)  # a second A100
+    box.managers.append(Boxes())
+    box.managers[-1].running = set(after)
+    same = box.run()
+    assert places(same) == placed and same.manager.removed == []
+    assert {s.name: services.Systemd.render(s) for s in same.manager.applied} == after
+    assert "moves from" not in capsys.readouterr().out
 
 
 def test_the_reference_setup_refuses_a_machine_that_runs_a_validator_and_unknown_models(reference_machine) -> None:
@@ -431,6 +486,29 @@ def test_uninstall_removes_the_reference_machine_and_purge_its_key(tmp_path) -> 
     common.Record(role="reference", config=str(home / "reference.json")).save(home)
     common.uninstall("reference", ["--home", str(home), "--purge"])
     assert sorted(p.name for p in home.iterdir()) == ["install"]
+
+
+def test_a_reinstall_after_uninstall_takes_the_network_from_the_kept_configuration(reference_machine, monkeypatch,
+                                                                                    capsys) -> None:
+    """uninstall keeps reference.json, which holds the network and netuid, and ends with the installer's command that
+    sets the machine up again with it (the code came from a git bundle); that setup takes them from it, as an update
+    does, unless they are given."""
+    box = reference_machine
+    box.run("--allow", "198.51.100.9")  # --network test
+    monkeypatch.setattr(services, "by_name", lambda name: box.managers[-1])
+    monkeypatch.setattr(common, "code_source", lambda: "/root/verathos-decide.bundle")
+    capsys.readouterr()
+    common.uninstall("reference", ["--home", str(box.home)])
+    out = capsys.readouterr().out
+    assert out.endswith("the installer sets the reference up again with them:\n      install.sh reference --yes "
+                        f"--source /root/verathos-decide.bundle --home {box.home}\n")
+    assert not common.Record.path(box.home, "reference").exists() and box.managers[-1].running == set()
+
+    again = box.run(network=None)  # install.sh reference --yes, as the line says
+    assert box.connected[-1] == "test" and (again.config.network, again.config.netuid) == ("test", 405)
+    assert "network test, netuid 405" in capsys.readouterr().out
+    assert again.config.allow == ["198.51.100.9"] and again.manager.running  # serving again
+    assert box.run("--netuid", "406", network=None).config.netuid == 406  # given: taken
 
 
 # ---- the validator setup that takes the file ----
@@ -529,7 +607,9 @@ def validator_machine(tmp_path, monkeypatch, lab_network):
         owner["hotkey"] = "5Validator" if owned else "5Owner"
         lines = [["throughput tests are run by 5Owner; applying its verdicts" if not owned
                   else "throughput auditor running (enforce mode)"], ["epoch 7: 3 miners, 3 open endpoints"]]
-        managers.append(ServiceManager(lines))
+        manager = ServiceManager(lines)
+        manager.running = set(managers[-1].running) if managers else set()  # the services run on between setups
+        managers.append(manager)
         validator_setup.init([mode, "--yes", "--wallet", "v", "--hotkey", "default", "--home", str(tmp_path),
                               *extra])
         return managers[-1], common.read_json(tmp_path / "validator.json")
@@ -578,6 +658,43 @@ def test_a_validator_with_part_of_its_references_elsewhere_runs_the_others_itsel
     assert config["references"]["kev-9b"]["url"] == "https://203.0.113.7:20004/reference/kev-9b"
     assert config["references"]["kev-4b"] == "http://127.0.0.1:8101" and installed == ["reference", "kev-4b"]
     assert [s.name for s in manager.applied] == ["verathos-reference-kev-4b", validator_setup.VALIDATOR]
+
+
+def test_a_validator_update_keeps_its_references_in_place_until_it_runs_other_ones(validator_machine, monkeypatch,
+                                                                                   capsys) -> None:
+    """Resident references keep their places while the setup runs the same ones, though the GPU has room for kev-9b's
+    then; once a reference machine takes kev-4b's, the setup runs other references and places each again in the memory
+    free once its own stop: kev-9b's moves from RAM to the GPU, and its service changes, which restarts it."""
+    v = validator_machine
+    monkeypatch.setattr(engines.KevEngine, "install", lambda self, purpose: None)
+    monkeypatch.setattr(engines, "download", lambda python, m, hf_home: None)
+
+    def free(gpu_bytes: int, ram_bytes: int) -> None:
+        monkeypatch.setattr(host, "gpus", lambda: [gpu(0, 80, free=gpu_bytes / GiB)])
+        monkeypatch.setattr(host, "memory_available", lambda: (128 * GiB, ram_bytes))
+
+    def places() -> dict[str, str]:
+        return {m: e["device"] for m, e in common.Record.load(v.home, "validator").engines.items()}
+
+    kev4_gpu, kev9_ram = plan.reference_memory(KEV["kev-4b"], "gpu"), plan.reference_memory(KEV["kev-9b"], "cpu")
+    free(30 * GiB, 100 * GiB)  # another program holds most of the GPU
+    manager, _ = v.run()
+    assert places() == {"kev-4b": "cuda:0", "kev-9b": "cpu"}
+    before = {s.name: services.Systemd.render(s) for s in manager.applied}
+    free(80 * GiB - kev4_gpu, 100 * GiB - kev9_ram)  # it ended: room for kev-9b's 48 GiB on the GPU
+    manager, _ = v.run()
+    assert places() == {"kev-4b": "cuda:0", "kev-9b": "cpu"} and manager.removed == []
+    assert "moves from" not in capsys.readouterr().out
+
+    path = engines_file(v.home / "reference-engines.json", "ab" * 32, "k" * 43, models=("kev-4b",), screens=())
+    free(80 * GiB, 100 * GiB - kev9_ram)  # as the setup measures it, kev-4b's reference removed first
+    manager, config = v.run("--remote-engines", str(path))
+    assert places() == {"kev-9b": "cuda:0"} and manager.removed == ["verathos-reference-kev-4b"]
+    assert config["references"]["kev-9b"] == "http://127.0.0.1:8102"
+    kev9 = next(s for s in manager.applied if s.name == "verathos-reference-kev-9b")
+    assert kev9.environment["CUDA_VISIBLE_DEVICES"] == "0" and services.Systemd.render(kev9) != before[kev9.name]
+    assert "kev-9b: float32 reference on GPU 0 (about 48 GiB), 127.0.0.1:8102; moves from CPU" in (
+        capsys.readouterr().out)
 
 
 def test_the_validator_setup_shows_what_each_remote_engine_serves_as_the_validator_reaches_it(tmp_path) -> None:
