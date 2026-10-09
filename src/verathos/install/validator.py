@@ -10,9 +10,12 @@ memory needs only the largest. The setup shows the validator's first epoch start
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -23,7 +26,8 @@ from verathos.install.services import Manager, Service
 from verathos.protocol import tls
 from verathos.protocol.callers import egress_addresses
 from verathos.subnet.chain import current_catalog
-from verathos.validator.config import ValidatorConfig
+from verathos.validator.config import ReferenceEngine, ValidatorConfig
+from verathos.validator.references import served_revisions
 
 REFERENCE_PORT = 8101
 VALIDATOR = "verathos-validator"
@@ -58,6 +62,10 @@ def parser() -> argparse.ArgumentParser:
                    "a later run keeps them, --no-candidates removes them")
     p.add_argument("--egress-ip", action="append", help="Full mode: a public IP address this validator's requests to "
                    "miners come from (repeat for several; default: as configured, else detected)")
+    p.add_argument("--remote-engines", action="append", metavar="FILE", help="Full mode: the engines a reference "
+                   "machine serves this validator (the file its setup writes, verathos-reference init): its "
+                   "references replace local ones, and the auditor also takes its screens. Repeat for several "
+                   "machines; replaces the remote engines configured before ('' for none); a later run keeps them")
     p.add_argument("--config", type=Path, help="Validator configuration (default <home>/validator.json)")
     return p
 
@@ -117,21 +125,74 @@ def reference_line(reference_mode: str, placement: dict[str, str], parameters: d
         f"{where(w)} for the largest: about {models[0][1] / host.GiB:.0f} GiB" for w, models in needs.items()) + ")"
 
 
+def entry_url(entry: str | dict) -> str:
+    """The URL of an engine of ``references`` or ``audit_screens`` (a URL, or an object with one)."""
+    return entry if isinstance(entry, str) else entry.get("url", "")
+
+
+def remote_entry(entry: str | dict) -> bool:
+    """Whether an engine of ``references`` or ``audit_screens`` runs on another machine: it is reached over https
+    (``ReferenceEngine.remote``)."""
+    return urlsplit(entry_url(entry)).scheme == "https"
+
+
+def remote_entries(section: dict) -> dict:
+    """The engines of a ``references`` or ``audit_screens`` section that run on other machines."""
+    return {m: v for m, v in section.items() if remote_entry(v)}
+
+
+def read_remote_engines(paths: list[str]) -> tuple[dict, dict]:
+    """The references and screens in the files reference machines write (``reference.config.engines_document``):
+    model -> {url, tls_pin, api_key}, each an engine on another machine over https with its pin. A model in two files
+    is refused. Raises SystemExit naming what is wrong."""
+    references: dict[str, dict] = {}
+    screens: dict[str, dict] = {}
+    for path in paths:
+        try:
+            document = json.loads(Path(path).expanduser().read_text())
+            sections = {"references": document["references"], "audit_screens": document.get("audit_screens", {})}
+            for section in sections.values():
+                for model, entry in section.items():
+                    engine = ReferenceEngine.model_validate(entry)
+                    if not engine.remote() or engine.tls_pin is None or engine.command:
+                        raise ValueError(f"{model}: {engine.url} is not an engine on another machine with a TLS pin")
+        except ValidationError as exc:
+            raise SystemExit(f"--remote-engines {path}: not a reference machine's file ("
+                             + "; ".join(e["msg"] for e in exc.errors()) + ")") from None
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise SystemExit(f"--remote-engines {path}: not a reference machine's file ({str(exc).splitlines()[0]})"
+                             ) from None
+        for into, section in ((references, sections["references"]), (screens, sections["audit_screens"])):
+            if twice := sorted(set(into) & set(section)):
+                raise SystemExit(f"--remote-engines: {', '.join(twice)} in two files; give each model one machine")
+            into.update({m: dict(v) for m, v in section.items()})
+    return references, screens
+
+
 def validator_config(existing: dict, *, network: str, netuid: int, wallet_name: str, hotkey_name: str,
                      ports: dict[str, int], dry_run: bool, managed_before: set[str], home: Path,
                      mode: str = "full", reference_mode: str | None = None,
                      launch: dict[str, dict] | None = None, auto_update: bool | None = None,
-                     egress_ips: list[str] | None = None) -> dict:
+                     egress_ips: list[str] | None = None, remote: dict | None = None,
+                     screens: dict | None = None) -> dict:
     """The configuration to write: ``existing`` with this setup's answers and a local reference per model (model ->
     port; none in light mode), with the command that serves it where the validator starts it (``launch``: model ->
-    command, directory, environment). References configured by hand (a remote engine) and other settings are kept."""
+    command, directory, environment). ``remote`` and ``screens`` (from reference machines' files) replace the
+    references and screens on other machines; without them those are kept, as are other settings."""
     references = {m: v for m, v in existing.get("references", {}).items()
                   if m not in ports and m not in managed_before}
+    if remote is not None:
+        references = {m: v for m, v in references.items() if not remote_entry(v)} | remote
     for m, port in ports.items():
         url = f"http://127.0.0.1:{port}"
         references[m] = {"url": url, **launch[m]} if launch and m in launch else url
     config = {**existing, "network": network, "netuid": netuid, "wallet_name": wallet_name,
               "hotkey_name": hotkey_name, "mode": mode, "references": references, "dry_run": dry_run}
+    if screens is not None:
+        kept = {m: v for m, v in existing.get("audit_screens", {}).items() if not remote_entry(v)}
+        config["audit_screens"] = kept | screens
+        if not config["audit_screens"]:
+            del config["audit_screens"]
     if reference_mode is not None:
         config["reference_mode"] = reference_mode
     if auto_update is not None:
@@ -150,6 +211,9 @@ def init(argv: list[str]) -> None:
     record = common.Record.load(home, "validator")
     config_path = (args.config or Path(record.config or home / "validator.json")).expanduser().absolute()
     existing = common.read_json(config_path)
+    if common.Record.load(home, "reference").services:
+        raise SystemExit("this machine is a reference machine (verathos-reference): it lends its GPUs to validators on "
+                         "other machines, which take its engines with --remote-engines, and runs no validator itself")
     manager = common.manager_for(args, record)
     dry_run = existing.get("dry_run", False) if args.dry_run is None else args.dry_run
 
@@ -185,20 +249,30 @@ def init(argv: list[str]) -> None:
         raise SystemExit(f"the subnet's catalog is not available: {exc}") from None
     info(f"catalog {cat.revision} ({cat.digest()[:12]})")
     if mode == "light":
+        if args.remote_engines:
+            raise SystemExit("--remote-engines gives a full validator its references; a light one runs none (--full)")
         init_light(ui, manager, record, existing, config_path, home, dry_run, cat=cat, network=network, netuid=netuid,
                    wallet_name=wallet_name, hotkey_name=hotkey_name, auto_update=auto_update)
         return
 
     step("References")
+    if args.remote_engines is not None:
+        remote, screens = read_remote_engines([p for p in args.remote_engines if p])
+        if screens and not owner:
+            info(f"the screens of {', '.join(sorted(screens))} are the auditor's: not configured here (set up the "
+                 "reference machine with --no-screens to leave their GPU memory to the references)")
+            screens = {}
+    else:
+        remote, screens = remote_entries(existing.get("references", {})), None  # kept as they are
     served = plan.servable_models(cat)
     for m in served:
-        if m.status == "active" and not plan.installable(m):
+        if m.status == "active" and m.model_id not in remote and not plan.installable(m):
             raise SystemExit(f"{m.model_id} is active and runs on the {m.engine.name} engine, which this setup does "
                              "not install; set up its reference by hand (docs/VALIDATING.md)")
-    candidates = sorted(m.model_id for m in served if m.status == "candidate")
+    candidates = sorted(m.model_id for m in served if m.status == "candidate" and m.model_id not in remote)
     with_candidates = args.candidates if args.candidates is not None else any(m in record.engines for m in candidates)
-    models = {m.model_id: m for m in served
-              if m.status == "active" or (with_candidates and plan.installable(m))}
+    models = {m.model_id: m for m in served if m.model_id not in remote
+              and (m.status == "active" or (with_candidates and plan.installable(m)))}
     try:
         parameters = {m: engines.parameters(models[m]) for m in models}
     except plan.PlanError as exc:
@@ -207,8 +281,9 @@ def init(argv: list[str]) -> None:
     if stale and manager is not None:
         # Their memory is free for the other references.
         manager.remove([service_name(m) for m in stale])
-        info(f"removed the references of {', '.join(stale)}, which this setup no longer runs (not an active model"
-             + (", nor a candidate)" if with_candidates else "; candidates only with --candidates)"))
+        info(f"removed the references of {', '.join(stale)}, which this setup no longer runs (on another machine, "
+             "or not an active model" + (", nor a candidate)" if with_candidates else "; candidates only with "
+                                         "--candidates)"))
         record.engines = {m: e for m, e in record.engines.items() if m in models}
         record.services = [s for s in record.services if s not in {service_name(m) for m in stale}]
         record.save(home)
@@ -218,7 +293,8 @@ def init(argv: list[str]) -> None:
          + "".join(f"; {g.describe()} ({g.memory_free / host.GiB:.0f} free)" for g in gpus))
     try:
         reference_mode, why_mode, placement = place(parameters, {g.index: g.memory_free for g in gpus}, ram_free,
-                                                    args, existing, record, owner, candidates)
+                                                    args, existing, record, owner, candidates) if parameters else (
+            "resident", "every reference runs on another machine", {})
     except plan.PlanError as exc:
         raise SystemExit(str(exc)) from None
     sequential = reference_mode == "sequential"
@@ -230,7 +306,8 @@ def init(argv: list[str]) -> None:
     step("Plan")
     for line in mode_lines("full", cat, owner):
         info(line)
-    info(f"{reference_line(reference_mode, placement, {m: parameters[m] for m in models})}: {why_mode}")
+    if models:
+        info(f"{reference_line(reference_mode, placement, {m: parameters[m] for m in models})}: {why_mode}")
     if sequential:
         info("each epoch the validator checks the models whose references fit in its reference time, drawn in turn; "
              "a model it does not check that epoch takes the results of "
@@ -246,6 +323,9 @@ def init(argv: list[str]) -> None:
              f"{plan.reference_memory(parameters[m], 'cpu') / host.GiB:.0f} GiB of RAM or "
              f"{plan.reference_memory(parameters[m], 'gpu') / host.GiB:.0f} GiB on a GPU); this validator does not "
              "check its endpoints")
+    for line in asyncio.run(remote_lines(remote, screens if screens is not None else
+                                         remote_entries(existing.get("audit_screens", {})) if owner else {}, cat)):
+        info(line)
     if candidates and not with_candidates:
         info(f"not checked by this validator: {', '.join(candidates)} ({plan.CANDIDATE}); --candidates runs "
              "their references too, where memory is left")
@@ -266,19 +346,20 @@ def init(argv: list[str]) -> None:
     if not ui.confirm("Go ahead?"):
         raise SystemExit("stopped; nothing changed")
 
-    step("Engines")
     installs = {}
     for m in sorted(models):
         engine = engines.engine_for(home, models[m])
         installs.setdefault(engine.directory, engine)
-    for engine in installs.values():
-        info(f"{engine.engine.name} at {engine.engine.revision[:12]} in {engine.directory}")
-        engine.install("reference")
-
-    step("Weights")
     hf_home = home / "hf"
-    for m in sorted(models):
-        engines.download(engines.engine_for(home, models[m]).python("reference"), models[m], hf_home)
+    if models:  # none on a machine whose references all run elsewhere
+        step("Engines")
+        for engine in installs.values():
+            info(f"{engine.engine.name} at {engine.engine.revision[:12]} in {engine.directory}")
+            engine.install("reference")
+
+        step("Weights")
+        for m in sorted(models):
+            engines.download(engines.engine_for(home, models[m]).python("reference"), models[m], hf_home)
 
     step("Configuration")
     reference_services = {}
@@ -296,7 +377,8 @@ def init(argv: list[str]) -> None:
     config = validator_config(existing, network=network, netuid=netuid, wallet_name=wallet_name,
                               hotkey_name=hotkey_name, ports=ports, dry_run=dry_run,
                               managed_before=set(record.engines), home=home, reference_mode=reference_mode,
-                              launch=launch, auto_update=auto_update, egress_ips=egress)
+                              launch=launch, auto_update=auto_update, egress_ips=egress, remote=remote,
+                              screens=screens)
     try:
         ValidatorConfig.model_validate(config)
     except ValidationError as exc:
@@ -364,6 +446,8 @@ def init(argv: list[str]) -> None:
         info("this epoch was scored before the restart; the validator starts the next one at its first block")
 
     step("Done")
+    for m, entry in sorted(remote.items()):
+        info(f"{m}: reference on another machine, {entry_url(entry)}")
     for m in models:
         if sequential:
             info(f"{m}: reference on {describe(placement[m])}, started by the validator when it checks {m}; log "
@@ -411,6 +495,30 @@ def place(parameters: dict[str, int], gpu_free: dict[int, int], ram_free: int, a
         parameters, {i: free + freed_gpu.get(i, 0) for i, free in gpu_free.items()}, ram_free + freed_ram,
         args.device, {m: e["device"] for m, e in record.engines.items()}, optional=candidates)
     return reference_mode, why, placement
+
+
+async def remote_lines(references: dict, screens: dict, cat: catalog.Catalog) -> list[str]:
+    """For the plan: each engine on another machine, and what it serves as this validator reaches it (its URL, pin
+    and key), or why it does not serve now."""
+    async def line(model: str, entry: str | dict, kind: str) -> str:
+        engine = ReferenceEngine.model_validate({"url": entry} if isinstance(entry, str) else entry)
+        client = engine.engine(timeout_s=10.0)
+        try:
+            why = await client.problem()
+            served = served_revisions(await client.info()) if why is None else set()
+        finally:
+            await client.close()
+        pinned = cat.get(model).hf_revision if cat.get(model) is not None else ""
+        if why is not None:
+            why = (f"it does not serve now, {why}; the validator waits for it at its start (15 minutes at most) and "
+                   "checks it each epoch")
+        accepted = f"pin {engine.tls_pin[:12]}..." if engine.tls_pin else "a public CA's certificate"
+        return f"{model}: {kind} on another machine, {engine.url} ({accepted}): " + common.engine_state(
+            why, served, pinned)
+
+    entries = [(m, e, "float32 reference") for m, e in sorted(references.items())]
+    entries += [(m, e, "bfloat16 screen") for m, e in sorted(screens.items())]
+    return list(await asyncio.gather(*(line(*e) for e in entries)))
 
 
 def egress_ips(args: argparse.Namespace, existing: dict) -> list[str]:

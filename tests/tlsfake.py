@@ -87,19 +87,26 @@ def free_port() -> int:
 
 
 @contextlib.contextmanager
-def serving(app: object, identity: tls.Identity, port: int | None = None) -> Iterator[str]:
+def serving(app: object, identity: tls.Identity | None, port: int | None = None) -> Iterator[str]:
     """``app`` served over TLS with ``identity`` on a loopback port (``port``, else a free one), as a miner or
-    validator serves; -> its base URL."""
+    validator serves, or without one over plain http, as an engine serves on its machine; -> its base URL."""
     port = port or free_port()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
-                                           **tls.server_options(identity)))
-    thread = threading.Thread(target=server.run, daemon=True)
+                                           **(tls.server_options(identity) if identity is not None else {})))
+    with running(server):
+        yield f"{'https' if identity is not None else 'http'}://127.0.0.1:{port}"
+
+
+@contextlib.contextmanager
+def running(server: uvicorn.Server, sockets: list | None = None) -> Iterator[None]:
+    """``server`` running in a thread (on ``sockets`` if given) until the block ends."""
+    thread = threading.Thread(target=server.run, kwargs={"sockets": sockets}, daemon=True)
     thread.start()
     while not server.started:
         assert thread.is_alive(), "the server did not start"
         time.sleep(0.02)
     try:
-        yield f"https://127.0.0.1:{port}"
+        yield
     finally:
         server.should_exit = True
         thread.join(5)

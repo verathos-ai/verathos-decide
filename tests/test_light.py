@@ -397,7 +397,7 @@ def auditor_and_light(tmp_path, cat: catalog.Catalog, verdicts=None):
                                  proven_invalid=no_evidence)
     current = SimpleNamespace(catalog=cat, for_epoch=lambda st, block: cat,
                               accepted=lambda: {cat.digest(): cat.mechanism})
-    auditor_cfg = SimpleNamespace(netuid=405, mechid=None, references={}, dry_run=False)
+    auditor_cfg = SimpleNamespace(netuid=405, mechid=None, references={}, audit_screens={}, dry_run=False)
     board = StatusBoard()
     app = FastAPI()
     add_network_route(app, board, owner, 405)

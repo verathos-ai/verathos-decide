@@ -823,7 +823,7 @@ def test_an_epoch_checks_what_fits_takes_the_rest_from_the_source_and_sets_one_w
     async def proven_invalid(evidence, references, cat, budget_s=None):
         return []
 
-    throughput = SimpleNamespace(auditor_hotkey=owner.ss58_address, manifests=ManifestCache(1000.0),
+    throughput = SimpleNamespace(auditor_hotkey=owner.ss58_address, auditor=None, manifests=ManifestCache(1000.0),
                                  update_slots=lambda *args: None, holding=lambda: False, identities=Identities(),
                                  verdicts=verdicts, proven_invalid=proven_invalid)
     # a short epoch: canaries over a twentieth of one block's time; on mechanism 1, the miners' manifests'

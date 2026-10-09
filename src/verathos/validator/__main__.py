@@ -69,6 +69,8 @@ OWNER_RESIDENT = ("this is the subnet owner's hotkey: its validator is the audit
                   "time and every model each epoch; its references stay resident: set reference_mode to resident "
                   "(scripts/install.sh validator --full --references resident)")
 SOURCE_MARGIN_S = 120.0  # references one at a time: the source's results are awaited until this long before the end
+REMOTE_CHECK_S = 10.0  # an engine on another machine answers its check within it
+_REMOTE_DOWN: list[str] = []  # the engines on other machines not serving at the last epoch's check
 
 
 def load_secret(state_dir: Path) -> bytes:
@@ -183,6 +185,36 @@ async def references_down(references: dict[str, ReferenceEngine]) -> list[str]:
     return sorted(m for m in await asyncio.gather(*(down(m, r) for m, r in references.items())) if m)
 
 
+async def remote_engines_down(engines: Mapping[str, ReferenceEngine]) -> list[str]:
+    """The engines on other machines among ``engines`` (name -> engine) that do not serve now, each with why."""
+    async def check(name: str, spec: ReferenceEngine) -> str | None:
+        engine = spec.engine(timeout_s=REMOTE_CHECK_S)
+        try:
+            why = await engine.problem()
+        finally:
+            await engine.close()
+        return None if why is None else f"{name} at {spec.url}: {why}"
+
+    remote = [(name, spec) for name, spec in sorted(engines.items()) if spec.remote()]
+    return [line for line in await asyncio.gather(*(check(n, s) for n, s in remote)) if line]
+
+
+async def check_remote_engines(cfg: ValidatorConfig, epoch: int, auditor: bool) -> None:
+    """One line per epoch while an engine on another machine (a reference, or the auditor's screen) does not serve:
+    what it checks stays unchecked, not penalized, as when a local reference is down."""
+    engines = {f"the {m} reference": r for m, r in cfg.references.items()}
+    if auditor:
+        engines |= {f"the {m} screen": s for m, s in cfg.audit_screens.items()}
+    down = await remote_engines_down(engines)
+    if down:
+        log.warning("epoch %d: engines on other machines not serving: %s; what they check stays unchecked, not "
+                    "penalized, until they serve again (docs/VALIDATING.md, When the GPU machine is gone)", epoch,
+                    "; ".join(down))
+    elif _REMOTE_DOWN:
+        log.info("epoch %d: the engines on other machines serve again", epoch)
+    _REMOTE_DOWN[:] = down
+
+
 def wait_for_references(references: dict[str, ReferenceEngine], timeout_s: float = REFERENCE_WAIT_S,
                         poll_s: float = 5.0) -> None:
     """Wait until every reference engine is up, at most ``timeout_s``: engines restarted with the validator load
@@ -252,6 +284,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
         log.critical("epoch %d: %s. Every miner refuses this validator, so it sends no canaries and sets no weights "
                      "this epoch", epoch, why)
         return
+    await check_remote_engines(cfg, epoch, throughput.auditor is not None)
     transition = transitioning(state.pins, cat, epoch)
     if transition:
         log.warning("  %s: the pinned weights or engine changed in place; answers are not checked for %d epochs after",
@@ -552,6 +585,10 @@ def main() -> None:
     state = ScoreState.load(state_path)
     if missing := missing_references(cfg, current.catalog):
         raise SystemExit(f"no reference engine configured for the active models {missing}")
+    if remote := sorted(f"the {m} {kind} at {e.url}" for kind, section in (("reference", cfg.references),
+                                                                           ("screen", cfg.audit_screens))
+                        for m, e in section.items() if e.remote()):
+        log.info("engines on other machines: %s", ", ".join(remote))
     runner = None
     if cfg.reference_mode == "sequential":
         if wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid):

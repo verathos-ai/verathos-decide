@@ -22,9 +22,11 @@ from verathos.install import host, services
 from verathos.protocol.tls import chain_network
 
 DEFAULT_HOME = Path("~/.verathos")
+ROLES = ("miner", "validator", "reference")
 TESTNET_NETUID = 405
 MAINNET_NETUID = 96
 INSTALLER = Path(__file__).resolve().parents[3] / "scripts" / "install.sh"  # the installer of this checkout
+ENGINES_FILE = "reference-engines.json"  # a reference machine's engines, for its callers
 
 
 # ---- output and questions ----
@@ -84,11 +86,14 @@ class Prompter:
         return input(f"    {question} [Y/n]: ").strip().lower() in ("", "y", "yes")
 
 
-def common_arguments(parser: argparse.ArgumentParser) -> None:
+def common_arguments(parser: argparse.ArgumentParser, *, wallet: bool = True) -> None:
+    """The options every setup takes; ``wallet``: also the wallet's and the self-update's (a reference machine holds
+    no wallet and is updated with the installer)."""
     parser.add_argument("--yes", "-y", action="store_true", help="Take the default (or the given option) for every "
                         "question")
-    parser.add_argument("--wallet", help="Wallet name (directory under ~/.bittensor/wallets)")
-    parser.add_argument("--hotkey", help="Hotkey name in that wallet")
+    if wallet:
+        parser.add_argument("--wallet", help="Wallet name (directory under ~/.bittensor/wallets)")
+        parser.add_argument("--hotkey", help="Hotkey name in that wallet")
     parser.add_argument("--network", help="finney (default), test, a wss:// subtensor node, or a node on this "
                         "machine (local, ws://127.0.0.1:<port>)")
     parser.add_argument("--netuid", type=int, help=f"Subnet (default {MAINNET_NETUID}; {TESTNET_NETUID} on test)")
@@ -96,9 +101,10 @@ def common_arguments(parser: argparse.ArgumentParser) -> None:
                         "set up, then print the commands to run under a process manager you run (pm2 or another)")
     parser.add_argument("--home", type=Path, default=DEFAULT_HOME, help="Configuration, state, engines and weights "
                         "(default ~/.verathos)")
-    parser.add_argument("--auto-update", action=argparse.BooleanOptionalAction, default=None, help="Update the code "
-                        "to each new release of the repository it came from, by itself (default: on, except for the "
-                        "subnet owner's validator; a later run keeps the choice)")
+    if wallet:
+        parser.add_argument("--auto-update", action=argparse.BooleanOptionalAction, default=None, help="Update the "
+                            "code to each new release of the repository it came from, by itself (default: on, except "
+                            "for the subnet owner's validator; a later run keeps the choice)")
 
 
 def auto_update(args: argparse.Namespace, existing: dict, default: bool = True) -> bool:
@@ -127,6 +133,7 @@ class Record:
     engines: dict[str, dict] = field(default_factory=dict)  # per endpoint or model: model, device, port
     paths: list[str] = field(default_factory=list)  # engine checkouts used
     firewall: bool = False  # the miner's firewall helper is set up (``install.firewall``)
+    options: dict = field(default_factory=dict)  # choices the next run keeps, which the configuration does not hold
 
     @staticmethod
     def path(home: Path, role: str) -> Path:
@@ -152,10 +159,14 @@ def read_json(path: Path) -> dict:
         return {}
 
 
-def write_json(path: Path, value: dict) -> None:
+def write_json(path: Path, value: dict, *, private: bool = False) -> None:
+    """Write ``value`` to ``path``, replacing it atomically; ``private``: readable by its owner only from the start."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(value, indent=2) + "\n")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600 if private else 0o644)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(value, indent=2) + "\n")
     tmp.replace(path)
 
 
@@ -286,6 +297,19 @@ def script_commands(role: str, home: Path, options: str = "") -> list[str]:
     return [f"update:  bash {script} {role} --yes{options}{extra}", f"uninstall: bash {script} uninstall{extra}"]
 
 
+def engine_state(why: str | None, served: set[str], pinned: str) -> str:
+    """What an engine serves, for a setup's output: why it does not serve (``why``), else the revisions it names
+    (``served``) against the one the catalog pins."""
+    if why is not None:
+        return why
+    if pinned in served:
+        return f"serves the pinned revision {pinned[:12]}"
+    if served:
+        return (f"serves revision {', '.join(r[:12] for r in sorted(served))}, the catalog pins {pinned[:12]}: "
+                "not used until it serves the pinned one")
+    return "names no revision"
+
+
 def engine_ready(port: int) -> bool:
     try:
         return httpx.get(f"http://127.0.0.1:{port}/v1/models", timeout=5).status_code == 200
@@ -377,9 +401,9 @@ def follow(manager: services.Manager, name: str, done: Callable[[str], bool], fa
 def main(role: str, command: str, argv: list[str]) -> None:
     """Run ``init`` or ``uninstall`` and exit (the chain SDK leaves threads that would keep the process alive)."""
     if command == "init":
-        from verathos.install import miner, validator
+        from verathos.install import miner, reference, validator
 
-        run = (miner if role == "miner" else validator).init
+        run = {"miner": miner, "validator": validator, "reference": reference}[role].init
     else:
         def run(args: list[str]) -> None:
             uninstall(role, args)
@@ -425,13 +449,12 @@ def uninstall(role: str, argv: list[str]) -> None:
     if record.firewall or (role == "miner" and firewall.installed()):
         removed = firewall.remove()
         info(f"removed the firewall: {', '.join(removed)}" if removed else "no firewall to remove")
-    other = Record.load(home, "validator" if role == "miner" else "miner")
-    still_used = set(other.paths)
+    still_used = {path for other in ROLES if other != role for path in Record.load(home, other).paths}
     for path in record.paths:
         if path not in still_used:
             shutil.rmtree(path, ignore_errors=True)
             info(f"removed {path}")
-    if not other.paths:
+    if not still_used:
         for name in ("engines", "hf"):
             shutil.rmtree(home / name, ignore_errors=True)
         info(f"removed engines and model weights in {home}")
@@ -439,7 +462,8 @@ def uninstall(role: str, argv: list[str]) -> None:
     if args.purge:
         config = Path(record.config) if record.config else home / f"{role}.json"
         state = Path(read_json(config).get("state_dir", home / role)).expanduser()
-        for path in (config, state):
+        extra = [home / ENGINES_FILE] if role == "reference" else []  # it holds the callers' key
+        for path in (config, state, *extra):
             if path.is_dir():
                 shutil.rmtree(path, ignore_errors=True)
             else:
