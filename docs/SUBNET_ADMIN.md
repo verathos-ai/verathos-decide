@@ -112,9 +112,9 @@ values, on an H100 80GB, relative to kev-4b:
 
 | Model | `relative_speed` | Measured |
 |---|---|---|
-| `kev-4b` | 1.0 | 28.1 requests/s of the standard mix within 2 s (28-30 in earlier runs) |
-| `kev-9b` | 0.92 | 25.8 requests/s in the same session (24.5-27 before); 0.82 on an A100 80GB SXM4, 0.68 on an A100 80GB PCIe, 0.55 on an RTX 5090 |
-| `clef-flash` | 0.85 | derived, not measured: 23.8 requests/s of its mix with images, from 25.8 of its mix without them in the same session and the GPU time of its requests with images measured on an H100 (`MINING.md`); without images 0.65 on an A100 80GB SXM4 (9.5 against kev-4b's 14.2-15.1) |
+| `kev-4b` | 1.0 | 28.1 requests/s of the standard mix within 2 s on 2026-10-08 (28-30 in earlier runs); 31.8 on 2026-10-09 (31.6-32.0 in four measurements) |
+| `kev-9b` | 0.92 | 25.8 requests/s in kev-4b's session of 2026-10-08 (24.5-27 before); 0.82 on an A100 80GB SXM4, 0.68 on an A100 80GB PCIe, 0.55 on an RTX 5090 |
+| `clef-flash` | 0.72 | measured: 23.0 requests/s of its mix with images (22.6-23.3 in three measurements) in kev-4b's session of 2026-10-09, and 25.0 of the same mix without images (24.8-25.8), which keeps its `first_test_rps` at 40 (45, its rate without images, times 23.0 / 25.0, to a multiple of 5); without images 0.65 on an A100 80GB SXM4 (9.5 against kev-4b's 14.2-15.1) |
 
 The ratio differs by GPU: a larger model costs relatively less on a larger GPU. Re-measure on the reference GPU when
 an engine gets faster, and replace an estimate once the model's standard mix is measured.
