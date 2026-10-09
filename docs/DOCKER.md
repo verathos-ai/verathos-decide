@@ -1,10 +1,11 @@
 # Docker
 
 Miners, validators and reference machines also run as Docker containers, from images each release ships. The
-installer stays the main way to set up a machine (`MINING.md`, `VALIDATING.md`); the containers set themselves up the
-same way and run the engines the release ships, unchanged. A miner may serve any engine whose answers pass
-verification ([3. Start one engine per GPU](MINING.md#3-start-one-engine-per-gpu)): a miner that changes its engine,
-to serve more requests per GPU for one, installs with the installer.
+installer stays the main way to set up a machine (`MINING.md`, `VALIDATING.md`), and the only one for the subnet
+owner's validator, the auditor; the containers set themselves up the same way and run the engines the catalog pins as
+the installer installs them, unchanged. A miner may serve any engine whose answers pass verification
+([3. Start one engine per GPU](MINING.md#3-start-one-engine-per-gpu)): a miner that changes its engine, to serve more
+requests per GPU for one, installs with the installer.
 
 ## Requirements
 
@@ -25,8 +26,15 @@ to serve more requests per GPU for one, installs with the installer.
 | `ghcr.io/verathos-ai/verathos-engines:<version>` | the code and the engines its shipped catalog pins: the Kev engine at its pinned revision and `verathos-engine` for Clef models, each for miners (bfloat16, with the fused kernels) and for references (float32), installed as the installer installs them | a miner; a reference machine |
 
 Each image is tagged with its release's version (`1.0.0` for `v1.0.0`) and nothing else: there is no `latest` tag. The
-images hold no weights: a container downloads the pinned weights at its first start into its data directory. The
-engines image is several GB.
+images hold no weights: a container downloads the pinned weights at its first start into its data directory.
+
+The engines image is about 6 GB to download and 11 GB on disk, nearly all of it the engines' Python environments:
+PyTorch with the CUDA libraries it loads (cuDNN, cuBLAS, NCCL and others, about 5 GB) and Triton, the compiler of the
+fused kernels. The Kev engine and `verathos-engine` each pin their own PyTorch release, so the image carries two
+stacks of about 7 GB each as installed. The CUDA libraries both use at the same version are stored once, as is all
+that a miner's and a reference's environment of one engine share, so the four environments take about 10 GB rather
+than 29. The image holds no weights, caches or compiled bytecode, and of the Kev engine's repository only the files it
+runs from.
 
 ## Quick start
 
@@ -146,8 +154,8 @@ the validator there. It keeps its certificate and key across restarts and update
 At each start a container sets up its role from these, as the installer does with `--yes`, and writes its
 configuration into `DATA_DIR`: `miner.json`, `validator.json` or `reference.json` (`MINING.md`, `VALIDATING.md`). What
 you add there that the variables do not set stays, such as a miner's `gateways`, an endpoint's `max_concurrency` or
-`catalog_mirrors`; `docker compose restart` applies it. The containers never update themselves (`auto_update` is
-false).
+`catalog_mirrors`; `docker compose restart` applies it. The containers never update their code (`auto_update` is
+false): a release is a new image ([Updates](#updates)).
 
 The wallet reaches a container as two files, read-only: the hotkey and `coldkeypub.txt`. A container never reads a
 coldkey, and `docker compose up` stops when either file is missing.
@@ -225,8 +233,8 @@ The subnet owner's catalog changes need no new image:
   image's engines run: a miner serves the model with the revision its image carries and warns at each start
   (`... this image carries ...`; validators check answers, not engines), and a reference machine leaves the model out
   (references run exactly what the catalog pins).
-- **A model the catalog retires.** The miner withdraws its endpoints at once; `docker compose restart` gives their GPUs
-  another model.
+- **A model the catalog retires.** A miner withdraws its endpoints at once; `docker compose restart` gives their GPUs
+  another model, and a reference machine leaves the model out.
 - **A model on a new engine family.** It needs the image of a release that ships the engine.
 
 A validator whose release the subnet owner retires sets no weights (`this validator's release is too old`): update.
@@ -277,5 +285,6 @@ pushes them, and only for a release. A branch or commit builds as it is, tagged 
 
 The engines' environments are a layer of their own, keyed by the Kev revisions the catalog pins and
 `verathos-engine`'s requirements: a release that changes neither, built where the previous one was, leaves that layer
-as it was, and machines download only the layers that changed. Publish the images of a release that ships another Kev
-revision before committing the catalog that pins it.
+as it was, and machines download only the layers that changed. A container installs a Kev revision its image does
+not carry by itself (`ENGINE_AUTO_INSTALL`); publishing the images of a release that ships it before committing the
+catalog that pins it spares the containers that install.

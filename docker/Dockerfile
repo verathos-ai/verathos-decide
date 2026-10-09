@@ -26,7 +26,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=uv /uv /usr/local/bin/uv
 # Python 3.12 as the installer gets it: uv's own build, with the headers Triton compiles against
-RUN uv python install 3.12
+RUN uv python install 3.12 \
+    && rm -rf /root/.cache
 ENTRYPOINT ["/usr/bin/tini", "--", "verathos-container"]
 
 # What the engines' environments depend on, read from the release (docker/pins.py): the layer installing them is
@@ -47,14 +48,23 @@ RUN apt-get update \
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     TRITON_CACHE_DIR=/data/cache/triton
 COPY --from=pins /pins/out/ /pins/
-# The engines' environments, filled as engines.KevEngine and engines.ClefEngine fill them, in one layer: files the
-# environments share (most of the CUDA libraries) are stored once. The installer's code installs every engine again
-# below and finds these in place.
+# The engines' environments, filled as engines.KevEngine and engines.ClefEngine fill them, in one layer and without
+# what the engines never read (docs/DOCKER.md, Images):
+# - each environment hardlinks its files from uv's cache, so the files the environments share (most of the CUDA
+#   libraries) are stored once, and identical files of different versions (the CUDA tools each Triton carries) are
+#   linked afterwards; nothing of the cache stays;
+# - the Kev engine is a checkout of the pinned revision with its package and project files alone: without the
+#   repository's history (blobs are fetched for those files only) and its experiment logs and evaluation sets.
+# The installer's code installs every engine again below and finds these in place.
 RUN set -eu; \
     if [ -n "${JOBS}" ]; then export UV_CONCURRENT_INSTALLS="${JOBS}" UV_CONCURRENT_BUILDS="${JOBS}"; fi; \
+    export UV_LINK_MODE=hardlink; \
     while read -r source revision; do \
         dir="/opt/engines/kev-$(printf '%.12s' "${revision}")"; \
-        git clone --quiet "${source}" "${dir}"; \
+        git clone --quiet --filter=blob:none --no-checkout "${source}" "${dir}"; \
+        git -C "${dir}" sparse-checkout set --no-cone /kev/ /pyproject.toml /uv.lock /README.md /LICENSE; \
+        git -C "${dir}" cat-file -e "${revision}^{commit}" 2>/dev/null \
+            || git -C "${dir}" fetch --quiet origin "${revision}"; \
         git -C "${dir}" checkout --quiet --force --detach "${revision}"; \
         UV_PROJECT_ENVIRONMENT="${dir}/.venv-reference" uv --directory "${dir}" sync --quiet --extra serve -p 3.12; \
         UV_PROJECT_ENVIRONMENT="${dir}/.venv" uv --directory "${dir}" sync --quiet --inexact --extra serve -p 3.12; \
@@ -69,6 +79,7 @@ RUN set -eu; \
         uv pip install --quiet --python "/opt/engines/verathos-clef/${environment}/bin/python" \
             -r /pins/clef-requirements.txt; \
     done; \
+    hardlink --quiet --ignore-time --exclude '^\.git$' /opt/engines; \
     rm -rf /root/.cache/uv
 WORKDIR /opt/verathos
 # The code's environment as install.sh makes it: its dependencies first, then the code (only its layers change with
@@ -79,7 +90,7 @@ RUN uv venv --quiet -p 3.12 .venv \
     && rm -rf /root/.cache/uv
 COPY . ./
 RUN VIRTUAL_ENV=/opt/verathos/.venv uv pip install --quiet -e "/opt/verathos[server,chain]" \
-    && verathos-container engines \
+    && PYTHONDONTWRITEBYTECODE=1 verathos-container engines \
     && rm -rf /root/.cache/uv
 WORKDIR /data
 ARG VERSION=

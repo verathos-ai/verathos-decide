@@ -113,6 +113,11 @@ def test_the_dockerfile_fills_each_environment_where_the_installer_runs_it() -> 
         assert (f'UV_PROJECT_ENVIRONMENT="${{dir}}/{kev.environment(purpose).name}" uv --directory "${{dir}}" '
                 f'{sync.removeprefix("uv ")} -p {engines.PYTHON}') in text
     assert '"${dir}/kev/fused_qwen35.py"' in text and "flash-linear-attention==${fla}" in text
+    # one layer: the environments hardlink from uv's cache, identical files are linked after, the cache goes
+    layer = text.split("RUN set -eu;", 1)[1].split("WORKDIR /opt/verathos", 1)[0]
+    assert "export UV_LINK_MODE=hardlink;" in layer
+    assert layer.index("hardlink --quiet --ignore-time --exclude '^\\.git$' /opt/engines") > layer.index(
+        "-r /pins/clef-requirements.txt") and layer.rstrip().endswith("rm -rf /root/.cache/uv")
     assert clef.directory == Path("/opt/engines/verathos-clef")
     assert {clef.environment(p).name for p in ("miner", "reference")} == {".venv", ".venv-reference"}
     assert 'uv venv --quiet -p 3.12 "/opt/engines/verathos-clef/${environment}"' in text
@@ -123,7 +128,8 @@ def test_the_dockerfile_fills_each_environment_where_the_installer_runs_it() -> 
     assert 'uv pip install --quiet -e "$dir[server,chain]"' in installer
     assert text.count('uv pip install --quiet -e "/opt/verathos[server,chain]"') == 2
     assert text.count("--extra server --extra chain") == 2
-    assert "&& verathos-container engines" in text  # then the installer's code installs every engine
+    # then the installer's code installs every engine, leaving no compiled bytecode in the layer
+    assert "&& PYTHONDONTWRITEBYTECODE=1 verathos-container engines" in text
     assert "loadgen" not in text and "cargo" not in text  # the auditor's load generator: the installer's alone
     assert re.search(r"^ARG UV=ghcr\.io/astral-sh/uv:\d+\.\d+\.\d+$", text, re.M)  # a pinned uv
     assert 'ENTRYPOINT ["/usr/bin/tini", "--", "verathos-container"]' in text
@@ -132,6 +138,48 @@ def test_the_dockerfile_fills_each_environment_where_the_installer_runs_it() -> 
     engines_stage, node_stage = text.split("FROM base AS engines")[1].split("FROM base AS node")
     assert 'CMD ["miner"]' in engines_stage and 'CMD ["validator"]' in node_stage
     assert "verathos-container engines" not in node_stage and "nftables" in engines_stage
+
+
+def test_the_image_checks_the_kev_engine_out_at_its_revision_with_the_files_it_runs_from_alone(tmp_path) -> None:
+    """The Dockerfile's own commands, run against a repository of the engine's layout: the checkout is detached at
+    the pinned revision, as KevEngine.install and the container read it, clean, and holds the package and the project
+    files (what uv builds and runs it from), not the history or the experiment logs."""
+    source = tmp_path / "kev-source"
+    for path, content in {"kev/__init__.py": "", "kev/serve.py": "print('serving')\n", "pyproject.toml": "[project]\n",
+                          "uv.lock": "version = 1\n", "README.md": "Kev\n", "LICENSE": "Apache-2.0\n",
+                          "runs/r1/rows.json": "[]\n" * 1000, "evals/v1/manifest.json": "{}\n"}.items():
+        (source / path).parent.mkdir(parents=True, exist_ok=True)
+        (source / path).write_text(content)
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
+           "GIT_AUTHOR_EMAIL": "t@example.org", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.org"}
+
+    def git(*args: str, cwd: Path = source) -> str:
+        return subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    git("init", "--quiet")
+    git("config", "uploadpack.allowFilter", "true")
+    git("add", ".")
+    git("commit", "--quiet", "-m", "pinned")
+    revision = git("rev-parse", "HEAD")
+    (source / "kev" / "serve.py").write_text("print('later')\n")
+    git("commit", "--quiet", "-am", "later")  # the pinned revision is not the tip
+    text = (DOCKER / "Dockerfile").read_text()
+    start = text.index('        dir="/opt/engines/kev-')
+    commands = text[start:text.index('UV_PROJECT_ENVIRONMENT="${dir}/.venv-reference"')]  # the checkout's commands
+    result = subprocess.run(["sh", "-euc", commands.replace("/opt/engines/", f"{tmp_path}/engines/")],
+                            env={**env, "source": f"file://{source}", "revision": revision}, capture_output=True,
+                            text=True)
+    assert result.returncode == 0, result.stderr
+    engine = engines.KevEngine(tmp_path, catalog.Engine(name="kev", source=f"file://{source}".replace(
+        "file://", "https://", 1), revision=revision))
+    assert engine.directory == tmp_path / "engines" / f"kev-{revision[:12]}"
+    assert container.checked_out(engine.directory) == revision == engines.git_output(engine.directory, "rev-parse",
+                                                                                     "HEAD")
+    assert sorted(p.name for p in engine.directory.iterdir()) == [".git", "LICENSE", "README.md", "kev",
+                                                                  "pyproject.toml", "uv.lock"]
+    assert (engine.directory / "kev" / "serve.py").read_text() == "print('serving')\n"
+    assert git("status", "--porcelain", cwd=engine.directory) == ""
 
 
 def test_the_images_take_the_code_and_nothing_else_of_the_repository() -> None:

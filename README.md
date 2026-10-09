@@ -40,8 +40,8 @@ system services; with `--no-service` it needs no root and prints the commands fo
 Miners and validators then install each new release by themselves (`--no-auto-update` turns that off); running the
 command again updates them too. What it asks, what it installs, how to check, update and uninstall, and
 the manual installation: [Mining](docs/MINING.md#quick-start-one-command),
-[Validating](docs/VALIDATING.md#quick-start-one-command). On a machine of your own with Docker, each role also runs
-as a container, with the engines the release ships: [Docker](docs/DOCKER.md).
+[Validating](docs/VALIDATING.md#quick-start-one-command). On a machine of your own with Docker, a miner, a light or
+full validator and a reference machine also run as containers: [Docker](docs/DOCKER.md).
 
 Models of the shipped catalog (the installers read the catalog the subnet owner commits on chain):
 
