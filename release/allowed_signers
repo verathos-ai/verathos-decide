@@ -1,0 +1,8 @@
+# The keys release tags (v<version>) are signed with. The self-update and the installer install a release only when
+# `git verify-tag` accepts its tag with this file as gpg.ssh.allowedSignersFile; the self-update reads the file of
+# the code it runs. Format: ssh-keygen(1), ALLOWED SIGNERS. scripts/install.sh holds a copy (release_signers), which
+# the tests keep the same. Adding and rotating keys: docs/SUBNET_ADMIN.md, Signing releases.
+#
+# PLACEHOLDER: no release signing key yet. Until a key's line replaces the one below, no release is installed by the
+# self-update or as the installer's default.
+verathos-release namespaces="git" ssh-ed25519 REPLACE_WITH_THE_RELEASE_SIGNING_PUBLIC_KEY
