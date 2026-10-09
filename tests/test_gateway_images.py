@@ -451,7 +451,7 @@ def test_confined_workers_make_every_kind_of_image_canonical_as_the_gateway_itse
     import binascii
     import io
 
-    from PIL import Image
+    from PIL import Image, ImageCms
 
     from tests.images import drawn
     from verathos.protocol.media import JPEG, PNG, WEBP, canonical_image
@@ -462,9 +462,13 @@ def test_confined_workers_make_every_kind_of_image_canonical_as_the_gateway_itse
         return out.getvalue()
 
     field, frames = drawn(320, 200), [drawn(96, 64), drawn(96, 64).transpose(Image.Transpose.ROTATE_180)]
-    turned = Image.Exif()
+    turned, photo = Image.Exif(), Image.Exif()
     turned[0x0112] = 6
+    photo[0x0112], photo[0x8825] = 8, {1: "N", 2: (47.0, 22.0, 0.0)}  # turned, and where it was taken
+    srgb = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
     images = {
+        "mpo, a camera's two pictures": (JPEG, saved(field, "MPO", save_all=True, append_images=[field.rotate(180)])),
+        "jpeg with a colour profile and a position": (JPEG, saved(field, "JPEG", icc_profile=srgb, exif=photo)),
         "png rgba": (PNG, saved(field.convert("RGBA"), "PNG")),
         "png palette, transparent": (PNG, saved(field.convert("P"), "PNG", transparency=0)),
         "png 16-bit grey": (PNG, saved(field.convert("I;16"), "PNG")),
