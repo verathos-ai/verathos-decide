@@ -31,9 +31,11 @@ Per test:
 An endpoint is credited from the latest confirmed test only: one that was not among its targets has no credit.
 
 The subnet's gateways submit sampled exchanges of their user traffic (``protocol.gateway``). Per endpoint and epoch
-the auditor checks up to ``gateway_checks_per_epoch`` of them the same way, between tests: a wrong answer is evidence
-like one in a test, and their differences form a drift tally of their own, so correct test answers cannot dilute
-drifted answers to users.
+the auditor checks up to ``gateway_checks_per_epoch`` of them the same way, between tests, and besides those up to
+``gateway_image_checks_per_epoch`` answers to requests with images: a wrong answer is evidence like one in a test, and
+their differences form a drift tally of their own, so correct test answers cannot dilute drifted answers to users. The
+request of a pending sample with images is held in memory only, never in the database (nor a core dump): a restart
+gives it up, unchecked.
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ import json
 import logging
 import math
 import random
+import resource
 import secrets
 import sqlite3
 import threading
@@ -57,6 +60,7 @@ from typing import Any
 from bittensor_wallet import Keypair
 
 from verathos import catalog as catalog_module
+from verathos.gateway.logs import Throttle
 from verathos.miner.engine import Engine
 from verathos.protocol.api import MAX_RESPONSE_BYTES
 from verathos.protocol.gateway import (
@@ -98,6 +102,7 @@ from verathos.validator.references import transitioning, wrong_revision
 from verathos.validator.scoring import bounded_shares, model_shares
 
 log = logging.getLogger(__name__)
+_throttled = Throttle()
 START_DELAY_MS = 500  # from observing the start block to the first request
 MAX_LATE_START_MS = 1000
 LATE_SEND_SHARE = 0.01  # more late sends than this voids an endpoint's result
@@ -108,6 +113,9 @@ BREAKER_FAILURES = 3  # an engine failing this often in a row is not asked again
 _UNCOUNTED: set[str] = set()  # models whose reference reported no input tokens (logged once each)
 ROUTES_TTL_S = 30.0
 KEPT_PER_ENDPOINT = 8  # gateway samples kept per endpoint and epoch, of which gateway_checks_per_epoch are checked
+MEDIA_KEPT_PER_ENDPOINT = 2  # ... of them with images, of which gateway_image_checks_per_epoch are checked
+MEDIA_SAMPLES_BYTES = 2 << 30  # the images of pending samples held at once, at most: a sample beyond is not kept
+_MEDIA_RESTARTED = "the auditor restarted before its check (a request with images is held in memory only)"
 MAX_CHECK_ATTEMPTS = 3
 SAMPLE_BUDGET_S = 40.0  # per round of sample checks, under the lead time of a test
 SERVED_WAIT_S = 12.0  # after a test's window, for the gateways' last served counts
@@ -118,7 +126,7 @@ MIN_TEST_SHARE = 0.1  # a test sends at least this share of the tested rate itse
 USERS_BEFORE_S = (80.0, 20.0)  # an endpoint's usual user rate: [window start - 80 s, window start - 20 s)
 SERVED_KEEP_S = 900
 KEEP_EPOCHS = 30  # at least STATUS_TESTS: with a test every epoch, the tests a status lists are all kept
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 USAGE_POLL_S = 12.0  # how often the usage pool's burns are read and its periods closed
 USAGE_SCAN_S = 30.0  # the most one round reads blocks for
 SCAN_REACH_BLOCKS = 200  # blocks a node keeps the state of (a pruned node about 256): older ones are not read
@@ -159,7 +167,8 @@ CREATE TABLE usage (first_block INTEGER NOT NULL, end_block INTEGER NOT NULL, do
 # from version -> the statements that bring it one version up
 _MIGRATIONS = {4: _DEMAND_SCHEMA, 5: _USERS_SCHEMA, 6: _RESULTS_INDEX,
                7: "ALTER TABLE samples ADD COLUMN test_id TEXT; " + _SAMPLES_BY_TEST, 8: _META_SCHEMA,
-               9: _SHARES_SCHEMA, 10: _PAID_SCHEMA, 11: _USAGE_SCHEMA}
+               9: _SHARES_SCHEMA, 10: _PAID_SCHEMA, 11: _USAGE_SCHEMA,
+               12: "ALTER TABLE samples ADD COLUMN media INTEGER NOT NULL DEFAULT 0;"}
 Runner = Callable[..., Awaitable[loadgen.LoadResult]]
 
 
@@ -378,7 +387,7 @@ CREATE TABLE samples (
     endpoint_id TEXT NOT NULL, model_id TEXT NOT NULL, request_id TEXT NOT NULL, request TEXT NOT NULL,
     response TEXT NOT NULL, proof INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
     evidence TEXT, drift_sum REAL NOT NULL DEFAULT 0, drift_count INTEGER NOT NULL DEFAULT 0,
-    attempts INTEGER NOT NULL DEFAULT 0, checked_epoch INTEGER, test_id TEXT);
+    attempts INTEGER NOT NULL DEFAULT 0, checked_epoch INTEGER, test_id TEXT, media INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX samples_by_state ON samples (state, epoch);
 CREATE INDEX samples_by_endpoint ON samples (hotkey, endpoint_id, epoch);
 CREATE TABLE verdicts (epoch INTEGER PRIMARY KEY, document TEXT NOT NULL);
@@ -390,7 +399,9 @@ _SCRUB = "request = '{}', response = ''"  # a user's request and answers are kep
 # reference for the model, its recompute kept failing, or it was not checked within the next epoch). A sample counts
 # (evidence, drift) in the epoch its check finished: verdicts for an epoch depend only on checks finished before it.
 # A sample with a test_id is the gateways' pick from an endpoint's answers to users in that test: checked when the
-# test is evaluated, or like a proof between tests if it came late or its recompute could not run then.
+# test is evaluated, or like a proof between tests if it came late or its recompute could not run then. A sample with
+# media = 1 is to a request with images, which the store holds in memory (its row's request is empty); a proof needs
+# no recompute, so its request is kept without its images, like a text sample's.
 
 
 class Store:
@@ -404,6 +415,8 @@ class Store:
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._db.execute("PRAGMA secure_delete = ON")  # a scrubbed request leaves nothing in the file
         self._lock = threading.Lock()
+        self._media: dict[str, tuple[dict[str, Any], int]] = {}  # pending sample -> its request with images, size
+        self._media_bytes = 0
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         while version in _MIGRATIONS:
             self._db.executescript(f"BEGIN; {_MIGRATIONS[version]} PRAGMA user_version = {version + 1}; COMMIT;")
@@ -419,6 +432,8 @@ class Store:
             log.info("auditor database %s started for schema %d", path, SCHEMA_VERSION)
         self._query("UPDATE tests SET state = 'void', reason = 'the auditor restarted during the test' "
                     "WHERE state = 'running'")
+        self._query(f"UPDATE samples SET state = 'unchecked', reason = ?, {_SCRUB} WHERE state = 'pending' "
+                    "AND media = 1", (_MEDIA_RESTARTED,))
         numbered = self._query("SELECT value FROM meta WHERE key = 'epoch_blocks'")
         self.epoch_blocks = int(numbered[0][0]) if numbered else epoch_blocks
         self.renumber(epoch_blocks)
@@ -595,55 +610,94 @@ class Store:
     def add_sample(self, *, sample_id: str, epoch: int, gateway: str, hotkey: str, endpoint_id: str, model_id: str,
                    request_id: str, request: dict[str, Any], response: str, proof: bool,
                    test_id: str | None = None) -> bool:
-        """Keep a sample, unless its endpoint already has ``KEPT_PER_ENDPOINT`` in the epoch (a proof is always kept;
-        a test's sample (``test_id``) is kept once per endpoint and test, besides those) or it is known."""
+        """Keep a sample, unless its endpoint already has ``KEPT_PER_ENDPOINT`` in the epoch, or
+        ``MEDIA_KEPT_PER_ENDPOINT`` to requests with images (a proof is always kept; a test's sample (``test_id``) is
+        kept once per endpoint and test, besides those), the images of pending samples would exceed
+        ``MEDIA_SAMPLES_BYTES``, or it is known. The request of a sample with images that is no proof is held in
+        memory only."""
+        images = request.get("images") or []
+        media = bool(images) and not proof
+        size = sum(len(i.get("base64", "")) for i in images if isinstance(i, dict)) if media else 0
+        stored = "{}" if media else json.dumps({k: v for k, v in request.items() if k != "images"})
         with self._lock:
             if test_id is not None:
                 if self._db.execute("SELECT 1 FROM samples WHERE test_id = ? AND hotkey = ? AND endpoint_id = ?",
                                     (test_id, hotkey, endpoint_id)).fetchall():
                     return False
-            else:
+            elif not proof:
                 (count,), = self._db.execute(
                     "SELECT COUNT(*) FROM samples WHERE hotkey = ? AND endpoint_id = ? AND epoch = ? AND proof = 0 "
-                    "AND test_id IS NULL", (hotkey, endpoint_id, epoch)).fetchall()
-                if count >= KEPT_PER_ENDPOINT and not proof:
+                    "AND test_id IS NULL AND media = ?", (hotkey, endpoint_id, epoch, int(media))).fetchall()
+                if count >= (MEDIA_KEPT_PER_ENDPOINT if media else KEPT_PER_ENDPOINT):
                     return False
+            if media and self._media_bytes + size > MEDIA_SAMPLES_BYTES:
+                if times := _throttled("media samples"):
+                    log.warning("a sample with images is not kept: pending samples hold %d MiB of images (%d times "
+                                "since last logged)", self._media_bytes >> 20, times)
+                return False
             cursor = self._db.execute(
                 "INSERT OR IGNORE INTO samples (sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, "
-                "request, response, proof, state, test_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-                (sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, json.dumps(request), response,
-                 int(proof), test_id))
-            return cursor.rowcount == 1
+                "request, response, proof, state, test_id, media) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, stored, response, int(proof),
+                 test_id, int(media)))
+            if cursor.rowcount != 1:
+                return False
+            if media:
+                self._media[sample_id] = (request, size)
+                self._media_bytes += size
+            return True
 
-    def test_sample(self, test_id: str, hotkey: str, endpoint_id: str) -> tuple[str, str, str, str] | None:
+    def _request(self, sample_id: str, stored: str, media: int) -> dict[str, Any] | None:
+        """A sample's request: from memory if it has images (None once given up), else from its row."""
+        if not media:
+            return json.loads(stored)
+        with self._lock:
+            held = self._media.get(sample_id)
+        return held[0] if held is not None else None
+
+    def _settle_media(self) -> None:
+        """Forget the requests with images of samples no longer pending (checked, skipped, given up or pruned)."""
+        with self._lock:
+            pending = {s for (s,) in self._db.execute("SELECT sample_id FROM samples WHERE state = 'pending' "
+                                                     "AND media = 1").fetchall()}
+            for sample_id in [s for s in self._media if s not in pending]:
+                self._media_bytes -= self._media.pop(sample_id)[1]
+
+    def test_sample(self, test_id: str, hotkey: str, endpoint_id: str) -> tuple[str, str, dict[str, Any], str] | None:
         """The pending sample of the endpoint's answers to users in the test: (sample_id, request_id, request,
         response), or None."""
-        rows = self._query("SELECT sample_id, request_id, request, response FROM samples WHERE test_id = ? "
+        rows = self._query("SELECT sample_id, request_id, request, response, media FROM samples WHERE test_id = ? "
                            "AND hotkey = ? AND endpoint_id = ? AND state = 'pending'", (test_id, hotkey, endpoint_id))
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        sample_id, request_id, stored, response, media = rows[0]
+        request = self._request(sample_id, stored, media)
+        return None if request is None else (sample_id, request_id, request, response)
 
-    def samples_to_check(self, epoch: int, per_endpoint: int, rng: random.Random) -> list[tuple]:
+    def samples_to_check(self, epoch: int, per_endpoint: int, per_endpoint_media: int,
+                         rng: random.Random) -> list[tuple]:
         """The samples to check now: every pending proof and test's sample, and per endpoint and epoch (this one and
-        the last) random pending samples until ``per_endpoint`` are checked; the rest of a done endpoint's are
-        skipped, and pending ones of older epochs given up. In the order to check them: proofs and tests' samples,
-        then every endpoint's first sample (the endpoints in random order), then every second one, so a round cut
-        short checks as many endpoints as it can.
+        the last) random pending samples until ``per_endpoint`` are checked, and of those with images until
+        ``per_endpoint_media`` are; the rest of a done endpoint's are skipped, and pending ones of older epochs given
+        up. In the order to check them: proofs and tests' samples, then every endpoint's first sample (the endpoints
+        in random order), then every second one, so a round cut short checks as many endpoints as it can.
         -> [(sample_id, gateway, hotkey, endpoint_id, model_id, request_id, request, response)]"""
         self._query(f"UPDATE samples SET state = 'unchecked', reason = 'not checked within the next epoch', "
                     f"{_SCRUB} WHERE state = 'pending' AND epoch < ?", (epoch - 1,))
         rows = self._query("SELECT sample_id, epoch, gateway, hotkey, endpoint_id, model_id, request_id, request, "
-                           "response, proof OR test_id IS NOT NULL FROM samples WHERE state = 'pending'")
-        checked = {(hk, ep, e): n for hk, ep, e, n in self._query(
-            "SELECT hotkey, endpoint_id, epoch, COUNT(*) FROM samples WHERE state = 'checked' AND proof = 0 "
-            "AND test_id IS NULL AND epoch >= ? GROUP BY hotkey, endpoint_id, epoch", (epoch - 1,))}
-        groups: dict[tuple[str, str, int], list[tuple]] = {}
+                           "response, proof OR test_id IS NOT NULL, media FROM samples WHERE state = 'pending'")
+        checked = {(hk, ep, e, m): n for hk, ep, e, m, n in self._query(
+            "SELECT hotkey, endpoint_id, epoch, media, COUNT(*) FROM samples WHERE state = 'checked' AND proof = 0 "
+            "AND test_id IS NULL AND epoch >= ? GROUP BY hotkey, endpoint_id, epoch, media", (epoch - 1,))}
+        groups: dict[tuple[str, str, int, int], list[tuple]] = {}
         chosen = [r for r in rows if r[9]]
         for r in rows:
             if not r[9]:
-                groups.setdefault((r[3], r[4], r[1]), []).append(r)
-        picks: dict[tuple[str, str, int], list[tuple]] = {}
+                groups.setdefault((r[3], r[4], r[1], r[10]), []).append(r)
+        picks: dict[tuple[str, str, int, int], list[tuple]] = {}
         for key, pending in groups.items():
-            wanted = max(per_endpoint - checked.get(key, 0), 0)
+            wanted = max((per_endpoint_media if key[3] else per_endpoint) - checked.get(key, 0), 0)
             picked = picks[key] = rng.sample(pending, min(wanted, len(pending)))
             if wanted <= len(picked):  # the endpoint's checks for the epoch are done (once these finish)
                 rest = [r[0] for r in pending if r not in picked]
@@ -651,11 +705,17 @@ class Store:
                     marks = ",".join("?" * len(rest))
                     self._query(f"UPDATE samples SET state = 'skipped', {_SCRUB} WHERE sample_id IN ({marks})",
                                 rest)
+        self._settle_media()
         keys = list(picks)
         rng.shuffle(keys)
         for k in range(max((len(p) for p in picks.values()), default=0)):
             chosen += [picks[key][k] for key in keys if k < len(picks[key])]
-        return [(r[0], r[2], r[3], r[4], r[5], r[6], r[7], r[8]) for r in chosen]
+        out = []
+        for r in chosen:
+            request = self._request(r[0], r[7], r[10])
+            if request is not None:
+                out.append((r[0], r[2], r[3], r[4], r[5], r[6], request, r[8]))
+        return out
 
     def failed_check(self, sample_id: str) -> None:
         """A recompute of the sample could not run; after ``MAX_CHECK_ATTEMPTS`` it is given up."""
@@ -663,6 +723,7 @@ class Store:
                     "ELSE state END, reason = CASE WHEN attempts + 1 >= ? THEN 'its recompute kept failing' "
                     "ELSE reason END WHERE sample_id = ?", (MAX_CHECK_ATTEMPTS, MAX_CHECK_ATTEMPTS, sample_id))
         self._query(f"UPDATE samples SET {_SCRUB} WHERE sample_id = ? AND state = 'unchecked'", (sample_id,))
+        self._settle_media()
 
     def finish_sample(self, sample_id: str, state: str, reason: str = "", evidence: Evidence | None = None,
                       drift_sum: float = 0.0, drift_count: int = 0, *, checked_epoch: int | None = None) -> None:
@@ -670,6 +731,12 @@ class Store:
                     f"checked_epoch = ?, {_SCRUB} WHERE sample_id = ?",
                     (state, reason, evidence.model_dump_json() if evidence else None, drift_sum, drift_count,
                      checked_epoch, sample_id))
+        self._settle_media()
+
+    def media_held(self) -> tuple[int, int]:
+        """(pending samples whose requests with images are held in memory, their images' bytes)."""
+        with self._lock:
+            return len(self._media), self._media_bytes
 
     def offenders(self, since_epoch: int) -> set[str]:
         """Hotkeys with a wrong answer proven since ``since_epoch``, confirmed or not yet."""
@@ -854,6 +921,7 @@ class Store:
             self._db.execute("DELETE FROM unscanned WHERE end_block <= ?", (usage_before * self.epoch_blocks,))
             self._db.execute("DELETE FROM usage WHERE end_block <= ?", (usage_before * self.epoch_blocks,))
             self.revision += 1
+        self._settle_media()
 
 
 def _beyond(total: float, count: int, tolerance: Tolerance) -> bool:
@@ -977,6 +1045,7 @@ class Auditor:
     # ---- running ----
 
     def start(self) -> None:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # sampled users' requests are in memory: none reaches a disk
         threading.Thread(target=lambda: asyncio.run(self.run()), name="throughput-auditor", daemon=True).start()
 
     async def run(self) -> None:
@@ -1242,11 +1311,10 @@ class Auditor:
         row = await asyncio.to_thread(self.store.test_sample, test.test_id, slot.hotkey, slot.endpoint_id)
         if row is None or model is None:
             return None
-        sample_id, request_id, request_json, response = row
+        sample_id, request_id, request, response = row
         parsed = json.loads(response)
-        fault, comparison = await recomputes.check(slot.model_id, json.loads(request_json), parsed["answers"],
-                                                   model.tolerance, recompute_answers=True,
-                                                   claimed=claimed_tokens(parsed), rank=rank)
+        fault, comparison = await recomputes.check(slot.model_id, request, parsed["answers"], model.tolerance,
+                                                   recompute_answers=True, claimed=claimed_tokens(parsed), rank=rank)
         if fault is None and comparison is None:
             checks = recomputes.checks
             return None if slot.model_id in checks.references or slot.model_id in checks.screens else ""
@@ -1262,9 +1330,11 @@ class Auditor:
 
     def accept_samples(self, gateway: str, samples: list[Any]) -> int:
         """Keep the samples of known endpoints whose receipt binds the request and the answers to the miner and names
-        ``gateway`` as caller (each judged on its own; up to ``KEPT_PER_ENDPOINT`` per endpoint and epoch, proofs of
-        malformed answers always); -> how many were kept."""
-        if self.policy.gateway_checks_per_epoch == 0:
+        ``gateway`` as caller (each judged on its own; up to ``KEPT_PER_ENDPOINT`` per endpoint and epoch and
+        ``MEDIA_KEPT_PER_ENDPOINT`` to requests with images, proofs of malformed answers always), of the kinds the
+        policy checks; -> how many were kept."""
+        checked = {False: self.policy.gateway_checks_per_epoch, True: self.policy.gateway_image_checks_per_epoch}
+        if not any(checked.values()):
             return 0
         cat, known = self.catalog(), {(s.hotkey, s.endpoint_id) for s in self._slots}
         epoch, kept = self.follower.head // self.policy.epoch_blocks, 0
@@ -1281,6 +1351,8 @@ class Auditor:
                 continue
             if ((s.hotkey, s.endpoint_id) not in known or cat.get(s.model_id) is None or not isinstance(nonce, str)
                     or not isinstance(sample_id, str)):
+                continue
+            if not checked[bool(s.request.get("images"))]:
                 continue
             answers = signed_answers(response, s.request, request_id=nonce, hotkey=s.hotkey,
                                      endpoint_id=s.endpoint_id, model_id=s.model_id, callers={gateway},
@@ -1303,17 +1375,17 @@ class Auditor:
         later, up to ``MAX_CHECK_ATTEMPTS``; a test starting stops the round."""
         epoch = self.follower.head // self.policy.epoch_blocks
         chosen = await asyncio.to_thread(self.store.samples_to_check, epoch, self.policy.gateway_checks_per_epoch,
-                                         self._rng)
+                                         self.policy.gateway_image_checks_per_epoch, self._rng)
         if not chosen:
             return
         checks = await self._usable(checks)
         recomputes, cat = checks.for_test(SAMPLE_BUDGET_S), self.catalog()
 
         async def check(rank: int, row: tuple) -> None:
-            sample_id, _, hotkey, endpoint_id, model_id, request_id, request_json, response = row
+            sample_id, _, hotkey, endpoint_id, model_id, request_id, request, response = row
             if self._tests_running:
                 return  # a test's checks come first; still pending
-            model, request = cat.get(model_id), json.loads(request_json)
+            model = cat.get(model_id)
             if model is None or (model_id not in checks.references and model_id not in checks.screens):
                 self.store.finish_sample(sample_id, "unchecked", "no reference for the model")
                 return
