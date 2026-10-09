@@ -338,7 +338,7 @@ Every response to `POST /v1/systemone` carries `X-Request-Id` (the client's, if 
 
 | Status | Type | When |
 |---|---|---|
-| 400 | `invalid_request` | not JSON (NaN and infinities included), not a SystemOne request, images to a model that reads text only or an image it cannot read ([Images](#images)), `videos` or `media_kwargs` |
+| 400 | `invalid_request` | not JSON (NaN and infinities included), not a SystemOne request, images to a model that reads text only or an image it cannot read ([Images](#images)), a request with images whose text holds the model's image token (`<|image_pad|>` for Clef), `videos` or `media_kwargs` |
 | 401 | `unauthorized` | missing, unknown, revoked or expired key, or a suspended account |
 | 402 | `insufficient_credit` | a prepaid account's balance is used up |
 | 404 | `model_not_found` | not an active model of the catalog |
@@ -382,6 +382,8 @@ for the request.
   or WebP counts as its first frame. GIF, SVG, HEIC, AVIF, TIFF and BMP get 400.
 - A model that reads text only answers images with 400 (`kev-4b reads text only`); `videos` and `media_kwargs` get
   400 for every model.
+- The text of a request with images may not hold the model's image token (`<|image_pad|>` for Clef): its processor
+  would count it as one of the images' tokens. Such a request gets 400; a text request may hold it.
 - An error names the image by its place, from 0: `images.1: its bytes are image/jpeg, not image/png`.
 
 The limits are the model's (the catalog's `images`; here the defaults):

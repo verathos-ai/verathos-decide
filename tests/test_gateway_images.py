@@ -108,6 +108,21 @@ def test_a_model_that_reads_text_only_refuses_images_and_no_request_has_videos_o
     assert engine.received == [TEXT]  # forwarded as its model, state and questions
 
 
+def test_a_request_with_images_whose_text_holds_the_image_token_is_refused(tmp_path, setups) -> None:
+    """The model's processor counts the image token in a request's text as one of its images', and the engines refuse
+    such a request with images: the gateway refuses it first. A text request may hold the token."""
+    engine = Recording("clef-flash")
+    s = setups(tmp_path, engine)
+    image, pad = data_url(encoded(256, 256), "image/png"), "<|image_pad|>"
+    asked = {**QUESTIONS, "corner": {"type": "noul", "instructions": f"Is there a {pad} corner?"}}
+    for request in ({**REQUEST, "state": f"Look at {pad}."}, {**REQUEST, "questions": asked}):
+        assert error(asyncio.run(s.post({**request, "images": [image]}))) == (
+            400, "invalid_request", f"a request with images may not hold {pad} in its text")
+    assert engine.received == []  # none reached a miner
+    text = {**REQUEST, "state": f"Look at {pad}."}
+    assert asyncio.run(s.post(text)).status_code == 200 and engine.received == [text]
+
+
 def test_images_are_forwarded_canonical_and_billed_their_exact_tokens(tmp_path, setups) -> None:
     engine = Recording("clef-flash")
     s = setups(tmp_path, engine)

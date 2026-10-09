@@ -51,14 +51,18 @@ MAX_IMAGE_TOKENS = 1 << 20  # the image tokens of one request an image model's l
 @dataclass(frozen=True)
 class EngineImages:
     """The images an engine family's processor takes as they are: each side a multiple of ``token_px`` (its patch
-    size times its merge size), its pixels within [``min_pixels``, ``max_pixels``]."""
+    size times its merge size), its pixels within [``min_pixels``, ``max_pixels``]; ``image_token``, the text of one
+    image token in its prompts, which the text of a request with images may not hold (the processor would count it
+    as one of the images')."""
 
     token_px: int
     min_pixels: int
     max_pixels: int
+    image_token: str
 
 
-ENGINE_IMAGES = {"clef": EngineImages(32, 65_536, 16_777_216)}  # the engine families whose models read images
+# the engine families whose models read images
+ENGINE_IMAGES = {"clef": EngineImages(32, 65_536, 16_777_216, "<|image_pad|>")}
 _ORIENTATION = 0x0112  # the EXIF orientation tag; 5 to 8 swap width and height
 _DATA_URL = re.compile(r"data:(image/[a-z]+);base64,", re.IGNORECASE)
 _HEADER_STEPS = 1024  # markers and fill bytes a JPEG header is read through, at most

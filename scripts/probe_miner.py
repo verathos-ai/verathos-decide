@@ -121,7 +121,10 @@ def main() -> None:
 
     if f"-{endpoint.model_id}-" not in args.reference.name:
         raise SystemExit(f"{args.reference.name} holds reference answers for another model than {endpoint.model_id}")
-    reference = [distributions(r["answers"]) for r in json.loads(args.reference.read_text())]
+    fixture = json.loads(args.reference.read_text())
+    if any("images" in r or r.get("state") != state for r, state in zip(fixture, states(len(fixture)))):
+        raise SystemExit(f"{args.reference.name} holds reference answers for other requests than the probe's tickets")
+    reference = [distributions(r["answers"]) for r in fixture]
     tolerance = cat.get(endpoint.model_id).tolerance if cat.get(endpoint.model_id) else Tolerance()
     tally, latencies, receipts_ok = EndpointTally(tolerance), [], 0
     for state, ref in zip(states(len(reference)), reference):

@@ -82,7 +82,13 @@ from verathos.protocol.api import (
 )
 from verathos.protocol.canonical import canonical_json, sha256_hex
 from verathos.protocol.gateway import Routes
-from verathos.protocol.media import BASE64_ALPHABET, ImageRefused, request_image_tokens, sent_image
+from verathos.protocol.media import (
+    BASE64_ALPHABET,
+    ENGINE_IMAGES,
+    ImageRefused,
+    request_image_tokens,
+    sent_image,
+)
 from verathos.throughput.workload import in_mix_form
 from verathos.validator.canaries import canary_like
 
@@ -319,6 +325,9 @@ def screen(g: Gateway, body: bytes) -> Screened:
         raise Rejected(400, "invalid_request", f"not a SystemOne request: {exc}"[:500]) from None
     if len(text_body) > MAX_REQUEST_BYTES:
         raise Rejected(413, "too_large", f"the request without its images exceeds {MAX_REQUEST_BYTES} bytes",
+                       model=model.model_id)
+    if parsed.images and (token := ENGINE_IMAGES[model.engine.name].image_token).encode() in text_body:
+        raise Rejected(400, "invalid_request", f"a request with images may not hold {token} in its text",
                        model=model.model_id)
     return Screened(parsed, model, forwarded, text_body, sent_images(parsed.images or [], model))
 
