@@ -16,16 +16,16 @@ has no top-up: its first top-up fixes its referrer.
 
 What counts. A top-up of a referred account counts for its code if it was credited after the referral, within the
 pool's ``term_days`` of it and before the code was revoked, up to the pool's ``account_cap_usd`` for the account: what
-counts of the account's top-ups credited within a window's length before or after it, less their refunds, stays within
-the cap, whatever order they are decided in. A refund counts negative, at most what its top-up counted less earlier
-refunds of it. A top-up decided while the catalog has no referral pool counts nothing. Each credit is decided once
-(``referral_reports``) and reported once.
+counts of the account's top-ups credited within a window's length before or after it stays within the cap, whatever
+order they are decided in (a refund frees none of it). A refund counts negative, at most what its top-up counted less
+earlier refunds of it. A top-up decided while the catalog has no referral pool counts nothing. Each credit is decided
+once (``referral_reports``) and reported once.
 
 The reporter. Every ``REPORT_S`` one gateway process (PostgreSQL's advisory lock ``LOCK_KEY``; the others skip the
 round) decides the new credits of referred accounts, then posts what the auditor has not taken, signed by the gateway:
-registrations and moves, then entries (``protocol.gateway.ReferralReport``). The auditor takes every item once, so a
-post whose answer was lost is sent again as it is. If it no longer knows a code an entry names (its database started
-over), every registration and move goes again, with those entries.
+registrations and moves, then, once every registration is out, entries (``protocol.gateway.ReferralReport``). The
+auditor takes every item once, so a post whose answer was lost is sent again as it is. If it no longer knows a code an
+entry names (its database started over), every registration and move goes again, then those entries.
 """
 
 from __future__ import annotations
@@ -124,7 +124,8 @@ def counted(kind: str, amount: int, refund_of: str | None, created: dt.datetime,
         return 0
     if pool.account_cap_usd is None:
         return amount
-    near = sum(e.counted for e in earlier if abs((e.created - created).total_seconds()) < window_s)
+    near = sum(e.counted for e in earlier
+               if e.kind == "topup" and abs((e.created - created).total_seconds()) < window_s)
     return max(0, min(amount, round(pool.account_cap_usd * 1_000_000) - near))
 
 
@@ -411,7 +412,9 @@ class Referrals:
                 .limit(MAX_REFERRAL_SIGNED))).all()
             moves = (await conn.execute(select(referral_moves.c.id, referral_moves.c.move).where(
                 referral_moves.c.reported_at.is_(None)).order_by(referral_moves.c.id).limit(MAX_REFERRAL_SIGNED))).all()
-            entries = (await conn.execute(
+            waiting = (await conn.execute(select(func.count()).select_from(referral_codes).where(
+                referral_codes.c.reported_at.is_(None)))).scalar()
+            entries = [] if waiting > len(codes) else (await conn.execute(  # entries once their codes are out
                 select(referral_reports.c.credit_id, referral_reports.c.code, referral_reports.c.amount,
                        credits.c.reference, credits.c.created_at)
                 .join(credits, credits.c.id == referral_reports.c.credit_id)

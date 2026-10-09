@@ -372,6 +372,13 @@ def test_the_account_cap_holds_within_any_window_whatever_the_order_top_ups_are_
     assert late.decide() == [900]
     late.credit("u_1", 900, at_s=500)
     assert late.decide() == [100]
+    freed = Ledger(tmp_path / "freed")
+    freed.code("alice")
+    freed.account("u_1", "alice")
+    pay = freed.credit("u_1", 1000, at_s=10)
+    freed.credit("u_1", -1000, at_s=20, kind="refund", refund_of=pay)
+    freed.credit("u_1", 500, at_s=30)
+    assert freed.decide() == [1000, -1000, 0]  # a refund frees none of the cap
     uncapped = Ledger(tmp_path / "uncapped")
     uncapped.code("alice")
     uncapped.account("u_1", "alice")
@@ -559,3 +566,35 @@ def test_the_operator_refunds_a_top_up_and_revokes_a_code_from_the_command_line(
     with pytest.raises(SystemExit):
         cli("referrals", "show", "--code", "nobody")
     assert "no referral code" in capsys.readouterr().err
+
+
+def test_entries_wait_until_every_registration_is_out(tmp_path, monkeypatch) -> None:
+    """More registrations than one post holds go first, over several posts; the entries follow, so the auditor never
+    hears of a code it does not know (and a registry sent again after its database started over gets through)."""
+    import verathos.gateway.referrals as referrals_module
+
+    monkeypatch.setattr(referrals_module, "MAX_REFERRAL_SIGNED", 1)
+    ledger = Ledger(tmp_path)
+    for code in ("alice", "bobby"):
+        ledger.code(code)
+        ledger.account(f"u_{code}", code)
+        ledger.credit(f"u_{code}", 5, at_s=10)
+    ledger.decide()
+    posted: list[ReferralReport] = []
+
+    async def post(report: ReferralReport, answer=None):
+        posted.append(report)
+        return answer or {}
+    for _ in range(3):
+        ledger.run(ledger.referrals.report(post))
+    assert [([c.registration.code for c in r.codes], len(r.entries)) for r in posted] == [
+        (["alice"], 0), (["bobby"], 2), ([], 0)][:len(posted)]
+    assert len(posted) == 2  # the third round had nothing to post
+    ledger.credit("u_alice", 1, at_s=WINDOW_S + 99)
+    ledger.decide()
+    ledger.run(ledger.referrals.report(lambda r: post(r, {"unknown_codes": ["alice"]})))
+    for _ in range(3):
+        ledger.run(ledger.referrals.report(post))
+    assert [([c.registration.code for c in r.codes], len(r.entries)) for r in posted[2:]] == [
+        ([], 1), (["alice"], 0), (["bobby"], 1)]
+

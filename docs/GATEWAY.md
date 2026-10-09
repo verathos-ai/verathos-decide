@@ -520,7 +520,7 @@ no top-up: its first top-up fixes its referrer. Grants, the referred user's bonu
 
 - a top-up counts its amount if it was credited after the referral, within `term_days` of it and before the code was
   revoked, at most what `account_cap_usd` leaves: what counts of the account's top-ups credited within a window's
-  length before or after it, less their refunds, stays within the cap, whatever order they are decided in;
+  length before or after it stays within the cap, whatever order they are decided in (a refund frees none of it);
 - a refund counts negative, at most what its top-up counted less earlier refunds of it;
 - a top-up decided while the catalog has no referral pool counts nothing, then or later.
 
