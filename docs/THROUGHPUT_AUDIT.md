@@ -186,15 +186,15 @@ window one answer to a request without images and one to a request with images, 
 signed by a gateway the catalog lists. The auditor keeps, for endpoints it tests, those whose receipt binds the request
 and the answers and names that gateway (up to 8 per endpoint and epoch, and 2 with images; signed malformed answers
 always), and recomputes per endpoint and epoch a random `gateway_checks_per_epoch` of them, and besides those
-`gateway_image_checks_per_epoch` with images, between tests (screen and fp32 reference as above; an answer with images
-on the fp32 reference alone, which gets the images as the miner received them). A wrong answer is evidence like one in a
-test; so is a receipt signing more or fewer input tokens than the reference counts (beyond 2% and 2 tokens), here and in
-tests, since users' input tokens are what they are billed and set the models' emission shares. The differences form a
-drift tally of their own over the last `drift_window_tests` epochs: an endpoint whose answers to users drift beyond the
-model's `mean_abs` loses its credit, however correct its test answers are. A gateway answer counts in the epoch its
-check finished, so an epoch's verdicts depend only on checks finished before it began. A sampled user request in the
-form of the test's requests or of a canary is logged as relayed: some miner forwards what it is sent to the gateway
-(`throughput.workload.in_mix_form`, `validator.canaries.canary_like`).
+`gateway_image_checks_per_epoch` with images, between tests (screen and fp32 reference as above, both with the images as
+the miner received them). A wrong answer is evidence like one in a test; so is a receipt signing more or fewer input
+tokens than the reference counts (beyond 2% and 2 tokens), here and in tests, since users' input tokens are what they
+are billed and set the models' emission shares. The differences form a drift tally of their own over the last
+`drift_window_tests` epochs: an endpoint whose answers to users drift beyond the model's `mean_abs` loses its credit,
+however correct its test answers are. A gateway answer counts in the epoch its check finished, so an epoch's verdicts
+depend only on checks finished before it began. A sampled user request in the form of the test's requests or of a canary
+is logged as relayed: some miner forwards what it is sent to the gateway (`throughput.workload.in_mix_form`,
+`validator.canaries.canary_like`).
 
 A sampled request with images is held in the auditor's memory only, never in its database, until its check (at most
 2 GiB of images at once; a sample beyond is not kept); the row keeps the receipt and the other columns. Once it is
@@ -335,7 +335,8 @@ The auditor needs:
   A100 with Kev-4B's request mix, fp32 recomputes about 2 per second and bf16 about 6, so a bf16 screen covers
   1,000 endpoints in about 6 minutes, with the fp32 reference (CPU is enough) confirming only what it flags. The
   screen can run on another machine over https (its `tls_pin`, or a public CA's certificate) with a key; while it
-  is unreachable, recomputes are skipped and receipts are still checked;
+  is unreachable, recomputes are skipped and receipts are still checked. For a model that reads images, the reference
+  runs on a GPU, beside the model's screen (`VALIDATING.md`): every recompute must answer within 30 s;
 - a public IP and port for its service, which serves TLS with the certificate the catalog's `auditor.tls` pins
   (`SUBNET_ADMIN.md`), and an uplink for the whole network's test traffic in one burst: about
   6 KB per request, so 1,000 endpoints at 20,000 requests/s take about 1 Gbit/s, and 2-3 CPU cores;

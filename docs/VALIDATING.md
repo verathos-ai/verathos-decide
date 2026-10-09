@@ -388,9 +388,10 @@ reference needs about 41 GiB of RAM (47 GiB on a GPU).
 ```
 
 For a model whose catalog entry lists `image` in its `input_modalities`, the reference also reads the canonical images
-of the requests it recomputes (`GATEWAY.md`, Images), decoded to pixels and given to the release's processor without
-resizing; on a GPU it computes float32 without TF32. An image adds up to 1,026 tokens to a request at the default
-pixel budget, and the auditor's recomputes must finish within 30 s: give the auditor's reference of such a model a GPU.
+of the canaries and the requests it recomputes (`GATEWAY.md`, Images), decoded to pixels and given to the release's
+processor without resizing; on a GPU it computes float32 without TF32. An image adds up to 1,026 tokens to a request at
+the default pixel budget, and the auditor's recomputes must finish within 30 s: the auditor runs such a model's
+reference on a GPU, beside its screen ([The auditor's GPU](#the-auditors-gpu-for-a-model-that-reads-images)).
 
 References one at a time are not started by hand: give each its command in `references` and set `reference_mode` to
 `sequential` ([3. Configure](#3-configure)); the validator runs the command from `directory` with `environment` over
@@ -446,7 +447,7 @@ of a full validator:
 | `mechid` | the catalog's | mechanism the weights are set on and manifests are accepted for, instead of the catalog's `mechanism`; leave it unset to follow the catalog |
 | `references` | {} | full: model id -> the model's fp32 reference engine: a URL (plain http on `127.0.0.1` only), or `{"url", "api_key", "tls_pin"}` for a remote engine over https, accepted by its certificate's pin or, without one, by a public CA's certificate for its hostname (the Kev server takes its key from `KEV_API_KEY`), or for references one at a time `{"url", "command", "directory", "environment"}`: the command that serves it at the URL on `127.0.0.1`, which the validator runs when it checks the model (the installer writes them; a reference without a command is taken as running). Every `active` model needs one: the validator does not start without, and stops when a new catalog activates a model it has none for; `candidate` models without one are not audited by this validator. Light validators ignore it |
 | `reference_mode` | `resident` | full: `resident` or `sequential` (one at a time, [References](#references-resident-or-one-at-a-time)); the subnet owner's validator does not start one at a time |
-| `audit_screens` | {} | auditor only: model id -> a bf16 engine (same forms) that screens the sampled answers to text requests; an answer it flags counts as wrong only once the fp32 reference confirms it, and answers to requests with images go to the reference alone |
+| `audit_screens` | {} | auditor only: model id -> a bf16 engine (same forms) that screens the sampled answers, with their images for a model that reads them (the miners' engine reads them); an answer it flags counts as wrong only once the fp32 reference confirms it |
 | `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database; references one at a time: their times (`references.json`) and logs (`references/`); light: the last epoch whose weights it set |
 | `dry_run` | false | compute weights without setting them (light: log the weights it would set) |
 | `auto_update` | false (the installer sets true, except for the subnet owner's validator) | install each new release by itself between epochs, then exit for the process manager to start it ([Update](#update)) |
@@ -616,3 +617,35 @@ If the validator's hotkey is the auditor, it also:
 The auditor database is `state_dir/throughput.sqlite`. Keep the auditor running continuously: a test it misses is
 not run, and endpoints keep the credit of their last test for `credit_ttl_epochs` (the gateway's routes keep it
 until the next confirmed test). A test running when it restarts is void.
+
+### The auditor's GPU for a model that reads images
+
+The auditor recomputes answers within 30 s each, which a CPU reference does not do for requests with images, so for a
+model that reads images (clef-flash) its float32 reference runs on a GPU, in one of two layouts.
+
+**One 80 GB GPU with nothing else on it**, the reference and the miners' engine as the model's screen, which takes
+requests with images as it takes text:
+
+```bash
+# the reference: an environment without flash-linear-attention; float32 on a GPU runs without TF32
+CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 /opt/clef-ref/bin/verathos-engine clef --repo Cloudflare/clef-flash \
+    --revision <hf_revision> --device cuda --dtype float32 --port 8103
+# the screen: the miners' engine, with flash-linear-attention at the version it pins (MINING.md)
+CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 /opt/clef/bin/verathos-engine clef --repo Cloudflare/clef-flash \
+    --revision <hf_revision> --port 8010
+```
+
+and in `validator.json` `"references": {"clef-flash": "http://127.0.0.1:8103", ...}` and `"audit_screens":
+{"clef-flash": "http://127.0.0.1:8010"}`. The other models' references go to another GPU or to RAM: a third engine
+does not fit beside these two.
+
+**The reference on a GPU of its own, on another machine**: `verathos-engine` as above (`--dtype float32`) on that
+machine's loopback, behind nginx with TLS (a certificate whose pin the auditor names), a check of the bearer key and an
+allowlist of the auditor's addresses, and in `validator.json`
+`"references": {"clef-flash": {"url": "https://<host>:<port>", "api_key": "<key>", "tls_pin": "<pin>"}}`. A screen can
+run on the auditor's GPU as above, or remotely in the same form under `audit_screens`; without one, the reference
+recomputes every check itself. The 30 s include the request's way there: a request with images is at most
+`images.max_request_bytes`, mostly far less (four canonical photos of 1 MP are about 2 MB).
+
+The installer places the references on the auditor's machine; the screen and a remote reference are set up by hand,
+as above.

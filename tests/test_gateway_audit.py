@@ -21,7 +21,7 @@ from verathos.protocol.gateway import GatewaySample
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest
 from verathos.protocol.requests import sign_request
 from verathos.throughput.auditor import Checks, Result, Slot, Target
-from verathos.throughput.feed import GATEWAY_EVIDENCE
+from verathos.throughput.feed import GATEWAY_EVIDENCE, Evidence
 from verathos.throughput.policy import AuditPolicy, ScheduledTest
 from verathos.validator.throughput import Throughput
 
@@ -1079,38 +1079,37 @@ def test_a_tests_pick_with_images_is_checked_from_memory(tmp_path) -> None:
     assert held(auditor.store) == (0, 0) and auditor.store.test_sample("ab" * 32, "hk", "gpu0") is None
 
 
-def test_answers_with_images_are_recomputed_on_the_reference_never_on_a_screen(tmp_path) -> None:
-    from verathos.miner.engine import EngineError
-
-    class TextScreen(Seeing):
-        """A bfloat16 screen, which serves text requests only."""
-
-        async def answer(self, request):
-            if request.get("images"):
-                raise EngineError("engine returned 422: images are not served by this engine")
-            return await super().answer(request)
-
-    gateway, miner_kp = kp(), kp()
-    app = miner(miner_kp, MockEngine("clef-flash"), gateway, "clef-flash")
-    samples = image_samples(app, miner_kp, gateway, [image_request(1), image_request(2)])
-    samples += image_samples(app, miner_kp, gateway, [{**image_request(i), "images": []} for i in (3, 4)])
-    auditor = _auditor(tmp_path, gateway_image_checks_per_epoch=2)
+def test_answers_with_images_are_screened_and_only_the_reference_confirms_a_flag_with_the_images(tmp_path) -> None:
+    """A screen takes answers to requests with images as it takes text (it is the miners' engine, which reads them);
+    the fp32 reference recomputes the answers it flags, with their images, and a flag the reference does not confirm
+    is no evidence. Without a reference, the screen still checks them, and its flags are no evidence."""
+    gateway, honest_kp, cheap_kp = kp(), kp(), kp()
+    samples = image_samples(miner(honest_kp, MockEngine("clef-flash"), gateway, "clef-flash"), honest_kp, gateway,
+                            [image_request(1)])
+    samples += image_samples(miner(cheap_kp, MockEngine("clef-flash", salt="a cheaper model"), gateway,
+                                   "clef-flash"), cheap_kp, gateway, [image_request(2)])
+    slots = [Slot(k.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)
+             for k in (honest_kp, cheap_kp)]
+    auditor = _auditor(tmp_path)
     auditor.follower.poll()
-    auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)])
-    assert auditor.accept_samples(gateway.ss58_address, samples) == 4
-    screen, reference = TextScreen("clef-flash"), Seeing("clef-flash")
+    auditor.update_slots(slots)
+    assert auditor.accept_samples(gateway.ss58_address, samples) == 2
+    screen, reference = Seeing("clef-flash", salt="noisy"), Seeing("clef-flash")  # the screen flags both answers
     asyncio.run(auditor.check_samples(Checks({"clef-flash": reference}, {"clef-flash": screen})))
-    states = sorted(auditor.store._query("SELECT media, state FROM samples"))
-    assert states == [(0, "checked"), (0, "checked"), (1, "checked"), (1, "checked")]
-    assert not any(r.get("images") for r in screen.asked) and len(screen.asked) == 2
-    assert sum(bool(r.get("images")) for r in reference.asked) == 2
-    # without a reference, a screen cannot check an answer with images: it is given up, not tried on the screen
+    def images(engine: Seeing) -> list[str]:
+        return sorted(json.dumps(r["images"]) for r in engine.asked)
+
+    assert images(screen) == images(reference) == sorted(json.dumps(s.request["images"]) for s in samples)
+    rows = dict(auditor.store._query("SELECT hotkey, evidence FROM samples WHERE state = 'checked'"))
+    assert rows[honest_kp.ss58_address] is None  # only the confirmed flag is evidence, which carries the receipt only
+    evidence = Evidence.model_validate_json(rows[cheap_kp.ss58_address])
+    assert evidence.request == {} and set(json.loads(evidence.response)) == {"receipt"}
     (tmp_path / "other").mkdir()
-    other = _auditor(tmp_path / "other", gateway_image_checks_per_epoch=2)
+    other = _auditor(tmp_path / "other")
     other.follower.poll()
-    other.update_slots([Slot(miner_kp.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)])
-    assert other.accept_samples(gateway.ss58_address, samples[:1]) == 1
-    screen = TextScreen("clef-flash")
+    other.update_slots(slots)
+    assert other.accept_samples(gateway.ss58_address, samples) == 2
+    screen = Seeing("clef-flash")
     asyncio.run(other.check_samples(Checks({}, {"clef-flash": screen})))
-    assert other.store._query("SELECT state, reason FROM samples") == [("unchecked", "no reference for the model")]
-    assert screen.asked == []
+    assert sorted(other.store._query("SELECT state, evidence FROM samples")) == [("checked", None)] * 2
+    assert len(screen.asked) == 2 and all(r.get("images") for r in screen.asked)

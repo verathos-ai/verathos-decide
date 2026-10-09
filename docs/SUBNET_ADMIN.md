@@ -76,8 +76,8 @@ reads no images (the Kev engine), a `token_px` other than its engine's (32 for C
 engine takes as it is (65,536 to 16,777,216 pixels for Clef). Older nodes ignore both fields, and the catalog's digest
 covers them, so every node agrees on the catalog. Open a model to images once the gateway, the auditor and the model's
 miners run a release that reads them, with engines that serve them (`MINING.md`; a miner of an earlier release may
-refuse a validator's image canary as larger than it takes from validators), and the auditor's reference of the
-model runs on a GPU (`VALIDATING.md`).
+refuse a validator's image canary as larger than it takes from validators), and the auditor's reference and screen of
+the model run on a GPU (`VALIDATING.md`).
 
 `relative_speed` is the model's speed relative to the other models: the requests/s of its standard mix one GPU
 serves within `max_latency_s`, measured for every model on the same reference GPU and divided by one model's (1.0;
