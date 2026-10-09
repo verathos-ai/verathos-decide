@@ -10,10 +10,12 @@ publish = false
 bytes = "=1.12.1"
 http-body-util = "=0.1.5"
 hyper = { version = "=1.12.0", features = ["client", "http1"] }
+hyper-rustls = { version = "=0.27.10", default-features = false, features = ["http1", "ring", "tls12"] }
 hyper-util = { version = "=0.1.21", features = ["client-legacy", "http1", "tokio"] }
 rand = { version = "=0.10.3", default-features = false }
 rand_chacha = "=0.10.0"
 rlimit = "=0.11.0"
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151", features = ["raw_value"] }
 sha2 = "=0.10.9"
@@ -22,6 +24,7 @@ tokio = { version = "=1.53.2", features = ["rt-multi-thread", "sync", "time"] }
 [dev-dependencies]
 hyper = { version = "=1.12.0", features = ["server"] }
 tokio = { version = "=1.53.2", features = ["io-util", "macros", "net", "process"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 
 [profile.release]
 codegen-units = 1

@@ -171,7 +171,8 @@ def test_the_miner_configuration_keeps_what_the_setup_does_not_manage(tmp_path) 
                     {"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:8008",
                      "max_concurrency": 64},
                     {"endpoint_id": "gpu1", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:8009"},
-                    {"endpoint_id": "mac", "model_id": "kev-4b", "engine_url": "http://10.0.0.2:8008"}]}
+                    {"endpoint_id": "mac", "model_id": "kev-4b", "engine_url": "https://10.0.0.2:8443",
+                     "engine_tls_pin": "ab" * 32}]}
     config = miner_config(existing, network="finney", netuid=96, wallet_name="w", hotkey_name="h",
                           public_ip="198.51.100.7", port=20003, endpoints={"gpu0": ("kev-9b", 8008)},
                           managed_before={"gpu0", "gpu1"}, home=tmp_path)
@@ -229,7 +230,7 @@ def test_a_worker_and_its_primary_are_configured_for_one_hotkey(tmp_path) -> Non
     assert [e["endpoint_id"] for e in worker["endpoints"]] == ["9-9-9-9-gpu0", "9-9-9-9-gpu1"]
 
     peers = parse_peers("9.9.9.9:20017, [2606:4700::1111]:8091")
-    assert peers == ["http://9.9.9.9:20017", "http://[2606:4700::1111]:8091"]
+    assert peers == ["https://9.9.9.9:20017", "https://[2606:4700::1111]:8091"]
     for bad in ("10.0.0.1:8091", "9.9.9.9", "localhost:8091", "[::ffff:8.8.8.8]:80"):
         with pytest.raises(SystemExit, match="--peers"):
             parse_peers(bad)

@@ -1,8 +1,10 @@
-//! The shared HTTP/1.1 keep-alive client and the classification of every exchange.
+//! The HTTP/1.1 keep-alive clients over TLS, one per certificate pin (the targets on one machine share
+//! its connections), and the classification of every exchange.
 
 use crate::{
     plan::{Target, REQUEST_ID_HEADER},
     stats::ErrorKind,
+    tls::{self, Pin},
     workload::GeneratedRequest,
 };
 use bytes::Bytes;
@@ -11,6 +13,7 @@ use hyper::{
     header::{HeaderValue, CONTENT_TYPE},
     Method, Request, StatusCode,
 };
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client as PooledClient},
     rt::TokioExecutor,
@@ -36,14 +39,22 @@ const LOCAL_ERRNOS: [i32; 5] = [
 
 #[derive(Clone)]
 pub struct Client {
-    pool: PooledClient<HttpConnector, Full<Bytes>>,
+    pool: PooledClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
     max_response_bytes: usize,
 }
 
 impl Client {
-    pub fn new(max_response_bytes: usize) -> Self {
+    /// A client for the targets whose certificate has `pin`: https only, the certificate accepted
+    /// by its pin alone.
+    pub fn new(max_response_bytes: usize, pin: Pin) -> Self {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
+        connector.enforce_http(false);
+        let connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls::client_config(pin))
+            .https_only()
+            .enable_http1()
+            .wrap_connector(connector);
         let pool = PooledClient::builder(TokioExecutor::new())
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .pool_max_idle_per_host(usize::MAX)
@@ -64,6 +75,7 @@ impl Client {
         let response = match timeout_at(deadline, self.pool.request(request)).await {
             Err(_) => return Err(ErrorKind::Timeout),
             Ok(Err(error)) if local_failure(&error) => return Err(ErrorKind::Local),
+            Ok(Err(error)) if tls_failure(&error) => return Err(ErrorKind::Tls),
             Ok(Err(error)) if error.is_connect() => return Err(ErrorKind::Connect),
             Ok(Err(_)) => return Err(ErrorKind::Transport),
             Ok(Ok(response)) => response,
@@ -119,6 +131,25 @@ fn local_failure(error: &(dyn std::error::Error + 'static)) -> bool {
             }
         }
         source = error.source();
+    }
+    false
+}
+
+/// Whether an error comes from the TLS handshake: a certificate other than the pinned one, or a
+/// failed handshake. An I/O error's payload is looked into too (its `source` skips it).
+fn tls_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut stack = vec![error];
+    while let Some(error) = stack.pop() {
+        if error.is::<rustls::Error>() {
+            return true;
+        }
+        if let Some(inner) = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            stack.push(inner);
+        }
+        stack.extend(error.source());
     }
     false
 }

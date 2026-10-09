@@ -8,6 +8,9 @@ measurement waits for a selected test (``timing``). An endpoint that cannot be m
 served. The primary (``role``) signs the hotkey's manifest, its own endpoints and its peers' (``miner.peers``), and
 publishes it; a worker serves its endpoints and what it declares (``GET /v1/endpoints``) and publishes nothing. Until
 the first measurement is done, a machine serves what it last served.
+
+The service speaks TLS only, with the machine's certificate (``protocol.tls``, kept in ``state_dir``), whose pin the
+manifest names; the measurement reaches the endpoints through it as tests do.
 """
 
 from __future__ import annotations
@@ -34,10 +37,11 @@ from verathos.miner.app import caller_request_bytes, create_app
 from verathos.miner.chain import PermitAuthorizer, build_host_endpoints, build_manifest, own_endpoints, publish
 from verathos.miner.config import EndpointConfig, MinerConfig
 from verathos.miner.engine import Engine, HttpEngine
-from verathos.miner.peers import Peers, merged
+from verathos.miner.peers import Peers, merged, pins
 from verathos.miner.shortfall import Shortfall, Shortfalls
 from verathos.miner.status import StatusWatcher
 from verathos.miner.timing import MeasurementDeferred, MeasurementWindow
+from verathos.protocol import tls
 from verathos.protocol.http import raise_open_file_limit
 from verathos.protocol.manifest import (
     ENDPOINTS_PATH,
@@ -91,7 +95,7 @@ def servable(config: MinerConfig, cat: catalog.Catalog) -> list[EndpointConfig]:
 async def engine_fingerprint(e: EndpointConfig, cat: catalog.Catalog) -> str:
     """What the endpoint's measurement depends on: its configuration, the model's pinned revisions, the engine's
     self-description and the request mix."""
-    engine = HttpEngine(e.engine_url, e.engine_api_key)
+    engine = HttpEngine(e.engine_url, e.engine_api_key, tls_pin=e.engine_tls_pin)
     try:
         info = await engine.info()
     finally:
@@ -110,8 +114,8 @@ class Publisher:
     is published on chain. With a ``window`` (``timing``), a measurement waits for a selected test."""
 
     def __init__(self, config: MinerConfig, wallet: bt.Wallet, cat: catalog.Catalog, *, publish_on_chain: bool,
-                 subtensor: bt.Subtensor) -> None:
-        self.config, self.wallet = config, wallet
+                 subtensor: bt.Subtensor, identity: tls.Identity) -> None:
+        self.config, self.wallet, self.identity = config, wallet, identity
         self.publish_on_chain = publish_on_chain and config.role == "primary"
         self.store = MeasurementStore(config.state_dir / STORE_FILE)
         self.shortfalls = Shortfalls(config.state_dir / "shortfalls.json")
@@ -133,7 +137,7 @@ class Publisher:
                                mechid=self.mechid)
             self.signed = self._last_published() or build_manifest(
                 config, own_endpoints(config, endpoints, dict.fromkeys((e.endpoint_id for e in endpoints), 0.0)),
-                wallet.hotkey, cat)
+                wallet.hotkey, cat, {config.base_url: identity.pin})
             self.peers.seed(self.signed.manifest)
         self.serving = {e.endpoint_id for e in endpoints}
         self.auditor = subtensor.get_subnet_owner_hotkey(config.netuid)  # the subnet owner's validator runs tests
@@ -156,9 +160,13 @@ class Publisher:
     def auditors(self) -> set[str]:
         return {self.auditor}
 
+    def catalog_auditor_pin(self) -> str:
+        """The pin of the auditor's certificate, as the catalog names it. Raises catalog.AuditorUnknown."""
+        return self.catalog.auditor_pin()
+
     def gateways(self) -> set[str]:
         """Callers served without the per-caller limits: the catalog's gateways and the configured ones."""
-        return {*self.config.gateway_hotkeys, *self.catalog.gateways}
+        return {*self.config.gateway_hotkeys, *self.catalog.gateway_hotkeys()}
 
     def note_test_traffic(self) -> None:
         self.test_seen = time.monotonic()
@@ -187,7 +195,8 @@ class Publisher:
         except (OSError, ValueError):
             return None
         m = signed.manifest
-        same = (m.hotkey, m.netuid, m.mechid) == (self.wallet.hotkey.ss58_address, self.config.netuid, self.mechid)
+        same = (m.hotkey, m.netuid, m.mechid, m.pin(self.config.base_url)) == (
+            self.wallet.hotkey.ss58_address, self.config.netuid, self.mechid, self.identity.pin)
         return signed if same else None
 
     def _last_served(self) -> SignedHostEndpoints | None:
@@ -196,8 +205,8 @@ class Publisher:
         except (OSError, ValueError):
             return None
         h = signed.host
-        same = (h.hotkey, h.netuid, h.mechid, h.url) == (self.wallet.hotkey.ss58_address, self.config.netuid,
-                                                         self.mechid, self.config.base_url)
+        same = (h.hotkey, h.netuid, h.mechid, h.url, h.tls) == (self.wallet.hotkey.ss58_address, self.config.netuid,
+                                                                self.mechid, self.config.base_url, self.identity.pin)
         return signed if same else None
 
     def _local_url(self, endpoint_id: str) -> str:
@@ -208,10 +217,10 @@ class Publisher:
                        stop: Callable[[], bool]) -> tuple[dict[str, Measurement], dict[str, str], bool]:
         """-> (measurements, failures, whether they were measured now rather than reused)."""
         limits = httpx.Limits(max_connections=None, max_keepalive_connections=1024)
-        async with httpx.AsyncClient(timeout=120.0, limits=limits) as client:
+        async with tls.client(timeout=120.0, limits=limits) as client:  # through this machine's TLS service
             targets = [Target(e.endpoint_id, e.model_id,
                               ServicePath(client, self._local_url(e.endpoint_id), self.wallet.hotkey,
-                                          self.config.netuid, e.endpoint_id),
+                                          self.config.netuid, e.endpoint_id, tls=self.identity.pin),
                               cat.get(e.model_id).workload, e.max_concurrency, "") for e in endpoints]
             failures = {}
             for t, outcome in zip(targets, await asyncio.gather(*(wait_ready(t) for t in targets),
@@ -296,7 +305,7 @@ class Publisher:
                         cat.digest()[:12], catalog.mechanism_of(cat, self.config.mechid))
         self.catalog = cat
         own = own_endpoints(self.config, listed, declared)
-        self.local = build_host_endpoints(self.config, own, self.wallet.hotkey, cat)
+        self.local = build_host_endpoints(self.config, own, self.wallet.hotkey, cat, self.identity.pin)
         self.endpoints_path.parent.mkdir(parents=True, exist_ok=True)
         self.endpoints_path.write_text(self.local.model_dump_json())
         self.serving = {e.endpoint_id for e in listed}
@@ -348,7 +357,7 @@ class Publisher:
         withdrawn."""
 
         async def run() -> None:
-            async with httpx.AsyncClient() as client:
+            async with tls.client() as client:
                 await self.peers.poll(client, self.catalog.digest(), self.catalog.epoch_blocks * BLOCK_TIME_S)
 
         asyncio.run(run())
@@ -361,7 +370,8 @@ class Publisher:
             for line in left_out:
                 log.error(line)
             self._left_out = left_out
-        signed = build_manifest(self.config, endpoints, self.wallet.hotkey, self.catalog)
+        signed = build_manifest(self.config, endpoints, self.wallet.hotkey, self.catalog,
+                                pins(self.config.base_url, self.identity.pin, endpoints, self.peers.peers))
         if signed.manifest.digest() != self.signed.manifest.digest():
             self.signed, self._published = signed, False
 
@@ -527,15 +537,20 @@ def main() -> None:
     wallet = bt.Wallet(name=config.wallet_name, hotkey=config.hotkey_name)
     subtensor = bt.Subtensor(network=config.network)
     cat = catalog.load() if args.no_publish else resolve_catalog(subtensor, config)
-    publisher = Publisher(config, wallet, cat, publish_on_chain=not args.no_publish, subtensor=subtensor)
+    identity = tls.identity(config.state_dir)
+    log.info("TLS certificate %s, pin %s (the manifest names it; validators, gateways and the auditor accept this "
+             "machine by it)", identity.cert_path, identity.pin)
+    publisher = Publisher(config, wallet, cat, publish_on_chain=not args.no_publish, subtensor=subtensor,
+                          identity=identity)
     authorizer = permits(config, publisher)
-    engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key, max_connections=e.max_concurrency)
+    engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key, max_connections=e.max_concurrency,
+                                         tls_pin=e.engine_tls_pin)
                for e in config.endpoints}
     app = build_app(config, wallet.hotkey, publisher, authorizer, engines)
     # Connections beyond the descriptors left are refused, so a flood of idle connections cannot starve the rest.
     limit = max(256, raise_open_file_limit() - 256)
     server = uvicorn.Server(uvicorn.Config(app, host=config.listen_host, port=config.port, log_level="warning",
-                                           access_log=False, limit_concurrency=limit))
+                                           access_log=False, limit_concurrency=limit, **tls.server_options(identity)))
     service = threading.Thread(target=server.run, name="service", daemon=True)
     service.start()
     while not server.started:
@@ -554,8 +569,8 @@ def main() -> None:
         publisher.updater = update.start(config.auto_update, "miner")
         publisher.watch()
         StatusWatcher(hotkey=wallet.hotkey.ss58_address, netuid=config.netuid, auditor_url=chain.auditor_url,
-                      auditor_hotkey=lambda: publisher.auditor, listed=publisher.own_ids,
-                      on_tests=publisher.note_tests).start()
+                      auditor_pin=publisher.catalog_auditor_pin, auditor_hotkey=lambda: publisher.auditor,
+                      listed=publisher.own_ids, on_tests=publisher.note_tests).start()
     log.info(serving_line(config, publisher))
     service.join()
     os._exit(1)  # the service stopped

@@ -1,11 +1,12 @@
 """One hotkey on several machines: the primary lists every machine's endpoints in the manifest it publishes.
 
-Each worker serves the endpoints it measured at ``GET /v1/endpoints``, signed by the hotkey. The primary polls its
-configured peers every minute and takes a peer's endpoints from a document the hotkey signed, for this netuid and
-mechanism, built for the primary's catalog, whose endpoints are all at that peer's own address (a public one, as
-validators require). A peer that stops answering so keeps its last endpoints until it has been out for ``hold_s`` (an
-epoch), then is withdrawn. Endpoint ids are unique across the hotkey's machines: an endpoint whose id an earlier
-machine lists (the primary's own first, then the peers in their configured order) is left out.
+Each worker serves the endpoints it measured at ``GET /v1/endpoints``, signed by the hotkey, with the pin of its TLS
+certificate. The primary polls its configured peers every minute over https and takes a peer's endpoints from a
+document the hotkey signed, for this netuid and mechanism, built for the primary's catalog, naming the certificate the
+peer presented, whose endpoints are all at that peer's own address (a public one, as validators require); the
+manifest names the peer's pin. A peer that stops answering so keeps its last endpoints until it has been out for
+``hold_s`` (an epoch), then is withdrawn. Endpoint ids are unique across the hotkey's machines: an endpoint whose id an
+earlier machine lists (the primary's own first, then the peers in their configured order) is left out.
 """
 
 from __future__ import annotations
@@ -18,7 +19,8 @@ from dataclasses import dataclass, field
 import httpx
 
 from verathos.catalog import Catalog
-from verathos.protocol.http import request_json
+from verathos.protocol import tls
+from verathos.protocol.http import request_document
 from verathos.protocol.manifest import (
     ENDPOINTS_PATH,
     MAX_ENDPOINTS,
@@ -36,8 +38,9 @@ MAX_DOCUMENT_BYTES = 256 * 1024
 
 @dataclass
 class Peer:
-    url: str  # http://ip:port
+    url: str  # https://ip:port
     endpoints: list[Endpoint] = field(default_factory=list)
+    pin: str | None = None  # its certificate's, from its endpoints document
     seen: float | None = None  # when its endpoints were last confirmed (time.monotonic)
     said: str = ""  # what was last logged about it
 
@@ -54,23 +57,28 @@ class Peers:
         now = time.monotonic()
         for p in self.peers:
             p.endpoints = [e for e in manifest.endpoints if endpoint_host(e.url, e.endpoint_id) == p.url]
-            p.seen = now if p.endpoints else None
+            p.pin = manifest.pin(p.url)
+            p.seen = now if p.endpoints and p.pin else None
+            if p.pin is None:
+                p.endpoints = []
 
     async def poll(self, client: httpx.AsyncClient, catalog_digest: str, hold_s: float) -> None:
         await asyncio.gather(*(self._poll(client, p, catalog_digest, hold_s) for p in self.peers))
 
     async def _poll(self, client: httpx.AsyncClient, p: Peer, catalog_digest: str, hold_s: float) -> None:
         try:
-            document = await request_json(client, "GET", p.url + ENDPOINTS_PATH, limit=MAX_DOCUMENT_BYTES,
-                                          timeout=FETCH_TIMEOUT_S)
-            host = accept_host(document, hotkey=self.hotkey, netuid=self.netuid, mechid=self.mechid, url=p.url)
+            # any certificate: the document is the hotkey's own, and names the pin the peer must have presented
+            document, seen = await request_document(client, "GET", p.url + ENDPOINTS_PATH, limit=MAX_DOCUMENT_BYTES,
+                                                    timeout=FETCH_TIMEOUT_S, tls=tls.ANY)
+            host = accept_host(document, hotkey=self.hotkey, netuid=self.netuid, mechid=self.mechid, url=p.url,
+                               seen=seen)
             if host.catalog_digest != catalog_digest:
                 raise ManifestRejected(f"its endpoints are for catalog {host.catalog_digest[:12]}, this machine's "
                                        f"for {catalog_digest[:12]}")
         except Exception as exc:  # whatever a peer serves, it only costs that peer its endpoints
             why = str(exc) or type(exc).__name__
             if p.seen is not None and time.monotonic() - p.seen > hold_s:
-                p.endpoints, p.seen = [], None
+                p.endpoints, p.seen, p.pin = [], None, None
                 self._say(p, logging.ERROR, f"peer {p.url}: endpoints withdrawn, none confirmed for an epoch ({why})")
             elif p.endpoints:
                 self._say(p, logging.WARNING, f"peer {p.url}: {why}; its {len(p.endpoints)} endpoints stay listed "
@@ -78,7 +86,7 @@ class Peers:
             else:
                 self._say(p, logging.WARNING, f"peer {p.url}: {why}")
             return
-        p.endpoints, p.seen = host.endpoints, time.monotonic()
+        p.endpoints, p.pin, p.seen = host.endpoints, host.tls, time.monotonic()
         self._say(p, logging.INFO, f"peer {p.url}: " + (", ".join(
             f"{e.endpoint_id} ({e.model_id}, {e.capacity_rps:.1f} requests/s)" for e in p.endpoints) or "no endpoint"))
 
@@ -111,3 +119,9 @@ def merged(own: list[Endpoint], peers: list[Peer], cat: Catalog) -> tuple[list[E
                 out.append(e)
                 listed[e.endpoint_id] = f"peer {p.url}"
     return out, left_out
+
+
+def pins(own_url: str, own_pin: str, endpoints: list[Endpoint], peers: list[Peer]) -> dict[str, str]:
+    """The manifest's pins: this machine's, and those of the peers with an endpoint among ``endpoints``."""
+    hosts = {endpoint_host(e.url, e.endpoint_id) for e in endpoints}
+    return {own_url: own_pin, **{p.url: p.pin for p in peers if p.url in hosts and p.pin is not None}}

@@ -14,6 +14,7 @@ use crate::{
 };
 use rand::RngExt;
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, PoisonError,
@@ -58,7 +59,6 @@ pub struct Outcome {
 
 struct Shared {
     generator: Generator,
-    client: Client,
     start: Instant,
     /// Warmup plus test: no request is scheduled at or after `start + duration`.
     duration: Duration,
@@ -68,6 +68,8 @@ struct Shared {
 struct TargetState {
     index: usize,
     plan: Target,
+    /// The client of the target's pin, shared with the other targets on its machine.
+    client: Client,
     /// Fraction of the send interval by which this target's timetable is shifted.
     phase: f64,
     stats: Mutex<TargetStats>,
@@ -102,17 +104,23 @@ pub async fn run(plan: Plan) -> Result<Outcome, String> {
         earliest_send: start + plan.warmup - plan.grace,
     };
     let generator = Generator::new(plan.key, plan.words);
+    let mut clients = HashMap::new();
     let targets = plan
         .targets
         .into_iter()
         .enumerate()
-        .map(|(index, plan)| {
+        .map(|(index, target)| {
             let mut rng = generator.target_rng(index);
             let phase = rng.random::<f64>();
-            let samples = Reservoir::new(plan.samples, rng);
+            let samples = Reservoir::new(target.samples, rng);
+            let client = clients
+                .entry(target.pin)
+                .or_insert_with(|| Client::new(plan.max_response_bytes, target.pin))
+                .clone();
             Arc::new(TargetState {
                 index,
-                plan,
+                plan: target,
+                client,
                 phase,
                 stats: Mutex::new(TargetStats::new(window, samples)),
                 outstanding: AtomicUsize::new(0),
@@ -121,7 +129,6 @@ pub async fn run(plan: Plan) -> Result<Outcome, String> {
         .collect::<Vec<_>>();
     let shared = Arc::new(Shared {
         generator,
-        client: Client::new(plan.max_response_bytes),
         start,
         duration: plan.warmup + plan.test,
         timeout: plan.timeout,
@@ -222,7 +229,7 @@ async fn send(
     let sent_at = Instant::now();
     lock(&target.stats).record_send(scheduled, sent_at);
     drop(sends_recorded);
-    let outcome = shared.client.exchange(post, sent_at + shared.timeout).await;
+    let outcome = target.client.exchange(post, sent_at + shared.timeout).await;
     let exchange = Exchange {
         request_id: request.id,
         request: request.body,

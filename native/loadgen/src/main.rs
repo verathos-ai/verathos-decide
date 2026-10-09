@@ -1,7 +1,8 @@
-//! Open-loop HTTP load generator for the throughput audit.
+//! Open-loop HTTPS load generator for the throughput audit.
 //!
-//! Reads one JSON plan from stdin, drives every target at its declared rate at the same time, and
-//! writes one JSON result object to stdout. Logs go to stderr. Exits 0 on success, 2 for an invalid
+//! Reads one JSON plan from stdin, drives every target at its declared rate at the same time over
+//! TLS, accepting each target's certificate by the pin the plan gives (`tls`), and writes one JSON
+//! result object to stdout. Logs go to stderr. Exits 0 on success, 2 for an invalid
 //! plan and 1 for an internal failure.
 
 mod client;
@@ -11,6 +12,7 @@ mod report;
 mod reservoir;
 mod run;
 mod stats;
+mod tls;
 mod workload;
 
 use plan::Plan;

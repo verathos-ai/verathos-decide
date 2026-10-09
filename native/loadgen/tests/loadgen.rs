@@ -1,4 +1,6 @@
-//! End-to-end runs of the binary against local HTTP servers.
+//! End-to-end runs of the binary against local HTTPS servers. They present
+//! `fixtures/server.crt.der` (an ECDSA P-256 key and self-signed certificate made as the services
+//! make theirs), whose pin is `fixtures/server.pin`.
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -9,7 +11,10 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     process::{ExitStatus, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -18,8 +23,46 @@ use tokio::{
     process::Command,
     time::{sleep_until, Instant},
 };
+use tokio_rustls::{
+    rustls::{
+        self,
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    },
+    TlsAcceptor,
+};
 
 const SESSION: &str = "session-token";
+const PIN: &str = include_str!("fixtures/server.pin");
+/// A pin no server here has.
+const OTHER_PIN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn acceptor() -> TlsAcceptor {
+    static ACCEPTOR: OnceLock<TlsAcceptor> = OnceLock::new();
+    ACCEPTOR
+        .get_or_init(|| {
+            let certificate =
+                CertificateDer::from(include_bytes!("fixtures/server.crt.der").to_vec());
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                include_bytes!("fixtures/server.key.der").to_vec(),
+            ));
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], key)
+            .unwrap();
+            TlsAcceptor::from(Arc::new(config))
+        })
+        .clone()
+}
+
+/// A server's address and the TLS handshakes it completed.
+struct Server {
+    address: SocketAddr,
+    handshakes: Arc<AtomicUsize>,
+}
 
 #[derive(Clone, Copy)]
 enum Overload {
@@ -148,9 +191,11 @@ fn response(status: u16, body: String) -> Response<Full<Bytes>> {
     response
 }
 
-async fn serve(behavior: Behavior) -> SocketAddr {
+/// Serves `behavior` over TLS (over plain HTTP with `plain`).
+async fn serve_with(behavior: Behavior, plain: bool) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let handshakes = Arc::new(AtomicUsize::new(0));
     let limiter = behavior.capacity.map(|(rps, overload)| {
         Arc::new(Mutex::new(Limiter {
             interval: Duration::from_secs_f64(1.0 / rps),
@@ -158,35 +203,56 @@ async fn serve(behavior: Behavior) -> SocketAddr {
             next_free: Instant::now(),
         }))
     });
+    let counted = handshakes.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
-            let limiter = limiter.clone();
+            let (limiter, counted) = (limiter.clone(), counted.clone());
             tokio::spawn(async move {
                 let service = service_fn(move |request| handle(request, behavior, limiter.clone()));
+                if plain {
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                    return;
+                }
+                let Ok(stream) = acceptor().accept(stream).await else {
+                    return;
+                };
+                counted.fetch_add(1, Ordering::Relaxed);
                 let _ = http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
                     .await;
             });
         }
     });
-    address
+    Server {
+        address,
+        handshakes,
+    }
 }
 
-/// Reads part of each request, then closes the connection without answering.
+async fn serve(behavior: Behavior) -> SocketAddr {
+    serve_with(behavior, false).await.address
+}
+
+/// Completes the TLS handshake and reads part of each request, then closes the connection without
+/// answering.
 async fn serve_hangup() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
+            let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
             tokio::spawn(async move {
-                let mut buffer = [0u8; 64];
-                let _ = stream.read(&mut buffer).await;
+                if let Ok(mut stream) = acceptor().accept(stream).await {
+                    let mut buffer = [0u8; 64];
+                    let _ = stream.read(&mut buffer).await;
+                }
             });
         }
     });
@@ -214,9 +280,14 @@ fn questions() -> Value {
 }
 
 fn target(id: &str, address: SocketAddr, rate_rps: f64, samples: usize) -> Value {
+    pinned(id, address, PIN.trim(), rate_rps, samples)
+}
+
+fn pinned(id: &str, address: SocketAddr, pin: &str, rate_rps: f64, samples: usize) -> Value {
     json!({
         "id": id,
-        "url": format!("http://{address}/e/gpu0/v1/systemone"),
+        "url": format!("https://{address}/e/gpu0/v1/systemone"),
+        "tls": pin,
         "rate_rps": rate_rps,
         "max_outstanding": 2000,
         "headers": {"X-Verathos-Session": SESSION},
@@ -280,7 +351,8 @@ fn assert_near(actual: f64, expected: f64, tolerance: f64, what: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delivered_rate_tracks_the_offered_rate_up_to_capacity() {
-    let fast = serve(Behavior::answer(20)).await;
+    let fast_server = serve_with(Behavior::answer(20), false).await;
+    let fast = fast_server.address;
     let queued = serve(Behavior::answer(20).capacity(150.0, Overload::Queue)).await;
     let rejecting = serve(Behavior::answer(20).capacity(100.0, Overload::Reject)).await;
     let (warmup_s, test_s) = (1.0, 2.5);
@@ -351,6 +423,12 @@ async fn delivered_rate_tracks_the_offered_rate_up_to_capacity() {
         targets[1]["latency_ms"]["max"].as_f64().unwrap() > 1_000.0,
         "the queue should build up"
     );
+    // Connections are kept alive: about 3 requests are in flight at once, 420 are sent.
+    let handshakes = fast_server.handshakes.load(Ordering::Relaxed);
+    assert!(
+        (1..=24).contains(&handshakes),
+        "{handshakes} TLS handshakes"
+    );
 
     let samples = targets[0]["samples"].as_array().unwrap();
     assert_eq!(samples.len(), 5);
@@ -416,6 +494,12 @@ async fn failures_are_counted_by_kind() {
         ),
         ("slow", serve(Behavior::answer(2_000)).await, "timeout"),
         ("hangup", serve_hangup().await, "transport"),
+        ("other_pin", serve(Behavior::answer(5)).await, "tls"),
+        (
+            "plain",
+            serve_with(Behavior::answer(5), true).await.address,
+            "tls",
+        ),
     ];
     let start_at_ms = now_ms() - 5_000;
     let plan = plan(
@@ -425,7 +509,14 @@ async fn failures_are_counted_by_kind() {
         0.4,
         targets
             .iter()
-            .map(|(id, address, _)| target(id, *address, rate, 3))
+            .map(|(id, address, _)| {
+                let pin = if *id == "other_pin" {
+                    OTHER_PIN
+                } else {
+                    PIN.trim()
+                };
+                pinned(id, *address, pin, rate, 3)
+            })
             .collect(),
     );
     let result = run_plan(&plan).await;

@@ -33,19 +33,22 @@ def own_endpoints(config: MinerConfig, endpoints: list[EndpointConfig],
                      tier=e.tier, capacity_rps=capacity_rps[e.endpoint_id]) for e in endpoints]
 
 
-def build_manifest(config: MinerConfig, endpoints: list[Endpoint], keypair, cat: Catalog) -> SignedManifest:
-    """Sign the hotkey's manifest, built for ``cat`` and its mechanism (or the configured ``mechid``). The same
-    endpoints and catalog always give the same manifest, so a restart does not change the on-chain commitment."""
+def build_manifest(config: MinerConfig, endpoints: list[Endpoint], keypair, cat: Catalog,
+                   pins: dict[str, str]) -> SignedManifest:
+    """Sign the hotkey's manifest, built for ``cat`` and its mechanism (or the configured ``mechid``), with ``pins``
+    (each machine's base URL -> its certificate's pin; this machine's included). The same endpoints, pins and catalog
+    always give the same manifest, so a restart does not change the on-chain commitment."""
     manifest = Manifest(netuid=config.netuid, mechid=mechanism_of(cat, config.mechid), hotkey=keypair.ss58_address,
-                        catalog_digest=cat.digest(), endpoints=endpoints)
+                        catalog_digest=cat.digest(), endpoints=endpoints, tls=pins)
     return SignedManifest.create(manifest, keypair)
 
 
-def build_host_endpoints(config: MinerConfig, endpoints: list[Endpoint], keypair, cat: Catalog) -> SignedHostEndpoints:
-    """Sign what this machine serves, for the primary (``GET /v1/endpoints``), built for ``cat`` as the manifest
-    is."""
+def build_host_endpoints(config: MinerConfig, endpoints: list[Endpoint], keypair, cat: Catalog,
+                         pin: str) -> SignedHostEndpoints:
+    """Sign what this machine serves, with ``pin``, its certificate's, for the primary (``GET /v1/endpoints``), built
+    for ``cat`` as the manifest is."""
     host = HostEndpoints(netuid=config.netuid, mechid=mechanism_of(cat, config.mechid), hotkey=keypair.ss58_address,
-                         catalog_digest=cat.digest(), url=config.base_url, endpoints=endpoints)
+                         catalog_digest=cat.digest(), url=config.base_url, tls=pin, endpoints=endpoints)
     return SignedHostEndpoints.create(host, keypair)
 
 

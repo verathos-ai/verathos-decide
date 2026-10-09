@@ -20,6 +20,8 @@ from verathos import catalog
 from verathos.install import common, engines, host, plan
 from verathos.install.common import Prompter, info, step, warn
 from verathos.install.services import Manager, Service
+from verathos.protocol import tls
+from verathos.protocol.callers import egress_addresses
 from verathos.subnet.chain import current_catalog
 from verathos.validator.config import ValidatorConfig
 
@@ -54,6 +56,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--candidates", action=argparse.BooleanOptionalAction, default=None, help="Also run references for "
                    "the catalog's candidate models (checked, scored zero) where memory is left after the active ones; "
                    "a later run keeps them, --no-candidates removes them")
+    p.add_argument("--egress-ip", action="append", help="Full mode: a public IP address this validator's requests to "
+                   "miners come from (repeat for several; default: as configured, else detected)")
     p.add_argument("--config", type=Path, help="Validator configuration (default <home>/validator.json)")
     return p
 
@@ -116,7 +120,8 @@ def reference_line(reference_mode: str, placement: dict[str, str], parameters: d
 def validator_config(existing: dict, *, network: str, netuid: int, wallet_name: str, hotkey_name: str,
                      ports: dict[str, int], dry_run: bool, managed_before: set[str], home: Path,
                      mode: str = "full", reference_mode: str | None = None,
-                     launch: dict[str, dict] | None = None, auto_update: bool | None = None) -> dict:
+                     launch: dict[str, dict] | None = None, auto_update: bool | None = None,
+                     egress_ips: list[str] | None = None) -> dict:
     """The configuration to write: ``existing`` with this setup's answers and a local reference per model (model ->
     port; none in light mode), with the command that serves it where the validator starts it (``launch``: model ->
     command, directory, environment). References configured by hand (a remote engine) and other settings are kept."""
@@ -131,6 +136,8 @@ def validator_config(existing: dict, *, network: str, netuid: int, wallet_name: 
         config["reference_mode"] = reference_mode
     if auto_update is not None:
         config["auto_update"] = auto_update
+    if egress_ips is not None:
+        config["egress_ips"] = egress_ips
     config.setdefault("state_dir", str(home / "validator"))
     config.setdefault("catalog_dir", str(home / "catalog"))
     return config
@@ -247,6 +254,13 @@ def init(argv: list[str]) -> None:
             info(f"{m.model_id} ({plan.CANDIDATE}) runs on the {m.engine.name} engine, which this setup does not "
                  "install")
     info(f"validator with hotkey {wallet_name}/{hotkey_name}" + (", dry run: no weights set" if dry_run else ""))
+    egress = egress_ips(args, existing)
+    if not egress:
+        warn("no public egress address detected (pass --egress-ip): miners that admit callers by address would not "
+             "admit this validator")
+    info(f"egress address(es) {', '.join(egress) or 'none'}: "
+         + ("the catalog's auditor.egress names them" if owner else "published in this validator's chain commitment, "
+            "for miners to admit its requests"))
     info("self-update off: the auditor is updated by hand" if owner else common.update_line(auto_update))
     info(f"configuration {config_path}; engines and weights in {home}")
     if not ui.confirm("Go ahead?"):
@@ -282,13 +296,18 @@ def init(argv: list[str]) -> None:
     config = validator_config(existing, network=network, netuid=netuid, wallet_name=wallet_name,
                               hotkey_name=hotkey_name, ports=ports, dry_run=dry_run,
                               managed_before=set(record.engines), home=home, reference_mode=reference_mode,
-                              launch=launch, auto_update=auto_update)
+                              launch=launch, auto_update=auto_update, egress_ips=egress)
     try:
         ValidatorConfig.model_validate(config)
     except ValidationError as exc:
         raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
     common.write_json(config_path, config)
     info(f"wrote {config_path}")
+    if owner or config.get("public_host"):  # its service presents this certificate
+        identity = tls.identity(Path(config["state_dir"]))
+        info(f"TLS certificate {identity.cert_path}, pin {identity.pin}: "
+             + ("the catalog's auditor.tls must name it (verathos-subnet commit-catalog on this machine fills it in)"
+                if owner else "published in this validator's chain commitment"))
     if sequential:  # the validator starts them itself
         reference_services = {}
     validator_bin = Path(sys.prefix) / "bin" / "verathos-validator"
@@ -392,6 +411,20 @@ def place(parameters: dict[str, int], gpu_free: dict[int, int], ram_free: int, a
         parameters, {i: free + freed_gpu.get(i, 0) for i, free in gpu_free.items()}, ram_free + freed_ram,
         args.device, {m: e["device"] for m, e in record.engines.items()}, optional=candidates)
     return reference_mode, why, placement
+
+
+def egress_ips(args: argparse.Namespace, existing: dict) -> list[str]:
+    """The addresses a full validator's requests come from: as given (``--egress-ip``), as configured, else this
+    machine's detected public address."""
+    if args.egress_ip:
+        try:
+            return egress_addresses(args.egress_ip)
+        except ValueError as exc:
+            raise SystemExit(f"--egress-ip: {exc}") from None
+    if existing.get("egress_ips"):
+        return list(existing["egress_ips"])
+    detected = host.detect_public_ip()
+    return [detected] if detected else []
 
 
 def mode_lines(mode: str, cat: catalog.Catalog, owner: bool) -> list[str]:

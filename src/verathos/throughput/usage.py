@@ -35,6 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from verathos.catalog import SHARE_DIGITS, Catalog, UsagePool
 from verathos.protocol.http import get_json
+from verathos.protocol.tls import CA
 
 log = logging.getLogger(__name__)
 
@@ -281,7 +282,7 @@ def coldkeys_at(st: Any, hotkeys: Iterable[str], block: int) -> dict[str, str | 
 
 def tao_usd(fetch: Callable[..., Any] = get_json) -> float:
     """TAO's price in USD from ``TAO_USD_URL``. Raises if it does not give a positive number."""
-    price = float(fetch(TAO_USD_URL, limit=4096, timeout=15)["bittensor"]["usd"])
+    price = float(fetch(TAO_USD_URL, limit=4096, timeout=15, tls=CA)["bittensor"]["usd"])
     if not (math.isfinite(price) and price > 0):
         raise ValueError(f"not a price: {price}")
     return price

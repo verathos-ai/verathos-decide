@@ -16,6 +16,7 @@ from fastapi import Request
 
 from tests.lineups import two_active_and_a_candidate
 from tests.mock_engine import MockEngine
+from tests.tlsfake import Presenting, pin
 from verathos import catalog
 from verathos.miner.app import caller_request_bytes, create_app
 from verathos.miner.config import MinerConfig
@@ -29,14 +30,8 @@ from verathos.validator.scoring import ScoreState, epoch_scores, record_window, 
 pytestmark = pytest.mark.usefixtures("lab_network")
 
 
-class HostRouter(httpx.AsyncBaseTransport):
-    """Routes requests to in-process ASGI apps by host name."""
-
-    def __init__(self, apps: dict[str, object]) -> None:
-        self._t = {host: httpx.ASGITransport(app=app) for host, app in apps.items()}
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        return await self._t[request.url.host].handle_async_request(request)
+HostRouter = Presenting  # routes requests to in-process apps by host, each presenting its host's certificate
+PIN = "ab" * 32  # a certificate pin, for endpoints no request reaches
 
 
 def kp() -> Keypair:
@@ -46,13 +41,13 @@ def kp() -> Keypair:
 def miner(host: str, keypair: Keypair, validator: Keypair, engine: MockEngine):
     config = MinerConfig.model_validate({
         "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": 80,
-        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://unused",
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1",
                        "max_concurrency": 8}]})
     digest = catalog.load().digest()
     signed = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest=digest,
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
-                            capacity_rps=40.0)]), keypair)
+                            capacity_rps=40.0)], tls={config.base_url: pin(host)}), keypair)
     kev = catalog.load().get("kev-4b")
     app = create_app(config=config, keypair=keypair, manifest=lambda: signed, engines={"gpu0": engine},
                      authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set(),
@@ -216,13 +211,14 @@ def multi_host_miner(hotkey: Keypair, validator: Keypair, hosts: dict[str, list[
     kev = catalog.load().get("kev-4b")
     signed = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=hotkey.ss58_address, catalog_digest=digest,
-        endpoints=[Endpoint(endpoint_id=e, url=f"http://{host}:80/e/{e}", model_id="kev-4b", capacity_rps=40.0)
-                   for e, host in listed.items()]), hotkey)
+        endpoints=[Endpoint(endpoint_id=e, url=f"https://{host}:80/e/{e}", model_id="kev-4b", capacity_rps=40.0)
+                   for e, host in listed.items()], tls={f"https://{h}:80": pin(h) for h in listed.values()}), hotkey)
     apps = {}
     for host, served in hosts.items():
         config = MinerConfig.model_validate({
             "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": 80,
-            "endpoints": [{"endpoint_id": e, "model_id": "kev-4b", "engine_url": "http://unused"} for e in served]})
+            "endpoints": [{"endpoint_id": e, "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1"}
+                          for e in served]})
         apps[host] = create_app(config=config, keypair=hotkey, manifest=lambda: signed,
                                 engines={e: MockEngine("kev-4b") for e in served},
                                 authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set(),
@@ -255,7 +251,7 @@ def test_endpoints_on_several_machines_are_checked_where_they_are_and_another_se
                                             identities=identities)
 
     found, results = asyncio.run(epoch(7))
-    assert {e.host for e in found.endpoints()} == {f"http://{h}:80" for h in (axon, worker, victim)}
+    assert {e.host for e in found.endpoints()} == {f"https://{h}:80" for h in (axon, worker, victim)}
     by_id = {r.endpoint.endpoint.endpoint_id: r for r in results.values()}
     for e in ("gpu0", "w-gpu0", "w-gpu1"):
         assert by_id[e].identity_ok and by_id[e].answered == by_id[e].sent == 3
@@ -364,7 +360,7 @@ def test_a_manifest_accepted_before_stands_in_while_the_axon_is_out() -> None:
         return asyncio.run(run())
 
     (found,), results = epoch(1)
-    assert found.axon == f"http://{axon}:80" and all(r.answered == 2 for r in results.values())
+    assert found.axon == f"https://{axon}:80" and all(r.answered == 2 for r in results.values())
     down.add(axon)
     (found,), results = epoch(2)
     assert found.axon is None and [e.endpoint_id for e in found.manifest.endpoints] == ["gpu0", "w-gpu0"]
@@ -457,8 +453,8 @@ def test_window_catches_subtle_drift_no_single_epoch_shows() -> None:
     from verathos.validator.discovery import DiscoveredEndpoint
 
     tol = Tolerance(min_probabilities=100, mean_abs=0.005)
-    ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id="gpu0", url="http://x/e/gpu0", model_id="kev-4b",
-                                                           capacity_rps=40.0))
+    ep = DiscoveredEndpoint(1, "hkA", "https://x", Endpoint(endpoint_id="gpu0", url="https://x/e/gpu0",
+                                                           model_id="kev-4b", capacity_rps=40.0), tls=PIN)
     state = ScoreState()
     verdicts = []
     for _ in range(3):
@@ -479,8 +475,8 @@ def test_score_is_proven_capacity_and_a_proven_wrong_answer_resets_the_hotkey() 
     from verathos.validator.discovery import DiscoveredEndpoint
 
     def result(hotkey: str, endpoint_id: str, uid: int) -> EndpointResult:
-        ep = DiscoveredEndpoint(uid, hotkey, "http://x", Endpoint(endpoint_id=endpoint_id,
-                                url=f"http://x/e/{endpoint_id}", model_id="kev-4b", capacity_rps=50.0))
+        ep = DiscoveredEndpoint(uid, hotkey, "https://x", Endpoint(endpoint_id=endpoint_id,
+                                url=f"https://x/e/{endpoint_id}", model_id="kev-4b", capacity_rps=50.0), tls=PIN)
         return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4,
                               latencies_ms=[40.0] * 4)
 
@@ -505,8 +501,8 @@ def test_credited_capacity() -> None:
     from verathos.validator.__main__ import credited_capacity
     from verathos.validator.discovery import DiscoveredEndpoint
 
-    endpoints = [DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=e, url=f"http://x/e/{e}",
-                                    model_id=model, capacity_rps=rps))
+    endpoints = [DiscoveredEndpoint(1, "hkA", "https://x", Endpoint(endpoint_id=e, url=f"https://x/e/{e}",
+                                    model_id=model, capacity_rps=rps), tls=PIN)
                  for e, model, rps in (("a", "kev-4b", 30.0), ("b", "kev-4b", 50.0), ("c", "kev-4b", 50.0),
                                        ("d", "kev-9b", 50.0))]
 
@@ -546,8 +542,8 @@ def test_latency_factor_comes_from_the_test_latencies() -> None:
     from verathos.validator.discovery import DiscoveredEndpoint
 
     def result(endpoint_id: str) -> EndpointResult:
-        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}",
-                                model_id="kev-4b", capacity_rps=20.0))
+        ep = DiscoveredEndpoint(1, "hkA", "https://x", Endpoint(endpoint_id=endpoint_id, url=f"https://x/e/{endpoint_id}",
+                                model_id="kev-4b", capacity_rps=20.0), tls=PIN)
         # canary latencies (the validator's own view) no longer matter
         return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4,
                               latencies_ms=[9_999.0] * 4)
@@ -571,8 +567,8 @@ def test_what_users_got_from_an_endpoint_counts_once_there_is_enough_of_it() -> 
     from verathos.validator.discovery import DiscoveredEndpoint
 
     def result(endpoint_id: str) -> EndpointResult:
-        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}",
-                                model_id="kev-4b", capacity_rps=20.0))
+        ep = DiscoveredEndpoint(1, "hkA", "https://x", Endpoint(endpoint_id=endpoint_id, url=f"https://x/e/{endpoint_id}",
+                                model_id="kev-4b", capacity_rps=20.0), tls=PIN)
         return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4)
 
     results = {k: result(k.split("/")[1]) for k in ("hkA/fast", "hkA/hoarder", "hkA/quiet")}
@@ -597,8 +593,8 @@ def test_answering_users_near_twice_the_latency_bound_earns_next_to_nothing() ->
     from verathos.validator.discovery import DiscoveredEndpoint
 
     def result(endpoint_id: str) -> EndpointResult:
-        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}",
-                                model_id="kev-4b", capacity_rps=20.0))
+        ep = DiscoveredEndpoint(1, "hkA", "https://x", Endpoint(endpoint_id=endpoint_id, url=f"https://x/e/{endpoint_id}",
+                                model_id="kev-4b", capacity_rps=20.0), tls=PIN)
         return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4)
 
     results = {k: result(k.split("/")[1]) for k in ("hkA/quick", "hkA/bound", "hkA/dawdler")}
@@ -619,8 +615,8 @@ def test_a_model_whose_endpoints_all_refuse_users_scores_zero_and_stops_nothing(
     from verathos.validator.discovery import DiscoveredEndpoint
 
     def result(endpoint_id: str) -> EndpointResult:
-        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}",
-                                model_id="kev-4b", capacity_rps=20.0))
+        ep = DiscoveredEndpoint(1, "hkA", "https://x", Endpoint(endpoint_id=endpoint_id, url=f"https://x/e/{endpoint_id}",
+                                model_id="kev-4b", capacity_rps=20.0), tls=PIN)
         return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4)
 
     results = {k: result(k.split("/")[1]) for k in ("hkA/a", "hkA/b")}
@@ -648,8 +644,8 @@ def test_splitting_capacity_over_endpoints_does_not_move_the_latency_median() ->
     from verathos.validator.discovery import DiscoveredEndpoint
 
     def result(hotkey: str, endpoint_id: str) -> EndpointResult:
-        ep = DiscoveredEndpoint(1, hotkey, "http://x", Endpoint(endpoint_id=endpoint_id,
-                                url=f"http://x/e/{endpoint_id}", model_id="kev-4b", capacity_rps=20.0))
+        ep = DiscoveredEndpoint(1, hotkey, "https://x", Endpoint(endpoint_id=endpoint_id,
+                                url=f"https://x/e/{endpoint_id}", model_id="kev-4b", capacity_rps=20.0), tls=PIN)
         return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4)
 
     for parts in (2, 10):
@@ -682,8 +678,8 @@ def test_a_canary_failure_puts_the_whole_hotkey_on_probation() -> None:
     from verathos.validator.discovery import DiscoveredEndpoint
 
     def result(endpoint_id: str) -> EndpointResult:
-        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}",
-                                model_id="kev-4b", capacity_rps=20.0))
+        ep = DiscoveredEndpoint(1, "hkA", "https://x", Endpoint(endpoint_id=endpoint_id, url=f"https://x/e/{endpoint_id}",
+                                model_id="kev-4b", capacity_rps=20.0), tls=PIN)
         return EndpointResult(ep, Tolerance(), identity_ok=True, sent=4, answered=4, latencies_ms=[40.0] * 4)
 
     state = ScoreState(ema={"hkA/gpu0": 10.0, "hkA/spare": 0.0}, window={"hkA/gpu0": [[1.0, 10.0]]})
@@ -744,8 +740,8 @@ def test_hostile_replies_fail_the_endpoint_without_aborting_the_epoch() -> None:
             return PlainTextResponse('{"answers": {"q": {"noul": NaN}}, "receipt": []}',
                                      media_type="application/json")
 
-    signed, unsigned = (DiscoveredEndpoint(1, hostile_kp.ss58_address, f"http://{host}:80", Endpoint(
-        endpoint_id="gpu0", url=f"http://{host}:80/e/gpu0", model_id="kev-4b", capacity_rps=40.0))
+    signed, unsigned = (DiscoveredEndpoint(1, hostile_kp.ss58_address, f"https://{host}:80", Endpoint(
+        endpoint_id="gpu0", url=f"https://{host}:80/e/gpu0", model_id="kev-4b", capacity_rps=40.0), tls=pin(host))
         for host in apps)
 
     async def run(ep):
@@ -778,8 +774,8 @@ def test_renamed_endpoint_inherits_probation() -> None:
     from verathos.validator.discovery import DiscoveredEndpoint
 
     def result(endpoint_id: str) -> EndpointResult:
-        ep = DiscoveredEndpoint(1, "hkA", "http://x", Endpoint(
-            endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}", model_id="kev-4b", capacity_rps=40.0))
+        ep = DiscoveredEndpoint(1, "hkA", "https://x", Endpoint(
+            endpoint_id=endpoint_id, url=f"https://x/e/{endpoint_id}", model_id="kev-4b", capacity_rps=40.0), tls=PIN)
         return EndpointResult(ep, Tolerance(), identity_ok=True, sent=4, answered=4, latencies_ms=[40.0] * 4)
 
     state = ScoreState()
@@ -827,8 +823,9 @@ def test_huge_numbers_and_deep_json_are_malformed_not_fatal() -> None:
         return PlainTextResponse('{"answers": {"q": {"noul": 1' + "0" * 400 + '}}, "receipt": {}}',
                                  media_type="application/json")
 
-    ep = DiscoveredEndpoint(1, hostile_kp.ss58_address, "http://10.0.0.9:80", Endpoint(
-        endpoint_id="gpu0", url="http://10.0.0.9:80/e/gpu0", model_id="kev-4b", capacity_rps=40.0))
+    ep = DiscoveredEndpoint(1, hostile_kp.ss58_address, "https://10.0.0.9:80", Endpoint(
+        endpoint_id="gpu0", url="https://10.0.0.9:80/e/gpu0", model_id="kev-4b", capacity_rps=40.0),
+        tls=pin("10.0.0.9"))
 
     async def run():
         async with httpx.AsyncClient(transport=HostRouter({"10.0.0.9": app})) as client:
@@ -884,8 +881,8 @@ def test_each_model_pool_is_split_by_its_own_endpoints() -> None:
     from verathos.validator.discovery import DiscoveredEndpoint
 
     def result(hotkey: str, model: str) -> EndpointResult:
-        ep = DiscoveredEndpoint(1, hotkey, "http://x", Endpoint(endpoint_id="gpu0", url="http://x/e/gpu0",
-                                model_id=model, capacity_rps=50.0))
+        ep = DiscoveredEndpoint(1, hotkey, "https://x", Endpoint(endpoint_id="gpu0", url="https://x/e/gpu0",
+                                model_id=model, capacity_rps=50.0), tls=PIN)
         return EndpointResult(ep, Tolerance(min_probabilities=1), identity_ok=True, sent=4, answered=4)
 
     results = {"a/gpu0": result("a", "kev-4b"), "b/gpu0": result("b", "kev-4b"), "c/gpu0": result("c", "kev-9b")}

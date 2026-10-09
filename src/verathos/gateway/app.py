@@ -410,7 +410,7 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         cat = g.catalog()
         if g.routes() is None or cat is None:
             return "no routes from the auditor yet"
-        if g.hotkey not in cat.gateways:
+        if g.hotkey not in cat.gateway_hotkeys():
             return "this gateway's hotkey is not among the catalog's gateways"
         return None
 

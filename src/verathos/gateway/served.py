@@ -34,6 +34,7 @@ from verathos.protocol.gateway import (
 )
 from verathos.protocol.http import post_idempotent
 from verathos.protocol.requests import sign_request
+from verathos.protocol.tls import Service
 
 log = logging.getLogger(__name__)
 REPORT_S = 5.0
@@ -55,9 +56,9 @@ class ServedCounter:
     """Counts per endpoint and second; the router's observer (``router.Observer``)."""
 
     def __init__(self, keypair: Keypair, client: httpx.AsyncClient, *,
-                 auditor_url: Callable[[], Awaitable[str | None]], auditor_hotkey: str,
+                 auditor: Callable[[], Awaitable[Service | None]], auditor_hotkey: str,
                  clock: Callable[[], float] = time.time) -> None:
-        self.keypair, self.client, self.auditor_url, self.auditor_hotkey = keypair, client, auditor_url, auditor_hotkey
+        self.keypair, self.client, self.auditor, self.auditor_hotkey = keypair, client, auditor, auditor_hotkey
         self.clock = clock
         self._counts: dict[tuple[str, str, int], _Second] = {}  # (hotkey, endpoint, second) -> counts
         self._unsent: list[tuple[int, int, bytes]] = []  # failed posts: (their latest second, counts, body)
@@ -105,26 +106,27 @@ class ServedCounter:
         if not self._unsent:
             return
         try:
-            url = await self.auditor_url()
+            auditor = await self.auditor()
         except Exception as exc:
             log.warning("the auditor's address is unknown: %s", exc)
             return
-        if not url:
+        if auditor is None:
             log.warning("the auditor's address is unknown: %d served counts wait", self.pending())
             return
         for post in list(self._unsent):
             try:
-                await self._post(url.rstrip("/") + SERVED_PATH, post[2])
+                await self._post(auditor, post[2])
             except Exception as exc:
                 log.warning("reporting served counts failed: %s", exc)
                 continue
             self._unsent.remove(post)
 
-    async def _post(self, url: str, body: bytes) -> None:
+    async def _post(self, auditor: Service, body: bytes) -> None:
         def headers() -> dict[str, str]:
             return {"Content-Type": "application/json",
                     **sign_request(self.keypair, "POST", SERVED_PATH, body, self.auditor_hotkey)}
-        await post_idempotent(self.client, url, body, headers, timeout=10)
+        await post_idempotent(self.client, auditor.url.rstrip("/") + SERVED_PATH, body, headers, timeout=10,
+                              tls=auditor.pin)
 
     async def run(self) -> None:
         while True:

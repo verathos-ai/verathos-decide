@@ -35,6 +35,7 @@
 #   validator: --device auto|cpu|gpu --dry-run --candidates (also references for candidate models)
 #              --references resident|sequential  (full: every reference running, or one at a time, which needs
 #                                                 memory for the largest only; default: resident if they fit)
+#              --egress-ip <ip>  (full: an address its requests to miners come from; default: detected)
 set -euo pipefail
 
 PUBLIC_REPOSITORY="https://github.com/<org>/verathos.git"

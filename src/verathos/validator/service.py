@@ -1,4 +1,4 @@
-"""The validator's HTTP service on its axon.
+"""The validator's service on its axon, over TLS only.
 
 The subnet owner's validator serves catalogs by digest (``GET /v1/catalog/{digest}``) so miners and validators can
 fetch a newly committed catalog; as the throughput auditor it serves its signed verdicts
@@ -6,7 +6,8 @@ fetch a newly committed catalog; as the throughput auditor it serves its signed 
 (``protocol.gateway``). It serves each hotkey's status (``GET /v1/status/{hotkey}``, see ``validator.status``) and all
 of them at once with the weights it set (``GET /v1/network``, which light validators follow), both signed with its
 hotkey (``protocol.status``). A full validator with a ``public_host`` serves these two as well; other validators run no
-service.
+service. The service presents the validator's certificate (``protocol.tls``, kept in its state directory): the
+auditor's pin is in the catalog, another validator's in its chain commitment (``protocol.callers``).
 
 A hotkey's signed status is built at most once per ``STATUS_CACHE_S`` (sooner once the board publishes an epoch or the
 auditor records, confirms or voids a test), and may be cached as long; the network's is built once per epoch and
@@ -54,6 +55,7 @@ from verathos.protocol.status import (
     HotkeyStatus,
     sign_document,
 )
+from verathos.protocol.tls import Identity, server_options
 from verathos.subnet.chain import serve_axon
 from verathos.throughput.auditor import Auditor
 from verathos.throughput.feed import VERDICTS_PATH
@@ -245,7 +247,7 @@ def add_gateway_routes(app: FastAPI, auditor: Auditor, *, probation: Callable[[]
             return {"taken": await asyncio.to_thread(auditor.accept_served, report.counts, report.report_id)}
 
 
-def start_service(*, st: bt.Subtensor, wallet: bt.Wallet, netuid: int, public_host: str, port: int,
+def start_service(*, st: bt.Subtensor, wallet: bt.Wallet, netuid: int, public_host: str, port: int, identity: Identity,
                   store: CatalogStore | None, auditor: Auditor | None, board: StatusBoard,
                   probation: Callable[[], Collection[str]] = frozenset,
                   gateways: Callable[[], Collection[str]] = frozenset) -> None:
@@ -264,7 +266,8 @@ def start_service(*, st: bt.Subtensor, wallet: bt.Wallet, netuid: int, public_ho
         add_verdicts_route(app, auditor)
         add_gateway_routes(app, auditor, probation=probation, gateways=gateways)
     logging.getLogger("uvicorn.error").addFilter(_DropInvalidRequests())
-    server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning", access_log=False))
+    server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning", access_log=False,
+                                           **server_options(identity)))
     thread = threading.Thread(target=server.run, name="validator-service", daemon=True)
     thread.start()
     while not server.started:
@@ -272,6 +275,6 @@ def start_service(*, st: bt.Subtensor, wallet: bt.Wallet, netuid: int, public_ho
             raise SystemExit(f"the validator service could not start on port {port}")
         time.sleep(0.1)
     serve_axon(st, wallet, netuid, public_host, port)
-    log.info("validator service on port %d (%s)", port, ", ".join(
+    log.info("validator service on port %d, TLS certificate pin %s (%s)", port, identity.pin, ", ".join(
         role for role, on in (("status and weights", True), ("catalog", store is not None),
                               ("throughput verdicts", auditor is not None)) if on))

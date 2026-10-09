@@ -1,6 +1,6 @@
 //! The run plan read from stdin and its validation.
 
-use crate::hex;
+use crate::{hex, tls::Pin};
 use hyper::{
     header::{self, HeaderMap, HeaderName, HeaderValue},
     Uri,
@@ -56,6 +56,7 @@ struct PlanInput {
 struct TargetInput {
     id: String,
     url: String,
+    tls: String,
     rate_rps: f64,
     max_outstanding: usize,
     #[serde(default)]
@@ -87,6 +88,8 @@ pub struct Plan {
 pub struct Target {
     pub id: String,
     pub uri: Uri,
+    /// The pin of the endpoint's certificate: the SHA-256 of its SubjectPublicKeyInfo.
+    pub pin: Pin,
     pub rate_rps: f64,
     pub max_outstanding: usize,
     pub headers: HeaderMap,
@@ -169,7 +172,8 @@ impl Target {
         if input.id.is_empty() {
             return Err("id must not be empty".into());
         }
-        let uri = http_uri(&input.url)?;
+        let uri = https_uri(&input.url)?;
+        let pin = tls_pin(&input.tls)?;
         if !(input.rate_rps.is_finite()
             && (0.0..=f64::from(MAX_RATE_RPS)).contains(&input.rate_rps))
         {
@@ -197,6 +201,7 @@ impl Target {
             headers: static_headers(&input.headers)?,
             id: input.id,
             uri,
+            pin,
             rate_rps: input.rate_rps,
             max_outstanding: input.max_outstanding,
             model: input.model,
@@ -227,14 +232,25 @@ fn seed_key(seed: &str) -> Result<[u8; 32], String> {
     }
 }
 
-fn http_uri(url: &str) -> Result<Uri, String> {
+fn https_uri(url: &str) -> Result<Uri, String> {
     let uri: Uri = url
         .parse()
         .map_err(|error| format!("url {url:?} is invalid: {error}"))?;
-    if uri.scheme_str() != Some("http") || uri.host().is_none_or(str::is_empty) {
-        return Err(format!("url {url:?} must be an absolute http:// URL"));
+    if uri.scheme_str() != Some("https") || uri.host().is_none_or(str::is_empty) {
+        return Err(format!("url {url:?} must be an absolute https:// URL"));
     }
     Ok(uri)
+}
+
+fn tls_pin(pin: &str) -> Result<Pin, String> {
+    match hex::decode(pin) {
+        Some(bytes) if pin.len() == 64 && pin == pin.to_ascii_lowercase() => {
+            Ok(bytes.try_into().expect("32 bytes"))
+        }
+        _ => Err(format!(
+            "tls {pin:?} must be a certificate pin: 64 lowercase hex digits"
+        )),
+    }
 }
 
 fn static_headers(input: &BTreeMap<String, String>) -> Result<HeaderMap, String> {
@@ -273,7 +289,8 @@ pub(crate) mod tests {
             "seed": "00112233445566778899aabbccddeeff",
             "targets": [{
                 "id": "hotkey/gpu0",
-                "url": "http://203.0.113.5:8091/e/gpu0/v1/systemone",
+                "url": "https://203.0.113.5:8091/e/gpu0/v1/systemone",
+                "tls": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
                 "rate_rps": 42.5,
                 "max_outstanding": 2000,
                 "headers": {"X-Verathos-Session": "abc", "X-Verathos-Session-Signature": "0xdef"},
@@ -316,6 +333,7 @@ pub(crate) mod tests {
         assert_eq!(target.uri.host(), Some("203.0.113.5"));
         assert_eq!(target.uri.port_u16(), Some(8091));
         assert_eq!(target.uri.path(), "/e/gpu0/v1/systemone");
+        assert_eq!(target.pin[..2], [0x00, 0x11]);
         assert_eq!(target.state_words, 150..=1200);
         assert_eq!(target.headers["x-verathos-session"], "abc");
         assert_eq!(target.headers.len(), 2);
@@ -384,10 +402,22 @@ pub(crate) mod tests {
         rejects(target("model", json!("")), "model");
         rejects(target("id", json!("")), "id");
         rejects(
-            target("url", json!("https://203.0.113.5/e/gpu0/v1/systemone")),
-            "http://",
+            target("url", json!("http://203.0.113.5/e/gpu0/v1/systemone")),
+            "https://",
         );
-        rejects(target("url", json!("/e/gpu0/v1/systemone")), "http://");
+        rejects(target("url", json!("/e/gpu0/v1/systemone")), "https://");
+        rejects(target("tls", json!("0011")), "certificate pin");
+        rejects(
+            target("tls", json!("00".repeat(31) + "AB")),
+            "certificate pin",
+        );
+        rejects(target("tls", json!("zz".repeat(32))), "certificate pin");
+        rejects(
+            |p| {
+                p["targets"][0].as_object_mut().unwrap().remove("tls");
+            },
+            "missing field",
+        );
         rejects(target("url", json!("http://exa mple/")), "invalid");
         rejects(
             target("headers", json!({"Content-Type": "text/plain"})),

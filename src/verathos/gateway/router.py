@@ -127,10 +127,11 @@ class Router:
         self._throttled = Throttle(clock=clock)
 
     def update(self, routes: Routes) -> None:
-        """Adopt a new table; endpoints that stay keep their load and breaker. A route is used only at a URL a
-        manifest may list (``protocol.manifest.endpoint_host``: a public address, any machine of the miner), so not
-        even a table the auditor signed can send this process's requests into a private network."""
-        known = {(e.key, e.route.url): e for pool in self._pools.values() for e in pool.endpoints}
+        """Adopt a new table; endpoints that stay (same URL and certificate pin) keep their load and breaker. A route is
+        used only at a URL a manifest may list (``protocol.manifest.endpoint_host``: a public address, any machine of
+        the miner), so not even a table the auditor signed can send this process's requests into a private
+        network."""
+        known = {(e.key, e.route.url, e.route.tls): e for pool in self._pools.values() for e in pool.endpoints}
         grouped: dict[str, list[Endpoint]] = {}
         for route in routes.routes:
             if endpoint_host(route.url, route.endpoint_id) is None:
@@ -139,7 +140,7 @@ class Router:
                               route.hotkey, route.endpoint_id, times, route.url)
                 continue
             cap = max(1, math.ceil(route.credited_rps * self.max_latency_s * self.share))
-            endpoint = known.get((f"{route.hotkey}/{route.endpoint_id}", route.url))
+            endpoint = known.get((f"{route.hotkey}/{route.endpoint_id}", route.url, route.tls))
             if endpoint is None:
                 endpoint = Endpoint(route, cap)
             else:
@@ -163,7 +164,8 @@ class Router:
     def describe(self) -> list[dict[str, object]]:
         """Every endpoint with the router's state of it."""
         now = self.clock()
-        return [{"model": model, "endpoint": e.key, "url": e.route.url, "credited_rps": e.route.credited_rps,
+        return [{"model": model, "endpoint": e.key, "url": e.route.url, "tls": e.route.tls,
+                 "credited_rps": e.route.credited_rps,
                  "latency_ms": e.route.latency_ms, "cap": e.cap, "in_flight": e.in_flight,
                  "busy_for_s": round(max(e.busy_until - now, 0.0), 1), "slow": e.slow, "last_failure": e.last_failure,
                  "breaker": {"open": e.breaker.is_open, "failures": e.breaker.failures, "probing": e.breaker.probing,

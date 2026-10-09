@@ -4,8 +4,10 @@
                       the epoch and the miner share in it, the usage pool
     setup-mechanisms  mechanism count 2 and the emission split (owner coldkey)
     commit-catalog    publish a catalog file: store it where the owner's validator serves it, commit its digest; the
-                      mechanism it names must exist on chain, and a usage pool's buyback coldkey must not be the
-                      subnet owner's coldkey
+                      mechanism it names must exist on chain, a usage pool's buyback coldkey must not be the subnet
+                      owner's coldkey, and it must name the auditor's TLS pin and egress addresses and each gateway's
+                      egress addresses; run on the auditor's machine, it fills in the auditor's pin and egress
+                      addresses from the validator's configuration and certificate where the file names none
 
 The owner coldkey comes from a bittensor wallet (``--wallet``, password prompt) or, for unattended test networks,
 from a mnemonic in the OS keyring (``--keyring SERVICE:USER``).
@@ -24,6 +26,7 @@ import bittensor as bt
 from bittensor_wallet import Keypair
 
 from verathos import __version__, catalog, release
+from verathos.protocol import tls
 from verathos.subnet.chain import committed_catalog, current_catalog
 
 MAX_UIDS_TWO_MECHANISMS = 128  # chain rule: max UIDs x mechanism count <= 256
@@ -108,6 +111,8 @@ def status(st: bt.Subtensor, netuid: int) -> None:
         "shipped_catalog": shipped.digest(),
         "shipped_catalog_is_committed": committed == shipped.digest(),
         "catalog_mechanism": cat.mechanism if cat else None,
+        "auditor": cat.auditor.model_dump() if cat and cat.auditor else None,
+        "gateways": [g.model_dump() for g in cat.gateways] if cat else None,
         "epoch": epoch,
         "miner_share": cat.scoring.miner_share_at(epoch) if cat else None,
         "weights_version_key": q("SubtensorModule", "WeightsVersionKey", [netuid]).value,
@@ -136,11 +141,42 @@ def setup_mechanisms(st: bt.Subtensor, kp: Keypair, netuid: int, split: str) -> 
                {"netuid": netuid, "maybe_split": [first, SPLIT_SCALE - first]})
 
 
-def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path | None, store_dir: Path) -> None:
-    """Validate the catalog, put it in the owner validator's catalog store, then commit its digest."""
+def with_auditor(document: dict, validator_config: Path | None) -> dict:
+    """``document`` with the auditor's pin and egress addresses filled in where it names none, from the auditor's
+    configuration on this machine (``validator_config``: its ``egress_ips`` and the certificate in its
+    ``state_dir``). Refuses a pin that differs from the certificate's."""
+    config: dict = {}
+    if validator_config is not None and validator_config.expanduser().exists():
+        config = json.loads(validator_config.expanduser().read_text())
+    state_dir = Path(config.get("state_dir", "~/.verathos/validator"))
+    served = tls.stored_pin(state_dir) if config else None
+    auditor = dict(document.get("auditor") or {})
+    if served is not None and auditor.get("tls") not in (None, served):
+        raise SystemExit(f"the catalog names {auditor['tls']} as the auditor's TLS pin, but the auditor's certificate "
+                         f"in {state_dir} has pin {served}: name the pin the auditor serves (or leave auditor.tls out "
+                         "to fill it in)")
+    filled = []
+    if "tls" not in auditor and served is not None:
+        auditor["tls"] = served
+        filled.append(f"auditor.tls {served} (from {state_dir})")
+    if not auditor.get("egress") and config.get("egress_ips"):
+        auditor["egress"] = list(config["egress_ips"])
+        filled.append(f"auditor.egress {', '.join(auditor['egress'])} (from {validator_config})")
+    for line in filled:
+        print(f"filled in {line}", flush=True)
+    return {**document, "auditor": auditor} if auditor else document
+
+
+def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path | None, store_dir: Path,
+                   validator_config: Path | None = None) -> None:
+    """Validate the catalog (with the auditor's pin and egress addresses filled in from ``validator_config`` where it
+    names none), put it in the owner validator's catalog store, then commit its digest."""
     if wallet.hotkey.ss58_address != st.get_subnet_owner_hotkey(netuid):
         raise SystemExit(f"{wallet.hotkey.ss58_address} is not the subnet owner hotkey")
-    cat = catalog.load(path)
+    document = json.loads(path.read_text()) if path else catalog.load().document()
+    cat = catalog.Catalog.parse(with_auditor(document, validator_config))
+    if problems := cat.identity_problems():
+        raise SystemExit("the catalog must name: " + "; ".join(problems) + " (docs/SUBNET_ADMIN.md)")
     cat.audit_policy(strict=True)  # nodes ignore settings their code does not know; a publisher must not mistype one
     if unknown := cat.unknown_settings():
         raise SystemExit(f"settings this code does not know: {', '.join(unknown)}")
@@ -187,6 +223,9 @@ def main() -> None:
     commit.add_argument("--file", type=Path, help="catalog JSON to publish (default: the shipped catalog)")
     commit.add_argument("--catalog-dir", type=Path, default=catalog.DEFAULT_CACHE_DIR,
                         help="the owner validator's catalog_dir, where it serves catalogs from")
+    commit.add_argument("--validator-config", type=Path, default=Path("~/.verathos/validator.json"),
+                        help="the auditor's configuration on this machine, whose certificate (in its state_dir) and "
+                        "egress_ips fill in the catalog's auditor section where it names none")
     args = parser.parse_args()
 
     st = bt.Subtensor(network=args.network)
@@ -196,7 +235,8 @@ def main() -> None:
         setup_mechanisms(st, owner_coldkey(args, st), args.netuid, args.split)
         status(st, args.netuid)
     else:
-        commit_catalog(st, bt.Wallet(name=args.wallet, hotkey=args.hotkey), args.netuid, args.file, args.catalog_dir)
+        commit_catalog(st, bt.Wallet(name=args.wallet, hotkey=args.hotkey), args.netuid, args.file, args.catalog_dir,
+                       args.validator_config)
     st.close()
 
 

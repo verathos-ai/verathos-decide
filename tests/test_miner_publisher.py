@@ -29,6 +29,7 @@ from verathos.miner.app import create_app
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import EngineError
 from verathos.miner.timing import MeasurementWindow
+from verathos.protocol import tls
 from verathos.throughput import measure
 from verathos.throughput.follow import ScheduleFollower
 from verathos.throughput.policy import AuditPolicy, Schedule, ScheduledTest
@@ -72,12 +73,13 @@ def test_capacity_is_measured_through_the_service_and_a_dead_engine_is_withdrawn
     cat = catalog.load()
     chain = SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: auditor.ss58_address)
     publisher = miner_main.Publisher(config, SimpleNamespace(hotkey=keypair), cat, publish_on_chain=False,
-                                     subtensor=chain)
+                                     subtensor=chain, identity=tls.identity(config.state_dir))
     engines = {"gpu0": CapacityEngine(rps=100), "gpu1": Down()}
     app = create_app(config=config, keypair=keypair, manifest=lambda: publisher.signed, engines=engines,
                      authorized=lambda hk: False, auditors=publisher.auditors, admissions=publisher.admissions,
                      serving=lambda: publisher.serving)
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
+                                           **tls.server_options(publisher.identity)))
     threading.Thread(target=server.run, daemon=True).start()
     while not server.started:
         time.sleep(0.05)
@@ -102,7 +104,8 @@ def test_a_test_arriving_at_the_start_delays_the_first_manifest_instead_of_stopp
         "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:9"}]})
     keypair = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
     publisher = miner_main.Publisher(config, SimpleNamespace(hotkey=keypair), catalog.load(), publish_on_chain=False,
-                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"))
+                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"),
+                                     identity=tls.identity(config.state_dir))
     outcomes = iter([(False, True), (False, True), (True, False)])  # (adopted, interrupted)
 
     def adopt(cat, *, remeasure):
@@ -177,7 +180,8 @@ def test_a_lost_chain_connection_is_one_warning_line_and_a_programming_error_kee
         "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:9"}]})
     keypair = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
     publisher = miner_main.Publisher(config, SimpleNamespace(hotkey=keypair), catalog.load(), publish_on_chain=False,
-                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"))
+                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"),
+                                     identity=tls.identity(config.state_dir))
     failure: list[Exception] = []
 
     def committed(st, netuid):

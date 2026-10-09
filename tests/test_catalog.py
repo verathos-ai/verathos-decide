@@ -105,7 +105,7 @@ def test_manifests_of_the_previous_catalog_stay_accepted_across_a_validator_rest
 
     first = catalog.load()  # mechanism 0
     second = catalog.Catalog.parse({**first.document(), "mechanism": 1,
-                                    "gateways": [Keypair.create_from_uri("//gw").ss58_address]})
+                                    "gateways": [{"hotkey": Keypair.create_from_uri("//gw").ss58_address}]})
     committed = {"catalog": first}
     monkeypatch.setattr(follow, "current_catalog", lambda *args, **kwargs: committed["catalog"])
     store = catalog.CatalogStore(tmp_path)

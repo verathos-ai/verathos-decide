@@ -6,14 +6,15 @@
                                answers, input tokens, how often it was considered for a user request and how often
                                it was not ready or refused, and how long its answers took
 
-A route is an endpoint listed in an accepted manifest that has qualified and is credited in the auditor's current
-verdicts, whose hotkey has no proven wrong answer there and is not on probation at the owner's validator. A sample is
-a request the gateway sent and the response it received, picked after the answer arrived; the miner's receipt binds
-the answers to the request and names the gateway as caller, so a wrong answer is proof against the miner. Miners
-serve the gateway before the auditor's test traffic, so the auditor counts what an endpoint answered the gateway
-inside a test's measured window as delivered too. What users get from an endpoint outside the tests (refusals and
-latency) is scored too: tests are known shortly ahead and their requests are recognisable, so they alone cannot show
-it.
+All of it over TLS, accepting the auditor's certificate by the pin the catalog names. A route is an endpoint listed in
+an accepted manifest, with the pin of its machine's TLS certificate, that has qualified and is credited in the
+auditor's current verdicts, whose hotkey has no proven wrong answer there and is not on probation at the owner's
+validator. A sample is a request the gateway sent and the response it received, picked after the answer arrived; the
+miner's receipt binds the answers to the request and names the gateway as caller, so a wrong answer is proof against
+the miner. Miners serve the gateway before the auditor's test traffic, so the auditor counts what an endpoint answered
+the gateway inside a test's measured window as delivered too. What users get from an endpoint outside the tests
+(refusals and latency) is scored too: tests are known shortly ahead and their requests are recognisable, so they alone
+cannot show it.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from verathos.protocol import signing
 from verathos.protocol.api import MAX_RESPONSE_BYTES
+from verathos.protocol.tls import PIN_PATTERN
 
 ROUTES_PATH = "/v1/routes"
 ROUTES_DOMAIN = "verathos/routes/v1"
@@ -44,6 +46,7 @@ class Route(BaseModel):
     endpoint_id: str
     model_id: str
     url: str  # the endpoint's base URL: requests go to url + "/v1/systemone"
+    tls: str = Field(pattern=PIN_PATTERN)  # the pin of its machine's certificate, as its manifest names it
     credited_rps: float = Field(gt=0)  # proven capacity in requests/s of the model's standard mix
     latency_ms: float = Field(ge=0)  # median latency in its throughput test
 

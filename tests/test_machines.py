@@ -24,12 +24,14 @@ from fastapi.testclient import TestClient
 
 from tests.fake_loadgen import make_runner
 from tests.mock_engine import MockEngine
+from tests.tlsfake import Presenting, pin
 from verathos import catalog
 from verathos.miner import __main__ as miner_main
 from verathos.miner import chain as miner_chain
 from verathos.miner.chain import build_host_endpoints, own_endpoints
 from verathos.miner.config import MinerConfig, peer_url
-from verathos.miner.peers import Peers, merged
+from verathos.miner.peers import Peers, merged, pins
+from verathos.protocol import tls
 from verathos.protocol.manifest import (
     ENDPOINTS_PATH,
     Endpoint,
@@ -69,16 +71,18 @@ def config(host: str, port: int, endpoints: list[str], tmp_path, **fields) -> Mi
 
 
 def test_peers_are_machines_base_urls_and_a_worker_has_none(tmp_path) -> None:
-    assert peer_url("9.9.9.9:20017") == "http://9.9.9.9:20017"
-    assert peer_url(" http://[2606:4700:0::1111]:8091/") == "http://[2606:4700::1111]:8091"
-    for bad in ("9.9.9.9", "miner.example:80", "1.2.3.4:0", "1.2.3.4:65536", "http://1.2.3.4:80/x", ""):
+    assert peer_url("9.9.9.9:20017") == "https://9.9.9.9:20017"
+    assert peer_url(" https://[2606:4700:0::1111]:8091/") == "https://[2606:4700::1111]:8091"
+    for bad in ("9.9.9.9", "miner.example:80", "1.2.3.4:0", "1.2.3.4:65536", "https://1.2.3.4:80/x", "",
+                "http://1.2.3.4:80"):
         with pytest.raises(ValueError):
             peer_url(bad)
     primary = config("203.0.113.5", 8091, ["gpu0"], tmp_path, peers=["198.51.100.7:20017"])
-    assert primary.role == "primary" and primary.peers == ["http://198.51.100.7:20017"]
+    assert primary.role == "primary" and primary.peers == ["https://198.51.100.7:20017"]
+    assert primary.base_url == "https://203.0.113.5:8091"
     for fields, why in (({"role": "worker", "peers": ["198.51.100.7:1"]}, "a worker has no peers"),
                         ({"peers": ["203.0.113.5:8091"]}, "not this one"),
-                        ({"peers": ["198.51.100.7:1", "http://198.51.100.7:1"]}, "unique")):
+                        ({"peers": ["198.51.100.7:1", "https://198.51.100.7:1"]}, "unique")):
         with pytest.raises(ValueError, match=why):
             config("203.0.113.5", 8091, ["gpu0"], tmp_path, **fields)
 
@@ -106,21 +110,27 @@ def test_a_worker_runs_the_full_miner_service_and_reveals_no_more_than_the_manif
     chain = FakeSubtensor({validator.ss58_address: floor, small.ss58_address: floor - 1}, auditor.ss58_address)
     monkeypatch.setattr(miner_chain.bt, "Subtensor", lambda *a, **k: chain)
     cfg = config("198.51.100.7", 20017, ["w-gpu0"], tmp_path, role="worker", gateway_hotkeys=[gateway.ss58_address])
+    identity = tls.identity(tmp_path / "tls")
     publisher = miner_main.Publisher(cfg, SimpleNamespace(hotkey=miner), CATALOG, publish_on_chain=True,
-                                     subtensor=chain)
+                                     subtensor=chain, identity=identity)
     assert not publisher.publish_on_chain and publisher.signed is None and publisher.local is None
     authorizer = miner_main.permits(cfg, publisher)
     client = TestClient(miner_main.build_app(cfg, miner, publisher, authorizer, {"w-gpu0": MockEngine("kev-4b")}))
     assert client.get(ENDPOINTS_PATH).status_code == 404  # nothing measured yet
-    publisher.local = build_host_endpoints(cfg, own_endpoints(cfg, cfg.endpoints, {"w-gpu0": 18.9}), miner, CATALOG)
+    publisher.local = build_host_endpoints(cfg, own_endpoints(cfg, cfg.endpoints, {"w-gpu0": 18.9}), miner, CATALOG,
+                                           identity.pin)
 
     assert client.get("/v1/manifest").status_code == 404  # the primary serves the hotkey's manifest
     document = client.get(ENDPOINTS_PATH).json()
     host = accept_host(document, hotkey=miner.ss58_address, netuid=405, mechid=CATALOG.mechanism,
-                       url="http://198.51.100.7:20017")
+                       url="https://198.51.100.7:20017", seen=identity.pin)
     assert set(document["host"]) == set(HostEndpoints.model_fields)
     assert [set(e) for e in document["host"]["endpoints"]] == [set(Endpoint.model_fields)]
-    assert host.endpoints[0].url == "http://198.51.100.7:20017/e/w-gpu0" and "127.0.0.1" not in json.dumps(document)
+    assert host.endpoints[0].url == "https://198.51.100.7:20017/e/w-gpu0" and "127.0.0.1" not in json.dumps(document)
+    assert host.tls == identity.pin
+    with pytest.raises(ManifestRejected, match="its TLS certificate"):
+        accept_host(document, hotkey=miner.ss58_address, netuid=405, mechid=CATALOG.mechanism,
+                    url="https://198.51.100.7:20017", seen=pin("another machine"))
     assert {client.post(ENDPOINTS_PATH).status_code, client.put(ENDPOINTS_PATH).status_code} == {405}
 
     def call(caller: Keypair, path: str = "/e/w-gpu0/v1/systemone", payload: dict = REQUEST):
@@ -145,13 +155,14 @@ def test_a_worker_runs_the_full_miner_service_and_reveals_no_more_than_the_manif
 
 
 def signed_host(keypair: Keypair, url: str, endpoints: dict[str, str], *, signer: Keypair | None = None,
-                catalog_digest: str = CATALOG.digest(), at: str | None = None) -> dict:
+                catalog_digest: str = CATALOG.digest(), at: str | None = None, pin_of: str | None = None) -> dict:
     """An endpoints document of the machine at ``url``: endpoint id -> model, each listed at ``at`` (default
-    ``url``)."""
+    ``url``), naming the certificate of ``pin_of`` (default: the machine at ``url``'s host)."""
     from verathos.protocol import signing
     from verathos.protocol.manifest import ENDPOINTS_DOMAIN
 
     host = HostEndpoints(netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest=catalog_digest, url=url,
+                         tls=pin(pin_of or httpx.URL(url).host),
                          endpoints=[Endpoint(endpoint_id=e, url=f"{at or url}/e/{e}", model_id=m, capacity_rps=10.0)
                                     for e, m in endpoints.items()]).model_dump(mode="json")
     return {"host": host, "signature": signing.sign(signer or keypair, ENDPOINTS_DOMAIN, host)}
@@ -159,47 +170,52 @@ def signed_host(keypair: Keypair, url: str, endpoints: dict[str, str], *, signer
 
 def test_the_primary_takes_each_peers_endpoints_only_as_the_hotkey_signed_them_for_that_machine() -> None:
     hotkey, other = kp(), kp()
-    urls = {name: f"http://10.0.6.{i}:80" for i, name in enumerate(("good", "foreign", "elsewhere", "posing"), 1)}
+    names = ("good", "foreign", "elsewhere", "posing", "other cert")
+    urls = {name: f"https://10.0.6.{i}:80" for i, name in enumerate(names, 1)}
     documents = {
         "good": signed_host(hotkey, urls["good"], {"a-gpu0": "kev-4b", "gpu0": "kev-4b", "a-gpu1": "kev-27b"}),
         "foreign": signed_host(hotkey, urls["foreign"], {"b-gpu0": "kev-4b"}, signer=other),
-        "elsewhere": signed_host(hotkey, urls["elsewhere"], {"c-gpu0": "kev-4b"}, at="http://10.0.6.9:80"),
+        "elsewhere": signed_host(hotkey, urls["elsewhere"], {"c-gpu0": "kev-4b"}, at="https://10.0.6.9:80"),
         "posing": signed_host(hotkey, urls["good"], {"d-gpu0": "kev-4b"}),
+        "other cert": signed_host(hotkey, urls["other cert"], {"e-gpu0": "kev-4b"}, pin_of="10.0.6.1"),
     }
     apps = {}
     for name, url in urls.items():
         app = apps[httpx.URL(url).host] = FastAPI()
         app.get(ENDPOINTS_PATH)(lambda name=name: documents[name])
 
-    class Transport(httpx.AsyncBaseTransport):
+    class Transport(Presenting):
         down: set[str] = set()
 
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             if request.url.host in self.down:
                 raise httpx.ConnectError("down")
-            return await httpx.ASGITransport(app=apps[request.url.host]).handle_async_request(request)
+            return await super().handle_async_request(request)
 
-    peers = Peers([urls["good"], urls["foreign"], urls["elsewhere"], urls["posing"]], hotkey=hotkey.ss58_address,
-                  netuid=405, mechid=1)
+    peers = Peers([urls[n] for n in names], hotkey=hotkey.ss58_address, netuid=405, mechid=1)
 
     def poll(hold_s: float = 3600.0, digest: str = CATALOG.digest()) -> None:
         async def run():
-            async with httpx.AsyncClient(transport=Transport()) as client:
+            async with httpx.AsyncClient(transport=Transport(apps)) as client:
                 await peers.poll(client, digest, hold_s)
 
         asyncio.run(run())
 
     poll()
-    own = [Endpoint(endpoint_id="gpu0", url="http://10.0.6.10:80/e/gpu0", model_id="kev-4b", capacity_rps=10.0)]
+    own = [Endpoint(endpoint_id="gpu0", url="https://10.0.6.10:80/e/gpu0", model_id="kev-4b", capacity_rps=10.0)]
     listed, left_out = merged(own, peers.peers, CATALOG)
     assert [e.endpoint_id for e in listed] == ["gpu0", "a-gpu0"]
-    assert {endpoint_host(e.url, e.endpoint_id) for e in listed} == {"http://10.0.6.10:80", urls["good"]}
-    assert any("gpu0 of peer http://10.0.6.1:80 left out: this machine lists an endpoint gpu0" in line
+    assert {endpoint_host(e.url, e.endpoint_id) for e in listed} == {"https://10.0.6.10:80", urls["good"]}
+    assert pins("https://10.0.6.10:80", "ab" * 32, listed, peers.peers) == {"https://10.0.6.10:80": "ab" * 32,
+                                                                           urls["good"]: pin("10.0.6.1")}
+    assert any("gpu0 of peer https://10.0.6.1:80 left out: this machine lists an endpoint gpu0" in line
                for line in left_out)
     assert any("does not serve kev-27b" in line for line in left_out)
     assert [p.said.split(": ", 1)[1] for p in peers.peers[1:]] == [
-        "not signed by this hotkey", "endpoint c-gpu0 is not listed at http://10.0.6.3:80/e/c-gpu0 on a public address",
-        "it says it is http://10.0.6.1:80"]
+        "not signed by this hotkey",
+        "endpoint c-gpu0 is not listed at https://10.0.6.3:80/e/c-gpu0 on a public address",
+        "it says it is https://10.0.6.1:80",
+        f"its TLS certificate (pin {pin('10.0.6.5')}) is not the one it names ({pin('10.0.6.1')})"]
 
     Transport.down.add("10.0.6.1")  # the peer is out: its endpoints stay listed for an epoch, then are withdrawn
     poll()
@@ -212,7 +228,7 @@ def test_the_primary_takes_each_peers_endpoints_only_as_the_hotkey_signed_them_f
     assert peers.peers[0].endpoints == [] and "for catalog" in peers.peers[0].said
     with pytest.raises(ManifestRejected, match="not signed"):
         accept_host({"host": documents["good"]["host"], "signature": "00" * 64}, hotkey=hotkey.ss58_address,
-                    netuid=405, mechid=1, url=urls["good"])
+                    netuid=405, mechid=1, url=urls["good"], seen=pin("10.0.6.1"))
 
 
 def free_port() -> int:
@@ -256,7 +272,7 @@ def test_a_validator_gets_its_request_budget_per_endpoint_and_epoch(tmp_path, mo
     assert CATALOG.scoring.request_budget() == 4 * CATALOG.scoring.canary_pool_size
     assert tight.scoring.request_budget() == 3
     publisher = miner_main.Publisher(cfg, SimpleNamespace(hotkey=miner), tight, publish_on_chain=False,
-                                     subtensor=chain)
+                                     subtensor=chain, identity=tls.identity(tmp_path / "tls"))
     authorizer = miner_main.permits(cfg, publisher)
     epoch, left_s = authorizer.epoch(tight.epoch_blocks)  # the chain's head at block 907
     assert epoch == 5 and 0 < left_s <= (6 * 180 - 907) * 12
@@ -298,11 +314,13 @@ def test_two_machines_end_to_end(tmp_path, monkeypatch) -> None:
     engines = {"gpu0": CapacityEngine(80), "w-gpu0": CapacityEngine(80), "w-gpu1": CapacityEngine(80)}
     publishers, servers = {}, []
     for role, cfg in configs.items():
+        identity = tls.identity(cfg.state_dir)  # each machine its own certificate, served over TLS
         publishers[role] = miner_main.Publisher(cfg, SimpleNamespace(hotkey=hotkey), CATALOG, publish_on_chain=False,
-                                                subtensor=chain)
+                                                subtensor=chain, identity=identity)
         app = miner_main.build_app(cfg, hotkey, publishers[role], miner_main.permits(cfg, publishers[role]),
                                    {e.endpoint_id: engines[e.endpoint_id] for e in cfg.endpoints})
-        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=cfg.port, log_level="warning"))
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=cfg.port, log_level="warning",
+                                               **tls.server_options(identity)))
         threading.Thread(target=server.run, daemon=True).start()
         servers.append(server)
     while not all(s.started for s in servers):
@@ -314,15 +332,16 @@ def test_two_machines_end_to_end(tmp_path, monkeypatch) -> None:
         primary.poll_peers()
         manifest = primary.signed.manifest
         assert {e.endpoint_id: endpoint_host(e.url, e.endpoint_id) for e in manifest.endpoints} == {
-            "gpu0": f"http://127.0.0.1:{ports['primary']}", "w-gpu0": f"http://127.0.0.1:{ports['worker']}",
-            "w-gpu1": f"http://127.0.0.1:{ports['worker']}"}
+            "gpu0": f"https://127.0.0.1:{ports['primary']}", "w-gpu0": f"https://127.0.0.1:{ports['worker']}",
+            "w-gpu1": f"https://127.0.0.1:{ports['worker']}"}
+        assert manifest.tls == {f"https://127.0.0.1:{ports[r]}": publishers[r].identity.pin for r in ports}
         assert primary.own_ids() == ["gpu0"] and publishers["worker"].own_ids() == ["w-gpu0", "w-gpu1"]
         assert "the manifest lists 3 endpoints on 2 machines" in miner_main.serving_line(configs["primary"], primary)
         neurons = [Neuron(1, hotkey.ss58_address, "127.0.0.1", ports["primary"],
                           commitment_value(manifest.digest()))]
 
         async def validate():
-            async with httpx.AsyncClient() as client:
+            async with tls.client() as client:
                 miners = await discover(neurons, 405, client, {CATALOG.digest(): CATALOG.mechanism})
                 return await audit_epoch([e for m in miners for e in m.endpoints()], epoch=5, secret=b"k" * 32,
                                          keypair=validator, references={"kev-4b": MockEngine("kev-4b")},
@@ -342,12 +361,12 @@ def test_two_machines_end_to_end(tmp_path, monkeypatch) -> None:
         fake_chain = FakeChain(head=5 * 180 + 40)
         auditor = Auditor(netuid=405, keypair=auditor_kp, chain=fake_chain, policy=policy,
                           catalog=lambda: CATALOG, references={}, db_path=tmp_path / "throughput.sqlite",
-                          runner=make_runner(httpx.AsyncHTTPTransport()))
+                          runner=make_runner(tls.PinnedTransport()))
         throughput = Throughput(netuid=405, policy=policy, auditor_hotkey=auditor_kp.ss58_address,
                                 chain=fake_chain, auditor=auditor)
 
         async def refresh():
-            async with httpx.AsyncClient() as client:
+            async with tls.client() as client:
                 return await throughput.refresh(neurons, {CATALOG.digest(): CATALOG.mechanism}, 5, client)
 
         throughput.update_slots(asyncio.run(refresh()), neurons, 5)

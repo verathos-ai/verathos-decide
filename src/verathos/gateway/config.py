@@ -8,6 +8,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from verathos.protocol.tls import https_url
+
 
 class GatewayConfig(BaseModel):
     network: str = "finney"
@@ -16,8 +18,12 @@ class GatewayConfig(BaseModel):
     hotkey_name: str = Field(description="The gateway's hotkey: one the catalog lists under gateways")
     database_url: str = Field(description="postgresql+asyncpg://... in production; sqlite+aiosqlite:///path for "
                               "development and tests")
-    listen_host: str = "127.0.0.1"
+    listen_host: str = Field("127.0.0.1", description="Where the public API listens: loopback behind the TLS reverse "
+                             "proxy, or any address with tls_cert_file and tls_key_file")
     port: int = Field(8080, ge=1, le=65535)
+    tls_cert_file: Path | None = Field(None, description="TLS certificate (PEM, its chain) the gateway serves its "
+                                       "listeners with; needed for a listener off loopback")
+    tls_key_file: Path | None = Field(None, description="The certificate's private key (PEM)")
     metrics_port: int | None = Field(None, ge=1, le=65535, description="Prometheus metrics on 127.0.0.1")
     admin_host: str = Field("127.0.0.1", description="Address of the admin API: loopback or a private network")
     admin_port: int | None = Field(None, ge=1, le=65535, description="The admin API's port; none: no admin API")
@@ -31,7 +37,8 @@ class GatewayConfig(BaseModel):
                                      "credit entry")
     accounts_max_credit_per_hour: int = Field(1_000_000_000, ge=1, description="micro-USD the account service may "
                                               "record per hour, per process")
-    auditor_url: str | None = Field(None, description="The auditor's service; default: the subnet owner's axon")
+    auditor_url: str | None = Field(None, description="The auditor's service (https://ip:port, reached with the "
+                                    "catalog's auditor pin); default: the subnet owner's axon")
     instances: int = Field(1, ge=1, description="Gateway processes sharing the miners' capacity (each uses 1 / "
                            "instances of it); route each API key to one process, so its limits hold exactly")
     trusted_proxies: list[str] = Field(default_factory=lambda: ["127.0.0.1/32", "::1/128"],
@@ -47,6 +54,11 @@ class GatewayConfig(BaseModel):
                                    "auditor")
     catalog_dir: Path = Path("~/.verathos/catalog")
     state_dir: Path = Path("~/.verathos/gateway")
+
+    @field_validator("auditor_url")
+    @classmethod
+    def _https(cls, value: str | None) -> str | None:
+        return None if value is None else https_url(value, what="auditor_url")
 
     @field_validator("trusted_proxies")
     @classmethod
@@ -71,7 +83,20 @@ class GatewayConfig(BaseModel):
             raise ValueError("accounts_token_file needs admin_port")
         if self.admin_port is not None and self.admin_port == self.port:
             raise ValueError("admin_port must differ from port")
+        if (self.tls_cert_file is None) != (self.tls_key_file is None):
+            raise ValueError("tls_cert_file and tls_key_file go together")
+        if self.tls_cert_file is None and self.plain_listeners_off_loopback():
+            raise ValueError(f"{', '.join(self.plain_listeners_off_loopback())} off loopback: plain http stays on "
+                             "this machine; serve TLS (tls_cert_file, tls_key_file) or listen on loopback behind the "
+                             "TLS reverse proxy")
         return self
+
+    def plain_listeners_off_loopback(self) -> list[str]:
+        """The listeners on an address other than loopback."""
+        listeners = [("listen_host", self.listen_host)]
+        if self.admin_port is not None:
+            listeners.append(("admin_host", self.admin_host))
+        return [name for name, host in listeners if not ipaddress.ip_address(host).is_loopback]
 
     @classmethod
     def load(cls, path: Path) -> GatewayConfig:

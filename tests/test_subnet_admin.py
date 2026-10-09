@@ -40,16 +40,65 @@ class Chain:
         return SimpleNamespace(success=True)
 
 
-def catalog_file(tmp_path, mechanism: int = 0, **scoring):
+AUDITOR = {"tls": "ab" * 32, "egress": ["9.9.9.9"]}
+
+
+def catalog_file(tmp_path, mechanism: int = 0, auditor: dict | None = AUDITOR, **scoring):
     document = catalog.load().document()
     path = tmp_path / "catalog.json"
-    path.write_text(json.dumps({**document, "mechanism": mechanism, "scoring": {**document["scoring"], **scoring}}))
+    document = {**document, "mechanism": mechanism, "scoring": {**document["scoring"], **scoring}}
+    if auditor is not None:
+        document["auditor"] = auditor
+    path.write_text(json.dumps(document))
     return path
 
 
-def commit(chain: Chain, path, tmp_path) -> None:
+def commit(chain: Chain, path, tmp_path, validator_config=None) -> None:
     admin.commit_catalog(chain, SimpleNamespace(hotkey=SimpleNamespace(ss58_address=OWNER)), 405, path,
-                         tmp_path / "store")
+                         tmp_path / "store", validator_config)
+
+
+def test_commit_catalog_needs_the_auditors_pin_and_egress_and_the_gateways_egress(tmp_path) -> None:
+    chain = Chain()
+    for auditor, why in ((None, "the auditor's TLS pin"), ({"tls": "ab" * 32}, "auditor.egress")):
+        with pytest.raises(SystemExit, match=why):
+            commit(chain, catalog_file(tmp_path, auditor=auditor), tmp_path)
+    with pytest.raises(ValueError, match="pattern"):
+        commit(chain, catalog_file(tmp_path, auditor={"tls": "AB" * 32, "egress": ["9.9.9.9"]}), tmp_path)
+    for egress in (["10.0.0.1"], ["9.9.9.9", "9.9.9.9"], ["::ffff:9.9.9.9"], ["2606:4700:0::1111"]):
+        with pytest.raises(ValueError, match="egress|public|unique|write the address"):
+            commit(chain, catalog_file(tmp_path, auditor={"tls": "ab" * 32, "egress": egress}), tmp_path)
+    path = catalog_file(tmp_path)
+    gateway = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "gateways": [{"hotkey": gateway}]}))
+    with pytest.raises(SystemExit, match=f"the egress addresses of {gateway}"):
+        commit(chain, path, tmp_path)
+    assert chain.commitments == []
+    path.write_text(json.dumps({**json.loads(path.read_text()), "gateways": [{"hotkey": gateway,
+                                                                              "egress": ["2606:4700::1111"]}]}))
+    commit(chain, path, tmp_path)
+    cat = catalog.load(path)
+    assert chain.commitments == [catalog.commitment_value(cat.digest())]
+    assert cat.gateway_hotkeys() == [gateway] and cat.auditor_pin() == "ab" * 32
+
+
+def test_commit_catalog_on_the_auditors_machine_fills_in_its_pin_and_egress(tmp_path, capsys) -> None:
+    from verathos.protocol import tls
+
+    chain = Chain()
+    state = tmp_path / "validator"
+    identity = tls.identity(state)
+    config = tmp_path / "validator.json"
+    config.write_text(json.dumps({"state_dir": str(state), "egress_ips": ["9.9.9.9", "2606:4700::1111"]}))
+    commit(chain, catalog_file(tmp_path, auditor=None), tmp_path, config)
+    stored = catalog.CatalogStore(tmp_path / "store").get(chain.commitments[-1].rsplit(":", 1)[1])
+    assert stored.auditor.tls == identity.pin and stored.auditor.egress == ["9.9.9.9", "2606:4700::1111"]
+    assert f"filled in auditor.tls {identity.pin}" in capsys.readouterr().out
+    with pytest.raises(SystemExit, match=f"the auditor's certificate in {state} has pin {identity.pin}"):
+        commit(chain, catalog_file(tmp_path), tmp_path, config)  # a pin the auditor does not serve
+    commit(chain, catalog_file(tmp_path, auditor={"tls": identity.pin, "egress": ["9.9.9.9"]}), tmp_path, config)
+    assert catalog.CatalogStore(tmp_path / "store").get(
+        chain.commitments[-1].rsplit(":", 1)[1]).auditor.egress == ["9.9.9.9"]  # the file's own egress stays
 
 
 def test_commit_catalog_states_the_miner_share_now_and_how_it_changes(tmp_path, capsys) -> None:

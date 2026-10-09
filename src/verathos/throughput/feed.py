@@ -128,15 +128,18 @@ class ReferenceUnavailable(Exception):
     """The reference engine could not answer, so an answer could not be checked."""
 
 
-async def fetch(client: httpx.AsyncClient, auditor_url: str | None, *, auditor_hotkey: str, netuid: int,
-                epoch: int) -> Verdicts:
-    """The auditor's verdicts for ``epoch``, signature checked. Raises VerdictsUnavailable (also while the epoch's
-    tests are still being settled)."""
+async def fetch(client: httpx.AsyncClient, auditor_url: str | None, auditor_pin: str | None, *, auditor_hotkey: str,
+                netuid: int, epoch: int) -> Verdicts:
+    """The auditor's verdicts for ``epoch`` from its service at ``auditor_url``, whose certificate has
+    ``auditor_pin``, signature checked. Raises VerdictsUnavailable (also while the epoch's tests are still being
+    settled)."""
     if not auditor_url:
         raise VerdictsUnavailable("auditor axon unknown")
+    if not auditor_pin:
+        raise VerdictsUnavailable("the catalog names no TLS pin for the auditor")
     try:
         document = await request_json(client, "GET", auditor_url.rstrip("/") + VERDICTS_PATH.format(epoch=epoch),
-                                      limit=MAX_VERDICTS_BYTES, timeout=30.0)
+                                      limit=MAX_VERDICTS_BYTES, timeout=30.0, tls=auditor_pin)
         signed = SignedVerdicts.model_validate(document)
     except (httpx.HTTPError, TimeoutError, ValueError) as exc:
         raise VerdictsUnavailable(f"{type(exc).__name__}: {exc}") from None

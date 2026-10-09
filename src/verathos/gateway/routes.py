@@ -1,4 +1,4 @@
-"""The auditor's signed routes (``protocol.gateway``), polled every ``POLL_S``.
+"""The auditor's signed routes (``protocol.gateway``), polled every ``POLL_S`` over TLS with the auditor's pin.
 
 A table is used only if the auditor signed it for this subnet, it is newer than the one in use and not issued more
 than ``MAX_AHEAD_S`` ahead of this host's clock (one dated in the future would shut out every correct table until
@@ -26,6 +26,7 @@ from verathos.gateway import metrics
 from verathos.gateway.logs import Throttle
 from verathos.protocol.gateway import ROUTES_PATH, Routes, SignedRoutes
 from verathos.protocol.http import request_json
+from verathos.protocol.tls import Service
 from verathos.throughput.policy import BLOCK_TIME_S
 
 log = logging.getLogger(__name__)
@@ -54,9 +55,9 @@ class Refused(Exception):
 
 
 class RouteTable:
-    def __init__(self, *, client: httpx.AsyncClient, auditor_url: Callable[[], Awaitable[str | None]],
+    def __init__(self, *, client: httpx.AsyncClient, auditor: Callable[[], Awaitable[Service | None]],
                  auditor_hotkey: str, netuid: int, path: Path, clock: Callable[[], float] = time.time) -> None:
-        self.client, self.auditor_url, self.auditor_hotkey, self.netuid = client, auditor_url, auditor_hotkey, netuid
+        self.client, self.auditor, self.auditor_hotkey, self.netuid = client, auditor, auditor_hotkey, netuid
         self.path, self.clock = path, clock
         self.table: Routes | None = None
         self.on_change: list[Callable[[Routes], Awaitable[None] | None]] = []
@@ -102,11 +103,11 @@ class RouteTable:
 
     async def refresh(self) -> bool:
         """Fetch the auditor's table; True if a newer one was adopted."""
-        url = await self.auditor_url()
-        if not url:
+        auditor = await self.auditor()
+        if auditor is None:
             return False
-        document = await request_json(self.client, "GET", url.rstrip("/") + ROUTES_PATH, limit=MAX_ROUTES_BYTES,
-                                      timeout=15.0)
+        document = await request_json(self.client, "GET", auditor.url.rstrip("/") + ROUTES_PATH,
+                                      limit=MAX_ROUTES_BYTES, timeout=15.0, tls=auditor.pin)
         signed = SignedRoutes.model_validate(document)
         if not self._accept(signed) or not await self._adopt(signed):
             return False

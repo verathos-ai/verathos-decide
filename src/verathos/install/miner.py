@@ -27,6 +27,7 @@ from verathos.install import common, engines, host, plan
 from verathos.install.common import Prompter, info, step, warn
 from verathos.install.services import Service
 from verathos.miner.config import MinerConfig, peer_url
+from verathos.protocol import tls
 from verathos.protocol.http import get_json
 from verathos.protocol.manifest import ENDPOINTS_PATH, axon_base, is_public
 from verathos.protocol.status import MAX_NETWORK_BYTES, NETWORK_DOMAIN, NETWORK_PATH, NetworkStatus, unverified
@@ -139,7 +140,7 @@ def read_market(st, netuid: int, hotkey: str, own: Collection[str], cat: catalog
         base = axon_url(st, netuid, auditor) if auditor else None
         if base is None:
             return None, "the subnet owner's validator serves no axon"
-        document = get_json(base + NETWORK_PATH, limit=MAX_NETWORK_BYTES, timeout=15)
+        document = get_json(base + NETWORK_PATH, limit=MAX_NETWORK_BYTES, timeout=15, tls=cat.auditor_pin())
     except Exception as exc:  # whatever stops the reading, the setup chooses without the network
         return None, f"the auditor's network status is not available ({one_line(exc)})"
     why = unverified(document, domain=NETWORK_DOMAIN, auditor=auditor, netuid=netuid, now_ms=int(clock() * 1000),
@@ -355,6 +356,9 @@ def init(argv: list[str]) -> None:
         raise SystemExit(f"{config_path} would not be valid; fix or remove it:\n{exc}") from None
     common.write_json(config_path, config)
     info(f"wrote {config_path}")
+    identity = tls.identity(Path(config["state_dir"]))
+    info(f"TLS certificate {identity.cert_path}, pin {identity.pin}: the manifest names it, and validators, the "
+         "auditor and gateways accept this machine by it (delete tls.key and tls.crt there to replace it)")
 
     engine_services = {}
     for g in gpus:
@@ -420,7 +424,7 @@ def init(argv: list[str]) -> None:
     for g in gpus:
         eid = endpoint_ids[g.index]
         info(f"endpoint {eid}: {chosen[g.index]} on GPU {g.index}, service {engine_services[eid].name}")
-    info(f"miner: http://{public_ip}:{port}, service {MINER}"
+    info(f"miner: https://{public_ip}:{port}, service {MINER}"
          + (" (testing: nothing published on chain)" if args.no_publish else ""))
     info(common.update_line(auto_update))
     info(f"configuration: {config_path}; state: {config['state_dir']}")
@@ -428,12 +432,13 @@ def init(argv: list[str]) -> None:
     info(f"logs:    {manager.log_command(MINER)}")
     info(f"after editing the configuration: {manager.restart_command([MINER])}")
     address = urlsplit(axon_base(public_ip, port)).netloc
+    check = f"curl -sk --pinnedpubkey '{tls.curl_pin(identity.pin)}' https://{address}"  # the pin is the check
     if role == "worker":
-        info(f"check from another machine: curl http://{address}{ENDPOINTS_PATH}")
+        info(f"check from another machine: {check}{ENDPOINTS_PATH}")
         info("list this machine on the primary, with every other worker (comma-separated):")
         print(f"      bash {common.INSTALLER} miner --yes --peers {address}", flush=True)
         info(f'or add "{address}" to "peers" in the primary\'s miner.json and restart its miner')
     else:
-        info(f"check from another machine: curl http://{address}/v1/manifest")
+        info(f"check from another machine: {check}/v1/manifest")
     for line in common.script_commands("miner", home, " --no-publish" if args.no_publish else ""):
         info(line)

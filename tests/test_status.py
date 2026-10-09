@@ -46,13 +46,13 @@ def kp() -> Keypair:
 
 
 def watching(listed: list[str], **kwargs) -> StatusWatcher:
-    return StatusWatcher(hotkey="hkA", netuid=405, auditor_url=lambda: None, auditor_hotkey=lambda: None,
-                         listed=lambda: listed, **kwargs)
+    return StatusWatcher(hotkey="hkA", netuid=405, auditor_url=lambda: None, auditor_pin=lambda: "ab" * 32,
+                         auditor_hotkey=lambda: None, listed=lambda: listed, **kwargs)
 
 
 def endpoint(endpoint_id: str, model: str = "kev-4b", hotkey: str = "hkA") -> DiscoveredEndpoint:
-    return DiscoveredEndpoint(1, hotkey, "http://x", Endpoint(endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}",
-                              model_id=model, capacity_rps=50.0))
+    return DiscoveredEndpoint(1, hotkey, "https://x", Endpoint(endpoint_id=endpoint_id,
+                              url=f"https://x/e/{endpoint_id}", model_id=model, capacity_rps=50.0), "ab" * 32)
 
 
 def result(ep: DiscoveredEndpoint) -> EndpointResult:
@@ -250,10 +250,17 @@ def test_a_miner_acts_only_on_a_status_the_subnet_owner_signed_and_logs_the_othe
         return sign_document(document, keypair, netuid=netuid, domain=STATUS_DOMAIN, now_ms=int(at * 1000))
 
     served: list[dict] = []
-    monkeypatch.setattr(miner_status, "get_json", lambda url, **kwargs: served[-1])
+    asked: list[tuple[str, str]] = []
+
+    def get_json(url, **kwargs):
+        asked.append((url, kwargs["tls"]))
+        return served[-1]
+
+    monkeypatch.setattr(miner_status, "get_json", get_json)
     acted: list[list[ThroughputOutcome]] = []
-    watcher = StatusWatcher(hotkey="hkA", netuid=405, auditor_url=lambda: "http://192.0.2.1:8091",
-                            auditor_hotkey=lambda: owner.ss58_address, listed=lambda: ["gpu0"],
+    watcher = StatusWatcher(hotkey="hkA", netuid=405, auditor_url=lambda: "https://192.0.2.1:8091",
+                            auditor_pin=lambda: "cd" * 32, auditor_hotkey=lambda: owner.ss58_address,
+                            listed=lambda: ["gpu0"],
                             on_tests=acted.append, clock=lambda: now)
 
     def poll(document: dict) -> bool:
@@ -276,6 +283,7 @@ def test_a_miner_acts_only_on_a_status_the_subnet_owner_signed_and_logs_the_othe
     assert warnings() == [warning("it is not signed (the auditor runs an older release)")]  # once
     assert poll(signed()) and acted[-1] == tests
     assert "the auditor's status verifies again: the miner acts on its test results" in caplog.messages
+    assert set(asked) == {("https://192.0.2.1:8091/v1/status/hkA", "cd" * 32)}  # over TLS with the auditor's pin
 
     tampered = signed()
     tampered["tests"][1]["delivered_rps"] = 2.0

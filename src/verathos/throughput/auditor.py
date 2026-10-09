@@ -324,17 +324,22 @@ class Recomputes:
 
 @dataclass(frozen=True)
 class Slot:
-    """An endpoint the auditor tests."""
+    """An endpoint the auditor tests, and the pin of its machine's certificate."""
 
     hotkey: str
     endpoint_id: str
     url: str
     model_id: str
     declared_rps: float
+    tls: str
 
     @property
     def key(self) -> str:
         return f"{self.hotkey}/{self.endpoint_id}"
+
+    @property
+    def where(self) -> tuple[str, str]:
+        return self.url, self.tls
 
 
 @dataclass(frozen=True)
@@ -1058,7 +1063,8 @@ class Auditor:
             session = Session(netuid=self.netuid, auditor=self.hotkey, miner_hotkey=t.slot.hotkey,
                               endpoint_id=t.slot.endpoint_id, test_id=test.test_id, not_after_ms=not_after_ms)
             planned.append({
-                "id": t.slot.key, "url": t.slot.url + "/v1/systemone", "rate_rps": self.test_rate(t, now_s, policy),
+                "id": t.slot.key, "url": t.slot.url + "/v1/systemone", "tls": t.slot.tls,
+                "rate_rps": self.test_rate(t, now_s, policy),
                 "max_outstanding": math.ceil(t.tested_rps * policy.request_timeout_s) + 16,
                 "headers": session_headers(session, self.keypair), "model": t.slot.model_id,
                 "state_words": list(workload.state_words), "questions": workload.questions,
@@ -1639,7 +1645,7 @@ class Auditor:
             if (credit_ is None or model is None or model.status != "active" or s.hotkey in invalid
                     or s.hotkey in excluded):
                 continue
-            routes.append(Route(hotkey=s.hotkey, endpoint_id=s.endpoint_id, model_id=s.model_id, url=s.url,
+            routes.append(Route(hotkey=s.hotkey, endpoint_id=s.endpoint_id, model_id=s.model_id, url=s.url, tls=s.tls,
                                 credited_rps=min(credit_.credited_rps, s.declared_rps), latency_ms=credit_.latency_ms))
         table = Routes(netuid=self.netuid, auditor=self.hotkey, epoch=current, issued_ms=int(time.time() * 1000),
                        catalog_digest=cat.digest(), routes=routes)

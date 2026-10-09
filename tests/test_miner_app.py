@@ -37,6 +37,7 @@ REQUEST = {
 
 
 AUDITOR = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
+PIN = "ab" * 32  # the miner machine's certificate, as its manifest names it
 
 
 @pytest.fixture()
@@ -52,7 +53,7 @@ def setup():
     manifest = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=miner.ss58_address, catalog_digest=cat_digest,
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
-                            capacity_rps=40.0)]), miner)
+                            capacity_rps=40.0)], tls={config.base_url: PIN}), miner)
     app = create_app(config=config, keypair=miner, manifest=lambda: manifest, engines={"gpu0": MockEngine("kev-4b")},
                      authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: {AUDITOR.ss58_address},
                      max_state_tokens=lambda model_id: 200)
@@ -69,7 +70,7 @@ def test_manifest_is_public_and_acceptable(setup) -> None:
     client, miner, *_ , manifest = setup
     assert accept(client.get("/v1/manifest").json(), hotkey=miner.ss58_address, netuid=405,
                   commitment=commitment_value(manifest.manifest.digest()),
-                  catalogs={manifest.manifest.catalog_digest: 1})
+                  catalogs={manifest.manifest.catalog_digest: 1}, axon="https://203.0.113.5:8091", seen=PIN)
 
 
 def test_answer_carries_binding_receipt(setup) -> None:
@@ -221,11 +222,11 @@ def test_an_engines_extra_fields_are_not_signed(setup) -> None:
 
     config = MinerConfig.model_validate({
         "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5", "port": 8091,
-        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://unused"}]})
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1"}]})
     signed = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=miner.ss58_address, catalog_digest=catalog.load().digest(),
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
-                            capacity_rps=10.0)]), miner)
+                            capacity_rps=10.0)], tls={config.base_url: PIN}), miner)
     chatty = TestClient(create_app(config=config, keypair=miner, manifest=lambda: signed,
                                    engines={"gpu0": Chatty("kev-4b")}, authorized=lambda hk: True,
                                    auditors=lambda: set()))
@@ -259,7 +260,7 @@ def capped_miner(engine: MockEngine, *, testing=lambda: False, admission_limit: 
     manifest = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=miner.ss58_address, catalog_digest=catalog.load().digest(),
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
-                            capacity_rps=40.0)]), miner)
+                            capacity_rps=40.0)], tls={config.base_url: PIN}), miner)
     cat = catalog.load()
     app = create_app(config=config, keypair=miner, manifest=lambda: manifest, engines={"gpu0": engine},
                      authorized=lambda hk: hk in (validator.ss58_address, gateway.ss58_address),

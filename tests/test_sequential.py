@@ -18,6 +18,7 @@ import pytest
 from bittensor_wallet import Keypair
 
 from tests.mock_engine import MockEngine
+from tests.tlsfake import Presenting, pin
 from verathos import catalog
 from verathos.miner.app import caller_request_bytes, create_app
 from verathos.miner.config import MinerConfig
@@ -50,7 +51,8 @@ from verathos.validator.sequential import (
 from verathos.validator.status import StatusBoard, build
 
 ROOT = Path(__file__).resolve().parents[1]
-CAT = catalog.load()
+AUDITOR_PIN = "ab" * 32  # the auditor's certificate, as the catalog names it
+CAT = catalog.Catalog.parse({**catalog.load().document(), "auditor": {"tls": AUDITOR_PIN}})
 SECRET = b"k" * 32
 OWNER = "owner-hotkey"
 
@@ -308,29 +310,30 @@ def test_the_epochs_waited_follow_the_models_run() -> None:
 def miner(host: str, keypair: Keypair, validator: Keypair, model_id: str):
     config = MinerConfig.model_validate({
         "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": 80,
-        "endpoints": [{"endpoint_id": "gpu0", "model_id": model_id, "engine_url": "http://unused",
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": model_id, "engine_url": "http://127.0.0.1:1",
                        "max_concurrency": 8}]})
     signed = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest=CAT.digest(),
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id=model_id,
-                            capacity_rps=40.0)]), keypair)
+                            capacity_rps=40.0)], tls={config.base_url: pin(host)}), keypair)
     app = create_app(config=config, keypair=keypair, manifest=lambda: signed, engines={"gpu0": MockEngine(model_id)},
                      authorized=lambda hk: hk == validator.ss58_address, auditors=lambda: set(),
                      max_caller_request=lambda m: caller_request_bytes(m, CAT.get(model_id).workload))
     return app, commitment_value(signed.manifest.digest())
 
 
-class Counting(httpx.AsyncBaseTransport):
-    """Routes requests to in-process apps by host and counts them per host and kind (the last path segment)."""
+class Counting(Presenting):
+    """Routes requests to in-process apps by host, each presenting its host's certificate, and counts them per host
+    and kind (the last path segment)."""
 
     def __init__(self, apps: dict[str, object]) -> None:
-        self.transports = {host: httpx.ASGITransport(app=app) for host, app in apps.items()}
+        super().__init__(apps)
         self.counts: dict[tuple[str, str], int] = {}
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         key = (request.url.host, request.url.path.rsplit("/", 1)[-1])
         self.counts[key] = self.counts.get(key, 0) + 1
-        return await self.transports[request.url.host].handle_async_request(request)
+        return await super().handle_async_request(request)
 
 
 def network(validator: Keypair, served: dict[str, str]):
@@ -420,8 +423,8 @@ SHARES = {"kev-4b": 0.6, "kev-9b": 0.4}
 
 def endpoint(key: str, model_id: str) -> DiscoveredEndpoint:
     hotkey, endpoint_id = key.split("/")
-    return DiscoveredEndpoint(UIDS[hotkey], hotkey, "http://x", Endpoint(
-        endpoint_id=endpoint_id, url=f"http://x/e/{endpoint_id}", model_id=model_id, capacity_rps=50.0))
+    return DiscoveredEndpoint(UIDS[hotkey], hotkey, "https://x", Endpoint(
+        endpoint_id=endpoint_id, url=f"https://x/e/{endpoint_id}", model_id=model_id, capacity_rps=50.0), "ab" * 32)
 
 
 def result(ep: DiscoveredEndpoint, *, fail: bool = False) -> EndpointResult:
@@ -572,7 +575,7 @@ def test_the_source_results_are_read_as_light_validators_read_them() -> None:
     served: list = []
 
     def fetch(url, **kwargs):
-        assert url == "http://198.51.100.20:8091/v1/network"
+        assert url == "https://198.51.100.20:8091/v1/network" and kwargs["tls"] == AUDITOR_PIN
         document = served.pop(0) if len(served) > 1 else served[0]
         if isinstance(document, Exception):
             raise document
@@ -581,7 +584,8 @@ def test_the_source_results_are_read_as_light_validators_read_them() -> None:
     def results(deadline_s: float, poll_s: float = 0.01, source_hotkey=None, hotkey="me"):
         return asyncio.run(fallback.source_results(
             Chain(owner.ss58_address), netuid=405, hotkey=hotkey, source_hotkey=source_hotkey, epoch=8,
-            epoch_blocks=CAT.epoch_blocks, deadline=time.monotonic() + deadline_s, fetch=fetch, poll_s=poll_s))
+            epoch_blocks=CAT.epoch_blocks, deadline=time.monotonic() + deadline_s, cat=CAT, fetch=fetch,
+            poll_s=poll_s))
 
     # the source publishes epoch 8 once it has scored it: asked again until then
     served[:] = [httpx.ConnectError("refused"), signed(owner, 7), signed(owner, 8)]
@@ -851,8 +855,7 @@ def test_an_epoch_checks_what_fits_takes_the_rest_from_the_source_and_sets_one_w
         return await fallback.source_results(*args, **kwargs, fetch=fetch)
 
     transport = Counting(apps)
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=transport, **kw))
+    monkeypatch.setattr(validator_main.tls, "client", lambda limits: httpx.AsyncClient(transport=transport))
     monkeypatch.setattr(validator_main, "source_results", from_source)
     weights_set: list = []
     monkeypatch.setattr(validator_main, "set_weights",
@@ -865,7 +868,7 @@ def test_an_epoch_checks_what_fits_takes_the_rest_from_the_source_and_sets_one_w
     fetched_document = [document]
     state, board = ScoreState(), StatusBoard()
     epoch(state, board)
-    assert fetched == ["http://198.51.100.20:8091/v1/network"]
+    assert fetched == ["https://198.51.100.20:8091/v1/network"]
     line = (f"epoch 7: references one at a time: checked kev-4b; taken from the subnet owner's validator "
             f"{owner.ss58_address}: kev-9b (not drawn)")
     assert any(r.levelname == "WARNING" and r.message == line for r in caplog.records)
@@ -887,5 +890,5 @@ def test_an_epoch_checks_what_fits_takes_the_rest_from_the_source_and_sets_one_w
     epoch(held := ScoreState(ema={kev9: 0.3}, uid_of={kev9: 3}), StatusBoard())
     assert held.ema[kev9] == 0.3 and held.held == {kev9: 1}
     assert any(r.levelname == "WARNING" and "not checked, their averages kept (no results of the source: the "
-               "source's axon http://198.51.100.20:8091 did not serve it" in r.message and r.message.endswith(
+               "source's axon https://198.51.100.20:8091 did not serve it" in r.message and r.message.endswith(
                    "kev-9b (not drawn)") for r in caplog.records)

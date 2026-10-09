@@ -27,6 +27,7 @@ import httpx
 from bittensor_wallet import Keypair
 
 from verathos.miner.engine import Engine, EngineError
+from verathos.protocol import tls as tls_module
 from verathos.protocol.canonical import digest
 from verathos.throughput.policy import HDR_REQUEST_ID, Session, session_headers
 from verathos.throughput.workload import Workload, make_request
@@ -93,10 +94,13 @@ def fingerprint(endpoint_config: dict[str, Any], engine_info: Any, workload: Wor
 
 
 class ServicePath:
-    """An endpoint reached through the miner's own service as test traffic, under a session the miner signs."""
+    """An endpoint reached through the miner's own service as test traffic, under a session the miner signs, over TLS
+    accepting the service's own certificate (``tls``, its pin)."""
 
-    def __init__(self, client: httpx.AsyncClient, url: str, keypair: Keypair, netuid: int, endpoint_id: str) -> None:
+    def __init__(self, client: httpx.AsyncClient, url: str, keypair: Keypair, netuid: int, endpoint_id: str, *,
+                 tls: str) -> None:
         self.client, self.url, self.keypair, self.netuid, self.endpoint_id = client, url, keypair, netuid, endpoint_id
+        self._extensions = tls_module.use(tls)
         self._headers: tuple[float, dict[str, str]] | None = None
 
     def _session(self) -> dict[str, str]:
@@ -111,7 +115,7 @@ class ServicePath:
     async def answer(self, request: dict[str, Any]) -> dict[str, Any]:
         headers = {**self._session(), HDR_REQUEST_ID: secrets.token_hex(16)}
         try:
-            r = await self.client.post(self.url, json=request, headers=headers)
+            r = await self.client.post(self.url, json=request, headers=headers, extensions=self._extensions)
         except httpx.HTTPError as e:
             raise EngineError(f"service unreachable: {e}") from e
         if r.status_code != 200:

@@ -29,6 +29,7 @@ from verathos.gateway.upstream import Exchange
 from verathos.protocol.gateway import MAX_SAMPLES_BYTES, MAX_SAMPLES_PER_POST, SAMPLES_PATH, GatewaySample
 from verathos.protocol.http import post_idempotent
 from verathos.protocol.requests import sign_request
+from verathos.protocol.tls import Service
 from verathos.throughput.follow import POLL_S, ScheduleFollower
 from verathos.throughput.policy import BLOCK_TIME_S, AuditPolicy, ScheduledTest
 
@@ -66,9 +67,9 @@ class _Test:
 
 class Sampler:
     def __init__(self, keypair: Keypair, client: httpx.AsyncClient, *,
-                 auditor_url: Callable[[], Awaitable[str | None]], auditor_hotkey: str, window_s: float,
+                 auditor: Callable[[], Awaitable[Service | None]], auditor_hotkey: str, window_s: float,
                  rng: random.Random | None = None, clock: Callable[[], float] = time.time) -> None:
-        self.keypair, self.client, self.auditor_url, self.auditor_hotkey = keypair, client, auditor_url, auditor_hotkey
+        self.keypair, self.client, self.auditor, self.auditor_hotkey = keypair, client, auditor, auditor_hotkey
         self.window_s, self.rng, self.clock = window_s, rng or random.Random(), clock
         self._seen: dict[str, int] = {}
         self._picked: dict[str, Exchange] = {}
@@ -103,14 +104,14 @@ class Sampler:
                 continue
             picks = [e for _, e in test.picks.values()]
             try:
-                url = await self.auditor_url()
+                auditor = await self.auditor()
             except Exception as exc:
                 log.warning("the auditor's address is unknown: %s", exc)
-                url = None
+                auditor = None
             serialized = [GatewaySample(hotkey=e.route.hotkey, endpoint_id=e.route.endpoint_id,
                                         model_id=e.route.model_id, request=e.request, response=e.response,
                                         test_id=test_id).model_dump_json() for e in picks]
-            sent = [await self._post(url, batch) for batch in batches(serialized)]
+            sent = [await self._post(auditor, batch) for batch in batches(serialized)]
             if all(sent) or now > test.post_at + TEST_SAMPLE_KEEP_S:
                 if not all(sent):
                     log.warning("the users' answers in test %s were not submitted: %d picks dropped", test_id[:12],
@@ -133,10 +134,10 @@ class Sampler:
         sent_proofs = False
         try:
             try:
-                url = await self.auditor_url()
+                auditor = await self.auditor()
             except Exception as exc:
                 log.warning("the auditor's address is unknown: %s", exc)
-                url = None
+                auditor = None
             for exchanges, is_proof in ((proofs, True), (picked, False)):
                 if not exchanges:
                     continue
@@ -145,7 +146,7 @@ class Sampler:
                                             response=e.response).model_dump_json() for e in exchanges]
                 failed = 0
                 for batch in batches(serialized):
-                    if not await self._post(url, batch):
+                    if not await self._post(auditor, batch):
                         failed += len(batch)
                 if is_proof:
                     sent_proofs = not failed
@@ -153,8 +154,8 @@ class Sampler:
             if proofs and not sent_proofs:  # proofs are kept for the next window, whatever stopped this one
                 self._proofs = (proofs + self._proofs)[:MAX_PROOFS]
 
-    async def _post(self, url: str | None, batch: list[str]) -> bool:
-        if not url:
+    async def _post(self, auditor: Service | None, batch: list[str]) -> bool:
+        if auditor is None:
             metrics.SAMPLES.labels("failed").inc(len(batch))
             log.warning("auditor unknown: %d samples not submitted", len(batch))
             return False
@@ -164,7 +165,8 @@ class Sampler:
             return {"Content-Type": "application/json",
                     **sign_request(self.keypair, "POST", SAMPLES_PATH, body, self.auditor_hotkey)}
         try:  # the auditor keeps a sample once, however often it arrives
-            r = await post_idempotent(self.client, url.rstrip("/") + SAMPLES_PATH, body, headers, timeout=30.0)
+            r = await post_idempotent(self.client, auditor.url.rstrip("/") + SAMPLES_PATH, body, headers,
+                                      timeout=30.0, tls=auditor.pin)
         except httpx.HTTPError as exc:
             metrics.SAMPLES.labels("failed").inc(len(batch))
             log.warning("submitting %d samples to the auditor failed: %s", len(batch), exc)

@@ -1,9 +1,12 @@
 """Find miners and their endpoints from chain state, and check that each endpoint is the hotkey's.
 
 Input is a chain snapshot (hotkey, axon and commitment per UID); output is the accepted manifests. Only hotkeys
-with a manifest commitment and an axon on a public address are contacted; a manifest accepted before stands in for a
-while when the axon is out (``ManifestCache``). A manifest may list endpoints on any public host, so an endpoint gets
-traffic only once it proved control at its URL (``Identities``).
+with a manifest commitment and an axon on a public address are contacted, over TLS: the manifest is fetched accepting
+any certificate, and accepted only if the certificate the axon presented is the one the manifest names for it
+(``protocol.manifest.accept``); every later request to a machine of the miner accepts exactly the pin the manifest
+names for that machine. A manifest accepted before stands in for a while when the axon is out (``ManifestCache``). A
+manifest may list endpoints on any public host, so an endpoint gets traffic only once it proved control at its URL
+with its pin (``Identities``).
 """
 
 from __future__ import annotations
@@ -20,8 +23,8 @@ import httpx
 from bittensor_wallet import Keypair
 
 from verathos.miner.app import IDENTITY_DOMAIN, identity_payload
-from verathos.protocol import signing
-from verathos.protocol.http import request_json
+from verathos.protocol import signing, tls
+from verathos.protocol.http import request_document, request_json
 from verathos.protocol.manifest import (
     Endpoint,
     Manifest,
@@ -60,6 +63,7 @@ class DiscoveredEndpoint:
     hotkey: str
     axon: str | None  # the axon its manifest was just fetched from (``axon_base``)
     endpoint: Endpoint
+    tls: str  # the pin of its machine's certificate, as the manifest names it
 
     @property
     def path_prefix(self) -> str:
@@ -75,8 +79,13 @@ class DiscoveredEndpoint:
         return self.endpoint.url
 
     @property
+    def where(self) -> tuple[str, str]:
+        """Its URL and its machine's pin: what it proves control at (``Identities``)."""
+        return self.endpoint.url, self.tls
+
+    @property
     def host(self) -> str:
-        """The miner service that serves it (``http://ip:port``)."""
+        """The miner service that serves it (``https://ip:port``)."""
         return endpoint_host(self.endpoint.url, self.endpoint.endpoint_id) or self.endpoint.url
 
 
@@ -88,7 +97,9 @@ class DiscoveredMiner:
     manifest: Manifest
 
     def endpoints(self) -> list[DiscoveredEndpoint]:
-        return [DiscoveredEndpoint(self.uid, self.hotkey, self.axon, e) for e in self.manifest.endpoints]
+        return [DiscoveredEndpoint(self.uid, self.hotkey, self.axon, e,
+                                   self.manifest.pin(endpoint_host(e.url, e.endpoint_id) or "") or "")
+                for e in self.manifest.endpoints]
 
 
 class ManifestCache:
@@ -129,9 +140,11 @@ async def _fetch_manifest(n: Neuron, netuid: int, client: httpx.AsyncClient, cat
     try:
         if not is_public(n.axon_ip) or not 0 < n.axon_port < 65536:
             raise ManifestRejected("the axon is not on a public address")
-        document = await request_json(client, "GET", base + "/v1/manifest", limit=MAX_MANIFEST_BYTES,
-                                      timeout=FETCH_TIMEOUT_S)
-        manifest = accept(document, hotkey=n.hotkey, netuid=netuid, commitment=n.commitment, catalogs=catalogs)
+        # any certificate: the manifest is signed and committed on chain, and names the pin the axon must have shown
+        document, seen = await request_document(client, "GET", base + "/v1/manifest", limit=MAX_MANIFEST_BYTES,
+                                                timeout=FETCH_TIMEOUT_S, tls=tls.ANY)
+        manifest = accept(document, hotkey=n.hotkey, netuid=netuid, commitment=n.commitment, catalogs=catalogs,
+                          axon=base, seen=seen)
     except Exception as e:  # whatever a neuron serves, it only costs that neuron its discovery
         held = cache.get(n, catalogs) if cache is not None else None
         if held is None:
@@ -167,14 +180,14 @@ async def discover(neurons: list[Neuron], netuid: int, client: httpx.AsyncClient
 
 
 async def verify_identity(endpoint: DiscoveredEndpoint, keypair: Keypair, client: httpx.AsyncClient) -> bool:
-    """The endpoint must sign a fresh challenge with the hotkey that lists it, at its URL."""
+    """The endpoint must sign a fresh challenge with the hotkey that lists it, at its URL, over TLS with its pin."""
     challenge = secrets.token_hex(16)
     body = (f'{{"challenge":"{challenge}"}}').encode()
     headers = {"Content-Type": "application/json",
                **sign_request(keypair, "POST", endpoint.path_prefix + "/v1/identity", body, endpoint.hotkey)}
     try:
         reply = await request_json(client, "POST", endpoint.url + "/v1/identity", content=body, headers=headers,
-                                   limit=MAX_IDENTITY_BYTES, timeout=FETCH_TIMEOUT_S)
+                                   limit=MAX_IDENTITY_BYTES, timeout=FETCH_TIMEOUT_S, tls=endpoint.tls)
         signature = reply["signature"] if isinstance(reply, dict) else None
     except Exception:
         return False
@@ -183,8 +196,9 @@ async def verify_identity(endpoint: DiscoveredEndpoint, keypair: Keypair, client
 
 
 class Identities:
-    """Which endpoints proved control at their URL, by epoch: everything in a validator that sends miners traffic
-    asks here first.
+    """Which endpoints proved control at their URL with their pin, by epoch: everything in a validator that sends
+    miners traffic asks here first. An endpoint is known by its key, URL and pin (``where``): a new pin is a new
+    place to prove control at.
 
     A hotkey's own hosts are its axon, while its manifest was just fetched from there, and every host where one of its
     endpoints passed this epoch or the last: there its endpoints are challenged at once, and again after a failure.
@@ -194,16 +208,16 @@ class Identities:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._passed: dict[tuple[str, str], int] = {}  # (endpoint key, url) -> latest epoch it passed
+        self._passed: dict[tuple[str, tuple[str, str]], int] = {}  # (endpoint key, where) -> latest epoch it passed
         self._hosts: dict[tuple[str, str], int] = {}  # (hotkey, host) -> latest epoch an endpoint passed there
         self._failed: dict[tuple[str, str], int] = {}  # (hotkey, host) -> latest epoch a challenge there failed
-        self._tried: dict[tuple[str, str], int] = {}  # (endpoint key, url) -> latest epoch it was challenged
+        self._tried: dict[tuple[str, tuple[str, str]], int] = {}  # (endpoint key, where) -> latest epoch challenged
         self._busy: set[tuple[str, str]] = set()  # (hotkey, host) not the hotkey's, with a challenge under way
 
-    def verified(self, key: str, url: str, since_epoch: int) -> bool:
-        """Whether endpoint ``key`` passed at ``url`` in ``since_epoch`` or later."""
+    def verified(self, key: str, where: tuple[str, str], since_epoch: int) -> bool:
+        """Whether endpoint ``key`` passed at ``where`` (its URL and pin) in ``since_epoch`` or later."""
         with self._lock:
-            return self._passed.get((key, url), -1) >= since_epoch
+            return self._passed.get((key, where), -1) >= since_epoch
 
     def own(self, ep: DiscoveredEndpoint, epoch: int) -> bool:
         """Whether the endpoint's host is one of its hotkey's own (see the class)."""
@@ -222,17 +236,17 @@ class Identities:
 
         def due(ep: DiscoveredEndpoint) -> bool:
             with self._lock:
-                return (self._passed.get((ep.key, ep.url), -1) < epoch
-                        and (retry or self._tried.get((ep.key, ep.url), -1) < epoch))
+                return (self._passed.get((ep.key, ep.where), -1) < epoch
+                        and (retry or self._tried.get((ep.key, ep.where), -1) < epoch))
 
         async def challenge(ep: DiscoveredEndpoint) -> bool:
             with self._lock:
-                self._tried[ep.key, ep.url] = epoch
+                self._tried[ep.key, ep.where] = epoch
             async with slots:
                 ok = await verify_identity(ep, keypair, client)
             if ok:
                 with self._lock:
-                    self._passed[ep.key, ep.url] = self._hosts[ep.hotkey, ep.host] = epoch
+                    self._passed[ep.key, ep.where] = self._hosts[ep.hotkey, ep.host] = epoch
             return ok
 
         async def at_host(key: tuple[str, str], group: list[DiscoveredEndpoint]) -> None:

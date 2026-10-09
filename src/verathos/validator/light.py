@@ -1,13 +1,14 @@
 """Light mode: a validator that sets the weights a source validator publishes, without checking miners itself.
 
-Each epoch the source (the subnet owner's validator, the auditor, or the validator ``source_hotkey`` names, which
-holds a permit and runs a service) scores the network, publishes its results with the weights it sets at
-``GET /v1/network``, signed with its hotkey, and sets them. A light validator fetches that document from the
-source's axon and sets exactly those weights, on the mechanism of the catalog it follows (or the configured
+Each epoch the source (the subnet owner's validator, the auditor, or the validator ``source_hotkey`` names, which holds
+a permit and runs a service) scores the network, publishes its results with the weights it sets at ``GET /v1/network``,
+signed with its hotkey, and sets them. A light validator fetches that document from the source's axon over TLS,
+accepting the certificate whose pin the catalog names for the auditor, or the source validator's chain commitment names
+(``protocol.callers``), and sets exactly those weights, on the mechanism of the catalog it follows (or the configured
 ``mechid``), through the code full validators use (version key, commit-reveal, retries, dry run), only from a document
 that verifies: signed by the source hotkey under ``verathos/network-status/v1`` for this netuid, issued within
-``STATUS_MAX_AGE_S`` of its clock, for the current or the previous epoch of the catalog's length, and for a later
-epoch than the weights it set last. It sends nothing to miners, runs no reference engine and needs no stake beyond the
+``STATUS_MAX_AGE_S`` of its clock, for the current or the previous epoch of the catalog's length, and for a later epoch
+than the weights it set last. It sends nothing to miners, runs no reference engine and needs no stake beyond the
 validator permit that setting weights takes.
 
 The source scores an epoch once its canaries are out, after the first ``canary_spread_fraction`` of the epoch, and
@@ -31,10 +32,12 @@ import bittensor as bt
 import httpx
 from pydantic import ValidationError
 
-from verathos.catalog import Catalog, mechanism_of
+from verathos.catalog import AuditorUnknown, Catalog, mechanism_of
+from verathos.protocol.callers import validator_identity
 from verathos.protocol.http import ResponseTooLarge, get_json
 from verathos.protocol.manifest import axon_base
 from verathos.protocol.status import MAX_NETWORK_BYTES, NETWORK_DOMAIN, NETWORK_PATH, NetworkStatus, unverified
+from verathos.protocol.tls import Service
 from verathos.subnet.chain import CHAIN_ERRORS, one_line
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator.chain import ReleaseTooOld, weights_version_key
@@ -76,9 +79,11 @@ def check(document: Any, *, source: str, netuid: int, epoch: int, epoch_blocks: 
     return network
 
 
-def find_source(st: bt.Subtensor, netuid: int, owner: str | None, source_hotkey: str | None) -> tuple[str, str]:
-    """The source hotkey (``source_hotkey``, else the subnet owner's, ``owner``) and its axon's URL, from the chain:
-    registered, with a validator permit unless it is the owner's, serving an axon. Raises Refused."""
+def find_source(st: bt.Subtensor, netuid: int, owner: str | None, source_hotkey: str | None,
+                cat: Catalog) -> tuple[str, Service]:
+    """The source hotkey (``source_hotkey``, else the subnet owner's, ``owner``) and its service, from the chain:
+    registered, with a validator permit unless it is the owner's, serving an axon; its pin is the auditor's in ``cat``
+    for the owner, else the one its validator commitment names. Raises Refused."""
     source = source_hotkey or owner
     if not source:
         raise Refused("the subnet owner hotkey is not known")
@@ -90,7 +95,18 @@ def find_source(st: bt.Subtensor, netuid: int, owner: str | None, source_hotkey:
     ip, port = neuron.axon_info.ip, neuron.axon_info.port
     if ip in ("", "0.0.0.0") or not port:
         raise Refused(f"the source hotkey {source} serves no axon")
-    return source, axon_base(ip, port)
+    if source == owner:
+        try:
+            pin = cat.auditor_pin()
+        except AuditorUnknown as exc:
+            raise Refused(str(exc)) from None
+    else:
+        identity = validator_identity(st.get_commitment(netuid, neuron.uid))
+        if identity is None or identity.tls is None:
+            raise Refused(f"the source hotkey {source} commits no TLS pin for its service (a verathos/validator/v1 "
+                          "commitment, which a full validator with public_host publishes)")
+        pin = identity.tls
+    return source, Service(axon_base(ip, port), pin)
 
 
 def describe(weights: dict[int, float]) -> str:
@@ -138,13 +154,13 @@ class LightValidator:
         """Blocks into an epoch before which the source has not scored it: its canaries' share of the epoch."""
         return int(cat.epoch_blocks * cat.scoring.canary_spread_fraction)
 
-    def source(self) -> tuple[str, str]:
-        """The source hotkey and its axon's URL, from the chain. Raises Refused, or SystemExit once this hotkey is the
+    def source(self) -> tuple[str, Service]:
+        """The source hotkey and its service, from the chain. Raises Refused, or SystemExit once this hotkey is the
         subnet owner's."""
         owner = self.st.get_subnet_owner_hotkey(self.cfg.netuid)
         if owner == self.hotkey:
             raise SystemExit(OWNER_IS_FULL)
-        return find_source(self.st, self.cfg.netuid, owner, self.cfg.source_hotkey)
+        return find_source(self.st, self.cfg.netuid, owner, self.cfg.source_hotkey, self.current.catalog)
 
     def permit(self) -> str | None:
         """Why this validator cannot set weights; None if it can."""
@@ -190,11 +206,12 @@ class LightValidator:
     def attempt(self, block: int) -> None:
         """Fetch the source's document and set its weights, at ``block``. Raises Refused."""
         epoch_blocks, window = self.current.catalog.epoch_blocks, self.due(block)
-        source, url = self.source()
+        source, service = self.source()
         try:
-            document = self.fetch(url + NETWORK_PATH, limit=MAX_NETWORK_BYTES, timeout=FETCH_TIMEOUT_S)
+            document = self.fetch(service.url + NETWORK_PATH, limit=MAX_NETWORK_BYTES, timeout=FETCH_TIMEOUT_S,
+                                  tls=service.pin)
         except (httpx.HTTPError, ResponseTooLarge, ValueError) as exc:
-            raise Refused(f"the source's axon {url} did not serve it: {one_line(exc)}") from None
+            raise Refused(f"the source's axon {service.url} did not serve it: {one_line(exc)}") from None
         network = check(document, source=source, netuid=self.cfg.netuid, epoch=block // epoch_blocks,
                         epoch_blocks=epoch_blocks, done_block=self.done_block, now_ms=int(self.clock() * 1000))
         if network.epoch < window:  # an earlier epoch's, not set before: the due ones follow within the window

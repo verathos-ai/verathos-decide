@@ -1,8 +1,9 @@
 """Signed requests to miners, and the checks on their responses.
 
-The request is signed with the gateway's hotkey for the endpoint's miner (``protocol.requests``). A response counts
-only as an uncompressed JSON object within ``MAX_RESPONSE_BYTES`` whose receipt is the miner's signature over this
-request and these answers, issued to this gateway for this request's nonce, with well-formed answers. Signed
+The request is signed with the gateway's hotkey for the endpoint's miner (``protocol.requests``) and sent over TLS,
+accepting exactly the certificate the route's pin names; a different certificate is a failed connection. A response
+counts only as an uncompressed JSON object within ``MAX_RESPONSE_BYTES`` whose receipt is the miner's signature over
+this request and these answers, issued to this gateway for this request's nonce, with well-formed answers. Signed
 malformed answers are proof on their own.
 
 A failed attempt says whose fault it is: ``miner`` failures (no connection, an invalid or unsigned response, a refusal
@@ -27,6 +28,7 @@ from verathos.protocol.api import MAX_RESPONSE_BYTES, SystemOneRequest, well_for
 from verathos.protocol.gateway import Route
 from verathos.protocol.receipts import parse_response, signed_exchange
 from verathos.protocol.requests import HDR_NONCE, sign_request
+from verathos.protocol.tls import use
 
 LOCAL_ERRNOS = {errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM, errno.ENETUNREACH, errno.EADDRNOTAVAIL}
 
@@ -82,7 +84,8 @@ class Upstream:
                    **sign_request(self.keypair, "POST", urlsplit(url).path, body, route.hotkey)}
         try:
             async with asyncio.timeout(timeout_s):
-                async with self.client.stream("POST", url, content=body, headers=headers) as r:
+                async with self.client.stream("POST", url, content=body, headers=headers,
+                                              extensions=use(route.tls)) as r:
                     if r.status_code in (429, 503):
                         raise UpstreamFailure("busy", "busy", str(r.status_code))
                     if r.status_code in (401, 403):

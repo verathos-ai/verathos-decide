@@ -4,9 +4,10 @@ Once per epoch the log gets one line per endpoint this machine serves (scored, q
 for every throughput test of those endpoints once its outcome is final (after a start, the latest of each endpoint).
 The status page itself lists every endpoint of the hotkey, on all its machines.
 
-The miner acts on the test results (``shortfall``) only from a status the subnet owner hotkey signed for this hotkey
-and netuid, recently and no earlier than one it read before (``protocol.status.unverified``). Any other status is
-logged all the same, with one warning line until a status verifies again.
+The status page is read over TLS, accepting the auditor's certificate by the pin the catalog names. The miner acts on
+the test results (``shortfall``) only from a status the subnet owner hotkey signed for this hotkey and netuid, recently
+and no earlier than one it read before (``protocol.status.unverified``). Any other status is logged all the same, with
+one warning line until a status verifies again.
 """
 
 from __future__ import annotations
@@ -83,13 +84,15 @@ def describe_test(t: ThroughputOutcome) -> str:
 class StatusWatcher:
     """Polls the auditor's status page for this hotkey, logs what changed and hands the test results of a verified
     status to ``on_tests`` (the miner measures again an endpoint that fell short). ``auditor_hotkey``: the subnet
-    owner hotkey, as read from the chain."""
+    owner hotkey, as read from the chain; ``auditor_pin``: its certificate's pin, as the catalog names it."""
 
     def __init__(self, *, hotkey: str, netuid: int, auditor_url: Callable[[], str | None],
-                 auditor_hotkey: Callable[[], str | None], listed: Callable[[], list[str]],
+                 auditor_pin: Callable[[], str], auditor_hotkey: Callable[[], str | None],
+                 listed: Callable[[], list[str]],
                  on_tests: Callable[[list[ThroughputOutcome]], None] = lambda tests: None,
                  clock: Callable[[], float] = time.time) -> None:
         self.hotkey, self.netuid, self.auditor_url, self.auditor_hotkey = hotkey, netuid, auditor_url, auditor_hotkey
+        self.auditor_pin = auditor_pin
         self.listed, self.on_tests, self.clock = listed, on_tests, clock
         self._epoch: int | None = None
         self._tests_logged: set[tuple[int, str]] | None = None  # None until the first status
@@ -112,7 +115,7 @@ class StatusWatcher:
         if not base:
             return
         document = get_json(base.rstrip("/") + STATUS_PATH.format(hotkey=self.hotkey), limit=MAX_STATUS_BYTES,
-                            timeout=15)
+                            timeout=15, tls=self.auditor_pin())
         status = HotkeyStatus.model_validate(document)
         for line in self.lines(status):
             log.info(line)

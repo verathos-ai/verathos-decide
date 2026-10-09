@@ -1,4 +1,5 @@
-"""The load generator's contract (``native/loadgen``) in Python, for tests against in-process miners."""
+"""The load generator's contract (``native/loadgen``) in Python, for tests against in-process miners: each target
+over https, accepting the certificate its pin names."""
 
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from verathos.protocol import tls
 from verathos.throughput.loadgen import LoadResult
 from verathos.throughput.policy import HDR_REQUEST_ID
 
@@ -54,7 +56,8 @@ async def _target(client: httpx.AsyncClient, target: dict[str, Any], plan: dict[
         sent = time.time()
         try:
             r = await asyncio.wait_for(
-                client.post(target["url"], json=body, headers={**target["headers"], HDR_REQUEST_ID: request_id}),
+                client.post(target["url"], json=body, headers={**target["headers"], HDR_REQUEST_ID: request_id},
+                            extensions=tls.use(target["tls"])),
                 max(0.0, min(window[1], sent + plan["timeout_s"]) - sent))
         except (httpx.HTTPError, TimeoutError):
             return  # unanswered by the end of the window

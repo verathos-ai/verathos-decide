@@ -6,6 +6,10 @@ cache, the owner's axon, or a mirror. A new catalog therefore takes effect witho
 the JSON document as published, so nodes whose code knows fewer fields still agree on it. The catalog also names the
 subnet mechanism the network runs on: miners publish their manifests for it and validators set weights on it.
 
+It names the auditor's TLS pin (``auditor.tls``), by which miners, validators, light validators and gateways accept the
+auditor's service, and the addresses the auditor and each gateway send their requests from (``egress``,
+``protocol.callers``).
+
 Only ``active`` models are scored. ``candidate`` models may be served and checked on the network but are not scored;
 ``retired`` models are ignored.
 """
@@ -20,10 +24,12 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from bittensor_wallet import Keypair
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
+from verathos.protocol.callers import egress_addresses
 from verathos.protocol.canonical import digest
 from verathos.protocol.http import get_json
+from verathos.protocol.tls import PIN_PATTERN, authenticated
 from verathos.throughput.policy import AuditPolicy, policy_from
 from verathos.throughput.workload import Workload
 from verathos.validator.compare import Tolerance
@@ -171,6 +177,41 @@ class Scoring(BaseModel):
         return self.validator_requests_per_epoch or 4 * self.canary_pool_size
 
 
+class AuditorIdentity(BaseModel):
+    """The auditor's service (the subnet owner's validator) and where its requests come from."""
+
+    tls: str = Field(pattern=PIN_PATTERN, description="Pin of the TLS certificate of the auditor's service "
+                     "(SHA-256 of its public key): miners, validators and gateways accept the auditor by it")
+    egress: list[str] = Field(default_factory=list, description="Public IP addresses the auditor sends its requests "
+                              "from (identity challenges, canaries, throughput tests)")
+
+    @field_validator("egress")
+    @classmethod
+    def _egress(cls, value: list[str]) -> list[str]:
+        return egress_addresses(value)
+
+
+class Gateway(BaseModel):
+    """A gateway of the subnet: miners serve it like a validator without the per-caller limits, and the auditor
+    checks a sample of its answers."""
+
+    hotkey: str
+    egress: list[str] = Field(default_factory=list, description="Public IP addresses its requests to miners come "
+                              "from")
+
+    @field_validator("hotkey")
+    @classmethod
+    def _ss58(cls, value: str) -> str:
+        if not is_ss58(value):
+            raise ValueError(f"gateway {value!r} is not an ss58 address")
+        return value
+
+    @field_validator("egress")
+    @classmethod
+    def _egress(cls, value: list[str]) -> list[str]:
+        return egress_addresses(value)
+
+
 class Catalog(BaseModel):
     version: Literal[1] = 1
     revision: str
@@ -182,9 +223,10 @@ class Catalog(BaseModel):
     throughput_audit: dict[str, Any] = Field(default_factory=dict, description="Throughput-audit settings over the "
                                              "code defaults")
     scoring: Scoring = Scoring()
-    gateways: list[str] = Field(default_factory=list, max_length=16, description="Hotkeys of the subnet's gateways: "
-                                "miners serve them like validators, without the per-caller limit, and the auditor "
-                                "checks a sample of their answers")
+    gateways: list[Gateway] = Field(default_factory=list, max_length=16, description="The subnet's gateways, each "
+                                    "{hotkey, egress}")
+    auditor: AuditorIdentity | None = Field(None, description="The auditor's TLS pin and egress addresses; nodes reach "
+                                            "the auditor only once the catalog names its pin")
     _document: Any = PrivateAttr(None)
 
     @classmethod
@@ -211,11 +253,33 @@ class Catalog(BaseModel):
         ids = [m.model_id for m in self.models]
         if len(ids) != len(set(ids)):
             raise ValueError("model ids must be unique")
-        for hotkey in self.gateways:
-            if not is_ss58(hotkey):
-                raise ValueError(f"gateway {hotkey!r} is not an ss58 address")
+        hotkeys = self.gateway_hotkeys()
+        if len(hotkeys) != len(set(hotkeys)):
+            raise ValueError("gateway hotkeys must be unique")
         self.audit_policy()
         return self
+
+    def gateway_hotkeys(self) -> list[str]:
+        """The gateways' hotkeys."""
+        return [g.hotkey for g in self.gateways]
+
+    def auditor_pin(self) -> str:
+        """The pin of the auditor's TLS certificate. Raises AuditorUnknown if the catalog names none."""
+        if self.auditor is None:
+            raise AuditorUnknown(f"catalog {self.digest()[:12]} names no TLS pin for the auditor (auditor.tls): the "
+                                 "auditor's service is not reached until the subnet owner commits one")
+        return self.auditor.tls
+
+    def identity_problems(self) -> list[str]:
+        """What a catalog must name before it is published: the auditor's TLS pin and egress addresses, and each
+        gateway's egress addresses."""
+        problems = []
+        if self.auditor is None:
+            problems.append("auditor: the auditor's TLS pin (auditor.tls) and egress addresses (auditor.egress)")
+        elif not self.auditor.egress:
+            problems.append("auditor.egress: the addresses the auditor sends its requests from")
+        problems += [f"gateways: the egress addresses of {g.hotkey}" for g in self.gateways if not g.egress]
+        return problems
 
     def anchor_shares(self, *, strict: bool = False) -> dict[str, float]:
         """The active models' anchor shares, summing to 1 (equal if none is set). ``strict``: they must sum to 1 as
@@ -242,6 +306,11 @@ class Catalog(BaseModel):
             unknown += [f"scoring.usage_pool.{k}" for k in scoring["usage_pool"] if k not in UsagePool.model_fields]
         for m in doc.get("models") or []:
             unknown += [f"models.{m.get('model_id', '?')}.{k}" for k in m if k not in CatalogModel.model_fields]
+        if isinstance(doc.get("auditor"), dict):
+            unknown += [f"auditor.{k}" for k in doc["auditor"] if k not in AuditorIdentity.model_fields]
+        for g in doc.get("gateways") or []:
+            if isinstance(g, dict):
+                unknown += [f"gateways.{g.get('hotkey', '?')}.{k}" for k in g if k not in Gateway.model_fields]
         return unknown
 
     def audit_policy(self, *, strict: bool = False) -> AuditPolicy:
@@ -272,6 +341,10 @@ def is_ss58(value: str) -> bool:
 
 class CatalogUnavailable(Exception):
     pass
+
+
+class AuditorUnknown(Exception):
+    """The catalog names no TLS pin for the auditor."""
 
 
 def load(path: Path | None = None) -> Catalog:
@@ -315,8 +388,10 @@ class CatalogStore:
 def resolve(catalog_digest: str, *, store: CatalogStore, sources: list[str]) -> Catalog:
     """The catalog with ``catalog_digest``: shipped copy, local store, then each source URL in order.
 
-    Sources are URL templates containing ``{digest}``. Anything fetched is accepted only if its digest matches. The
-    shipped copy, when committed, is kept in the store too, so a later release still finds it without a source.
+    Sources are https URL templates containing ``{digest}``: a public CA's certificate is required for a hostname,
+    any certificate is accepted at an IP address (the owner's axon), since anything fetched is accepted only if its
+    digest matches. The shipped copy, when committed, is kept in the store too, so a later release still finds it
+    without a source.
     """
     shipped = load()
     if shipped.digest() == catalog_digest:
@@ -329,7 +404,7 @@ def resolve(catalog_digest: str, *, store: CatalogStore, sources: list[str]) -> 
     for template in sources:
         url = template.format(digest=catalog_digest)
         try:
-            document = get_json(url, limit=MAX_CATALOG_BYTES, timeout=15)
+            document = get_json(url, limit=MAX_CATALOG_BYTES, timeout=15, tls=authenticated(url))
             if digest(document) != catalog_digest:
                 log.warning("catalog from %s is not the committed %s", url, catalog_digest[:12])
                 continue

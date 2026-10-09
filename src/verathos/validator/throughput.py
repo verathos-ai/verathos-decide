@@ -1,10 +1,10 @@
 """The validator's side of the throughput audit.
 
-Every validator follows the public test schedule and holds its canaries while a test runs. The subnet owner's
-validator is the auditor: it runs the tests and serves signed verdicts (``validator.service``); every other validator
-fetches them. A validator applies a piece of evidence only after
-checking the miner's receipt in it, and, when it runs a reference engine for the model, only if its own reference also
-proves the answer wrong.
+Every validator follows the public test schedule and holds its canaries while a test runs. The subnet owner's validator
+is the auditor: it runs the tests and serves signed verdicts (``validator.service``); every other validator fetches them
+over TLS, accepting the auditor's certificate by the pin the catalog names. A validator applies a piece of evidence only
+after checking the miner's receipt in it, and, when it runs a reference engine for the model, only if its own reference
+also proves the answer wrong.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import httpx
 
 from verathos import catalog
 from verathos.miner.engine import Engine
+from verathos.protocol import tls
 from verathos.protocol.manifest import Endpoint
 from verathos.protocol.receipts import issued_receipt, parse_response, signed_answers
 from verathos.throughput import feed
@@ -45,16 +46,18 @@ def testable(e: Endpoint) -> bool:
 
 
 def slots(miners: list[DiscoveredMiner]) -> list[Slot]:
-    """Every endpoint the auditor tests."""
-    return [Slot(m.hotkey, e.endpoint_id, e.url, e.model_id, e.capacity_rps)
-            for m in miners for e in m.manifest.endpoints if testable(e)]
+    """Every endpoint the auditor tests, with its machine's pin."""
+    return [Slot(e.hotkey, e.endpoint.endpoint_id, e.url, e.endpoint.model_id, e.endpoint.capacity_rps, e.tls)
+            for m in miners for e in m.endpoints() if testable(e.endpoint)]
 
 
 class Throughput:
     def __init__(self, *, netuid: int, policy: AuditPolicy, auditor_hotkey: str, chain: SubtensorChainView,
-                 auditor: Auditor | None = None, follower: ScheduleFollower | None = None) -> None:
+                 auditor: Auditor | None = None, follower: ScheduleFollower | None = None,
+                 auditor_pin: Callable[[], str] | None = None) -> None:
+        """``auditor_pin``: the pin of the auditor's certificate, as the catalog names it (``Catalog.auditor_pin``)."""
         self.netuid, self.policy, self.auditor_hotkey, self.chain = netuid, policy, auditor_hotkey, chain
-        self.auditor, self.follower = auditor, follower
+        self.auditor, self.follower, self.auditor_pin = auditor, follower, auditor_pin
         # what the validator knows of the miners, shared by its canary audit and the auditor's refresh
         self.identities = Identities()
         self.manifests = ManifestCache(MANIFEST_HOLD_EPOCHS * policy.epoch_blocks * BLOCK_TIME_S)
@@ -72,7 +75,8 @@ class Throughput:
             follower = ScheduleFollower(chain, policy)
             follower.start()
             log.info("throughput tests are run by %s; applying its verdicts", auditor_hotkey)
-            return cls(netuid=netuid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain, follower=follower)
+            return cls(netuid=netuid, policy=policy, auditor_hotkey=auditor_hotkey, chain=chain, follower=follower,
+                       auditor_pin=lambda: current().auditor_pin())
         auditor = Auditor(netuid=netuid, keypair=wallet.hotkey, chain=chain, policy=policy,
                           catalog=current, references=references, screens=screens,
                           db_path=state_dir / "throughput.sqlite",
@@ -115,7 +119,7 @@ class Throughput:
 
     async def _refresh(self, neurons: list[Neuron], catalogs: Mapping[str, int],
                        epoch: int) -> list[DiscoveredMiner]:
-        async with httpx.AsyncClient() as client:
+        async with tls.client() as client:
             return await self.refresh(neurons, catalogs, epoch, client)
 
     async def refresh(self, neurons: list[Neuron], catalogs: Mapping[str, int], epoch: int,
@@ -135,7 +139,7 @@ class Throughput:
         if not miners and any(n.commitment for n in neurons):
             log.warning("no miner could be discovered; keeping the endpoints known before")
             return  # a failed discovery must not empty the tests and the gateways' routes
-        self.auditor.update_slots([s for s in slots(miners) if self.identities.verified(s.key, s.url, epoch - 1)])
+        self.auditor.update_slots([s for s in slots(miners) if self.identities.verified(s.key, s.where, epoch - 1)])
 
     # ---- verdicts ----
 
@@ -168,7 +172,9 @@ class Throughput:
             return signed.verdicts
         try:
             url = await asyncio.to_thread(self.chain.auditor_url)
-            return await feed.fetch(client, url, auditor_hotkey=self.auditor_hotkey, netuid=self.netuid, epoch=epoch)
+            pin = self.auditor_pin() if self.auditor_pin is not None else None
+            return await feed.fetch(client, url, pin, auditor_hotkey=self.auditor_hotkey, netuid=self.netuid,
+                                    epoch=epoch)
         except feed.VerdictsUnavailable:
             raise
         except Exception as exc:  # chain or transport trouble is an unavailable feed, never a failed epoch
@@ -189,7 +195,7 @@ class Throughput:
             if e.from_gateway:
                 receipt = None if response is None or model is None else issued_receipt(
                     response.get("receipt"), request_id=e.request_id, hotkey=e.hotkey, endpoint_id=e.endpoint_id,
-                    model_id=e.model_id, callers=set(cat.gateways), netuid=self.netuid)
+                    model_id=e.model_id, callers=set(cat.gateway_hotkeys()), netuid=self.netuid)
                 if receipt is None:
                     log.warning("evidence against %s/%s rejected: no receipt issued to a gateway", e.hotkey,
                                 e.endpoint_id)

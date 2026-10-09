@@ -17,6 +17,7 @@ from bittensor_wallet import Keypair
 
 from tests.test_miner_publisher import CapacityEngine, free_port, scheduled
 from tests.test_throughput import FakeChain
+from tests.tlsfake import Presenting, der
 from verathos import catalog
 from verathos.miner import __main__ as miner_main
 from verathos.miner import status as miner_status
@@ -26,6 +27,7 @@ from verathos.miner.peers import Peers, merged
 from verathos.miner.shortfall import COOLDOWN_EPOCHS, OUTAGE_SHARE, Shortfalls
 from verathos.miner.status import StatusWatcher
 from verathos.miner.timing import Deferral, MeasurementDeferred, MeasurementWindow
+from verathos.protocol import tls
 from verathos.protocol.manifest import Endpoint
 from verathos.protocol.receipts import SignedReceipt
 from verathos.protocol.requests import sign_request
@@ -155,7 +157,8 @@ def publisher_with(tmp_path, rps: dict[str, float], *, role: str = "primary", ho
         "endpoints": [{"endpoint_id": e, "model_id": "kev-4b", "engine_url": "http://127.0.0.1:9"} for e in rps]})
     keypair = kp()
     publisher = miner_main.Publisher(config, SimpleNamespace(hotkey=keypair), CATALOG, publish_on_chain=True,
-                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"))
+                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"),
+                                     identity=tls.identity(config.state_dir))
     calls: list[bool] = []
 
     async def measuring(endpoints, cat, remeasure, stop):
@@ -273,11 +276,12 @@ def test_a_changed_declaration_is_published_by_the_primary_and_served_by_a_worke
     hotkey = worker.wallet.hotkey
     app = create_app(config=worker.config, keypair=hotkey, manifest=lambda: worker.signed, engines={},
                      authorized=lambda hk: False, auditors=worker.auditors, host_endpoints=lambda: worker.local)
-    peers = Peers(["http://198.51.100.7:20017"], hotkey=hotkey.ss58_address, netuid=405, mechid=CATALOG.mechanism)
+    peers = Peers(["https://198.51.100.7:20017"], hotkey=hotkey.ss58_address, netuid=405, mechid=CATALOG.mechanism)
+    transport = Presenting({"198.51.100.7": app}, {"198.51.100.7": der(worker.identity)})
 
     def primary_lists() -> list[Endpoint]:
         async def poll():
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as client:
+            async with httpx.AsyncClient(transport=transport) as client:
                 await peers.poll(client, CATALOG.digest(), 3600.0)
 
         asyncio.run(poll())
@@ -297,8 +301,9 @@ def test_only_tests_in_a_status_the_subnet_owner_signed_make_the_miner_measure_a
     status = HotkeyStatus(hotkey=hotkey, tests=[outcome(45417), outcome(45418)]).model_dump(mode="json")
     served = [status]  # an auditor of an older release: unsigned
     monkeypatch.setattr(miner_status, "get_json", lambda url, **kwargs: served[-1])
-    watcher = StatusWatcher(hotkey=hotkey, netuid=405, auditor_url=lambda: "http://192.0.2.1:8091",
-                            auditor_hotkey=lambda: publisher.auditor, listed=publisher.own_ids,
+    watcher = StatusWatcher(hotkey=hotkey, netuid=405, auditor_url=lambda: "https://192.0.2.1:8091",
+                            auditor_pin=lambda: "ab" * 32, auditor_hotkey=lambda: publisher.auditor,
+                            listed=publisher.own_ids,
                             on_tests=publisher.note_tests)
     watcher.poll_once()
     assert publisher.tests == [] and not publisher.measure_shortfalls() and len(calls) == 1
@@ -323,7 +328,8 @@ def test_a_measurement_for_a_shortfall_waits_for_a_selected_test_and_a_first_sta
         "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:9",
                        "max_concurrency": 8}]})
     publisher = miner_main.Publisher(config, SimpleNamespace(hotkey=keypair), CATALOG, publish_on_chain=False,
-                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"))
+                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"),
+                                     identity=tls.identity(config.state_dir))
     test = scheduled(1, policy)
     chain = FakeChain(head=test.selection_block)  # the test of epoch 1 is selected, its traffic still to come
     publisher.window = MeasurementWindow(ScheduleFollower(chain, policy))
@@ -331,7 +337,8 @@ def test_a_measurement_for_a_shortfall_waits_for_a_selected_test_and_a_first_sta
     app = create_app(config=config, keypair=keypair, manifest=lambda: publisher.signed, engines={"gpu0": engine},
                      authorized=lambda hk: False, auditors=publisher.auditors, admissions=publisher.admissions,
                      serving=lambda: publisher.serving)
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
+                                           **tls.server_options(publisher.identity)))
     threading.Thread(target=server.run, daemon=True).start()
     while not server.started:
         time.sleep(0.05)
@@ -408,13 +415,15 @@ def test_users_are_served_while_an_endpoint_that_fell_short_is_measured_again(tm
         "endpoints": [{"endpoint_id": e, "model_id": "kev-4b", "engine_url": "http://127.0.0.1:9", "max_concurrency": 8}
                       for e in ("gpu0", "gpu1")]})
     publisher = miner_main.Publisher(config, SimpleNamespace(hotkey=keypair), CATALOG, publish_on_chain=False,
-                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"))
+                                     subtensor=SimpleNamespace(get_subnet_owner_hotkey=lambda netuid: "auditor"),
+                                     identity=tls.identity(config.state_dir))
     engines = {"gpu0": CapacityEngine(rps=100), "gpu1": CapacityEngine(rps=100)}
     app = create_app(config=config, keypair=keypair, manifest=lambda: publisher.signed, engines=engines,
                      authorized=lambda hk: hk == gateway.ss58_address, auditors=publisher.auditors,
                      admissions=publisher.admissions, serving=lambda: publisher.serving,
                      gateways=lambda: {gateway.ss58_address})
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
+                                           **tls.server_options(publisher.identity)))
     threading.Thread(target=server.run, daemon=True).start()
     while not server.started:
         time.sleep(0.05)
@@ -431,8 +440,10 @@ def test_users_are_served_while_an_endpoint_that_fell_short_is_measured_again(tm
             time.sleep(0.02)
         path = "/e/gpu0/v1/systemone"
         body = json.dumps(REQUEST).encode()
-        r = httpx.post(f"http://127.0.0.1:{port}{path}", content=body, timeout=10, headers={
-            "Content-Type": "application/json", **sign_request(gateway, "POST", path, body, keypair.ss58_address)})
+        with tls.sync_client(timeout=10) as client:  # over TLS, as a gateway reaches the miner
+            r = client.post(f"https://127.0.0.1:{port}{path}", content=body, extensions=tls.use(publisher.identity.pin),
+                            headers={"Content-Type": "application/json",
+                                     **sign_request(gateway, "POST", path, body, keypair.ss58_address)})
         assert measuring.is_alive()  # answered during the measurement
         assert r.status_code == 200 and SignedReceipt.model_validate(r.json()["receipt"]).signature_valid()
         measuring.join()

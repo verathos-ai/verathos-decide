@@ -20,6 +20,7 @@ from tests.lineups import two_active_and_a_candidate
 from tests.mock_engine import MockEngine
 from tests.test_miner_app import REQUEST
 from tests.test_throughput import HostRouter, _auditor, kp
+from tests.tlsfake import pin
 from verathos import catalog
 from verathos.gateway import db
 from verathos.gateway.accounts import Accounts
@@ -35,6 +36,7 @@ from verathos.gateway.usage import UsageMeter
 from verathos.miner.app import create_app as miner_app
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import EngineError
+from verathos.protocol import tls
 from verathos.protocol.gateway import Route, Routes, SignedRoutes
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest
 from verathos.protocol.receipts import SignedReceipt
@@ -70,12 +72,12 @@ def miner(host: str, gateway: Keypair, engine) -> tuple[Keypair, FastAPI]:
     keypair = kp()
     config = MinerConfig.model_validate({
         "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": 8091,
-        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://unused",
+        "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1",
                        "max_concurrency": 64}]})
     signed = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest=catalog.load().digest(),
         endpoints=[Endpoint(endpoint_id="gpu0", url=config.endpoint_url("gpu0"), model_id="kev-4b",
-                            capacity_rps=40.0)]), keypair)
+                            capacity_rps=40.0)], tls={config.base_url: pin(host)}), keypair)
     app = miner_app(config=config, keypair=keypair, manifest=lambda: signed, engines={"gpu0": engine},
                     authorized=lambda hk: hk == gateway.ss58_address, auditors=lambda: set(),
                     gateways=lambda: {gateway.ss58_address})
@@ -86,8 +88,8 @@ LONG = {**REQUEST, "state": "the customer asks about an invoice " * 40}  # its a
 
 
 def route(keypair: Keypair, host: str, credited: float = 20.0) -> Route:
-    return Route(hotkey=keypair.ss58_address, endpoint_id="gpu0", model_id="kev-4b", url=f"http://{host}:8091/e/gpu0",
-                 credited_rps=credited, latency_ms=300.0)
+    return Route(hotkey=keypair.ss58_address, endpoint_id="gpu0", model_id="kev-4b",
+                 url=f"https://{host}:8091/e/gpu0", tls=pin(host), credited_rps=credited, latency_ms=300.0)
 
 
 class Setup:
@@ -107,7 +109,8 @@ class Setup:
                                     max_attempts=max_attempts, attempt_timeout_s=attempt_timeout_s)
         self.auditor = _auditor(tmp_path)
         self.auditor.follower.poll()
-        self.auditor.update_slots([Slot(keypair.ss58_address, "gpu0", f"http://{host}:8091/e/gpu0", "kev-4b", 40.0)
+        self.auditor.update_slots([Slot(keypair.ss58_address, "gpu0", f"https://{host}:8091/e/gpu0", "kev-4b", 40.0,
+                                        pin(host))
                                    for host, (keypair, _) in self.miners.items()])
         auditor_app = FastAPI()
         from verathos.validator.service import add_gateway_routes
@@ -122,15 +125,16 @@ class Setup:
                                    catalog_digest=catalog.load().digest(), routes=routes)
         self.router.update(self.router_table)
 
-        async def auditor_url():
-            return "http://auditor"
+        async def auditor():
+            return tls.Service("https://auditor", pin("auditor"))
 
-        self.sampler = Sampler(self.gateway_kp, self.client, auditor_url=auditor_url,
+        self.sampler = Sampler(self.gateway_kp, self.client, auditor=auditor,
                                auditor_hotkey=self.auditor.hotkey, window_s=600, rng=random.Random(2))
-        self.served = ServedCounter(self.gateway_kp, self.client, auditor_url=auditor_url,
+        self.served = ServedCounter(self.gateway_kp, self.client, auditor=auditor,
                                     auditor_hotkey=self.auditor.hotkey)
         self.router.observer = self.served
-        cat = catalog.Catalog.parse({**(cat or catalog.load()).document(), "gateways": [self.gateway_kp.ss58_address]})
+        cat = catalog.Catalog.parse({**(cat or catalog.load()).document(),
+                                     "gateways": [{"hotkey": self.gateway_kp.ss58_address}]})
         self.gateway = Gateway(
             config=self.config, hotkey=self.gateway_kp.ss58_address, catalog=lambda: cat, accounts=self.accounts,
             meter=self.meter, router=self.router, sampler=self.sampler, served=self.served,
@@ -212,7 +216,7 @@ def test_failing_miners_are_retried_elsewhere_and_their_breaker_opens(tmp_path) 
     s = Setup(tmp_path, {"10.0.0.1": Failing(), "10.0.0.2": MockEngine("kev-4b")})
     responses = s.many(12)
     assert {r.status_code for r in responses} == {200}
-    failing = next(e for e in s.router._pools["kev-4b"].endpoints if e.route.url.startswith("http://10.0.0.1"))
+    failing = next(e for e in s.router._pools["kev-4b"].endpoints if e.route.url.startswith("https://10.0.0.1"))
     assert failing.breaker.is_open
 
 
@@ -228,7 +232,7 @@ def test_failing_endpoints_and_their_breakers_are_logged_without_repeating(tmp_p
     s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b"), "10.0.0.2": MockEngine("kev-4b")})
     s.client._transport._t["10.0.0.1"] = Unreachable()
     assert {r.status_code for r in s.many(12)} == {200}
-    dead = next(e for e in s.router._pools["kev-4b"].endpoints if e.route.url.startswith("http://10.0.0.1"))
+    dead = next(e for e in s.router._pools["kev-4b"].endpoints if e.route.url.startswith("https://10.0.0.1"))
     opened = [r.message for r in caplog.records if r.message.startswith(f"the breaker of {dead.key} opened")]
     attempts = [r.message for r in caplog.records if r.message.startswith(f"an attempt at {dead.key} failed")]
     assert len(opened) == 1 and opened[0].endswith("the latest: connect: ConnectError")
@@ -447,8 +451,8 @@ def test_answers_whose_visible_fields_disagree_with_their_distribution_are_proof
     s = Setup(tmp_path, {"10.0.0.2": MockEngine("kev-4b")})
     liar = kp()
     s.client._transport._t["10.0.0.7"] = httpx.ASGITransport(app=signing_miner(liar, lying))
-    s.auditor.update_slots([*s.auditor._slots, Slot(liar.ss58_address, "gpu0", "http://10.0.0.7:8091/e/gpu0",
-                                                    "kev-4b", 40.0)])
+    s.auditor.update_slots([*s.auditor._slots, Slot(liar.ss58_address, "gpu0", "https://10.0.0.7:8091/e/gpu0",
+                                                    "kev-4b", 40.0, pin("10.0.0.7"))])
     s.router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=2, catalog_digest="0" * 64, routes=[
         route(liar, "10.0.0.7", 1000.0), route(s.miners["10.0.0.2"][0], "10.0.0.2", 20.0)]))
     honest = asyncio.run(MockEngine("kev-4b").answer(REQUEST))["answers"]
@@ -600,8 +604,9 @@ def test_an_endpoint_that_refuses_users_or_keeps_them_waiting_is_reported() -> N
     router = Router(share=1.0, max_latency_s=2.0, rng=random.Random(3), clock=clock, observer=observer)
     fast, slow = kp().ss58_address, kp().ss58_address
     router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=1, catalog_digest="0" * 64, routes=[
-        Route(hotkey=h, endpoint_id="gpu0", model_id="kev-4b", url=f"http://10.0.0.{i}:8091/e/gpu0",
-              credited_rps=20.0, latency_ms=300.0) for i, h in enumerate((fast, slow), start=1)]))
+        Route(hotkey=h, endpoint_id="gpu0", model_id="kev-4b", url=f"https://10.0.0.{i}:8091/e/gpu0",
+              tls=pin(f"10.0.0.{i}"), credited_rps=20.0, latency_ms=300.0)
+        for i, h in enumerate((fast, slow), start=1)]))
     f, s = router._pools["kev-4b"].endpoints
 
     def considered(endpoint_hotkey: str, picks: int = 200) -> tuple[int, int]:
@@ -690,9 +695,9 @@ def test_a_table_that_drops_every_route_of_an_active_model_is_refused(tmp_path, 
         return served["doc"].model_dump(mode="json")
 
     async def url():
-        return "http://auditor"
+        return tls.Service("https://auditor", pin("auditor"))
 
-    t = RouteTable(client=httpx.AsyncClient(transport=HostRouter({"auditor": app})), auditor_url=url,
+    t = RouteTable(client=httpx.AsyncClient(transport=HostRouter({"auditor": app})), auditor=url,
                    auditor_hotkey=auditor.ss58_address, netuid=405, path=tmp_path / "routes.json", clock=clock)
     cat = catalog.load()
 
@@ -729,10 +734,10 @@ def test_routes_are_taken_only_from_the_auditor_and_newer(tmp_path) -> None:
         return served["doc"].model_dump(mode="json")
 
     async def url():
-        return "http://auditor"
+        return tls.Service("https://auditor", pin("auditor"))
 
     def table() -> RouteTable:
-        return RouteTable(client=httpx.AsyncClient(transport=HostRouter({"auditor": app})), auditor_url=url,
+        return RouteTable(client=httpx.AsyncClient(transport=HostRouter({"auditor": app})), auditor=url,
                           auditor_hotkey=auditor.ss58_address, netuid=405, path=tmp_path / "routes.json")
 
     t = table()
@@ -1231,9 +1236,9 @@ def test_served_counts_are_kept_while_the_auditor_cannot_be_found() -> None:
     async def unknown():
         raise RuntimeError("chain unreachable")
 
-    counter = ServedCounter(kp(), httpx.AsyncClient(), auditor_url=unknown, auditor_hotkey="a", clock=lambda: 1000.0)
-    r = Route(hotkey="hk", endpoint_id="gpu0", model_id="kev-4b", url="http://x/e/gpu0", credited_rps=10.0,
-              latency_ms=300.0)
+    counter = ServedCounter(kp(), httpx.AsyncClient(), auditor=unknown, auditor_hotkey="a", clock=lambda: 1000.0)
+    r = Route(hotkey="hk", endpoint_id="gpu0", model_id="kev-4b", url="https://x/e/gpu0", tls="ab" * 32,
+              credited_rps=10.0, latency_ms=300.0)
     counter.record(r, 10, 3.0)
     assert ("hk", "gpu0", 997) in counter._counts  # in the second its request was sent
     asyncio.run(counter.report(final=True))
@@ -1287,7 +1292,7 @@ def test_the_admin_api_exists_only_on_its_port_and_only_with_the_token(tmp_path)
     state = asyncio.run(admin_call(s, "GET", "/admin/v1/state")).json()
     assert state["models"] == ["kev-4b"] and state["routes"]["endpoints"] == 2 and "usage_rows" in state["pending"]
     routes = asyncio.run(admin_call(s, "GET", "/admin/v1/routes")).json()["routes"]
-    assert {r["url"] for r in routes} == {"http://10.0.0.1:8091/e/gpu0", "http://10.0.0.2:8091/e/gpu0"}
+    assert {r["url"] for r in routes} == {"https://10.0.0.1:8091/e/gpu0", "https://10.0.0.2:8091/e/gpu0"}
     assert all(r["in_flight"] == 0 and not r["breaker"]["open"] for r in routes)
 
 
@@ -1331,7 +1336,10 @@ def test_the_admin_api_is_never_public_and_needs_a_private_token(tmp_path) -> No
         GatewayConfig(**base, admin_port=9100)
     with pytest.raises(ValueError):
         GatewayConfig(**base, accounts_token_file="c")  # a scoped token needs the admin API
-    GatewayConfig(**base, admin_host="10.1.2.3", admin_port=9100, admin_token_file="t")
+    with pytest.raises(ValueError, match="admin_host off loopback"):  # a private network is a network hop
+        GatewayConfig(**base, admin_host="10.1.2.3", admin_port=9100, admin_token_file="t")
+    GatewayConfig(**base, admin_host="10.1.2.3", admin_port=9100, admin_token_file="t", tls_cert_file="c.pem",
+                  tls_key_file="k.pem")
     token = tmp_path / "admin.token"
     token.write_text(ADMIN_TOKEN)
     os.chmod(token, 0o644)
@@ -1342,6 +1350,21 @@ def test_the_admin_api_is_never_public_and_needs_a_private_token(tmp_path) -> No
     token.write_text("short")
     with pytest.raises(SystemExit):
         read_token(token)
+
+
+def test_the_gateway_listens_off_loopback_only_over_tls_and_reaches_the_auditor_over_https() -> None:
+    base = {"netuid": 405, "wallet_name": "w", "hotkey_name": "h", "database_url": "sqlite+aiosqlite:///x.db"}
+    assert GatewayConfig(**base).listen_host == "127.0.0.1"  # behind the TLS reverse proxy by default
+    for host in ("0.0.0.0", "203.0.113.5", "::"):
+        with pytest.raises(ValueError, match="listen_host off loopback"):
+            GatewayConfig(**base, listen_host=host)
+        GatewayConfig(**base, listen_host=host, tls_cert_file="c.pem", tls_key_file="k.pem")
+    with pytest.raises(ValueError, match="go together"):
+        GatewayConfig(**base, tls_cert_file="c.pem")
+    for url in ("http://203.0.113.5:8091", "http://127.0.0.1:8091", "203.0.113.5:8091"):
+        with pytest.raises(ValueError, match="https"):
+            GatewayConfig(**base, auditor_url=url)
+    assert GatewayConfig(**base, auditor_url="https://127.0.0.1:8091").auditor_url == "https://127.0.0.1:8091"
 
 
 def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:

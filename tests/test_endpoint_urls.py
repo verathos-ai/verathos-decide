@@ -47,28 +47,32 @@ def test_only_address_literals_are_public(value: str) -> None:
 
 
 def test_endpoint_hosts() -> None:
-    assert endpoint_host("http://8.8.8.8:8091/e/gpu0", "gpu0") == "http://8.8.8.8:8091"
-    assert endpoint_host("http://[2606:4700::1111]:1/e/w-gpu7", "w-gpu7") == "http://[2606:4700::1111]:1"
-    for url in ("http://10.0.0.1:8091/e/gpu0", "http://127.0.0.1:8091/e/gpu0", "http://[::ffff:8.8.8.8]:80/e/gpu0",
-                "http://[::ffff:808:808]:80/e/gpu0", "http://203.0.113.5:8091/e/gpu0", "http://8.8.8.8:8091/e/gpu1"):
+    assert endpoint_host("https://8.8.8.8:8091/e/gpu0", "gpu0") == "https://8.8.8.8:8091"
+    assert endpoint_host("https://[2606:4700::1111]:1/e/w-gpu7", "w-gpu7") == "https://[2606:4700::1111]:1"
+    for url in ("https://10.0.0.1:8091/e/gpu0", "https://127.0.0.1:8091/e/gpu0", "https://[::ffff:8.8.8.8]:80/e/gpu0",
+                "https://[::ffff:808:808]:80/e/gpu0", "https://203.0.113.5:8091/e/gpu0", "https://8.8.8.8:8091/e/gpu1",
+                "http://8.8.8.8:8091/e/gpu0"):
         assert endpoint_host(url, "gpu0") is None, url
 
 
 def test_a_manifest_naming_a_non_public_host_is_rejected() -> None:
     keypair = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
+    axon, pin = "https://8.8.8.8:8091", "ab" * 32
     for host in ("8.8.8.8", "10.0.0.1"):
         signed = SignedManifest.create(Manifest(
             netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest="0" * 64, endpoints=[
-                Endpoint(endpoint_id="gpu0", url="http://8.8.8.8:8091/e/gpu0", model_id="kev-4b", capacity_rps=1.0),
-                Endpoint(endpoint_id="gpu1", url=f"http://{host}:8091/e/gpu1", model_id="kev-4b",
-                         capacity_rps=1.0)]), keypair)
+                Endpoint(endpoint_id="gpu0", url=f"{axon}/e/gpu0", model_id="kev-4b", capacity_rps=1.0),
+                Endpoint(endpoint_id="gpu1", url=f"https://{host}:8091/e/gpu1", model_id="kev-4b",
+                         capacity_rps=1.0)], tls={axon: pin}), keypair)
         document = signed.model_dump(mode="json")
         commitment = commitment_value(signed.manifest.digest())
         if host == "8.8.8.8":
-            accept(document, hotkey=keypair.ss58_address, netuid=405, commitment=commitment, catalogs={"0" * 64: 1})
+            accept(document, hotkey=keypair.ss58_address, netuid=405, commitment=commitment, catalogs={"0" * 64: 1},
+                   axon=axon, seen=pin)
             continue
         with pytest.raises(ManifestRejected, match="gpu1: its URL is not"):
-            accept(document, hotkey=keypair.ss58_address, netuid=405, commitment=commitment, catalogs={"0" * 64: 1})
+            accept(document, hotkey=keypair.ss58_address, netuid=405, commitment=commitment, catalogs={"0" * 64: 1},
+                   axon=axon, seen=pin)
 
 
 def test_the_gateway_routes_to_public_hosts_only() -> None:
@@ -77,10 +81,12 @@ def test_the_gateway_routes_to_public_hosts_only() -> None:
     from verathos.gateway.router import Router  # after the chain SDK's import, which silences the loggers there are
 
     router = Router(share=1.0, max_latency_s=2.0)
-    urls = {"a": "http://8.8.8.8:8091/e/gpu0", "b": "http://1.2.3.4:20017/e/gpu0", "c": "http://10.0.0.1:8091/e/gpu0",
-            "d": "http://127.0.0.1:8091/e/gpu0", "e": "http://[::ffff:10.0.0.1]:8091/e/gpu0",
-            "f": "http://metadata.internal/e/gpu0"}
+    urls = {"a": "https://8.8.8.8:8091/e/gpu0", "b": "https://1.2.3.4:20017/e/gpu0",
+            "c": "https://10.0.0.1:8091/e/gpu0", "d": "https://127.0.0.1:8091/e/gpu0",
+            "e": "https://[::ffff:10.0.0.1]:8091/e/gpu0", "f": "https://metadata.internal/e/gpu0",
+            "g": "http://9.9.9.9:8091/e/gpu0"}
     router.update(Routes(netuid=405, auditor="a", epoch=1, issued_ms=1, catalog_digest="0" * 64, routes=[
-        Route(hotkey=h, endpoint_id="gpu0", model_id="kev-4b", url=url, credited_rps=10.0, latency_ms=100.0)
+        Route(hotkey=h, endpoint_id="gpu0", model_id="kev-4b", url=url, tls="ab" * 32, credited_rps=10.0,
+              latency_ms=100.0)
         for h, url in urls.items()]))
     assert {e.route.hotkey for e in router._pools["kev-4b"].endpoints} == {"a", "b"}

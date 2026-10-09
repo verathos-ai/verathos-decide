@@ -15,10 +15,12 @@ from bittensor_wallet import Keypair
 
 from tests.fake_loadgen import make_runner
 from tests.mock_engine import MockEngine
+from tests.tlsfake import Presenting, pin
 from verathos import catalog
 from verathos.miner.admission import Admission
 from verathos.miner.app import caller_request_bytes, create_app
 from verathos.miner.config import MinerConfig
+from verathos.protocol import tls
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest
 from verathos.throughput import loadgen
 from verathos.throughput.auditor import Auditor, Checks, Slot, planned_rate
@@ -34,6 +36,7 @@ from verathos.throughput.workload import Workload, make_request
 from verathos.validator.throughput import Throughput, slots
 
 pytestmark = pytest.mark.usefixtures("lab_network")
+PIN = "ab" * 32  # a certificate pin, for endpoints no request reaches
 
 KEV = catalog.load().get("kev-4b")
 
@@ -136,7 +139,7 @@ def test_requests_are_unique_and_follow_the_mix() -> None:
 
 
 def test_tested_rate_grows_from_what_was_delivered() -> None:
-    slot = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", declared_rps=400.0)
+    slot = Slot("hk", "gpu0", "https://x/e/gpu0", "kev-4b", declared_rps=400.0, tls=PIN)
     policy = AuditPolicy()
     assert planned_rate(slot, 50.0, None, policy) == 50.0
     assert planned_rate(slot, 50.0, 90.0, policy) == 180.0
@@ -309,24 +312,20 @@ def test_declared_capacity_stays_within_the_latency_bound() -> None:
 
 # ---- the auditor end to end ----
 
-class HostRouter(httpx.AsyncBaseTransport):
-    def __init__(self, apps: dict[str, object]) -> None:
-        self._t = {host: httpx.ASGITransport(app=app) for host, app in apps.items()}
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        return await self._t[request.url.host].handle_async_request(request)
+HostRouter = Presenting  # in-process apps by host, each presenting its host's certificate
 
 
 def miner_app(host: str, keypair: Keypair, auditor: Keypair, engines: dict[str, object], declared: float,
-              port: int = 80):
+              port: int = 80, tls_pin: str | None = None):
+    """A miner service on ``host``, whose certificate has ``tls_pin`` (default: the host's in ``tlsfake``)."""
     config = MinerConfig.model_validate({
         "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": port,
-        "endpoints": [{"endpoint_id": e, "model_id": "kev-4b", "engine_url": "http://unused", "max_concurrency": 64}
-                      for e in engines]})
+        "endpoints": [{"endpoint_id": e, "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1",
+                       "max_concurrency": 64} for e in engines]})
     signed = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest=catalog.load().digest(),
         endpoints=[Endpoint(endpoint_id=e, url=config.endpoint_url(e), model_id="kev-4b", capacity_rps=declared)
-                   for e in engines]), keypair)
+                   for e in engines], tls={config.base_url: tls_pin or pin(host)}), keypair)
     app = create_app(config=config, keypair=keypair, manifest=lambda: signed, engines=engines,
                      authorized=lambda hk: False, auditors=lambda: {auditor.ss58_address}, testing=lambda: True,
                      max_caller_request=lambda m: caller_request_bytes(m, KEV.workload))
@@ -359,7 +358,7 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
         apps, miners = {}, []
         for uid, name in enumerate(keys, start=1):
             apps[hosts[name]], manifest = miner_app(hosts[name], keys[name], auditor_kp, engines[name], 40.0)
-            miners.append(DiscoveredMiner(uid, keys[name].ss58_address, f"http://{hosts[name]}:80", manifest))
+            miners.append(DiscoveredMiner(uid, keys[name].ss58_address, f"https://{hosts[name]}:80", manifest))
         auditor = Auditor(netuid=405, keypair=auditor_kp, chain=chain, policy=policy,
                           catalog=catalog.load, references={}, db_path=tmp_path / "throughput.sqlite",
                           runner=make_runner(HostRouter(apps)))
@@ -425,13 +424,14 @@ def test_the_auditor_tests_an_endpoint_only_once_it_proved_control_at_its_url(tm
     digest = catalog.load().digest()
     signed = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=miner_kp.ss58_address, catalog_digest=digest, endpoints=[
-            Endpoint(endpoint_id=e, url=f"http://{host}:80/e/{e}", model_id="kev-4b", capacity_rps=20.0)
-            for e, host in (("gpu0", axon), ("gpu1", other))]), miner_kp)
+            Endpoint(endpoint_id=e, url=f"https://{host}:80/e/{e}", model_id="kev-4b", capacity_rps=20.0)
+            for e, host in (("gpu0", axon), ("gpu1", other))],
+        tls={f"https://{host}:80": pin(host) for host in (axon, other)}), miner_kp)
 
     def app(host: str, keypair: Keypair, endpoint_id: str):
         config = MinerConfig.model_validate({
             "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": 80,
-            "endpoints": [{"endpoint_id": endpoint_id, "model_id": "kev-4b", "engine_url": "http://unused"}]})
+            "endpoints": [{"endpoint_id": endpoint_id, "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1"}]})
         return create_app(config=config, keypair=keypair, manifest=lambda: signed,
                           engines={endpoint_id: MockEngine("kev-4b")},
                           authorized=lambda hk: hk == auditor_kp.ss58_address, auditors=lambda: set(),
@@ -503,13 +503,14 @@ def test_auditor_with_the_load_generator_over_tcp(tmp_path) -> None:
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
-        keypair = kp()
+        keypair, identity = kp(), tls.identity(tmp_path / f"miner{uid}")
         engines = {"gpu0": CapacityEngine(MockEngine("kev-4b"), rps=rps)}
-        app, manifest = miner_app("127.0.0.1", keypair, auditor_kp, engines, 40.0, port=port)
-        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+        app, manifest = miner_app("127.0.0.1", keypair, auditor_kp, engines, 40.0, port=port, tls_pin=identity.pin)
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
+                                               **tls.server_options(identity)))
         threading.Thread(target=server.run, daemon=True).start()
         servers.append(server)
-        miners.append(DiscoveredMiner(uid, keypair.ss58_address, f"http://127.0.0.1:{port}", manifest))
+        miners.append(DiscoveredMiner(uid, keypair.ss58_address, f"https://127.0.0.1:{port}", manifest))
     while not all(s.started for s in servers):
         time.sleep(0.05)
 
@@ -572,17 +573,26 @@ def test_a_reference_that_counts_no_input_tokens_is_reported_once(caplog) -> Non
     assert caplog.text.count("uncounted reference reports no usage.input_tokens") == 1
 
 
-def test_reference_engines_take_a_url_or_a_keyed_tls_endpoint() -> None:
+def test_reference_engines_take_a_url_on_this_machine_or_a_remote_one_over_tls() -> None:
+    """Plain http only on this machine's loopback; a remote engine over https, accepted by its pin, or by a public
+    CA's certificate for a hostname."""
     from verathos.validator.config import ValidatorConfig
 
     base = {"netuid": 405, "wallet_name": "w", "hotkey_name": "h"}
     cfg = ValidatorConfig.model_validate({**base, "references": {"kev-4b": "http://127.0.0.1:8101"},
                                           "audit_screens": {"kev-4b": {"url": "https://gpu.example.org:8443",
-                                                                       "api_key": "k"}}})
+                                                                       "api_key": "k"},
+                                                            "kev-9b": {"url": "https://203.0.113.7:8443",
+                                                                       "tls_pin": PIN}}})
     assert cfg.references["kev-4b"].api_key is None and cfg.audit_screens["kev-4b"].api_key == "k"
-    with pytest.raises(ValueError, match="needs https"):
-        ValidatorConfig.model_validate({**base, "references": {"kev-4b": {"url": "http://203.0.113.7:8101",
-                                                                          "api_key": "k"}}})
+    for reference, why in (({"url": "http://203.0.113.7:8101", "api_key": "k"}, "must be an https"),
+                           ("http://203.0.113.7:8101", "must be an https"),
+                           ("http://gpu.example.org:8101", "must be an https"),
+                           ("https://203.0.113.7:8101", "needs its TLS pin"),
+                           ({"url": "http://127.0.0.1:8101", "tls_pin": PIN}, "a TLS pin is for an https engine"),
+                           ({"url": "https://203.0.113.7:8101", "tls_pin": "AB" * 32}, "TLS pin is the SHA-256")):
+        with pytest.raises(ValueError, match=why):
+            ValidatorConfig.model_validate({**base, "references": {"kev-4b": reference}})
 
 
 # ---- review fixes: the auditor stays robust whatever endpoints do ----
@@ -608,7 +618,7 @@ def test_a_hostile_response_voids_nothing_but_its_own_endpoint(tmp_path) -> None
 
     auditor = _auditor(tmp_path)
     test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
-    target = Target(Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 10.0), 10.0)
+    target = Target(Slot("hk", "gpu0", "https://x/e/gpu0", "kev-4b", 10.0, tls=PIN), 10.0)
     deep = '{"answers": ' + "[" * 300 + "]" * 300 + ', "receipt": {}}'
     sample = {"request": {"model": "kev-4b"}, "request_id": "ab" * 16, "response": deep}
 
@@ -631,15 +641,15 @@ def test_a_hotkey_cannot_reset_its_test_rate_by_renaming_endpoints(tmp_path) -> 
     from verathos.throughput.auditor import Result, Target
 
     auditor = _auditor(tmp_path)
-    old = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 50.0)
+    old = Slot("hk", "gpu0", "https://x/e/gpu0", "kev-4b", 50.0, tls=PIN)
     test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
     auditor.store.add_test(test)
     auditor.store.add_results(test.test_id, [Result(Target(old, 50.0), "partial", "", 2.0, 0.16)])
     # the old endpoint delivered 2 requests/s; eight renamed endpoints are tested at 2 x 2 in total
-    auditor.update_slots([Slot("hk", f"new{i}", f"http://x/e/new{i}", "kev-4b", 50.0) for i in range(8)])
+    auditor.update_slots([Slot("hk", f"new{i}", f"https://x/e/new{i}", "kev-4b", 50.0, tls=PIN) for i in range(8)])
     rates = [t.tested_rps for t in auditor.targets(auditor.policy)]
     assert sum(rates) == pytest.approx(50.0, abs=0.1)  # at least one first test's worth, never 8 x 50
-    auditor.update_slots([Slot("fresh", f"g{i}", f"http://y/e/g{i}", "kev-4b", 50.0) for i in range(8)])
+    auditor.update_slots([Slot("fresh", f"g{i}", f"https://y/e/g{i}", "kev-4b", 50.0, tls=PIN) for i in range(8)])
     assert sum(t.tested_rps for t in auditor.targets(auditor.policy)) == pytest.approx(50.0, abs=0.1)
 
 
@@ -649,7 +659,7 @@ def test_an_endpoint_that_switches_model_starts_from_the_new_models_first_test(t
     from verathos.throughput.auditor import Result, Target
 
     auditor = _auditor(tmp_path)
-    small = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 100.0)
+    small = Slot("hk", "gpu0", "https://x/e/gpu0", "kev-4b", 100.0, tls=PIN)
     test = ScheduledTest(3, 581, block_hash(581).hex(), 586)
     auditor.store.add_test(test)
     auditor.store.add_results(test.test_id, [Result(Target(small, 50.0), "passed", "", 40.0, 40.0)])
@@ -662,7 +672,7 @@ def test_answers_drifting_across_tests_lose_their_credit(tmp_path) -> None:
     from verathos.throughput.auditor import Result, Target
 
     auditor = _auditor(tmp_path, drift_window_tests=3)
-    slot = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 20.0)
+    slot = Slot("hk", "gpu0", "https://x/e/gpu0", "kev-4b", 20.0, tls=PIN)
     tol = KEV.tolerance
     for epoch, block in ((1, 200), (2, 380), (3, 560)):
         test = ScheduledTest(epoch, block, block_hash(block).hex(), block + 5)
@@ -695,7 +705,7 @@ def test_a_new_epoch_length_renumbers_the_auditors_history_instead_of_wiping_it(
     chain = FakeChain(head=100 * 180 + 40)
     auditor = Auditor(netuid=405, keypair=kp(), chain=chain, policy=AuditPolicy(), catalog=catalog.load,
                       references={}, db_path=tmp_path / "t.sqlite")
-    slot = Slot("hk", "gpu0", "http://x/e/gpu0", "kev-4b", 30.0)
+    slot = Slot("hk", "gpu0", "https://x/e/gpu0", "kev-4b", 30.0, tls=PIN)
     auditor.update_slots([slot])
     test = ScheduledTest(100, 18_020, block_hash(18_020).hex(), 18_025)
     auditor.store.add_test(test)
@@ -737,7 +747,8 @@ def test_a_hotkeys_status_lists_its_results_of_the_last_ten_tests_which_the_audi
     chain = FakeChain(head=40 * 180 + 1)
     auditor = Auditor(netuid=405, keypair=kp(), chain=chain, policy=AuditPolicy(), catalog=catalog.load,
                       references={}, db_path=tmp_path / "t.sqlite")
-    slots = [Slot(kp().ss58_address, f"gpu{i}", f"http://x/e/gpu{i}", "kev-4b", 50.0) for i in range(MAX_ENDPOINTS)]
+    slots = [Slot(kp().ss58_address, f"gpu{i}", f"https://x/e/gpu{i}", "kev-4b", 50.0, tls=PIN)
+             for i in range(MAX_ENDPOINTS)]
     slots = [dataclasses.replace(s, hotkey=slots[0].hotkey) for s in slots]  # one hotkey's full manifest
     reason = ("delivered 21.0 of 40.0 requests/s asked (12.3 of them to the gateway), 3 of 10 sampled responses "
               "without a valid receipt; its answers to users in the test are unchecked: credited only its replies")

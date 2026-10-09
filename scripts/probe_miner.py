@@ -1,8 +1,9 @@
 """Validator-style probe of one miner on a live network (bittensor SDK 10.x).
 
-Discovers the miner from chain (axon + manifest commitment), checks endpoint control with the identity challenge,
-sends signed SystemOne requests, verifies every receipt, and compares the answers with stored reference answers
-for the same requests (``tests/fixtures/drift``: 30 generated tickets, 6 questions each).
+Discovers the miner from chain (axon + manifest commitment, over TLS checked against the pin the manifest names),
+checks endpoint control with the identity challenge, sends signed SystemOne requests over TLS with the endpoint's pin,
+verifies every receipt, and compares the answers with stored reference answers for the same requests
+(``tests/fixtures/drift``: 30 generated tickets, 6 questions each).
 """
 
 from __future__ import annotations
@@ -15,14 +16,14 @@ import secrets
 import statistics
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 import bittensor as bt
+import httpx
 
 from verathos import catalog
 from verathos.miner.app import IDENTITY_DOMAIN, identity_payload
-from verathos.protocol import signing
+from verathos.protocol import signing, tls
 from verathos.protocol.api import distributions
 from verathos.protocol.manifest import accept, axon_base, endpoint_host
 from verathos.protocol.receipts import SignedReceipt
@@ -63,11 +64,12 @@ def states(n: int = 30) -> list[str]:
     return out
 
 
-def post(url: str, path: str, payload: dict, caller, receiver: str) -> dict:
+def post(client: httpx.Client, url: str, pin: str, path: str, payload: dict, caller, receiver: str) -> dict:
     body = json.dumps(payload).encode()
     headers = {"Content-Type": "application/json", **sign_request(caller, "POST", path, body, receiver)}
-    req = urllib.request.Request(url + path, body, headers)
-    return json.loads(urllib.request.urlopen(req, timeout=120).read())
+    r = client.post(url + path, content=body, headers=headers, extensions=tls.use(pin))
+    r.raise_for_status()
+    return r.json()
 
 
 def main() -> None:
@@ -89,18 +91,23 @@ def main() -> None:
     base = axon_base(axon.ip, axon.port)
     cat = current_catalog(st, args.netuid, catalog.CatalogStore(), [])
     mechid = catalog.mechanism_of(cat, args.mechid)
-    document = json.loads(urllib.request.urlopen(base + "/v1/manifest", timeout=10).read())
+    client = tls.sync_client(timeout=120)
+    with client.stream("GET", base + "/v1/manifest", extensions=tls.use(tls.ANY)) as r:
+        r.raise_for_status()
+        seen = tls.peer_pin(r)
+        document = json.loads(r.read())
     manifest = accept(document, hotkey=hotkey, netuid=args.netuid, commitment=st.get_commitment(args.netuid, args.uid),
-                      catalogs={cat.digest(): mechid})
+                      catalogs={cat.digest(): mechid}, axon=base, seen=seen)
     print(f"manifest accepted: catalog {manifest.catalog_digest[:12]}, "
           f"endpoints {[e.endpoint_id for e in manifest.endpoints]}")
 
     caller = bt.Wallet(name=args.caller_wallet, hotkey=args.caller_hotkey).hotkey
     endpoint = next(e for e in manifest.endpoints if args.endpoint in (None, e.endpoint_id))
     host, prefix = endpoint_host(endpoint.url, endpoint.endpoint_id), f"/e/{endpoint.endpoint_id}"
-    print(f"endpoint {endpoint.endpoint_id} at {host}" + (" (the axon)" if host == base else ""))
+    pin = manifest.pin(host)
+    print(f"endpoint {endpoint.endpoint_id} at {host}, TLS pin {pin}" + (" (the axon)" if host == base else ""))
     challenge = secrets.token_hex(16)
-    ident = post(host, prefix + "/v1/identity", {"challenge": challenge}, caller, hotkey)
+    ident = post(client, host, pin, prefix + "/v1/identity", {"challenge": challenge}, caller, hotkey)
     ok = signing.verify(
         hotkey, IDENTITY_DOMAIN,
         identity_payload(endpoint.endpoint_id, challenge, caller.ss58_address),
@@ -119,8 +126,9 @@ def main() -> None:
         body = json.dumps(request).encode()
         path = prefix + "/v1/systemone"
         headers = {"Content-Type": "application/json", **sign_request(caller, "POST", path, body, hotkey)}
-        response = json.loads(urllib.request.urlopen(urllib.request.Request(host + path, body, headers),
-                                                     timeout=120).read())
+        reply = client.post(host + path, content=body, headers=headers, extensions=tls.use(pin))
+        reply.raise_for_status()
+        response = reply.json()
         latencies.append((time.time() - t0) * 1000)
         receipt = SignedReceipt.model_validate(response["receipt"])
         r = receipt.receipt

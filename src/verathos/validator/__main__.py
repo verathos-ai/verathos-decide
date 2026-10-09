@@ -31,6 +31,8 @@ import httpx
 
 from verathos import __version__, catalog, release
 from verathos import update as self_update
+from verathos.protocol import tls
+from verathos.protocol.callers import ValidatorIdentity
 from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.throughput.usage import contradiction
@@ -169,15 +171,14 @@ def missing_references(cfg: ValidatorConfig, cat: catalog.Catalog) -> list[str]:
 
 async def references_down(references: dict[str, ReferenceEngine]) -> list[str]:
     """The models whose reference engine does not answer HTTP yet (any reply counts: the engine is up)."""
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        async def down(model: str, reference: ReferenceEngine) -> str | None:
-            try:
-                await client.get(reference.url.rstrip("/") + "/v1/models")
-            except httpx.HTTPError:
-                return model
-            return None
+    async def down(model: str, reference: ReferenceEngine) -> str | None:
+        engine = reference.engine(timeout_s=5.0)
+        try:
+            return None if await engine.reachable() else model
+        finally:
+            await engine.close()
 
-        return sorted(m for m in await asyncio.gather(*(down(m, r) for m, r in references.items())) if m)
+    return sorted(m for m in await asyncio.gather(*(down(m, r) for m, r in references.items())) if m)
 
 
 def wait_for_references(references: dict[str, ReferenceEngine], timeout_s: float = REFERENCE_WAIT_S,
@@ -266,7 +267,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     try:
         # No pool limit: a miner's hanging connections must not delay requests to the others.
         limits = httpx.Limits(max_connections=None, max_keepalive_connections=256)
-        async with httpx.AsyncClient(limits=limits) as client:
+        async with tls.client(limits=limits) as client:
             miners = await discover(neurons, cfg.netuid, client, manifest_catalogs(cfg, cat, current),
                                     throughput.manifests)
             throughput.update_slots(miners, neurons, epoch)
@@ -315,7 +316,7 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
             try:
                 source_hotkey, network = await source_results(
                     st, netuid=cfg.netuid, hotkey=wallet.hotkey.ss58_address, source_hotkey=cfg.source_hotkey,
-                    epoch=epoch, epoch_blocks=cat.epoch_blocks,
+                    epoch=epoch, epoch_blocks=cat.epoch_blocks, cat=cat,
                     deadline=started + blocks_left * BLOCK_TIME_S - SOURCE_MARGIN_S)
             except Refused as exc:
                 refused = str(exc)
@@ -436,6 +437,35 @@ def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: di
     return False
 
 
+def log_auditor_pin(cat: catalog.Catalog, pin: str) -> None:
+    """The auditor's check that the catalog names its certificate: miners, validators and gateways reach it by that
+    pin only."""
+    named = cat.auditor.tls if cat.auditor is not None else None
+    if named == pin:
+        log.info("catalog %s names this service's TLS pin %s: miners, validators and gateways reach it",
+                 cat.digest()[:12], pin)
+        return
+    log.critical("catalog %s names %s as the auditor's TLS pin, but this service's certificate has pin %s: no miner, "
+                 "validator or gateway reaches the auditor until the subnet owner commits a catalog naming it "
+                 "(verathos-subnet commit-catalog on this machine fills it in)", cat.digest()[:12],
+                 named or "no pin", pin)
+
+
+def publish_own_identity(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, pin: str | None) -> None:
+    """A full validator's chain commitment: its service's pin, if it serves, and its egress addresses
+    (``protocol.callers``); nothing to publish without either."""
+    identity = ValidatorIdentity(pin, tuple(cfg.egress_ips))
+    if not cfg.egress_ips:
+        log.warning("no egress_ips configured: miners that admit callers by address do not admit this validator's "
+                    "requests (docs/VALIDATING.md)")
+    if identity.tls is None and not identity.egress:
+        return
+    try:
+        chain.publish_identity(st, wallet, cfg.netuid, identity)
+    except Exception as exc:
+        log.error("the validator identity was not committed on chain: %s", exc)
+
+
 def main() -> None:
     if sys.argv[1:2] in (["init"], ["uninstall"]):
         from verathos.install import common
@@ -493,15 +523,21 @@ def main() -> None:
         log.critical("%s. Every miner refuses this validator's requests, and it sets no weights until that changes",
                      why)
     is_owner = wallet.hotkey.ss58_address == st.get_subnet_owner_hotkey(cfg.netuid)
+    identity = None
     if is_owner or throughput.auditor is not None or cfg.public_host:
         if not cfg.public_host:
             raise SystemExit("this validator serves the catalog or the throughput verdicts: set public_host")
         if is_owner:
             current.store.put(current.catalog)
+        identity = tls.identity(state_dir)
         start_service(st=st, wallet=wallet, netuid=cfg.netuid, public_host=cfg.public_host, port=cfg.port,
-                      store=current.store if is_owner else None, auditor=throughput.auditor, board=board,
-                      probation=lambda: [key for key, left in list(state.probation.items()) if left > 0],
-                      gateways=lambda: current.catalog.gateways)
+                      identity=identity, store=current.store if is_owner else None, auditor=throughput.auditor,
+                      board=board, probation=lambda: [key for key, left in list(state.probation.items()) if left > 0],
+                      gateways=lambda: current.catalog.gateway_hotkeys())
+    if is_owner:
+        log_auditor_pin(current.catalog, identity.pin)
+    else:
+        publish_own_identity(cfg, st, wallet, identity.pin if identity is not None else None)
     if is_owner and cfg.auto_update:
         log.info("self-update: the auditor does not update itself (its restart would stop the throughput tests); "
                  "update it by hand")
@@ -530,6 +566,8 @@ def main() -> None:
                         "manifests for mechanism %d stay accepted for an epoch", cat.digest()[:12], now, mechanism[0])
             mechanism[0] = now
         throughput.set_policy(cat.audit_policy())
+        if is_owner:
+            log_auditor_pin(cat, identity.pin)
 
     current.on_change.append(adopt)
     current.start()

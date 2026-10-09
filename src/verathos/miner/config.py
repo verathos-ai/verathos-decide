@@ -9,13 +9,15 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from verathos.miner.engine import engine_tls
+from verathos.protocol import tls
 from verathos.protocol.manifest import MAX_HOSTS, axon_base, endpoint_url, public_ip
 
-_PEER = re.compile(r"^(?:http://)?(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})/?$")
+_PEER = re.compile(r"^(?:https://)?(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})/?$")
 
 
 def peer_url(value: str) -> str:
-    """A machine's miner base URL, ``http://ip:port``, from ``ip:port``, ``[ipv6]:port`` or the URL itself; raises
+    """A machine's miner base URL, ``https://ip:port``, from ``ip:port``, ``[ipv6]:port`` or the URL itself; raises
     ValueError for anything else."""
     match = _PEER.match(value.strip())
     if match is None or not 0 < int(match[3]) < 65536:
@@ -26,11 +28,19 @@ def peer_url(value: str) -> str:
 class EndpointConfig(BaseModel):
     endpoint_id: str
     model_id: str
-    engine_url: str = Field(description="Local decision engine serving POST /v1/systemone, e.g. http://127.0.0.1:8008")
+    engine_url: str = Field(description="Decision engine serving POST /v1/systemone: on this machine (e.g. "
+                            "http://127.0.0.1:8008), or https with engine_tls_pin or a public CA's certificate")
     engine_api_key: str | None = None
+    engine_tls_pin: str | None = Field(None, pattern=tls.PIN_PATTERN, description="Pin of a remote https engine's "
+                                       "certificate; none: a public CA's certificate for its hostname")
     max_concurrency: int = Field(256, ge=1, le=4096, description="Highest concurrency the capacity measurement tries; "
                                  "the engine then never gets more than the concurrency that measured best")
     tier: Literal["open", "private"] = "open"
+
+    @model_validator(mode="after")
+    def _engine_tls(self) -> EndpointConfig:
+        engine_tls(self.engine_url, self.engine_tls_pin)
+        return self
 
 
 class MinerConfig(BaseModel):
@@ -51,8 +61,8 @@ class MinerConfig(BaseModel):
     gateway_hotkeys: list[str] = Field(default_factory=list,
                                        description="Extra caller hotkeys allowed besides permitted validators")
     endpoints: list[EndpointConfig] = Field(min_length=1)
-    catalog_mirrors: list[str] = Field(default_factory=list, description="Catalog URL templates with {digest}, "
-                                       "tried after the subnet owner's axon")
+    catalog_mirrors: list[str] = Field(default_factory=list, description="Catalog URL templates (https) with "
+                                       "{digest}, tried after the subnet owner's axon")
     catalog_dir: Path = Path("~/.verathos/catalog")
     state_dir: Path = Path("~/.verathos/miner")
     auto_update: bool = Field(False, description="Update the code to each new release of the repository it was "
@@ -63,6 +73,11 @@ class MinerConfig(BaseModel):
     @classmethod
     def _public_ip(cls, value: str) -> str:
         return public_ip(value)
+
+    @field_validator("catalog_mirrors")
+    @classmethod
+    def _mirrors(cls, value: list[str]) -> list[str]:
+        return [tls.https_url(v, what="catalog mirror") for v in value]
 
     @field_validator("peers")
     @classmethod
@@ -87,7 +102,7 @@ class MinerConfig(BaseModel):
 
     @property
     def base_url(self) -> str:
-        """Where this machine's miner service is reached (``http://public_host:port``)."""
+        """Where this machine's miner service is reached (``https://public_host:port``)."""
         return axon_base(self.public_host, self.port)
 
     def endpoint_url(self, endpoint_id: str) -> str:

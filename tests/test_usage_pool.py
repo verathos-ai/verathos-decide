@@ -358,8 +358,8 @@ class UsageChain(FakeChain):
 def usage_auditor(tmp_path, cat: catalog.Catalog, chain: UsageChain) -> Auditor:
     auditor = Auditor(netuid=405, keypair=kp(), chain=chain, policy=dataclasses.replace(AuditPolicy()),
                       catalog=lambda: cat, references={}, db_path=tmp_path / "t.sqlite", tao_usd=lambda: 300.0)
-    auditor.update_slots([Slot("hkA", "gpu0", "http://a/e/gpu0", "kev-4b", 50.0),
-                          Slot("hkB", "gpu0", "http://b/e/gpu0", "kev-9b", 50.0)])
+    auditor.update_slots([Slot("hkA", "gpu0", "https://a/e/gpu0", "kev-4b", 50.0, "ab" * 32),
+                          Slot("hkB", "gpu0", "https://b/e/gpu0", "kev-9b", 50.0, "cd" * 32)])
     return auditor
 
 

@@ -185,7 +185,7 @@ class Chain:
 
 def test_the_setup_uses_the_network_status_only_as_the_subnet_owner_signed_it_recently(monkeypatch) -> None:
     owner, other = Keypair.create_from_uri("//owner"), Keypair.create_from_uri("//other")
-    cat, now = catalog.load(), 1_800_000_000.0
+    cat, now = catalog.Catalog.parse({**catalog.load().document(), "auditor": {"tls": "ab" * 32}}), 1_800_000_000.0
     shares = cat.anchor_shares()
     status = NetworkStatus(epoch=7, model_shares=shares, hotkeys=[HotkeyStatus(hotkey="5Miner", endpoints=[
         EndpointStatus(endpoint_id="gpu0", model_id="kev-4b", state="scored", credited_rps=14.0)])])
@@ -197,7 +197,7 @@ def test_the_setup_uses_the_network_status_only_as_the_subnet_owner_signed_it_re
     served: dict = {}
 
     def get_json(url: str, **kwargs):
-        assert url == "http://203.0.113.10:8091/v1/network"
+        assert url == "https://203.0.113.10:8091/v1/network" and kwargs["tls"] == "ab" * 32
         if isinstance(served.get("doc"), Exception):
             raise served["doc"]
         return json.loads(json.dumps(served["doc"]))

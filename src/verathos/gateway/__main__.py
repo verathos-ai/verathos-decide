@@ -53,11 +53,13 @@ from verathos.gateway.sampler import Sampler, TestFollower
 from verathos.gateway.served import ServedCounter
 from verathos.gateway.upstream import Upstream
 from verathos.gateway.usage import UsageMeter
+from verathos.protocol import tls
 from verathos.protocol.gateway import Routes
 from verathos.protocol.http import raise_open_file_limit
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.follow import ScheduleFollower
 from verathos.throughput.policy import AuditPolicy
+from verathos.validator.follow import CatalogFollower
 
 log = logging.getLogger("verathos.gateway")
 RESERVED_FILES = 512  # the database pool, the listeners, the metrics and log files
@@ -75,10 +77,18 @@ async def serve(config: GatewayConfig) -> None:
     chain = SubtensorChainView(config.network, config.netuid)
     st = await asyncio.to_thread(bt.Subtensor, network=config.network)
     auditor_hotkey = await asyncio.to_thread(st.get_subnet_owner_hotkey, config.netuid)
+    state_dir = config.state_dir.expanduser()
+    store = catalog_module.CatalogStore(config.catalog_dir)
+    # the committed catalog names the auditor's pin: followed from the chain, so a new pin is taken within a minute
+    committed = await asyncio.to_thread(CatalogFollower, st, config.network, config.netuid, store, [],
+                                        state_path=state_dir / "catalog_followed.json")
     st.close()
+    committed.start()
 
-    async def auditor_url() -> str | None:
-        return config.auditor_url or await asyncio.to_thread(chain.auditor_url)
+    async def auditor() -> tls.Service | None:
+        """The auditor's service, at its pin as the committed catalog names it (raises catalog.AuditorUnknown)."""
+        url = config.auditor_url or await asyncio.to_thread(chain.auditor_url)
+        return tls.Service(url, committed.catalog.auditor_pin()) if url else None
 
     # Every connection holds a descriptor: the users' requests in flight, and at most the rest to miners and auditor.
     files = raise_open_file_limit()
@@ -87,24 +97,23 @@ async def serve(config: GatewayConfig) -> None:
         log.warning("the open-file limit %d cannot hold max_in_flight %d and connections to the miners: raise it "
                     "(LimitNOFILE=65536 in the systemd unit) or lower max_in_flight", files, config.max_in_flight)
     outbound = max(outbound, MIN_OUTBOUND)
-    client = httpx.AsyncClient(limits=httpx.Limits(max_connections=outbound, keepalive_expiry=KEEPALIVE_S,
-                                                   max_keepalive_connections=min(outbound, 4096)),
-                               timeout=httpx.Timeout(30.0, connect=3.0))
-    state_dir = config.state_dir.expanduser()
+    # one connection pool per miner machine (its pin), each within the limits
+    client = tls.client(limits=httpx.Limits(max_connections=outbound, keepalive_expiry=KEEPALIVE_S,
+                                            max_keepalive_connections=min(outbound, 4096)),
+                        timeout=httpx.Timeout(30.0, connect=3.0))
 
-    routes = RouteTable(client=client, auditor_url=auditor_url, auditor_hotkey=auditor_hotkey, netuid=config.netuid,
+    routes = RouteTable(client=client, auditor=auditor, auditor_hotkey=auditor_hotkey, netuid=config.netuid,
                         path=state_dir / "routes.json")
-    store = catalog_module.CatalogStore(config.catalog_dir)
     current: list[catalog_module.Catalog | None] = [None]
     known: list[set[tuple[str, str, str]] | None] = [None]
 
     async def adopt(table: Routes) -> None:
         cat = current[0]
         if cat is None or cat.digest() != table.catalog_digest:
-            url = await auditor_url()
+            url = config.auditor_url or await asyncio.to_thread(chain.auditor_url)
             sources = [url.rstrip("/") + catalog_module.CATALOG_PATH] if url else []
             cat = await asyncio.to_thread(catalog_module.resolve, table.catalog_digest, store=store, sources=sources)
-            if keypair.ss58_address not in cat.gateways:
+            if keypair.ss58_address not in cat.gateway_hotkeys():
                 log.error("this gateway's hotkey %s is not among catalog %s's gateways: miners will refuse it",
                           keypair.ss58_address, cat.digest()[:12])
         dropped = dropped_models(routes.table, table, cat)
@@ -124,9 +133,9 @@ async def serve(config: GatewayConfig) -> None:
     routes.on_change.append(adopt)
     meter = UsageMeter(engine)
     accounts = Accounts(engine, meter)
-    sampler = Sampler(keypair, client, auditor_url=auditor_url, auditor_hotkey=auditor_hotkey,
+    sampler = Sampler(keypair, client, auditor=auditor, auditor_hotkey=auditor_hotkey,
                       window_s=config.sample_window_s, rng=random.SystemRandom())
-    served = ServedCounter(keypair, client, auditor_url=auditor_url, auditor_hotkey=auditor_hotkey)
+    served = ServedCounter(keypair, client, auditor=auditor, auditor_hotkey=auditor_hotkey)
     tests = TestFollower(sampler, ScheduleFollower(chain, AuditPolicy()),
                          lambda: current[0].audit_policy() if current[0] is not None else None)
     router = Router(share=1 / config.instances, max_latency_s=2.0, observer=served)
@@ -174,8 +183,10 @@ async def serve(config: GatewayConfig) -> None:
     # On SIGTERM: stop accepting (the reverse proxy turns to the standby), finish what is in flight (its account
     # checks and its miners' deadline), write usage.
     in_flight_s = 3 * ACCOUNTS_WAIT_S + config.request_timeout_s
+    served_tls = ({"ssl_certfile": str(config.tls_cert_file), "ssl_keyfile": str(config.tls_key_file)}
+                  if config.tls_cert_file is not None else {})
     server = uvicorn.Server(uvicorn.Config(app, log_level="warning", access_log=False, server_header=False,
-                                           timeout_graceful_shutdown=in_flight_s + 2))
+                                           timeout_graceful_shutdown=in_flight_s + 2, **served_tls))
     await server.serve(sockets=sockets)
 
 

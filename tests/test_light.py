@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from verathos import catalog, release
+from verathos.protocol.callers import ValidatorIdentity
 from verathos.protocol.status import NETWORK_DOMAIN, NETWORK_PATH, STATUS_MAX_AGE_S, NetworkStatus, sign_document
 from verathos.validator import chain as validator_chain
 from verathos.validator import light
@@ -25,7 +26,8 @@ from verathos.validator.scoring import ScoreState
 from verathos.validator.service import add_network_route
 from verathos.validator.status import StatusBoard
 
-CAT = catalog.load()
+AUDITOR_PIN = "ab" * 32  # the auditor's certificate, as the catalog names it
+CAT = catalog.Catalog.parse({**catalog.load().document(), "auditor": {"tls": AUDITOR_PIN}})
 BLOCKS = CAT.epoch_blocks
 OFFSET = light.LightValidator.offset(CAT)
 SOURCE_AXON = ("198.51.100.20", 8091)
@@ -42,11 +44,13 @@ def neuron(uid: int, ip: str = "0.0.0.0", port: int = 0, permit: bool = True) ->
 
 class Chain:
     """The chain as a light validator and the weight-setting code see it. A light validator reads no metagraph and
-    no commitments: those are how validators find miners."""
+    no miner's commitment: those are how validators find miners; it reads the commitment of a source validator other
+    than the auditor, which names its TLS pin."""
 
     def __init__(self, owner: str, own: str, block: int) -> None:
         self.owner, self.block = owner, block
         self.neurons = {owner: neuron(0, *SOURCE_AXON), own: neuron(5)}
+        self.commitments: dict[int, str] = {}
         self.set: list[dict] = []
         self.last_update: dict[int, list[int]] = {}  # per mechanism, per UID
         self.version_floor = 7  # the subnet's WeightsVersionKey
@@ -91,7 +95,10 @@ class Chain:
         raise AssertionError("a light validator reads no metagraph")
 
     def get_all_commitments(self, *args, **kwargs):
-        raise AssertionError("a light validator reads no commitments")
+        raise AssertionError("a light validator reads no miner's commitments")
+
+    def get_commitment(self, netuid: int, uid: int) -> str:
+        return self.commitments.get(uid, "")
 
 
 @pytest.fixture(autouse=True)
@@ -122,14 +129,16 @@ def document(signer: Keypair, epoch: int, *, weights: dict[int, float] | None = 
 
 
 def validator(tmp_path, chain: Chain, own: Keypair, served: list, *, fetched: list | None = None,
-              **cfg) -> light.LightValidator:
-    """A light validator whose source's axon serves ``served[-1]`` (an exception is raised)."""
+              pins: list | None = None, **cfg) -> light.LightValidator:
+    """A light validator whose source's axon serves ``served[-1]`` (an exception is raised); ``fetched`` gets the
+    URLs it asks, ``pins`` the certificate pin it accepts for each."""
     from verathos.validator import __main__ as validator_main
 
     settings = config(tmp_path, **cfg)
 
     def fetch(url: str, **kwargs):
         (fetched if fetched is not None else []).append(url)
+        (pins if pins is not None else []).append(kwargs["tls"])
         if isinstance(served[-1], Exception):
             raise served[-1]
         return json.loads(json.dumps(served[-1]))
@@ -146,8 +155,9 @@ def test_a_light_validator_sets_exactly_the_weights_its_source_published(tmp_pat
     owner, own = kp(), kp()
     chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET + 5)
     fetched: list[str] = []
+    pins: list[str] = []
     served = [document(owner, 99)]  # the source has not scored epoch 100 yet
-    started = validator(tmp_path, chain, own, served, fetched=fetched)
+    started = validator(tmp_path, chain, own, served, fetched=fetched, pins=pins)
     assert started.step() == light.POLL_S and chain.set == []  # once epoch 100's are due, 99's are not set
     assert started.why == "the source has not published the results of epoch 100 yet (its latest are for epoch 99)"
     (tmp_path / "light.json").write_text(json.dumps({"epoch": 99, "epoch_blocks": BLOCKS}))
@@ -160,7 +170,8 @@ def test_a_light_validator_sets_exactly_the_weights_its_source_published(tmp_pat
     assert chain.set == [{"netuid": 405, "uids": [3, 7, 12], "weights": [WEIGHTS[3], WEIGHTS[7], WEIGHTS[12]],
                           "mechid": CAT.mechanism, "version_key": release.weights_version_key()}]  # exactly, with
     # this release's version key and on the catalog's mechanism, as full ones
-    assert fetched == [f"http://{SOURCE_AXON[0]}:{SOURCE_AXON[1]}{NETWORK_PATH}"] * 2
+    assert fetched == [f"https://{SOURCE_AXON[0]}:{SOURCE_AXON[1]}{NETWORK_PATH}"] * 2
+    assert set(pins) == {AUDITOR_PIN}  # over TLS, accepting the certificate the catalog names for the auditor
     assert (f"epoch 100: set the weights of the subnet owner's validator {owner.ss58_address}: 3 UIDs, top 3: 0.512, "
             "7: 0.300, 12: 0.188") in caplog.messages
     # Done for the epoch: it waits for the next epoch's results, also after a restart.
@@ -235,21 +246,24 @@ def test_without_a_fresh_verified_document_a_light_validator_sets_nothing_and_sa
     chain.block = 102 * BLOCKS + OFFSET
     v.step()
     assert len(caplog.records) == 2 and caplog.records[-1].getMessage().startswith("epoch 101: no weights set")
-    assert v.why == (f"the source's axon http://{SOURCE_AXON[0]}:{SOURCE_AXON[1]} did not serve it: ConnectError: "
+    assert v.why == (f"the source's axon https://{SOURCE_AXON[0]}:{SOURCE_AXON[1]} did not serve it: ConnectError: "
                      "connection refused")
 
 
-def test_a_source_other_than_the_owner_needs_a_permit_and_an_axon(tmp_path) -> None:
+def test_a_source_other_than_the_owner_needs_a_permit_an_axon_and_a_committed_pin(tmp_path) -> None:
     owner, other, own = kp(), kp(), kp()
     chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET)
     chain.neurons[other.ss58_address] = neuron(9, "198.51.100.30", 8091, permit=False)
-    served = [document(other, 100)]
-    v = validator(tmp_path, chain, own, served, source_hotkey=other.ss58_address)
+    served, pins = [document(other, 100)], []
+    v = validator(tmp_path, chain, own, served, source_hotkey=other.ss58_address, pins=pins)
     v.step()
     assert chain.set == [] and v.why == f"the source hotkey {other.ss58_address} holds no validator permit"
     chain.neurons[other.ss58_address].validator_permit = True
     v.step()
-    assert len(chain.set) == 1
+    assert chain.set == [] and v.why.startswith(f"the source hotkey {other.ss58_address} commits no TLS pin")
+    chain.commitments[9] = ValidatorIdentity("cd" * 32, ("8.8.8.8",)).commitment()
+    v.step()
+    assert len(chain.set) == 1 and pins == ["cd" * 32]  # its service, accepted by the pin it committed
     chain.neurons[own.ss58_address].validator_permit = False
     assert v.permit() == "this hotkey holds no validator permit, which setting weights takes"
     with pytest.raises(ValueError, match="not a hotkey"):
@@ -319,7 +333,7 @@ def test_a_light_validator_never_contacts_miners_or_loads_references(tmp_path, m
                                 "references": {"kev-4b": "http://127.0.0.1:8101"}}))
     monkeypatch.setattr(sys, "argv", ["verathos-validator", "--config", str(path), "--once"])
     validator_main.main()
-    assert recorder.urls == [f"http://{SOURCE_AXON[0]}:{SOURCE_AXON[1]}{NETWORK_PATH}"]
+    assert recorder.urls == [f"https://{SOURCE_AXON[0]}:{SOURCE_AXON[1]}{NETWORK_PATH}"]
     assert [s["uids"] for s in chain.set] == [[3, 7, 12]]
 
 

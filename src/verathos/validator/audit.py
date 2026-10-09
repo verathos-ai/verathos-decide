@@ -122,7 +122,7 @@ async def _canary(result: EndpointResult, request: dict[str, Any], reference: di
     t0 = time.monotonic()
     try:
         data = await request_json(client, "POST", ep.url + "/v1/systemone", content=body, headers=headers,
-                                  limit=MAX_REPLY_BYTES, timeout=timeout_s)
+                                  limit=MAX_REPLY_BYTES, timeout=timeout_s, tls=ep.tls)
     except httpx.HTTPStatusError as e:
         result.errors.append(f"refused: HTTP {e.response.status_code}")
         if e.response.status_code == 429 and "retry-after" in e.response.headers:
@@ -172,7 +172,7 @@ async def _audit_endpoint(result: EndpointResult, canaries: list[tuple[dict[str,
             waited += HOLD_POLL_S
         if not result.identity_ok:
             await identities.verify([ep], epoch, keypair, client)
-            result.identity_ok = identities.verified(ep.key, ep.url, epoch)
+            result.identity_ok = identities.verified(ep.key, ep.where, epoch)
             if not result.identity_ok:
                 continue
         await _canary(result, request, reference, keypair, client, netuid, timeout_s)
@@ -233,7 +233,7 @@ async def audit_epoch(
         if not picked:
             continue
         res = EndpointResult(ep, tolerances[ep.endpoint.model_id],
-                             identity_ok=identities.verified(ep.key, ep.url, epoch))
+                             identity_ok=identities.verified(ep.key, ep.where, epoch))
         results[ep.key] = res
         tasks.append(_audit_endpoint(res, picked, keypair, client, spread_s, random.Random(rng.random()), holding,
                                      netuid, identities, epoch, request_timeout_s))

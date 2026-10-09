@@ -2,7 +2,8 @@
 at a time, ``validator.sequential``).
 
 The source is the subnet owner's validator (the auditor), or the validator ``source_hotkey`` names. Its network
-document (``GET /v1/network``) for the epoch is read and verified as light validators read it (``validator.light``):
+document (``GET /v1/network``, over TLS with the source's pin) for the epoch is read and verified as light validators
+read it (``validator.light``):
 signed by the source hotkey for this netuid within ``STATUS_MAX_AGE_S``, for the catalog's epoch length and for this
 epoch, asked every ``light.POLL_S`` until shortly before the epoch ends. Each endpoint of such a model the source lists
 enters this validator's scoring by the state the source gave it:
@@ -31,6 +32,7 @@ from typing import Any
 import bittensor as bt
 import httpx
 
+from verathos.catalog import Catalog
 from verathos.protocol.http import ResponseTooLarge, get_json
 from verathos.protocol.status import MAX_NETWORK_BYTES, NETWORK_PATH, EndpointStatus, NetworkStatus
 from verathos.subnet.chain import CHAIN_ERRORS, one_line
@@ -82,14 +84,15 @@ def scores_valid(network: NetworkStatus) -> str | None:
 
 
 async def source_results(st: bt.Subtensor, *, netuid: int, hotkey: str, source_hotkey: str | None, epoch: int,
-                         epoch_blocks: int, deadline: float, fetch: Callable[..., Any] = get_json,
+                         epoch_blocks: int, deadline: float, cat: Catalog, fetch: Callable[..., Any] = get_json,
                          clock: Callable[[], float] = time.time, poll_s: float = POLL_S) -> tuple[str, NetworkStatus]:
     """The source hotkey and its network document for ``epoch``, once it verifies, asked every ``poll_s`` until
-    ``deadline`` (``time.monotonic``; at least once). Raises Refused with the last reason."""
+    ``deadline`` (``time.monotonic``; at least once); ``cat`` names the auditor's pin. Raises Refused with the last
+    reason."""
     while True:
         try:
             return await _attempt(st, netuid=netuid, hotkey=hotkey, source_hotkey=source_hotkey, epoch=epoch,
-                                  epoch_blocks=epoch_blocks, fetch=fetch, now_ms=int(clock() * 1000))
+                                  epoch_blocks=epoch_blocks, cat=cat, fetch=fetch, now_ms=int(clock() * 1000))
         except Refused:
             if time.monotonic() + poll_s > deadline:
                 raise
@@ -97,17 +100,19 @@ async def source_results(st: bt.Subtensor, *, netuid: int, hotkey: str, source_h
 
 
 async def _attempt(st: bt.Subtensor, *, netuid: int, hotkey: str, source_hotkey: str | None, epoch: int,
-                   epoch_blocks: int, fetch: Callable[..., Any], now_ms: int) -> tuple[str, NetworkStatus]:
+                   epoch_blocks: int, cat: Catalog, fetch: Callable[..., Any],
+                   now_ms: int) -> tuple[str, NetworkStatus]:
     try:
-        source, url = find_source(st, netuid, st.get_subnet_owner_hotkey(netuid), source_hotkey)
+        source, service = find_source(st, netuid, st.get_subnet_owner_hotkey(netuid), source_hotkey, cat)
     except CHAIN_ERRORS as exc:
         raise Refused(f"the chain is not available: {one_line(exc)}") from None
     if source == hotkey:
         raise Refused("the source is this validator")
     try:
-        document = await asyncio.to_thread(fetch, url + NETWORK_PATH, limit=MAX_NETWORK_BYTES, timeout=FETCH_TIMEOUT_S)
+        document = await asyncio.to_thread(fetch, service.url + NETWORK_PATH, limit=MAX_NETWORK_BYTES,
+                                           timeout=FETCH_TIMEOUT_S, tls=service.pin)
     except (httpx.HTTPError, ResponseTooLarge, ValueError) as exc:
-        raise Refused(f"the source's axon {url} did not serve it: {one_line(exc)}") from None
+        raise Refused(f"the source's axon {service.url} did not serve it: {one_line(exc)}") from None
     network = check(document, source=source, netuid=netuid, epoch=epoch, epoch_blocks=epoch_blocks, done_block=None,
                     now_ms=now_ms)
     if network.epoch != epoch:

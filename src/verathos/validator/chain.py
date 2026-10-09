@@ -10,6 +10,8 @@ from bittensor.core.settings import DEFAULT_PERIOD
 from bittensor.utils import get_mechid_storage_index
 
 from verathos import __version__, release
+from verathos.protocol.callers import ValidatorIdentity
+from verathos.protocol.manifest import committed_digest
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.validator.discovery import Neuron
 
@@ -27,6 +29,26 @@ def snapshot(subtensor: bt.Subtensor, netuid: int) -> tuple[list[Neuron], dict[i
     neurons = [Neuron(uid, hk, ax.ip, ax.port, commitments.get(hk), float(stake), bool(permit))
                for uid, (hk, ax, stake, permit) in enumerate(zip(mg.hotkeys, mg.axons, mg.S, mg.validator_permit))]
     return neurons, dict(enumerate(mg.hotkeys))
+
+
+def publish_identity(subtensor: bt.Subtensor, wallet: bt.Wallet, netuid: int, identity: ValidatorIdentity) -> None:
+    """Commit the validator's identity (its service's TLS pin, its egress addresses; ``protocol.callers``) unless the
+    hotkey commits it already. A hotkey whose commitment is a miner's manifest keeps it: one hotkey is either."""
+    value = identity.commitment()
+    uid = subtensor.get_uid_for_hotkey_on_subnet(wallet.hotkey.ss58_address, netuid)
+    if uid is None:
+        raise RuntimeError(f"hotkey {wallet.hotkey.ss58_address} is not registered on netuid {netuid}")
+    current = subtensor.get_commitment(netuid, uid)
+    if current == value:
+        log.info("validator identity already committed on chain (%s)", value)
+        return
+    if committed_digest(current) is not None:
+        raise RuntimeError("this hotkey commits a miner's manifest; a validator publishes its identity with a hotkey "
+                           "of its own")
+    result = subtensor.set_commitment(wallet, netuid, value)
+    if not getattr(result, "success", False):
+        raise RuntimeError(f"set_commitment failed: {getattr(result, 'message', result)}")
+    log.info("validator identity committed on chain: %s", value)
 
 
 def mechanism_ready(subtensor: bt.Subtensor, netuid: int, mechid: int) -> bool:
