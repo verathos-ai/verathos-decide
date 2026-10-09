@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import socket
 from collections.abc import Callable, Mapping
 
 import httpx
@@ -135,7 +136,7 @@ def create_app(engines: Mapping[tuple[str, str], str], key: str, allowed: Callab
     return app
 
 
-def bind(config: ReferenceConfig, identity: tls.Identity, key: str) -> tuple[uvicorn.Server, object]:
+def bind(config: ReferenceConfig, identity: tls.Identity, key: str) -> tuple[uvicorn.Server, socket.socket]:
     """The front's server and its listening socket, filtered to the callers' addresses: ``server.run(sockets=[it])``
     serves. A socket the kernel does not filter is logged; the app refuses other addresses on it all the same."""
     engines = {(kind, m): config.engines[m][kind].rstrip("/") for kind, m in config.served()}

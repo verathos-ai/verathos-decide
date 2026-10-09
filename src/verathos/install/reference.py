@@ -61,9 +61,9 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
-def engine_service(key: str) -> str:
+def engine_service(item: str) -> str:
     """The service of an engine (``plan.engine_key``): ``verathos-reference-<model>`` or ``verathos-screen-<model>``."""
-    kind, model = key.split("/", 1)
+    kind, model = item.split("/", 1)
     return f"verathos-{kind}-" + re.sub(r"[^A-Za-z0-9-]", "-", model)
 
 
@@ -99,8 +99,8 @@ def reference_config(existing: dict, *, public_ip: str, port: int, callers: list
     """The configuration to write: ``existing`` with this setup's address, callers and engines (``plan.engine_key`` ->
     port on this machine's loopback)."""
     served: dict[str, dict[str, str]] = {}
-    for key, engine_port in sorted(ports.items()):
-        kind, model = key.split("/", 1)
+    for item, engine_port in sorted(ports.items()):
+        kind, model = item.split("/", 1)
         served.setdefault(model, {})[kind] = f"http://127.0.0.1:{engine_port}"
     config = {**existing, "public_host": public_ip, "port": port, "allow": callers, "engines": served}
     if any(":" in c for c in callers):  # an IPv6 caller: a socket for both families
@@ -121,12 +121,12 @@ async def through_front(config: ReferenceConfig, pin: str, key: str, cat: catalo
         try:
             while (why := await engine.problem()) is not None and time.monotonic() < deadline:
                 await asyncio.sleep(2.0)
-            info = await engine.info() if why is None else None
+            models = await engine.info() if why is None else None
         finally:
             await engine.close()
         pinned = cat.get(model).hf_revision if cat.get(model) is not None else ""
-        out[plan.engine_key(kind, model)] = common.engine_state(why, served_revisions(info), pinned,
-                                                                served_code(info))
+        out[plan.engine_key(kind, model)] = common.engine_state(why, served_revisions(models), pinned,
+                                                                served_code(models))
     return out
 
 

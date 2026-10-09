@@ -508,7 +508,7 @@ async def remote_lines(references: dict, screens: dict, cat: catalog.Catalog) ->
         client = engine.engine(timeout_s=10.0)
         try:
             why = await client.problem()
-            info = await client.info() if why is None else None
+            models = await client.info() if why is None else None
         finally:
             await client.close()
         pinned = cat.get(model).hf_revision if cat.get(model) is not None else ""
@@ -517,7 +517,7 @@ async def remote_lines(references: dict, screens: dict, cat: catalog.Catalog) ->
                    "checks it each epoch")
         accepted = f"pin {engine.tls_pin[:12]}..." if engine.tls_pin else "a public CA's certificate"
         return f"{model}: {kind} on another machine, {engine.url} ({accepted}): " + common.engine_state(
-            why, served_revisions(info), pinned, served_code(info))
+            why, served_revisions(models), pinned, served_code(models))
 
     entries = [(m, e, "float32 reference") for m, e in sorted(references.items())]
     entries += [(m, e, "bfloat16 screen") for m, e in sorted(screens.items())]
