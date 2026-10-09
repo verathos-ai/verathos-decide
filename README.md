@@ -101,7 +101,8 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway,test]" ruff
 ```
 
 The test suite runs on CPU. It includes an end-to-end throughput test (miners, auditor, verdicts) against
-in-process miners.
+in-process miners. The Clef engine's tests also need the `clef` extra and the pinned clef-flash release's code,
+tokenizer and configs in the Hugging Face cache (not its weights); without them they are skipped.
 
 ## License
 

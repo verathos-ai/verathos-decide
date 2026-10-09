@@ -382,6 +382,11 @@ reference needs about 41 GiB of RAM (47 GiB on a GPU).
 /opt/clef/bin/verathos-engine clef --repo <hf_repo> --revision <hf_revision> --port 8103 --device cpu --dtype float32
 ```
 
+For a model whose catalog entry lists `image` in its `input_modalities`, the reference also reads the canonical images
+of the requests it recomputes (`GATEWAY.md`, Images), decoded to pixels and given to the release's processor without
+resizing; on a GPU it computes float32 without TF32. An image adds up to 1,026 tokens to a request at the default
+pixel budget, and the auditor's recomputes must finish within 30 s: give the auditor's reference of such a model a GPU.
+
 References one at a time are not started by hand: give each its command in `references` and set `reference_mode` to
 `sequential` ([3. Configure](#3-configure)); the validator runs the command from `directory` with `environment` over
 its own, and the engine must serve on the URL's port on `127.0.0.1`:
@@ -599,7 +604,9 @@ If the validator's hotkey is the auditor, it also:
 - runs every scheduled test with the load generator, checks the sampled answers on its reference engines, and
   confirms tests once their selection block is final;
 - serves the subnet's gateway its routes (`GET /v1/routes`) and takes its sampled exchanges
-  (`POST /v1/gateway/samples`, signed by a catalog gateway), which it checks between tests (`GATEWAY.md`).
+  (`POST /v1/gateway/samples`, signed by a catalog gateway), which it checks between tests (`GATEWAY.md`); a sampled
+  request with images is held in memory only until its check, never in its database, and the process writes no core
+  dump.
 
 The auditor database is `state_dir/throughput.sqlite`. Keep the auditor running continuously: a test it misses is
 not run, and endpoints keep the credit of their last test for `credit_ttl_epochs` (the gateway's routes keep it
