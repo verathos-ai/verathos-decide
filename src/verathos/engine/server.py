@@ -1,5 +1,6 @@
 """HTTP server around a decision engine: ``POST /v1/systemone`` and ``GET /v1/models``.
 
+A request's body is at most ``MAX_BODY_BYTES`` (413 beyond), the largest request a catalog model may take.
 Requests are prepared (validated and tokenized) in worker threads as they arrive, then queued for one device thread,
 which takes everything waiting, up to ``max_batch`` requests, lets the engine split it into passes and runs them one
 after the other, answering each pass's requests when it ends. A request that arrives while passes run joins the next
@@ -10,6 +11,7 @@ again one at a time, so only a request that fails on its own (one too long for t
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue
 import threading
@@ -21,8 +23,10 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from verathos.protocol.api import SystemOneRequest
+from verathos.protocol.media import MAX_IMAGE_REQUEST_BYTES
 
 log = logging.getLogger(__name__)
+MAX_BODY_BYTES = MAX_IMAGE_REQUEST_BYTES
 
 
 class Engine(Protocol):
@@ -101,8 +105,16 @@ def create_app(engine: Engine, served_models: list[dict[str, Any]] | None = None
 
     @app.post("/v1/systemone")
     async def systemone(request: Request) -> JSONResponse:
+        declared, raw = request.headers.get("content-length", ""), bytearray()
+        too_large = JSONResponse({"error": f"request larger than {MAX_BODY_BYTES} bytes"}, status_code=413)
+        if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+            return too_large
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > MAX_BODY_BYTES:
+                return too_large
         try:
-            body = await request.json()
+            body = json.loads(raw)
             SystemOneRequest.model_validate(body)
             item = await asyncio.to_thread(engine.prepare, body)
         except (ValueError, ValidationError) as exc:
