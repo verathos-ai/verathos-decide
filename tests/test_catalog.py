@@ -117,7 +117,8 @@ def test_manifests_of_the_previous_catalog_stay_accepted_across_a_validator_rest
     assert running.accepted() == {first.digest(): 0}
     committed["catalog"] = second
     # each catalog's manifests are for its own mechanism
-    assert running.refresh(None) and running.accepted() == {first.digest(): 0, second.digest(): 1}
+    chain = object()
+    assert running.follow(chain) is chain and running.accepted() == {first.digest(): 0, second.digest(): 1}
     assert start().accepted() == {first.digest(): 0, second.digest(): 1}  # restarted inside the grace
     committed["catalog"] = first  # changed back while the validator was down: miners still announce the second
     assert start().accepted() == {first.digest(): 0, second.digest(): 1}
@@ -128,6 +129,46 @@ def test_manifests_of_the_previous_catalog_stay_accepted_across_a_validator_rest
     (tmp_path / "followed.json").write_text(json.dumps({"catalog": second.digest(), "previous": None, "until": 0}))
     store.put(second)
     assert start().accepted() == {first.digest(): 0, second.digest(): 1}
+
+
+def test_the_catalog_follower_connects_again_after_the_chain_failed_it(tmp_path, monkeypatch) -> None:
+    """A connection that cannot be made, or a read that fails, ends nothing: the catalog followed stays, and the next
+    round connects again and follows the catalog committed meanwhile."""
+    from types import SimpleNamespace
+
+    from verathos.validator import follow
+
+    first = catalog.load()
+    second = catalog.Catalog.parse({**first.document(), "revision": "2026-10-10"})
+    connections, reads = [], []
+
+    def connect(network: str) -> SimpleNamespace:
+        connections.append(network)
+        if len(connections) == 1:
+            raise TimeoutError("timed out while waiting for handshake response")
+        return SimpleNamespace(number=len(connections))
+
+    def current_catalog(st, netuid, store, mirrors, block=None) -> catalog.Catalog:
+        if st is None:  # the validator's start, over the validator's connection
+            return first
+        reads.append(st.number)
+        if len(reads) == 1:
+            raise ConnectionError("connection closed")
+        return second
+
+    monkeypatch.setattr(follow, "bt", SimpleNamespace(Subtensor=connect))
+    monkeypatch.setattr(follow, "current_catalog", current_catalog)
+    follower = follow.CatalogFollower(None, "test", 405, catalog.CatalogStore(tmp_path), [],
+                                      state_path=tmp_path / "followed.json")
+    changed: list[catalog.Catalog] = []
+    follower.on_change.append(changed.append)
+    st = follower.follow(None)  # no connection
+    assert st is None and reads == [] and follower.catalog.digest() == first.digest()
+    st = follower.follow(st)  # connected, and the read fails
+    assert st is None and reads == [2] and follower.catalog.digest() == first.digest()
+    st = follower.follow(st)  # connected again
+    assert st.number == 3 and follower.catalog.digest() == second.digest() and changed == [second]
+    assert follower.follow(st) is st and connections == ["test"] * 3  # kept while it serves
 
 
 def test_settings_this_code_does_not_know_are_found_before_publishing() -> None:

@@ -104,32 +104,35 @@ class CatalogFollower:
                       self.catalog.digest()[:12], exc)
             return self.catalog
 
-    def refresh(self, st: bt.Subtensor) -> bool:
-        """Re-resolve the committed catalog; True if it changed. Keeps the current one while a new one is
-        unavailable."""
+    def follow(self, st: bt.Subtensor | None) -> bt.Subtensor | None:
+        """One round of ``start``: re-resolve the committed catalog over ``st`` (connecting first without one) and
+        follow it if it changed; the current one stays while a new one is unavailable. -> the connection for the next
+        round: None after a failure, so the next round connects again."""
         try:
+            st = st or bt.Subtensor(network=self.network)
             new = current_catalog(st, self.netuid, self.store, self.mirrors)
         except Exception as exc:
             log.error("committed catalog unavailable, keeping %s: %s", self.catalog.digest()[:12], exc)
-            return False
-        if new.digest() == self.catalog.digest():
-            return False
-        with self._lock:
-            self._previous = (self.catalog.digest(), self.catalog.mechanism, time.time() + self._grace_s())
-            self.catalog = new
-            self._save()
-        log.info("catalog %s committed", new.digest()[:12])
-        for callback in self.on_change:
-            callback(new)
-        return True
+            return None
+        if new.digest() != self.catalog.digest():
+            with self._lock:
+                self._previous = (self.catalog.digest(), self.catalog.mechanism, time.time() + self._grace_s())
+                self.catalog = new
+                self._save()
+            log.info("catalog %s committed", new.digest()[:12])
+            for callback in self.on_change:
+                callback(new)
+        return st
 
     def start(self, interval_s: float = POLICY_WATCH_S) -> None:
+        """Follow the commitment every ``interval_s`` in the background, over a connection of its own."""
+
         def run() -> None:
-            st = bt.Subtensor(network=self.network)
+            st: bt.Subtensor | None = None
             while True:
                 time.sleep(interval_s)
                 try:
-                    self.refresh(st)
+                    st = self.follow(st)
                 except Exception:
                     log.exception("catalog follow failed")
 
