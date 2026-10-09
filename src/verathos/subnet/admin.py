@@ -7,8 +7,8 @@
                       mechanism it names must exist on chain, a usage pool's buyback coldkey must not be the subnet
                       owner's coldkey, it must name the auditor's TLS pin and egress addresses and each gateway's
                       egress addresses, and its models may read only text and, where their engine reads them, images
-                      of its token size; run on the auditor's machine, it fills in the auditor's pin and egress
-                      addresses from the validator's configuration and certificate where the file names none
+                      its processor takes as they are; run on the auditor's machine, it fills in the auditor's pin and
+                      egress addresses from the validator's configuration and certificate where the file names none
 
 The owner coldkey comes from a bittensor wallet (``--wallet``, password prompt) or, for unattended test networks,
 from a mnemonic in the OS keyring (``--keyring SERVICE:USER``).
