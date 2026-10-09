@@ -90,6 +90,9 @@ Pins come from documents the chain authenticates:
   comma-separated (`-` for none), in one raw field of at most 128 bytes. A full validator commits it at start when it
   changed; the subnet owner's hotkey commits the catalog instead, and light validators commit nothing.
 
+A validator's engines on a reference machine (a GPU machine serving them over TLS) are accepted by the pin in the
+file that machine's setup writes, which the operator copies to the validator, and need its key (`VALIDATING.md`).
+
 Documents that are authenticated otherwise are fetched accepting any certificate: a manifest (signed by its hotkey,
 its digest committed), whose pin for the axon must then be the certificate the axon presented; a worker's endpoints
 document (signed by the hotkey), likewise for the worker; a catalog by its digest. Catalog mirrors with a hostname
