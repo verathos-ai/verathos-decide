@@ -47,7 +47,6 @@ import json
 import logging
 import math
 import random
-import resource
 import secrets
 import sqlite3
 import threading
@@ -72,6 +71,7 @@ from verathos.protocol.gateway import (
     latency_median_ms,
 )
 from verathos.protocol.manifest import MAX_ENDPOINTS
+from verathos.protocol.media import keep_out_of_dumps
 from verathos.protocol.receipts import parse_response, signed_answers
 from verathos.protocol.status import STATUS_TESTS, ThroughputOutcome
 from verathos.throughput import loadgen
@@ -1040,7 +1040,7 @@ class Auditor:
     # ---- running ----
 
     def start(self) -> None:
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # sampled users' requests are in memory: none reaches a disk
+        keep_out_of_dumps()  # sampled users' requests are in memory
         threading.Thread(target=lambda: asyncio.run(self.run()), name="throughput-auditor", daemon=True).start()
 
     async def run(self) -> None:

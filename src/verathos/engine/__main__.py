@@ -16,6 +16,7 @@ import uvicorn
 
 from verathos.engine import code_version
 from verathos.engine.server import create_app
+from verathos.protocol.media import keep_out_of_dumps
 
 FAMILIES = ("clef",)
 
@@ -31,6 +32,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8010)
     args = parser.parse_args()
+    keep_out_of_dumps()  # users' requests are in memory, their images among them
 
     from verathos.engine import clef
 

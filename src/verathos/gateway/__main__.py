@@ -24,7 +24,6 @@ import importlib.util
 import json
 import logging
 import random
-import resource
 import socket
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -58,6 +57,7 @@ from verathos.gateway.usage import UsageMeter
 from verathos.protocol import tls
 from verathos.protocol.gateway import Routes
 from verathos.protocol.http import raise_open_file_limit
+from verathos.protocol.media import keep_out_of_dumps
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.follow import ScheduleFollower
 from verathos.throughput.policy import AuditPolicy
@@ -74,7 +74,7 @@ KEEPALIVE_S = 3.0
 async def serve(config: GatewayConfig) -> None:
     if importlib.util.find_spec("PIL") is None:
         raise SystemExit("Pillow is missing: the gateway decodes users' images with it (install the gateway extra)")
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # users' requests and images are in memory: none reaches a disk
+    keep_out_of_dumps()
     engine = db.create_engine(config.database_url)
     if await db.schema_revision(engine) != db.head_revision():
         raise SystemExit("the database schema is not current: run `verathos-gateway db upgrade` first")
