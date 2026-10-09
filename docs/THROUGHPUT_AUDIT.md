@@ -68,8 +68,8 @@ than half the rate tested, both of them, show an outage rather than its capacity
 no cap from them. An endpoint makes the miner measure again this way at most once every 3 epochs, never twice for the
 same test.
 
-The miner never sends an engine more requests at once than its knee concurrency; further requests wait in the
-miner (up to four per engine slot).
+Between its measurements, the miner never sends an engine more requests at once than its knee concurrency; further
+requests wait in the miner (up to four per engine slot).
 
 ## Schedule
 
@@ -153,7 +153,8 @@ Outcomes per endpoint: `passed` (delivered at least `pass_fraction` of what it w
 ## Other traffic goes first
 
 The miner admits requests from validators and gateways ahead of test requests: a test request waits while any
-other request waits, and a request that finds the queue full takes the place of the newest waiting test request. A
+other request waits, and a request that finds the queue full takes the place of the newest waiting request it goes
+ahead of (a validator's held behind a test, else a test request). A
 test request is dropped once its session expires, or when the load generator has given up on it. A test never
 delays users. What an endpoint answers the subnet's gateway during the test's window counts as delivered (see
 Gateway answers); test requests beyond its spare capacity otherwise go undelivered, and the credit shows it.
@@ -172,7 +173,7 @@ least 10% of the tested rate and enough for the test's samples. With users at th
 for its tested rate in all, not more; it is judged against what it was asked (Credit above), so users sending less
 in the window cost it nothing within their random spread (two standard deviations around its usual rate of the
 minute before, scaled by the dip of all the model's users), and users it refused count against it; an endpoint whose
-users went elsewhere beyond that spread (it was slow) is judged against their usual rate. Users sending more than
+users went elsewhere beyond that spread (it was slow) is judged against the low end of that spread. Users sending more than
 usual (a burst, or test traffic relayed through the gateway) cost it nothing either: the miner serves them first, so
 each answer beyond what the test left of the tested rate takes the place of a test request, and the test's requests
 count as asked only up to what the users' answers leave of the tested rate.
@@ -291,12 +292,12 @@ recognisable by its session, so hardware used for other work between tests could
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `mode` | `enforce` | `observe`: validators count declared capacities and apply no evidence; tests still run |
+| `mode` | `enforce` | `observe`: validators count declared capacities, each up to its model's `first_test_rps`, and apply no evidence; tests still run |
 | `lead_blocks` | 5 | blocks from the selection block to the start of the traffic |
 | `max_latency_s` | 2 | highest latency at which a miner's measurement counts throughput |
 | `warmup_s`, `test_s` | 3, 16 | shortest unmeasured traffic (each test draws it from [`warmup_s`, 2 x `warmup_s`]) and the measured window, seconds; `warmup_s` is at least `max_latency_s` |
 | `request_timeout_s` | 10 | per-request timeout of the load generator |
-| `pass_fraction` | 0.95 | share of the tested rate below which the credit is scaled down once more |
+| `pass_fraction` | 0.95 | share of what the endpoint was asked (Credit) below which the credit is scaled down once more |
 | `samples_per_test` | 10 | responses per endpoint whose receipts are checked |
 | `answer_checks_per_test` | 2 | of those, answers the reference recomputes |
 | `capacity_margin` | 0.95 | share of the measured median a miner declares |
@@ -332,7 +333,9 @@ The auditor needs:
   unscanned. In `revenue` mode it reads TAO's price in USD from CoinGecko once per period.
 
 Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers), `verdicts`
-(as served), `demand` (users' input tokens per model) and `users` (what users got from each endpoint), the last 30
-epochs, more than the last 10 tests a hotkey's status lists). A catalog with another `epoch_blocks` renumbers it (a
+(as served), `demand` (users' input tokens per model), `shares` (the models' emission shares), `users` (what users
+got from each endpoint) and `paid` (paid input tokens per endpoint), the last 30 epochs, more than the last 10 tests a
+hotkey's status lists; with a usage pool, `paid`, `burns`, `unscanned` and `usage` (the period records) from the
+start of the period before when that is earlier). A catalog with another `epoch_blocks` renumbers it (a
 test by its selection block, the rest by the first block of its epoch; the verdicts served for the old epochs are
 dropped), so credits, test rates, demand and wrong answers carry on.
