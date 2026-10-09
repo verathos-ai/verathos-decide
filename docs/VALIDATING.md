@@ -391,8 +391,13 @@ What it does:
    without the fused kernels) and its bfloat16 screen (the miners' engine), and downloads the pinned weights;
 3. places the engines as a validator places its references, the smallest first, each on the GPU with the most free
    memory while one has room: a reference that fits no GPU runs in RAM, a screen that fits no GPU is left out (the
-   reference then recomputes that model's checks itself). On one 80 GB GPU with 216 GiB of RAM, for Kev-4B, Kev-9B and
-   Clef-flash, the three screens share the GPU (about 62 GiB) and the references run in RAM (about 104 GiB);
+   reference then recomputes that model's checks itself). On one A100 80 GB with 216 GiB of RAM, for Kev-4B, Kev-9B
+   and Clef-flash, the three screens share the GPU and the references run in RAM (about 104 GiB). Measured there:
+   the screens, placed at about 62 GiB, held 77 GB after their first checks and peaked at 79.5 GB of the 80 GB under
+   bursts of 64 requests each at once (the auditor sends at most 4 at once); a screen answered in 0.1 to 0.2 s, a
+   reference in RAM in 15 to 22 s with the three busy on the machine's 24 cores, Clef-flash's test requests with an
+   image in about 25 s, so for the auditor give Clef-flash's reference a GPU
+   ([The auditor's GPU](#the-auditors-gpu-for-a-model-that-reads-images));
 4. runs each engine as a service on `127.0.0.1` (`verathos-reference-<model>`, `verathos-screen-<model>`) and the front
    (`verathos-reference`) on the port. The front serves TLS with a certificate of its own
    (`~/.verathos/reference/tls.crt`), which validators accept by its pin, needs the callers' bearer key
