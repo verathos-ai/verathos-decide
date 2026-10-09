@@ -5,7 +5,7 @@ Miners and the model catalog are discovered from native chain state only. No EVM
 ```
                          SUBSTRATE (SN96)
   ┌──────────────────────────────────────────────────────────────────┐
-  │  owner hotkey (UID 0)                                            │
+  │  subnet owner hotkey                                             │
   │    commitment: "verathos/catalog/v1 sha256:<catalog digest>"     │
   │                                                                  │
   │  miner hotkey (any UID)                                          │
@@ -18,25 +18,27 @@ Miners and the model catalog are discovered from native chain state only. No EVM
           ▲ serve_axon / set_commitment              │ read axons + commitments
           │ (free, hotkey-signed, primary only)      ▼
   ┌──────────────────────────┐ GET /v1/manifest TLS ┌───────────────────────────┐
-  │ MINER primary (axon)     │ ◄────────────────────│ VALIDATOR / GATEWAY       │
+  │ MINER primary (axon)     │ ◄────────────────────│ VALIDATOR / AUDITOR       │
   │  signed manifest:        │                      │  1. hotkeys with manifest │
   │   gpu0 kev-4b, here      │                      │     commitment            │
   │   w1-gpu0 kev-9b, worker │                      │  2. fetch manifest        │
   │   each machine's pin     │  identity, canaries, │  3. signature == hotkey   │
   │  decision engines        │ ◄────────────────────│  4. digest == commitment  │
-  └────────────┬─────────────┘  tests, requests,    │  5. catalog digest ==     │
+  └────────────┬─────────────┘  tests,              │  5. catalog digest ==     │
                │                pinned TLS          │     owner commitment      │
                │ GET /v1/endpoints, every minute    │  6. axon's certificate == │
                ▼                                    │     the pin it names      │
   ┌──────────────────────────┐  identity, canaries, │  7. each endpoint signs a │
   │ MINER worker, same hotkey│ ◄────────────────────│     challenge at its URL  │
-  │  no chain writes         │  tests, requests,    │     before any traffic    │
+  │  no chain writes         │  tests,              │     before any traffic    │
   │  decision engines        │  pinned TLS          └───────────────────────────┘
   └──────────────────────────┘
 ```
 
 Rules:
 - Only hotkeys with a manifest commitment and an axon on a public address are contacted.
+- Gateways read no manifest: they send users' requests to the endpoints of the auditor's signed routes, over TLS
+  with the pins the routes name (`GATEWAY.md`).
 - A manifest is accepted only if it is signed by the hotkey that owns the axon, is for this netuid, is built for the
   committed catalog (or, for one epoch after a change, the previous one) and for that catalog's mechanism, its digest
   equals that hotkey's current commitment, every endpoint URL is exactly
@@ -45,8 +47,8 @@ Rules:
   an IPv4 address), the port 1-65535, nothing else, it names the pin of every endpoint's machine and of the axon
   (`tls`, base URL `https://<ip>:<port>` -> pin), and the axon presented the certificate with that pin when it served
   the manifest. The host is the axon or any other machine of the miner. A manifest names at most 64 machines and
-  lists at most 64 endpoints. A miner therefore cannot show different endpoint lists to different validators. The manifest depends only on the miner's configuration, its capacity measurements and the
-  catalog, so a restart does not change the commitment.
+  lists at most 64 endpoints. A miner therefore cannot show different endpoint lists to different validators. The manifest depends only on the miner's configuration, its machines' TLS certificates, its
+  capacity measurements and the catalog, so a restart does not change the commitment.
 - An endpoint gets traffic only once it proved control at its URL, over TLS with its machine's pin: it signs a fresh
   challenge with the listing hotkey (`POST /e/<endpoint_id>/v1/identity`); a new pin is a new place to prove control
   at. Validators challenge every endpoint each epoch before its first
@@ -77,7 +79,7 @@ reverse proxy). Miners and validators are reached by IP address, where no public
 P-256, no expiry) once in its `state_dir` (`tls.key`, `tls.crt`, mode 600) and reuses them; deleting both rotates
 them. A certificate is accepted by its pin, the SHA-256 of its SubjectPublicKeyInfo (DER) as 64 lowercase hex digits,
 and nothing else: no CA, name or date check, and a client sends no byte of a request before the handshake shows the
-pinned key. `curl --pinnedpubkey` takes the same pin in base64 (`sha256//...`), which the installer prints.
+pinned key. `curl --pinnedpubkey` takes the same pin in base64 (`sha256//...`), which the miner installer prints.
 
 Pins come from documents the chain authenticates:
 - a miner machine's from its hotkey's manifest (`tls`: each machine's base URL -> its pin);
