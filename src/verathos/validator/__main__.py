@@ -415,8 +415,8 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
                  credited.get(key, 0.0), proven.user_availability.get(key, 1.0), scores.get(key, 0.0),
                  f" errors={sorted(set(r.errors))}" if r.errors else "")
     capacity = weights(state, hotkey_of_uid)
-    paid = referral.take(state, verdicts, cat, epoch, check=lambda r: None if throughput.auditor is not None else
-                         referral_contradiction(r, st, cfg.netuid))  # the auditor's own record is not checked again
+    paid = referral.take(state, verdicts, cat, epoch, check=lambda r, before: None if throughput.auditor is not None
+                         else referral_contradiction(r, st, cfg.netuid, before))  # the auditor's is not checked again
     referral_by_uid, referrers = referral.referral_weights(paid, cat, epoch, hotkey_of_uid, capacity)
     referral_share = (round(sum(referral_by_uid.values()), catalog.SHARE_DIGITS) if sc.referral_pool is not None
                       else None)
@@ -465,8 +465,9 @@ def weight_parts(w: dict[int, float], hotkey_of_uid: dict[int, str], owner_hotke
     weights added (they sum to at most ``1 - miner_share``, ``validator.usage``, ``validator.referral``), and the
     rest on the subnet owner's UID, whose incentive the chain does not pay out; all on the owner's UID if no miner has
     a positive score, usage or referral weight. If the owner hotkey holds no UID there is nothing to put the rest on:
-    the miners get it all, in those proportions (nothing if none has a weight). -> (the weights, and the parts of
-    them per UID: ``serving`` from the scores, ``usage`` and ``referral`` from the pools)."""
+    the miners' weights take what the pools leave, and with none, no weights are set, as the chain would scale the
+    pools' up (they pay at most what they size). -> (the weights, and the parts of them per UID: ``serving`` from the
+    scores, ``usage`` and ``referral`` from the pools)."""
     pools = {name: {uid: value for uid, value in (by_uid or {}).items() if value > 0}
              for name, by_uid in (("usage", usage_by_uid), ("referral", referral_by_uid))}
     extra: dict[int, float] = {}
@@ -482,14 +483,16 @@ def weight_parts(w: dict[int, float], hotkey_of_uid: dict[int, str], owner_hotke
                         "%.6f", miner_share)
         if not extra:
             return w, {"serving": dict(w), **pools}
-        serving = {uid: value * miner_share for uid, value in w.items()}
+        if not w:
+            log.warning("no miner has a positive score and the subnet owner hotkey holds no UID: no weights set, as "
+                        "the pools' alone would be scaled up")
+            return {}, {"serving": {}, "usage": {}, "referral": {}}
+        rest = 1.0 - sum(extra.values())
+        serving = {uid: value * rest for uid, value in w.items()}
         out = dict(serving)
         for uid, value in extra.items():
             out[uid] = out.get(uid, 0.0) + value
-        total = sum(out.values())
-        return ({uid: value / total for uid, value in out.items()},
-                {name: {uid: value / total for uid, value in part.items()}
-                 for name, part in (("serving", serving), *pools.items())})
+        return out, {"serving": serving, **pools}
     if not w and not extra:
         return {owner: 1.0}, {"serving": {}, **pools}
     if miner_share >= 1 and not extra:

@@ -109,7 +109,9 @@ def test_codes_are_random_or_readable_and_unique_after_folding() -> None:
         code = random_code()
         assert well_formed(code) and len(code) == 8 and not set(code) & set("01oil")
     assert reserved("verathos-fan") == "verathos" and reserved("decideai") == "decide"
-    assert reserved("v3rathos") is None  # 3 is not folded: a code is not "verathos" by it
+    for look_alike, name in (("v3rathos", "verathos"), ("dec1de", "decide"), ("b1ttensor", "bittensor"),
+                             ("adm1n", "adm1n"), ("off1cial", "off1cial"), ("t3am-x", "t3am"), ("h3lp", "h3lp")):
+        assert reserved(look_alike) == name, look_alike  # digits read as the letters they look like
     assert reserved("team") == "team" and reserved("the-team") == "team" and reserved("te-am") == "te-am"
     assert reserved("steamboat") is None and reserved("helpful") is None  # words only whole or as a part
     assert reserved("kev4bfan", ["kev-4b"]) == "kev-4b" and reserved("chutesfan", ["chutes"]) == "chutes"
@@ -597,4 +599,54 @@ def test_entries_wait_until_every_registration_is_out(tmp_path, monkeypatch) -> 
         ledger.run(ledger.referrals.report(post))
     assert [([c.registration.code for c in r.codes], len(r.entries)) for r in posted[2:]] == [
         ([], 1), (["alice"], 0), (["bobby"], 1)]
+
+
+def test_a_move_keeps_the_limit_of_codes_per_hotkey(tmp_path) -> None:
+    s = admin(tmp_path)
+    a, b = kp(), kp()
+    for code in ("alice", "anna", "ally"):
+        assert call(s, "POST", "/admin/v1/referral-codes", registration(a, code)).status_code == 201
+    assert call(s, "POST", "/admin/v1/referral-codes", registration(b, "bobby")).status_code == 201
+    over = call(s, "POST", "/admin/v1/referral-codes/move", move(b, a.ss58_address, b.ss58_address))
+    assert over.status_code == 409 and "more than 3 codes" in over.json()["error"]["message"]
+    call(s, "DELETE", "/admin/v1/referral-codes/bobby", token=ADMIN_TOKEN)  # revoked codes do not count
+    assert call(s, "POST", "/admin/v1/referral-codes/move", move(b, a.ss58_address, b.ss58_address)).status_code == 200
+    for code in ("amy1", "amy2", "amy3"):  # a holds none now: three more, which cannot join b's
+        assert call(s, "POST", "/admin/v1/referral-codes", registration(a, code)).status_code == 201
+    assert call(s, "POST", "/admin/v1/referral-codes/move", move(b, a.ss58_address, b.ss58_address)).status_code == 409
+
+
+def test_one_entry_counts_at_most_what_a_report_carries(tmp_path) -> None:
+    ledger = Ledger(tmp_path)
+    ledger.code("alice")
+    ledger.account("u_1", "alice")
+    ledger.credit("u_1", 2_000_000, at_s=10)  # a top-up of 2 million USD, no account cap
+    assert ledger.decide(POOL.model_copy(update={"account_cap_usd": None})) == [1_000_000]
+    posted: list[ReferralReport] = []
+
+    async def post(report: ReferralReport):
+        posted.append(report)
+        return {}
+    assert ledger.run(ledger.referrals.report(post)) == 2 and posted[0].entries[0].amount_micros == 10**12
+
+
+def test_registrations_and_moves_are_posted_in_the_order_they_happened(tmp_path) -> None:
+    """The auditor applies a move to the codes it took before it: a code registered after a move goes in a later post
+    than the move, so the move does not take it along."""
+    ledger = Ledger(tmp_path)
+    a, b = ledger.miner, kp()
+    ledger.code("alice")
+    ledger.run(ledger.referrals.move(SignedMove.model_validate(move(b, a.ss58_address, b.ss58_address))))
+    ledger.code("anna")  # on a again, after the move
+    later = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=5)
+    ledger.run(ledger._at(db.referral_codes, db.referral_codes.c.code == "anna", created_at=later))
+    posted: list[ReferralReport] = []
+
+    async def post(report: ReferralReport):
+        posted.append(report)
+        return {}
+    while ledger.run(ledger.referrals.report(post)):
+        pass
+    assert [([c.registration.code for c in r.codes], [m.move.to_hotkey for m in r.moves]) for r in posted] == [
+        (["alice"], [b.ss58_address]), (["anna"], [])]
 

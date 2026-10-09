@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 from types import SimpleNamespace
 
@@ -28,7 +29,16 @@ from verathos.protocol.status import NetworkStatus
 from verathos.throughput.auditor import Auditor
 from verathos.throughput.feed import VERDICTS_DOMAIN, Verdicts
 from verathos.throughput.policy import AuditPolicy
-from verathos.throughput.referral import close, code_hotkeys, contradiction, owner_at, record_of, sized
+from verathos.throughput.referral import (
+    CodeState,
+    Move,
+    close,
+    contradiction,
+    follow,
+    owner_at,
+    record_of,
+    sized,
+)
 from verathos.validator import status as status_module
 from verathos.validator.__main__ import weight_parts, weights_to_set
 from verathos.validator.referral import referral_period, referral_weights, rewrites, take
@@ -176,7 +186,7 @@ def test_a_validator_takes_a_record_once_per_period_and_refuses_one_that_rewrite
     r2, r3, r4 = (rec(k, history) for k in (2, 3, 4))
     state, checked = ScoreState(), []
 
-    def check(record):
+    def check(record, previous):
         checked.append(record.period)
         return None
     assert take(state, verdicts_of(r2), CAT, 6, check) == r2  # epochs 6 and 7 pay period 2
@@ -196,11 +206,11 @@ def test_a_validator_takes_a_record_once_per_period_and_refuses_one_that_rewrite
     assert take(state, verdicts_of(r3), CAT, 14) is None  # a record of another period pays nothing
     assert take(ScoreState(), verdicts_of(r2), pooled({"window_periods": 4}), 6) is None  # not the catalog's window
     assert "other parameters" in take_why(r2, pooled({"payout_per_usd": 0.2}))
-    assert take_why(r2, CAT, lambda r: "the chain has no such owner") == "the chain has no such owner"
+    assert take_why(r2, CAT, lambda r, previous: "the chain has no such owner") == "the chain has no such owner"
     tampered = verdicts_of(r2).model_copy(update={"referral": {**r2.model_dump(mode="json"), "share": 0.3}})
     assert take(ScoreState(), tampered, CAT, 6) is None
 
-    def unreachable(record):
+    def unreachable(record, previous):
         raise ConnectionError("node down")
     assert take(ScoreState(), verdicts_of(r2), CAT, 6, unreachable) == r2  # unchecked: the auditor's word
     assert take(ScoreState(), verdicts_of(r2), catalog.load(), 6) is None  # no pool: nothing
@@ -212,25 +222,61 @@ def take_why(record, cat, check=None) -> str | None:
     return (state.referral_refused or {}).get("why")
 
 
-def test_a_code_moves_only_within_its_coldkey(caplog) -> None:
-    """The auditor applies a move only between hotkeys of one coldkey; a full validator refuses a record that moves a
-    code to a hotkey of another coldkey, and takes a move within one, or the chain's coldkey swap."""
-    moves = [("hkA", "hkB"), ("hkB", "hkX")]
-    hotkeys, refused = code_hotkeys({"alice": "hkA", "bob": "hkB", "carol": "hkC"}, moves,
-                                    {"hkA": COLD_A, "hkB": COLD_A, "hkX": COLD_B})
-    assert hotkeys == {"alice": "hkB", "bob": "hkB", "carol": "hkC"} and refused == [("hkB", "hkX")]
-    assert code_hotkeys({"alice": "hkA"}, [("hkA", "hkB")], {"hkA": COLD_A})[1] == [("hkA", "hkB")]  # unknown: no
+def test_a_code_moves_once_only_to_a_hotkey_of_its_coldkey_and_stays_there(caplog) -> None:
+    """The auditor decides each move once, in the order things arrived, by the coldkey a code belongs to: the coldkey
+    of the hotkey that registered it, followed through the chain's coldkey swaps. A hotkey swapped away later, or a
+    code registered after a move, changes nothing decided."""
+    codes = [CodeState("alice", "hkA", 1, 10), CodeState("bob", "hkB", 2, 10), CodeState("carol", "hkC", 3, 10)]
+    moves = [Move(4, "hkA", "hkB"), Move(5, "hkB", "hkX"), Move(6, "hkC", "hkZ"), Move(7, "hkQ", "hkA")]
+    states, outcomes = follow(codes, moves, {"hkA": COLD_A, "hkB": COLD_A, "hkC": COLD_B, "hkX": COLD_B}, 2 * L)
+    assert states == {"alice": ("hkB", COLD_A), "bob": ("hkB", COLD_A), "carol": ("hkC", COLD_B)}
+    assert outcomes == {4: "moved", 5: "refused", 6: "refused", 7: "empty"}  # hkZ belongs to no coldkey
+    late = [CodeState("alice", "hkA", 1, 10, "hkB", COLD_A), CodeState("zed", "hkA", 9, 4 * L + 1)]
+    swapped = follow(late, [], {"hkB": COLD_A}, 4 * L)[0]  # zed arrived after the period: not yet
+    assert swapped == {"alice": ("hkB", COLD_A)}
+    after_move = follow([CodeState("alice", "hkA", 1, 10), CodeState("zed", "hkA", 3, 10)], [Move(2, "hkA", "hkB")],
+                        {"hkA": COLD_A, "hkB": COLD_A}, 2 * L)[0]
+    assert after_move == {"alice": ("hkB", COLD_A), "zed": ("hkA", COLD_A)}  # registered after the move: stays
 
+    # a hotkey swap: the old hotkey has no owner any more, the new one has the code's coldkey
+    rotated = follow([CodeState("alice", "hkA", 1, 10, "hkA", COLD_A)], [Move(2, "hkA", "hkN")],
+                     {"hkA": None, "hkN": COLD_A}, 3 * L)
+    assert rotated == ({"alice": ("hkN", COLD_A)}, {2: "moved"})
+    # a coldkey swap, then a move to a hotkey of the new coldkey in the same period
+    swap = follow([CodeState("alice", "hkA", 1, 10, "hkA", COLD_A)], [Move(2, "hkA", "hkB")],
+                  {"hkA": COLD_B, "hkB": COLD_B}, 3 * L)
+    assert swap == ({"alice": ("hkB", COLD_B)}, {2: "moved"})
+    # once moved, a later swap of the hotkey it left changes nothing
+    assert follow([CodeState("alice", "hkA", 1, 10, "hkB", COLD_A)], [], {"hkB": COLD_A, "hkA": None},
+                  4 * L)[0] == {"alice": ("hkB", COLD_A)}
+
+
+def test_a_full_validator_refuses_a_record_that_moves_a_code_to_another_coldkey(caplog) -> None:
+    """Against the last record it accepted and its node at the record's end block: a code now on another hotkey is
+    refused when its previous hotkey belongs to another coldkey than its new one there; a move within a coldkey, after
+    a coldkey swap, or from a hotkey swapped away (no owner) is taken."""
     history = [("alice", 2 * L + 5, 40)]
     before = rec(2, history, coldkeys={"hkA": COLD_A})
+
+    def node(owners: dict[str, str | None]) -> SimpleNamespace:
+        storage = {**STORAGE, "SubnetOwnerHotkey": OWNER_HOTKEY, "SubnetOwner": OWNER_COLDKEY,
+                   "Owner": lambda params: owners.get(params[0])}
+        return SimpleNamespace(substrate=Substrate({}, storage))
     stolen = rec(3, history, hotkeys={"alice": "hkX"}, coldkeys={"hkX": COLD_B})
-    assert rewrites(before, stolen) == "it moves code alice from hkA to hkX, a hotkey of another coldkey"
+    why = contradiction(stolen, node({"hkA": COLD_A, "hkX": COLD_B}), 405, before)
+    assert why.startswith("it moves code alice from hkA to hkX, a hotkey of another coldkey")
     state = ScoreState()
     take(state, verdicts_of(before), CAT, 6)
-    assert take(state, verdicts_of(stolen), CAT, 8) is None
-    assert rewrites(before, rec(3, history, hotkeys={"alice": "hkB"}, coldkeys={"hkB": COLD_A})) is None
-    assert rewrites(before, rec(3, history, coldkeys={"hkA": COLD_B})) is None  # same hotkey: the chain's swap
-    assert rewrites(before, rec(3, history, cat=pooled({"window_periods": 4}))) is None  # another window: not compared
+    assert take(state, verdicts_of(stolen), CAT, 8, lambda r, previous: contradiction(
+        r, node({"hkA": COLD_A, "hkX": COLD_B}), 405, previous)) is None
+    within = rec(3, history, hotkeys={"alice": "hkB"}, coldkeys={"hkB": COLD_A})
+    assert contradiction(within, node({"hkA": COLD_A, "hkB": COLD_A}), 405, before) is None
+    swapped = rec(3, history, hotkeys={"alice": "hkB"}, coldkeys={"hkB": COLD_B})  # hkA's coldkey swapped to COLD_B
+    assert contradiction(swapped, node({"hkA": COLD_B, "hkB": COLD_B}), 405, before) is None
+    rotated = rec(3, history, hotkeys={"alice": "hkN"}, coldkeys={"hkN": COLD_A})
+    assert contradiction(rotated, node({"hkA": None, "hkN": COLD_A}), 405, before) is None
+    assert contradiction(stolen, node({"hkA": COLD_A, "hkX": COLD_B}), 405, rec(0, history)) is None  # no overlap
+    assert rewrites(before, stolen) is None  # the sums are as they were: the chain tells a move apart
 
 
 def test_referral_weights_pay_registered_referrers_within_what_the_miner_share_leaves() -> None:
@@ -519,3 +565,57 @@ def test_a_hotkeys_status_shows_its_referral_and_the_parts_of_its_weight() -> No
     status = by_hotkey["hkR"]
     assert (status.uid, status.weight, status.referral_weight, status.referral_share) == (3, 0.01, 0.01, 0.01)
     assert status.referral == referrer and status.epoch == 7
+
+
+def test_a_move_decided_once_stands_when_the_hotkey_it_left_is_swapped_away(tmp_path) -> None:
+    """A code moved within its coldkey stays moved, and the next record is taken, after the hotkey it left loses its
+    owner (a hotkey swap reads as the zero account, which counts as none)."""
+    a, b = kp(), kp()
+    chain = ReferralChain(2 * L + 1, {a.ss58_address: COLD_A, b.ss58_address: COLD_A})
+    auditor = referral_auditor(tmp_path, CAT, chain)
+    at(auditor, 2 * L + 1)
+    moved = SignedMove.model_validate(move(b, a.ss58_address, b.ss58_address))
+    auditor.accept_referrals("gw", ReferralReport(codes=[signed_code(a, "alice")], moves=[moved],
+                                                  entries=[entry("alice", 40, 1)]))
+    at(auditor, 3 * L + 1)
+    r2 = record_of(auditor.verdicts(6).verdicts.model_extra["referral"])
+    assert [(c.hotkey, c.coldkey) for c in r2.codes] == [(b.ss58_address, COLD_A)]
+    chain.coldkey_of[a.ss58_address] = None
+    auditor.accept_referrals("gw", ReferralReport(entries=[entry("alice", 5, 2)]))
+    for block in range(3 * L + 101, 4 * L, 100):
+        at(auditor, block)
+    at(auditor, 4 * L + 2)
+    r3 = record_of(auditor.verdicts(8).verdicts.model_extra["referral"])
+    assert [(c.hotkey, c.periods) for c in r3.codes] == [(b.ss58_address, [0, 40 * USD, 5 * USD])]
+    storage = {**STORAGE, "SubnetOwnerHotkey": OWNER_HOTKEY, "SubnetOwner": OWNER_COLDKEY,
+               "Owner": lambda params: {b.ss58_address: COLD_A}.get(params[0], "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1"
+                                                                                 "eSuyUpnhM")}  # the zero account
+    st = SimpleNamespace(substrate=Substrate({}, storage))
+    state = ScoreState()
+    assert take(state, verdicts_of(r2), CAT, 6) == r2
+    assert take(state, verdicts_of(r3), CAT, 8, lambda r, previous: contradiction(r, st, 405, previous)) == r3
+
+
+def test_what_arrives_while_a_period_is_closed_counts_in_the_next(tmp_path) -> None:
+    """Once a period's close has begun, a report counts in a later period, even taken with a chain head the auditor
+    has not seen pass the period's end."""
+    chain = ReferralChain(2 * L + 5)
+    auditor = referral_auditor(tmp_path, CAT, chain)
+    auditor.follower.poll()
+    auditor.accept_referrals("gw", ReferralReport(codes=[signed_code(kp(), "alice")], entries=[entry("alice", 1, 1)]))
+    chain.finalized = 3 * L  # the end is final; the auditor's head is behind
+    auditor.tao_usd = lambda: (_ for _ in ()).throw(ConnectionError("no price"))
+    auditor.step_referrals()  # begins the close, fails: tried again
+    auditor.accept_referrals("gw", ReferralReport(entries=[entry("alice", 2, 2)]))
+    auditor.tao_usd = lambda: TAO_USD
+    auditor.step_referrals()
+    r2 = record_of(json.loads(auditor.store.referral_record(2 * L, 3 * L)))
+    assert [c.periods for c in r2.codes] == [[0, 0, 1 * USD]]  # the 2 USD count in period 3
+
+
+def test_with_the_owner_hotkey_holding_no_uid_the_pools_are_never_scaled_up(caplog) -> None:
+    unowned = {1: "hkA", 2: "hkB"}
+    w, parts = weight_parts({1: 0.75, 2: 0.25}, unowned, "owner", 0.59, None, {2: 0.05})
+    assert w == pytest.approx({1: 0.75 * 0.95, 2: 0.25 * 0.95 + 0.05}) and parts["referral"] == {2: 0.05}
+    assert weight_parts({}, unowned, "owner", 0.59, None, {2: 0.05})[0] == {}  # nothing to put the rest on
+    assert "no weights set" in caplog.text

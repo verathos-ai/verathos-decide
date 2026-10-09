@@ -45,6 +45,7 @@ MINER_PART = 0.5  # of what a block emits to a subnet's participants after the o
 PRICE_SCALE = 2**32  # SubnetMovingPrice is a fixed-point number with 32 fractional bits
 TAO_USD_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bittensor&vs_currencies=usd"
 TOKENS_PER_PRICE = 1_000_000  # a model's price is in USD per million input tokens
+NO_OWNER = "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM"  # the zero account: ``Owner`` of a hotkey nobody owns
 
 
 class Burn(BaseModel):
@@ -275,9 +276,14 @@ def alpha_price_at(st: Any, block: int, netuid: int) -> float:
 
 
 def coldkeys_at(st: Any, hotkeys: Iterable[str], block: int) -> dict[str, str | None]:
-    """Each hotkey's owner coldkey at ``block`` (``Owner``)."""
+    """Each hotkey's owner coldkey at ``block`` (``Owner``); None for a hotkey without one, which the chain reads as
+    the zero account (``NO_OWNER``)."""
     at = _hash(st, block)
-    return {hk: st.substrate.query("SubtensorModule", "Owner", [hk], block_hash=at).value or None for hk in hotkeys}
+
+    def owner(hotkey: str) -> str | None:
+        value = st.substrate.query("SubtensorModule", "Owner", [hotkey], block_hash=at).value
+        return value if value and value != NO_OWNER else None
+    return {hk: owner(hk) for hk in hotkeys}
 
 
 def tao_usd(fetch: Callable[..., Any] = get_json) -> float:

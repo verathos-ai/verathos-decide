@@ -487,10 +487,11 @@ web app (`MINING.md`, Referrals).
 **Codes.** A code is random, 8 characters of `abcdefghjkmnpqrstuvwxyz23456789` (no 0, o, 1, l or i), or readable, 4 to
 24 characters of a-z, digits and single hyphens, starting with a letter. Codes are unique after folding: lower case,
 hyphens dropped, `0` read as `o`, `1` as `l`, `5` as `s`, so `a1ice` cannot be taken beside `alice`, and a look-up
-reads a code the same way (`A1ICE` finds `alice`). No code contains `verathos`, `decide`, `bittensor`, `opentensor`,
-`taostats`, a model id of the catalog or a name of `referral_reserved` (each folded), nor is `official`, `support`,
-`admin`, `team` or `help` or has one of them as a hyphen-separated part. A hotkey holds at most 3 codes not revoked.
-A code is never deleted, so it is never given out twice.
+reads a code the same way (`A1ICE` finds `alice`). Read as it looks (digits as the letters they look like: 0 o, 1 l or
+i, 3 e, 4 a, 5 s, 7 t, 8 b), no code contains `verathos`, `decide`, `bittensor`, `opentensor`, `taostats`, a model id
+of the catalog or a name of `referral_reserved`, nor is `official`, `support`, `admin`, `team` or `help` or has one of
+them as a hyphen-separated part. A hotkey holds at most 3 codes not revoked. A code is never deleted, so it is never
+given out twice.
 
 **Signed messages** (`protocol/referral.py`). The hotkey signs `<domain>`, a line break and the message's canonical
 JSON (sorted keys, no whitespace, UTF-8) with its sr25519 key, as hex:
@@ -507,8 +508,11 @@ a move is taken within 5 minutes after `issued_ms` (and a minute before it, for 
 canonical JSON in base64url without padding, a dot, and the signature.
 
 **Moves and revocation.** A move takes every code of `from_hotkey` to `to_hotkey`, another hotkey of the same coldkey
-(a rotated hotkey, a new registration); the web app checks on chain that the two have one owner (`Owner`), and the
-auditor applies a move only if they have at the end of each period. The operator revokes a code
+(a rotated hotkey, a new registration), as long as `to_hotkey` then holds at most 3 codes not revoked; the web app
+checks the coldkey on chain. The auditor decides each move once, when the first period after it ends: it moves a code
+only to a hotkey of the coldkey the code belongs to (the one that owned the hotkey registering it, followed through
+the chain's coldkey swaps), so a code never changes coldkey, and a move decided stands whatever happens on chain
+later. The operator revokes a code
 (`verathos-gateway referrals revoke --code`, or the admin token): it takes no new account, its accounts keep their
 referral, and their top-ups count no more.
 
@@ -527,10 +531,13 @@ no top-up: its first top-up fixes its referrer. Grants, the referred user's bonu
 Every 30 s the gateway posts to the auditor what it has not taken yet (`POST /v1/gateway/referrals`, signed by the
 gateway's hotkey as served counts are): `{"codes": [signed registrations], "moves": [signed moves], "entries": [{"id"
 (the SHA-256 of the credit's reference), "code", "amount_micros", "credited_ms"}]}`, up to 1,000 registrations or moves
-and 5,000 entries per post. The auditor takes every item once, so a post whose answer was lost goes again as it was; if
-it answers with codes it does not know (its database started over), every registration and move goes again with
-those entries. It counts each entry in the period in which it arrives (`THROUGHPUT_AUDIT.md`). No account, address or
-reference leaves the gateway: the auditor sees codes and amounts.
+and 5,000 entries per post, an entry counting at most 1,000,000 USD. Registrations and moves go in the order they
+happened (the auditor takes a post's registrations before its moves), and entries once every registration is out. The
+auditor takes every item once, so a post whose answer was lost goes again as it was; if it answers with codes it does
+not know (its database started over), every registration and move goes again, then those entries. It counts each
+entry in the period in which it arrives (`THROUGHPUT_AUDIT.md`). No account, address or reference leaves the gateway:
+the auditor sees codes and amounts. One gateway database serves the subnet's gateway processes; a second one would
+keep codes of its own.
 
 ## Admin API
 
@@ -703,7 +710,7 @@ counting each account once. Never an account, an address or a reference:
 | 400 | `invalid_request` | a body that is not the message (a field missing or unknown); a signature that does not verify; signed for another netuid or site, more than 5 minutes ago, or ahead of the gateway's clock; not a code; a reserved name; a move to the hotkey it is from; `days` out of range |
 | 403 | `forbidden` | revoking with the account service's token; an account outside its prefix |
 | 404 | `not_found` | no such code (a look-up, a revocation, a referral: or a revoked one); a move from a hotkey that holds no code; no such account |
-| 409 | `conflict` | the code is taken, or reads as one that is (`a1ice` beside `alice`); the hotkey holds 3 codes; the account has another code, or has topped up |
+| 409 | `conflict` | the code is taken, or reads as one that is (`a1ice` beside `alice`); the hotkey holds 3 codes, or a move would leave it more; the account has another code, or has topped up |
 | 503 | `unavailable` | the gateway names no `referral_site` |
 
 ### The web app's part
@@ -713,8 +720,10 @@ The web app checks what needs the chain and passes the rest on, unchanged:
 - `POST /api/referral/codes` with a signed registration: the hotkey holds a UID on the subnet and is not the subnet
   owner's (neither `SubnetOwnerHotkey` nor a hotkey whose `Owner` is `SubnetOwner`), within its own limits (20
   registrations an hour per address); then `POST /admin/v1/referral-codes`, answering its status and body.
-- `POST /api/referral/move` with a signed move: `Owner` of both hotkeys is one coldkey, and `to_hotkey` holds a UID;
-  then `POST /admin/v1/referral-codes/move`.
+- `POST /api/referral/move` with a signed move: `to_hotkey` holds a UID and its `Owner` is the coldkey the codes
+  belong to: `from_hotkey`'s `Owner`, or, once a hotkey swap left `from_hotkey` without one, the coldkey the web app
+  recorded when the codes were registered; then `POST /admin/v1/referral-codes/move`. The chain reads `Owner` of a
+  hotkey nobody owns as the zero account (`5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM`): that is no owner.
 - `GET /api/referral/dashboard?days=` with `Authorization: Referral <token>`: the token's signature verifies against its
   hotkey under `verathos/referral-view/v1`, its `netuid` and `site` are the web app's, and `expires_ms` is in the
   future, at most a day ahead (60 queries an hour per hotkey); then `GET /admin/v1/referrers/{hotkey}`.

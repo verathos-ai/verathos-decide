@@ -123,8 +123,8 @@ mechanism (`SUBNET_ADMIN.md`) once per epoch. The chain pays the subnet owner ho
 recycles it under the subnet's `RecycleOrBurn` setting (`SUBNET_ADMIN.md`). The share is a constant or moves linearly
 from one value to another over a number of epochs; each epoch's comes from the catalog and the epoch number alone,
 rounded to 6 decimals, so every validator sets the same split. If no endpoint has a positive average and neither pool
-pays anybody, all weight goes to the subnet owner's UID. If the owner hotkey holds no UID, the miners' and the pools'
-weights are scaled to sum to 1.
+pays anybody, all weight goes to the subnet owner's UID. If the owner hotkey holds no UID, the miners' weights take
+what the pools leave (the pools' are never scaled up), and with no miner weight no weights are set.
 
 Everything above is what a full validator does. A full validator running its references one at a time scores the
 endpoints of the models it does not check in an epoch with the source's published results for them: the score the
@@ -215,8 +215,9 @@ The auditor records each period (`THROUGHPUT_AUDIT.md`) and states the record, s
 the next period. A full validator recomputes the record's figures, checks that it states the catalog's
 `payout_per_usd`, `share` and `window_periods`, and checks what its own node holds of the period's end block (the
 emission, the moving alpha price, the subnet owner, each referrer's coldkey). It also compares the record with the
-last one it accepted: every code's earlier periods must be as stated there, and a code may move to another hotkey only
-of the same coldkey. A record that fails pays nothing at that validator for the period. A light validator sets the
+last one it accepted, while their windows overlap: every code's sums in the periods both hold must be as stated there,
+and a code now on another hotkey must not have left a hotkey that belongs, at the record's end block, to another
+coldkey than its new one. A record that fails pays nothing at that validator for the period. A light validator sets the
 weights its source publishes, referral weights included. The network document states the epoch's `referral_share` and
 the record it pays (`referral`), each hotkey's `serving_weight`, `usage_weight` and `referral_weight`, and lists
 referrers without endpoints too, with their codes' sums (`VALIDATING.md`).

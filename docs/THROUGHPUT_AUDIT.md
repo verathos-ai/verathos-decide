@@ -276,15 +276,17 @@ With the catalog's referral pool (`SCORING.md`, Referrals), the gateways post th
 refunds as they count (`POST /v1/gateway/referrals`, signed by a catalog gateway, `GATEWAY.md`), with the codes'
 registrations and moves. The auditor takes a registration or a move only if the hotkey it names signed it for its
 netuid (the first registration of a code stands), and an entry only of a registered code, each once however often it
-is posted, in the period in which it arrives, never in one recorded already; an entry of a code it does not know is
-answered with the code (`unknown_codes`), and the gateway sends its registrations and moves again. The verdicts of
+is posted, in the period in which it arrives, never in one whose close has begun; an entry of a code it does not know
+is answered with the code (`unknown_codes`), and the gateway sends its registrations and moves again. When a period
+closes, the auditor takes the registrations and moves that arrived before its end once each, in the order they
+arrived: a code belongs to the coldkey that owned the hotkey registering it (and follows it through the chain's
+coldkey swaps), and a move takes it only to a hotkey of that coldkey, decided once. The verdicts of
 every epoch of a period state the record of the period before (`referral`), closed once its end block is final; the
 first verdicts of a period wait up to 20 blocks after its start for it, then come without it. The record lists:
 
 - `codes`: each code with entries in the window (the period and the `window_periods - 1` before it), with its hotkey at
-  the period's end (as registered, then moved, a move only between two hotkeys of one coldkey at the end block), that
-  hotkey's coldkey at the end block, and its entries' sum in each period of the window, oldest first (`periods`,
-  micro-USD, signed);
+  the period's end, that hotkey's coldkey at the end block, and its entries' sum in each period of the window, oldest
+  first (`periods`, micro-USD, signed);
 - `referrers`: per hotkey, `referred_micros` (its codes' sums over the window, at least 0), `cap` and `share`;
 - `share`: the caps' sum, at most `max_share` (the catalog's `share`);
 - the inputs: `payout_per_usd`, `max_share`, `window_periods`; `emission` and `period_emission` as in the usage record;
@@ -292,7 +294,7 @@ first verdicts of a period wait up to 20 blocks after its start for it, then com
   subnet's `SubnetMovingPrice` at the end block); `owner_hotkey` and `owner_coldkey`, the subnet owner at the end block.
 
 A validator recomputes the sums, caps and shares from these, checks the end block's state its node still holds, and
-compares the record with the last one it accepted. A new period length or window starts the windows afresh: entries
+compares the record with the last one it accepted (`SCORING.md`, Referrals). A new period length or window starts the windows afresh: entries
 from before the last period recorded under the old ones do not count, so no dollar counts in more periods than one
 window holds.
 

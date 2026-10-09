@@ -1,12 +1,13 @@
 """The referral pool on the validators' side (``catalog.ReferralPool``, ``throughput.referral``).
 
 Each epoch of period ``k + 1`` pays period ``k``'s record, which comes signed with the auditor's verdicts. A validator
-takes the record once per period: it recomputes its figures, checks that it states the catalog's parameters and,
-unless it is the auditor, what its node still holds of the reference block, and compares it with the last record it
-accepted: every code's earlier periods in the window must be as that record stated them, and a code may move to
-another hotkey only of the same coldkey. A record that fails any of these is refused for the whole period (no referral
-weights; the subnet owner's UID keeps the share). The last record accepted is kept with the scores, so an epoch whose
-verdicts do not come still pays it.
+takes the record once per period: it recomputes its figures, checks that it states the catalog's parameters and that
+every code's sums in the periods its window shares with the last record it accepted are as that record stated them,
+and, unless it is the auditor, what its node still holds of the reference block: the chain's state there, and that a
+code now on another hotkey than in that record moved within a coldkey (``throughput.referral.contradiction``). A
+record that fails any of these is refused for the whole period (no referral weights; the subnet owner's UID keeps the
+share); once the windows no longer overlap, the next record is compared with nothing earlier. The last record accepted
+is kept with the scores, so an epoch whose verdicts do not come still pays it.
 
 The epoch's referral share is the record's share, at most what the epoch's miner share leaves. Each referrer gets its
 share in the record, scaled down alike when the miner share leaves less, on the UID it holds now; it gets nothing, and
@@ -45,8 +46,7 @@ def parameters(record: ReferralRecord, pool: ReferralPool) -> str | None:
 
 def rewrites(previous: ReferralRecord | None, record: ReferralRecord) -> str | None:
     """Why ``record`` contradicts ``previous``, an earlier record of periods as long and a window as long: a code's
-    sum in a period both windows hold differs, or a code moved to a hotkey of another coldkey. None if it does not
-    (or the two cannot be compared)."""
+    sum in a period both windows hold differs. None if it does not (or the two cannot be compared)."""
     length = record.end_block - record.first_block
     if (previous is None or previous.end_block >= record.end_block or previous.window_periods != record.window_periods
             or previous.end_block - previous.first_block != length):
@@ -62,19 +62,14 @@ def rewrites(previous: ReferralRecord | None, record: ReferralRecord) -> str | N
         for end in ends:
             if old.get((code, end), 0) != new.get((code, end), 0):
                 return f"it rewrites the sum of code {code} in the period ending at block {end}"
-    before = {c.code: c for c in previous.codes}
-    for c in record.codes:
-        was = before.get(c.code)
-        if was is not None and was.hotkey != c.hotkey and was.coldkey != c.coldkey:
-            return f"it moves code {c.code} from {was.hotkey} to {c.hotkey}, a hotkey of another coldkey"
     return None
 
 
 def take(state: ScoreState, verdicts: Verdicts | None, cat: Catalog, epoch: int,
-         check: Callable[[ReferralRecord], str | None] | None = None) -> ReferralRecord | None:
+         check: Callable[[ReferralRecord, ReferralRecord | None], str | None] | None = None) -> ReferralRecord | None:
     """The record the epoch pays (the period before its own), from ``verdicts`` the first time they state it, else as
-    kept in ``state``; None without one, or if it was refused. ``check`` gives why the chain contradicts a record
-    (None: not checked)."""
+    kept in ``state``; None without one, or if it was refused. ``check`` gives why the chain contradicts a record,
+    given the last one accepted (None: not checked)."""
     pool = cat.scoring.referral_pool
     if pool is None:
         return None
@@ -89,7 +84,7 @@ def take(state: ScoreState, verdicts: Verdicts | None, cat: Catalog, epoch: int,
         why = stated.inconsistency() or parameters(stated, pool) or rewrites(accepted, stated)
         if why is None and check is not None:
             try:
-                why = check(stated)
+                why = check(stated, accepted)
             except Exception as exc:  # chain trouble: unchecked, on the auditor's word
                 log.warning("  referrals: the record of period %d could not be checked on chain: %s", wanted, exc)
         if why:

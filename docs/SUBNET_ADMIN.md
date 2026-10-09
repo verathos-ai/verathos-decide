@@ -310,7 +310,9 @@ To enable it:
    epoch.
 
 Removing the section stops the pay at once; a top-up decided meanwhile never counts. A new `period_epochs`,
-`window_periods` or `epoch_blocks` starts the windows afresh, so no dollar counts twice. Run it on the test network
+`window_periods` or `epoch_blocks` starts the windows afresh, so no dollar counts twice. Commit a change of `share`,
+`payout_per_usd` or `window_periods` early in a period: a full validator refuses a record whose parameters are not its
+catalog's, and the record of the period that ends under the old ones is paid under the new. Run it on the test network
 first, with a short `period_epochs` and `window_periods`, `term_days` 30 and `account_cap_usd` 1000.
 
 ## Throughput audit

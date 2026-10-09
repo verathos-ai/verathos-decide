@@ -8,9 +8,9 @@ the period into a ``ReferralRecord`` and states it with every verdicts document 
 (``referral``):
 
 - ``codes``: each code with entries in the window (period ``k`` and the ``window_periods - 1`` before it), with its
-  hotkey at the end of the period (as registered, then moved, each move only between hotkeys of one coldkey at the
-  reference block), that hotkey's coldkey at the reference block, and the sum of its entries in each period of the
-  window, oldest first (micro-USD, signed);
+  hotkey at the end of the period (as registered, then moved, a move only to a hotkey of the code's coldkey), that
+  hotkey's coldkey at the reference block, and the sum of its entries in each period of the window, oldest first
+  (micro-USD, signed);
 - ``referrers``: per hotkey, ``referred_micros``, its codes' sums over the window, at least 0 (``R``); ``cap``,
   ``payout_per_usd x R / (window_periods x tao_usd x alpha_tao x period_emission)``, the share of the mechanism's miner
   emission that pays ``payout_per_usd / window_periods`` of R in USD; and ``share``, ``cap x share / the caps' sum``;
@@ -24,6 +24,9 @@ the period into a ``ReferralRecord`` and states it with every verdicts document 
 A referred USD counts in at most ``window_periods`` periods at most ``payout_per_usd / window_periods`` of it each:
 it earns at most ``payout_per_usd`` USD of emission, however it is timed or split over accounts and codes.
 
+The registrations and moves are taken once, in the order they arrive; each move is decided once, when the first
+period after it closes (``follow``), so later events on chain never change where a code went.
+
 Validators recompute the record's figures (``ReferralRecord.inconsistency``), check what their own node holds of the
 reference block (``contradiction``) and compare the record with the last one they took (``validator.referral``).
 """
@@ -32,6 +35,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -132,19 +136,59 @@ def sized(referred: dict[str, int], *, payout_per_usd: float, window_periods: in
     return caps, share, {hotkey: cap * share / total if total > 0 else 0.0 for hotkey, cap in caps.items()}
 
 
-def code_hotkeys(registered: dict[str, str], moves: Iterable[tuple[str, str]],
-                 coldkeys: dict[str, str | None]) -> tuple[dict[str, str], list[tuple[str, str]]]:
-    """Each code's hotkey: the one that registered it, then each move (from, to) in order, as far as both hotkeys have
-    one coldkey in ``coldkeys``. -> (code -> hotkey, the moves refused)."""
-    hotkeys, refused = dict(registered), []
-    for source, target in moves:
-        if coldkeys.get(source) is None or coldkeys.get(source) != coldkeys.get(target):
-            refused.append((source, target))
+@dataclass(frozen=True)
+class CodeState:
+    """A code at the auditor: its registration (the hotkey that signed it, the order and block it arrived in) and,
+    once a period after it was closed, the hotkey it is on (``at``) and the coldkey it belongs to."""
+
+    code: str
+    hotkey: str
+    seq: int
+    block: int
+    at: str | None = None
+    coldkey: str | None = None
+
+
+@dataclass(frozen=True)
+class Move:
+    """A move the auditor has not decided yet: every code on ``source`` to ``target``."""
+
+    seq: int
+    source: str
+    target: str
+
+
+def follow(codes: Iterable[CodeState], moves: Iterable[Move], coldkeys: dict[str, str | None],
+           end_block: int) -> tuple[dict[str, tuple[str, str | None]], dict[int, str]]:
+    """Each code's hotkey and coldkey at a period's end, from what the auditor held before (``codes``' ``at`` and
+    ``coldkey``) and the registrations and moves since that arrived before ``end_block``, each taken once, in the
+    order they arrived. ``coldkeys``: the hotkeys' owners at the end block.
+
+    A code belongs to the coldkey that owned the hotkey registering it, and follows that coldkey when the chain moves
+    its hotkey to another (a coldkey swap). A move takes the codes on its source hotkey that arrived before it to its
+    target only if the target belongs to the codes' coldkey, so a code never changes coldkey by a move, whatever
+    happens to the source hotkey since (a hotkey swap leaves it without an owner). -> (code -> (hotkey, coldkey), each
+    move -> moved, refused (its codes belong to another coldkey) or empty (no code on its source))."""
+    states: dict[str, tuple[str, str | None]] = {}
+    events: list[tuple[int, CodeState | Move]] = []
+    for c in codes:
+        if c.at is not None:
+            states[c.code] = (c.at, coldkeys.get(c.at) or c.coldkey)
+        elif c.block < end_block:
+            events.append((c.seq, c))
+    events += [(m.seq, m) for m in moves]
+    outcomes: dict[int, str] = {}
+    for _, event in sorted(events, key=lambda e: e[0]):
+        if isinstance(event, CodeState):
+            states[event.code] = (event.hotkey, coldkeys.get(event.hotkey))
             continue
-        for code, hotkey in hotkeys.items():
-            if hotkey == source:
-                hotkeys[code] = target
-    return hotkeys, refused
+        on_source = [code for code, (at, _) in states.items() if at == event.source]
+        target = coldkeys.get(event.target)
+        moved = [code for code in on_source if target is not None and states[code][1] == target]
+        for code in moved:
+            states[code] = (event.target, target)
+        outcomes[event.seq] = "moved" if moved else "refused" if on_source else "empty"
+    return states, outcomes
 
 
 def close(period: int, *, pool: ReferralPool, epoch_blocks: int, entries: Iterable[tuple[str, int, int]],
@@ -198,10 +242,12 @@ def owner_at(st: Any, block: int, netuid: int) -> tuple[str | None, str | None]:
     return value("SubnetOwnerHotkey"), value("SubnetOwner")
 
 
-def contradiction(record: ReferralRecord, st: Any, netuid: int) -> str | None:
+def contradiction(record: ReferralRecord, st: Any, netuid: int,
+                  previous: ReferralRecord | None = None) -> str | None:
     """What the chain, as this node still holds it at the reference block, says against ``record``: another
-    emission, alpha price, subnet owner or referrer's coldkey. None if nothing; what the node no longer holds (or
-    cannot read now) is not checked."""
+    emission, alpha price, subnet owner or referrer's coldkey, or, against ``previous`` (an earlier record whose
+    window overlaps this one's), a code on another hotkey whose previous hotkey belongs to another coldkey than its new
+    one. None if nothing; what the node no longer holds (or cannot read now) is not checked."""
     block = record.end_block
     try:
         emission = emission_at(st, block, netuid, record.emission.mechanism)
@@ -229,4 +275,18 @@ def contradiction(record: ReferralRecord, st: Any, netuid: int) -> str | None:
     for r in record.referrers:
         if r.hotkey in coldkeys and coldkeys[r.hotkey] != r.coldkey:
             return f"{r.hotkey}'s coldkey at block {block} is {coldkeys[r.hotkey]}, not {r.coldkey}"
+    length = record.end_block - record.first_block
+    if previous is None or previous.end_block <= record.end_block - record.window_periods * length:
+        return None  # no earlier record whose window this one overlaps
+    before = {c.code: c.hotkey for c in previous.codes}
+    moved = {c.code: c for c in record.codes if before.get(c.code, c.hotkey) != c.hotkey}
+    try:
+        owners = coldkeys_at(st, sorted({before[code] for code in moved}), block)
+    except Exception:
+        owners = {}
+    for code, c in sorted(moved.items()):
+        owner = owners.get(before[code])
+        if owner is not None and owner != c.coldkey:
+            return (f"it moves code {code} from {before[code]} to {c.hotkey}, a hotkey of another coldkey than "
+                    f"{before[code]}'s at block {block}")
     return None

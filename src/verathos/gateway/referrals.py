@@ -4,11 +4,12 @@ they count for the catalog's referral pool, reported to the auditor.
 Codes (``protocol.referral``). A hotkey has a code by its signed registration, which the account service (the web
 app) forwards after checking on chain that the hotkey holds a UID and is not the subnet owner's. The gateway takes it
 when the hotkey's signature verifies, it was signed for this netuid and ``referral_site`` within the last 5 minutes,
-the code is well formed, no code folds to the same form, it contains no reserved name (``RESERVED_NAMES``, the
-catalog's model ids and ``referral_reserved``) and is not a reserved word nor has one as a hyphen-separated part
-(``RESERVED_WORDS``), and its hotkey holds fewer than ``MAX_CODES`` codes not revoked. A code is never deleted, so it is
-never given out twice. A move takes every code of one hotkey to another of its coldkey (the account service checks the
-coldkey on chain), signed by the new hotkey. The operator may revoke a code: it takes no new accounts, and its accounts'
+the code is well formed, no code folds to the same form, read as it looks (digits as the letters they look like) it
+contains no reserved name (``RESERVED_NAMES``, the catalog's model ids and ``referral_reserved``) and is not a reserved
+word nor has one as a hyphen-separated part (``RESERVED_WORDS``), and its hotkey holds fewer than ``MAX_CODES`` codes
+not revoked. A code is never deleted, so it is never given out twice. A move takes every code of one hotkey to another
+of its coldkey (the account service checks the coldkey on chain), signed by the new hotkey, if the new one then holds
+at most ``MAX_CODES`` codes not revoked. The operator may revoke a code: it takes no new accounts, and its accounts'
 top-ups stop counting.
 
 Attribution. An account has at most one code (``referrals``), set once by the account service, only while the account
@@ -23,9 +24,10 @@ once (``referral_reports``) and reported once.
 
 The reporter. Every ``REPORT_S`` one gateway process (PostgreSQL's advisory lock ``LOCK_KEY``; the others skip the
 round) decides the new credits of referred accounts, then posts what the auditor has not taken, signed by the gateway:
-registrations and moves, then, once every registration is out, entries (``protocol.gateway.ReferralReport``). The
-auditor takes every item once, so a post whose answer was lost is sent again as it is. If it no longer knows a code an
-entry names (its database started over), every registration and move goes again, then those entries.
+registrations and moves in the order they happened, then, once every registration is out, entries
+(``protocol.gateway.ReferralReport``). The auditor takes every item once, so a post whose answer was lost is sent again
+as it is. If it no longer knows a code an entry names (its database started over), every registration and move goes
+again, then those entries. An entry counts at most ``MAX_REFERRAL_MICROS``.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ from verathos.gateway.db import (
 )
 from verathos.protocol.gateway import (
     MAX_REFERRAL_ENTRIES,
+    MAX_REFERRAL_MICROS,
     MAX_REFERRAL_SIGNED,
     REFERRALS_PATH,
     ReferralEntry,
@@ -87,14 +90,24 @@ class Refused(Exception):
         self.status, self.kind, self.message = status, kind, message
 
 
+_LOOKS = (str.maketrans("0134578", "oleastb"), str.maketrans("0134578", "oieastb"))  # digits as the letters they
+# look like, 1 as l or i
+
+
+def looks(text: str) -> set[str]:
+    """``text`` as it reads: lower case, hyphens dropped, digits read as the letters they look like."""
+    plain = text.lower().replace("-", "")
+    return {plain.translate(table) for table in _LOOKS}
+
+
 def reserved(code: str, names: Iterable[str] = ()) -> str | None:
-    """The reserved name or word ``code`` holds, if any (see the module)."""
-    folded = fold(code)
+    """The reserved name or word ``code`` holds, if any (see the module), read as it looks (``looks``)."""
+    readings = looks(code)
     for name in (*RESERVED_NAMES, *names):
-        if fold(name) and fold(name) in folded:
+        if any(form and form in reading for form in looks(name) for reading in readings):
             return name
-    words = {fold(w) for w in RESERVED_WORDS}
-    return next((part for part in (code, *code.split("-")) if fold(part) in words), None)
+    words = {form for word in RESERVED_WORDS for form in looks(word)}
+    return next((part for part in (code, *code.split("-")) if looks(part) & words), None)
 
 
 @dataclass(frozen=True)
@@ -123,10 +136,10 @@ def counted(kind: str, amount: int, refund_of: str | None, created: dt.datetime,
     if pool.term_days is not None and created >= referred + dt.timedelta(days=pool.term_days):
         return 0
     if pool.account_cap_usd is None:
-        return amount
+        return min(amount, MAX_REFERRAL_MICROS)
     near = sum(e.counted for e in earlier
                if e.kind == "topup" and abs((e.created - created).total_seconds()) < window_s)
-    return max(0, min(amount, round(pool.account_cap_usd * 1_000_000) - near))
+    return max(0, min(amount, round(pool.account_cap_usd * 1_000_000) - near, MAX_REFERRAL_MICROS))
 
 
 def entry_id(reference: str) -> str:
@@ -156,6 +169,16 @@ class Referrals:
         if not fresh(issued_ms, int(self.clock() * 1000)):
             raise Refused(400, "invalid_request", "signed more than 5 minutes ago, or ahead of this gateway's clock")
 
+    @staticmethod
+    async def _lock_hotkeys(conn: Any, *hotkeys: str) -> None:
+        """Registrations and moves of these hotkeys one at a time, until the transaction ends (PostgreSQL; SQLite
+        writes one at a time anyway)."""
+        if conn.dialect.name != "postgresql":
+            return
+        for hotkey in sorted(set(hotkeys)):  # one order everywhere: no deadlocks
+            key = int.from_bytes(hashlib.sha256(f"referral {hotkey}".encode()).digest()[:8], "big", signed=True)
+            await conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+
     def names(self) -> list[str]:
         """The names besides ``RESERVED_NAMES`` no code may contain: the catalog's model ids and the configured
         ones."""
@@ -178,6 +201,7 @@ class Referrals:
         for last in (False, True):
             try:
                 async with self.engine.begin() as conn:
+                    await self._lock_hotkeys(conn, r.hotkey)
                     taken = (await conn.execute(select(referral_codes.c.code, referral_codes.c.hotkey).where(
                         referral_codes.c.folded == fold(r.code)))).first()
                     if taken is not None and tuple(taken) == (r.code, r.hotkey):
@@ -227,9 +251,16 @@ class Referrals:
             raise Refused(400, "invalid_request", "from_hotkey and to_hotkey are the same hotkey")
         try:
             async with self.engine.begin() as conn:
+                await self._lock_hotkeys(conn, m.from_hotkey, m.to_hotkey)
                 created = not (await conn.execute(select(referral_moves.c.id).where(
                     referral_moves.c.signature == signed.signature))).first()
                 if created:
+                    held = dict((await conn.execute(
+                        select(referral_codes.c.hotkey, func.count()).where(
+                            referral_codes.c.hotkey.in_((m.from_hotkey, m.to_hotkey)),
+                            referral_codes.c.revoked_at.is_(None)).group_by(referral_codes.c.hotkey))).all())
+                    if sum(held.values()) > MAX_CODES:
+                        raise Refused(409, "conflict", f"{m.to_hotkey} would hold more than {MAX_CODES} codes")
                     moved = (await conn.execute(update(referral_codes).where(
                         referral_codes.c.hotkey == m.from_hotkey).values(hotkey=m.to_hotkey))).rowcount
                     if not moved:
@@ -407,14 +438,24 @@ class Referrals:
         async with self.engine.begin() as conn:
             if not await self._locked(conn):
                 return 0
-            codes = (await conn.execute(select(referral_codes.c.code, referral_codes.c.registration).where(
+            pending = (await conn.execute(select(
+                referral_codes.c.code, referral_codes.c.registration, referral_codes.c.created_at).where(
                 referral_codes.c.reported_at.is_(None)).order_by(referral_codes.c.created_at, referral_codes.c.code)
-                .limit(MAX_REFERRAL_SIGNED))).all()
-            moves = (await conn.execute(select(referral_moves.c.id, referral_moves.c.move).where(
-                referral_moves.c.reported_at.is_(None)).order_by(referral_moves.c.id).limit(MAX_REFERRAL_SIGNED))).all()
-            waiting = (await conn.execute(select(func.count()).select_from(referral_codes).where(
-                referral_codes.c.reported_at.is_(None)))).scalar()
-            entries = [] if waiting > len(codes) else (await conn.execute(  # entries once their codes are out
+                .limit(MAX_REFERRAL_SIGNED + 1))).all()
+            moves = (await conn.execute(select(referral_moves.c.id, referral_moves.c.move, referral_moves.c.created_at)
+                                        .where(referral_moves.c.reported_at.is_(None)).order_by(referral_moves.c.id)
+                                        .limit(MAX_REFERRAL_SIGNED))).all()
+            # in the order they happened: the auditor takes a post's registrations before its moves, and applies a
+            # move to the codes it took before the move
+            codes = []
+            for c in pending:
+                if len(codes) == MAX_REFERRAL_SIGNED or (moves and _utc(c.created_at) > _utc(moves[0].created_at)):
+                    break
+                codes.append(c)
+            later = pending[len(codes)] if len(pending) > len(codes) else None
+            if later is not None:
+                moves = [m for m in moves if _utc(m.created_at) < _utc(later.created_at)]
+            entries = [] if later is not None else (await conn.execute(  # entries once their codes are out
                 select(referral_reports.c.credit_id, referral_reports.c.code, referral_reports.c.amount,
                        credits.c.reference, credits.c.created_at)
                 .join(credits, credits.c.id == referral_reports.c.credit_id)
