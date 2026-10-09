@@ -84,6 +84,10 @@ def main() -> None:
                    help="fixture JSON with reference answers, named drift-<model>-<hardware>.json")
     p.add_argument("--endpoint", default=None)
     args = p.parse_args()
+    try:
+        tls.chain_network(args.network)
+    except ValueError as exc:
+        p.error(str(exc))
 
     st = bt.Subtensor(network=args.network)
     mg = st.metagraph(args.netuid, lite=True)

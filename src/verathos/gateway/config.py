@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from verathos.protocol.tls import https_url
+from verathos.protocol.tls import chain_network, https_url
 
 
 class GatewayConfig(BaseModel):
@@ -54,6 +54,11 @@ class GatewayConfig(BaseModel):
                                    "auditor")
     catalog_dir: Path = Path("~/.verathos/catalog")
     state_dir: Path = Path("~/.verathos/gateway")
+
+    @field_validator("network")
+    @classmethod
+    def _network(cls, value: str) -> str:
+        return chain_network(value)
 
     @field_validator("auditor_url")
     @classmethod

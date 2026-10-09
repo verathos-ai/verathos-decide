@@ -60,7 +60,7 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--public-ip`, `--port` | the address validators reach the miner at |
 | `--model` | one model for every GPU, or one per GPU in order (`kev-4b,clef-flash`); `auto` leaves a GPU to the setup ([Models](#models)) |
 | `--gpus` | the GPUs to serve on (`0,1`; default all) |
-| `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), or a subtensor websocket URL |
+| `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), a `wss://` subtensor node, or a node on this machine (`local`, `ws://127.0.0.1:<port>`) |
 | `--no-publish` | try the machine before registering: the miner serves and measures, but writes nothing on chain; once the hotkey is registered, run the command again without it |
 | `--worker`, `--name` | this machine serves its GPUs for the hotkey's primary machine; its endpoint ids start with `--name` (default: its IP address) ([One hotkey, several GPUs and machines](#one-hotkey-several-gpus-and-machines)) |
 | `--peers` | on the primary: every worker's public `ip:port`, comma-separated; replaces the list (`''` for none) |
@@ -461,7 +461,7 @@ reference.
 
 | Field | Meaning |
 |---|---|
-| `network` | `finney`, `test`, or a subtensor websocket URL |
+| `network` | `finney`, `test`, a `wss://` subtensor node, or a node on this machine (`local`, `ws://127.0.0.1:<port>`); plain `ws://` to another machine is refused |
 | `mechid` | the mechanism the manifest is for, instead of the one the catalog names (`SUBNET_ADMIN.md`); leave it unset to follow the catalog |
 | `public_host`, `port` | the public IP address and port validators reach this machine's endpoints at (on the primary also the axon); the miner listens on `listen_host` (default `0.0.0.0`) at `port` |
 | `role` | `primary` (default): publishes the hotkey's manifest; `worker`: serves its endpoints for a primary and writes nothing on chain ([One hotkey, several GPUs and machines](#one-hotkey-several-gpus-and-machines)) |

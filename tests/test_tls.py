@@ -227,3 +227,33 @@ def test_catalog_mirrors_and_engines_off_this_machine_are_reached_over_tls_only(
                                                    "engine_url": "http://127.0.0.1:1"}]})
     assert tls.authenticated("https://1.2.3.4:8091/v1/catalog/x") == tls.ANY  # a digest-checked catalog at an IP
     assert tls.authenticated("https://mirror.example/x") == tls.CA
+
+
+def test_the_chain_is_reached_over_wss_or_on_this_machine_only() -> None:
+    from verathos.gateway.config import GatewayConfig
+    from verathos.install.common import network_and_netuid
+    from verathos.validator.config import ValidatorConfig
+
+    for network in ("finney", "test", "archive", "local", "wss://node.example.org:443", "wss://203.0.113.5:9944",
+                    "ws://127.0.0.1:9944", "ws://localhost:9944"):
+        assert tls.chain_network(network) == network
+    for network in ("ws://203.0.113.5:9944", "ws://node.example.org", "http://127.0.0.1:9933", "https://node.example",
+                    "203.0.113.5:9944", "wss://", "unknown-network"):
+        with pytest.raises(ValueError, match="every connection between machines is TLS"):
+            tls.chain_network(network)
+    plain = "ws://203.0.113.5:9944"
+    base = {"netuid": 405, "wallet_name": "w", "hotkey_name": "h", "network": plain}
+    with pytest.raises(ValueError, match="plain ws:// only on this machine"):
+        ValidatorConfig.model_validate(base)
+    with pytest.raises(ValueError, match="plain ws:// only on this machine"):
+        GatewayConfig.model_validate({**base, "database_url": "sqlite+aiosqlite:///x.db"})
+    with pytest.raises(ValueError, match="plain ws:// only on this machine"):
+        MinerConfig.model_validate({**base, "public_host": "1.2.3.4", "port": 1,
+                                    "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b",
+                                                   "engine_url": "http://127.0.0.1:1"}]})
+    assert ValidatorConfig.model_validate({**base, "network": "test"}).network == "test"
+    with pytest.raises(SystemExit, match="plain ws:// only on this machine"):
+        network_and_netuid(SimpleNamespace(network=plain, netuid=None), {})
+    with pytest.raises(SystemExit, match="plain ws:// only on this machine"):
+        network_and_netuid(SimpleNamespace(network=None, netuid=None), {"network": plain})
+    assert network_and_netuid(SimpleNamespace(network="test", netuid=None), {}) == ("test", 405)

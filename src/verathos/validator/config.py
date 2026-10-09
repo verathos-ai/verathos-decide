@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from verathos.miner.engine import HttpEngine, engine_tls
 from verathos.protocol.callers import egress_addresses
 from verathos.protocol.manifest import public_ip
-from verathos.protocol.tls import https_url
+from verathos.protocol.tls import chain_network, https_url
 
 
 class ReferenceEngine(BaseModel):
@@ -98,6 +98,11 @@ class ValidatorConfig(BaseModel):
     auto_update: bool = Field(False, description="Update the code to each new release of the repository it was "
                               "installed from (release tags), at a quiet moment, and exit for the process manager to "
                               "start it (the installer turns it on; verathos.update)")
+
+    @field_validator("network")
+    @classmethod
+    def _network(cls, value: str) -> str:
+        return chain_network(value)
 
     @field_validator("public_host")
     @classmethod

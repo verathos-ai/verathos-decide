@@ -453,8 +453,8 @@ def test_network_and_netuid_defaults() -> None:
     args = argparse.Namespace(network=None, netuid=None)
     assert common.network_and_netuid(args, {}) == ("finney", 96)
     assert common.network_and_netuid(argparse.Namespace(network="test", netuid=None), {}) == ("test", 405)
-    assert common.network_and_netuid(args, {"network": "ws://10.0.0.1:9944", "netuid": 405}) == (
-        "ws://10.0.0.1:9944", 405)
+    assert common.network_and_netuid(args, {"network": "wss://node.example.org:443", "netuid": 405}) == (
+        "wss://node.example.org:443", 405)
     assert common.network_and_netuid(argparse.Namespace(network="finney", netuid=None),
                                      {"network": "test", "netuid": 405}) == ("finney", 96)
 

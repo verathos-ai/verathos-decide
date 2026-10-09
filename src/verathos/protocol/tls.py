@@ -317,6 +317,21 @@ def https_url(value: str, *, what: str = "url") -> str:
     return value
 
 
+def chain_network(value: str) -> str:
+    """``value`` if the chain node it names is reached over TLS or on this machine: a network name the bittensor client
+    maps to such a node (``finney``, ``test``, ``local``), a ``wss://`` URL, or a ``ws://`` URL on loopback; raises
+    ValueError otherwise (for validators)."""
+    from bittensor.core.settings import NETWORK_MAP
+
+    url = NETWORK_MAP.get(value, value)
+    parts = urlsplit(url)
+    if parts.scheme == "wss" and parts.hostname or parts.scheme == "ws" and loopback_url(url):
+        return value
+    raise ValueError(f"network {value!r}: a chain node is reached over wss:// (finney, test or a wss:// URL), plain "
+                     "ws:// only on this machine (local or ws://127.0.0.1:<port>): every connection between machines "
+                     "is TLS")
+
+
 def loopback_url(value: str) -> bool:
     """Whether ``value`` is a URL on this machine (localhost or a loopback address)."""
     host = urlsplit(value).hostname or ""

@@ -236,6 +236,10 @@ def main() -> None:
                         help="the auditor's configuration on this machine, whose certificate (in its state_dir) and "
                         "egress_ips fill in the catalog's auditor section where it names none")
     args = parser.parse_args()
+    try:
+        tls.chain_network(args.network)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     st = bt.Subtensor(network=args.network)
     if args.command == "status":

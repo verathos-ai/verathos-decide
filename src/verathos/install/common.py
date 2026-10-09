@@ -19,6 +19,7 @@ from pathlib import Path
 import httpx
 
 from verathos.install import host, services
+from verathos.protocol.tls import chain_network
 
 DEFAULT_HOME = Path("~/.verathos")
 TESTNET_NETUID = 405
@@ -88,7 +89,8 @@ def common_arguments(parser: argparse.ArgumentParser) -> None:
                         "question")
     parser.add_argument("--wallet", help="Wallet name (directory under ~/.bittensor/wallets)")
     parser.add_argument("--hotkey", help="Hotkey name in that wallet")
-    parser.add_argument("--network", help="finney (default), test, or a subtensor websocket URL")
+    parser.add_argument("--network", help="finney (default), test, a wss:// subtensor node, or a node on this "
+                        "machine (local, ws://127.0.0.1:<port>)")
     parser.add_argument("--netuid", type=int, help=f"Subnet (default {MAINNET_NETUID}; {TESTNET_NETUID} on test)")
     parser.add_argument("--no-service", action="store_true", help="Install no system services and need no root: "
                         "set up, then print the commands to run under a process manager you run (pm2 or another)")
@@ -161,6 +163,10 @@ def write_json(path: Path, value: dict) -> None:
 
 def network_and_netuid(args: argparse.Namespace, existing: dict) -> tuple[str, int]:
     network = args.network or existing.get("network") or "finney"
+    try:
+        chain_network(network)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     default_netuid = existing.get("netuid") if network == existing.get("network") else None
     netuid = args.netuid or default_netuid or (TESTNET_NETUID if network == "test" else MAINNET_NETUID)
     return network, netuid
