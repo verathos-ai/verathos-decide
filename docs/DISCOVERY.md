@@ -74,7 +74,8 @@ Rules:
 ## TLS
 
 Every connection between machines is TLS; plain HTTP stays on one machine's loopback (engines, the gateway behind its
-reverse proxy). Miners and validators are reached by IP address, where no public CA applies: each serving process
+reverse proxy). The chain is reached the same way: over wss (`finney`, `test` or a `wss://` node), plain `ws://` only
+to a node on the same machine (`local`); every configuration and command refuses anything else. Miners and validators are reached by IP address, where no public CA applies: each serving process
 (a miner's service on each machine, a validator's service) creates a TLS key and a self-signed certificate (ECDSA
 P-256, no expiry) once in its `state_dir` (`tls.key`, `tls.crt`, mode 600) and reuses them; deleting both rotates
 them. A certificate is accepted by its pin, the SHA-256 of its SubjectPublicKeyInfo (DER) as 64 lowercase hex digits,
