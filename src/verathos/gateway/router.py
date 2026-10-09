@@ -1,9 +1,12 @@
 """Which endpoint answers a request.
 
-Per model, the endpoints of the routes with their proven capacity (credited requests/s). A request goes to the better
-of two endpoints drawn in proportion to capacity (power of two choices): the one with fewer requests in flight per
-unit of capacity. In this process an endpoint takes at most ``credited x max_latency_s x share`` requests at once:
-what it serves within the latency bound (Little's law), for this process's share of its capacity.
+Per model, the endpoints of the routes with their proven capacity (credited requests/s of the model's request mix). A
+request goes to the better of two endpoints drawn in proportion to capacity (power of two choices): the one with less
+load in flight per unit of capacity. Load is counted in requests of the mix, 1 for a request of the mix on average
+(``catalog.CatalogModel.request_cost``): a request with images counts for more and, where the mix has images, a text
+request for a little less; every request of a model whose mix has no images counts 1. In this process an endpoint
+takes at most ``credited x max_latency_s x share`` of load at once: what it serves within the latency bound (Little's
+law), for this process's share of its capacity; a request is sent to it while it holds less.
 
 A circuit breaker per endpoint stops traffic after ``BREAKER_FAILURES`` failures in a row, for ``OPEN_S``; then one
 probe request decides, and each failed probe doubles the time, up to ``MAX_OPEN_S``. A miner refusing work because it
@@ -89,9 +92,10 @@ class Breaker:
 @dataclass(eq=False)
 class Endpoint:
     route: Route
-    cap: int  # requests at once in this process
+    cap: int  # load at once in this process, in requests of the model's mix
     breaker: Breaker = field(default_factory=Breaker)
-    in_flight: int = 0
+    in_flight: int = 0  # requests
+    cost: float = 0.0  # their load, in requests of the model's mix
     busy_until: float = 0.0  # it refused work: no requests until then
     slow: bool = False  # its latest answer took more than SLOW_FACTOR x max_latency_s
     latest_s: float = 0.0  # how long its latest answer took
@@ -102,8 +106,12 @@ class Endpoint:
         return f"{self.route.hotkey}/{self.route.endpoint_id}"
 
     @property
+    def full(self) -> bool:
+        return self.cost >= self.cap
+
+    @property
     def load(self) -> float:
-        return self.in_flight / self.route.credited_rps
+        return self.cost / self.route.credited_rps
 
 
 class Pool:
@@ -167,6 +175,7 @@ class Router:
         return [{"model": model, "endpoint": e.key, "url": e.route.url, "tls": e.route.tls,
                  "credited_rps": e.route.credited_rps,
                  "latency_ms": e.route.latency_ms, "cap": e.cap, "in_flight": e.in_flight,
+                 "in_flight_cost": round(e.cost, 3),
                  "busy_for_s": round(max(e.busy_until - now, 0.0), 1), "slow": e.slow, "last_failure": e.last_failure,
                  "breaker": {"open": e.breaker.is_open, "failures": e.breaker.failures, "probing": e.breaker.probing,
                              "open_for_s": round(max(e.breaker.open_until - now, 0.0), 1) if e.breaker.is_open
@@ -193,16 +202,15 @@ class Router:
         now = self.clock()
 
         def usable(e: Endpoint) -> bool:
-            return (e.in_flight < e.cap and e.busy_until <= now and e.route.hotkey not in exclude
-                    and e.breaker.allows(now))
+            return not e.full and e.busy_until <= now and e.route.hotkey not in exclude and e.breaker.allows(now)
 
         picks: list[Endpoint] = []
         drawn: set[int] = set()
         for _ in range(DRAWS):
             e = pool.draw(self.rng)
-            late = e.in_flight >= e.cap and e.latest_s > self.max_latency_s  # full, and beyond the bound
+            late = e.full and e.latest_s > self.max_latency_s  # full, and beyond the bound
             if observe and self.observer is not None and id(e) not in drawn and e.route.hotkey not in exclude and (
-                    e.in_flight < e.cap or e.slow or late):
+                    not e.full or e.slow or late):
                 drawn.add(id(e))
                 ready = e.busy_until <= now and e.breaker.allows(now) and not e.slow and not late
                 self.observer.offered(e.route, refused=not ready)
@@ -225,18 +233,22 @@ class Router:
         pool = self._pools.get(model_id)
         return pool is not None and bool(pool.endpoints) and all(e.breaker.is_open for e in pool.endpoints)
 
-    def started(self, endpoint: Endpoint, *, observe: bool = True) -> None:
-        """An attempt is sent; ``observe``: it is user traffic (the auditor judges a test against what was sent)."""
+    def started(self, endpoint: Endpoint, *, cost: float = 1.0, observe: bool = True) -> None:
+        """An attempt is sent, of a request of ``cost`` (see the module); ``observe``: it is user traffic (the auditor
+        judges a test against what was sent)."""
         endpoint.in_flight += 1
+        endpoint.cost += cost
         endpoint.breaker.started()
         if observe and self.observer is not None:
             self.observer.attempted(endpoint.route)
 
     def finished(self, endpoint: Endpoint, outcome: Outcome | None, seconds: float | None = None, *,
-                 observe: bool = True, why: str = "") -> None:
-        """One attempt is over after ``seconds``; ``outcome`` None: it counts neither way yet, until ``penalize`` or
-        ``settled`` (a probe stays the breaker's one probe until then, so a failed one doubles the open time)."""
+                 cost: float = 1.0, observe: bool = True, why: str = "") -> None:
+        """One attempt is over after ``seconds``, of a request of ``cost`` as it started; ``outcome`` None: it counts
+        neither way yet, until ``penalize`` or ``settled`` (a probe stays the breaker's one probe until then, so a
+        failed one doubles the open time)."""
         endpoint.in_flight -= 1
+        endpoint.cost = endpoint.cost - cost if endpoint.in_flight else 0.0  # no rounding left behind once idle
         endpoint.last_failure = why or endpoint.last_failure
         slow = seconds is not None and seconds >= SLOW_FACTOR * self.max_latency_s
         if outcome is Outcome.ANSWERED or slow:  # a timeout at the attempt's limit is slow too

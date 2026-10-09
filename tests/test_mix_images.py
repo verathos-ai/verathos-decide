@@ -19,7 +19,15 @@ from pydantic import ValidationError
 from verathos import catalog
 from verathos.protocol.api import SystemOneRequest
 from verathos.protocol.canonical import canonical_json, digest
-from verathos.protocol.media import PNG, ImageLimits, b64decode, canonical_image, canonical_sizes, header
+from verathos.protocol.media import (
+    PNG,
+    ImageLimits,
+    b64decode,
+    canonical_image,
+    canonical_sizes,
+    header,
+    request_image_tokens,
+)
 from verathos.throughput import images
 from verathos.throughput.images import BACKGROUNDS, COLOURS, Rectangle, draw, png, png_bound
 from verathos.throughput.loadgen import mix_plan
@@ -192,3 +200,17 @@ def test_a_mix_with_images_is_checked() -> None:
         Workload(state_words=(1, 2), questions={**questions, **IMAGE_QUESTIONS},
                  images=WorkloadImages(share=0.5, count=(1, 1), sides_px=[256]))
     assert Workload(state_words=(1, 2), questions={**questions, **IMAGE_QUESTIONS}).images is None
+
+
+def test_requests_cost_the_mix_one_on_average_and_a_text_models_cost_one() -> None:
+    rng, costs = random.Random(5), []
+    for _ in range(4000):
+        request = make_request("clef-flash", CLEF.workload, rng)
+        sizes = canonical_sizes(request.get("images", []), token_px=32, min_pixels=1, max_pixels=1 << 30)
+        costs.append(CLEF.request_cost(request_image_tokens(sizes, 32)))
+    assert sum(costs) / len(costs) == pytest.approx(1.0, abs=0.01)
+    text = CLEF.request_cost(0)
+    assert 0.9 < text < 1.0 and CLEF.request_cost(259) > CLEF.request_cost(67) > 1.0
+    # four 1 MP images: about six requests of the mix (an H100 serves 4.1 of them a second, 25.8 of the text mix)
+    assert 5.5 < CLEF.request_cost(4 * 1026 + 1) < 7.5
+    assert KEV.request_cost(0) == 1.0

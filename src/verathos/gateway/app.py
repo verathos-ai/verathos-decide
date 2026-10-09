@@ -232,6 +232,7 @@ class Checked:
     min_tokens: int  # billed at least, whatever the miner signs: one per 8 characters of the state, and the images'
     max_tokens: int  # billed at most: one per byte of the request without its images, and the images' tokens
     image_tokens: int = 0  # the images' input tokens (``protocol.media.request_image_tokens``)
+    cost: float = 1.0  # the load it puts on an endpoint, in requests of the model's mix (``gateway.router``)
 
 
 @dataclass(frozen=True)
@@ -391,7 +392,7 @@ async def made_canonical(g: Gateway, screened: Screened) -> Checked:
                            model=model_id)
     min_tokens = len(text(screened.parsed.state)) // STATE_CHARS_PER_BILLED_TOKEN + image_tokens
     return Checked(forwarded, body, screened.parsed, sha256_hex(body), model.price, min_tokens,
-                   len(screened.text_body) + image_tokens, image_tokens)
+                   len(screened.text_body) + image_tokens, image_tokens, model.request_cost(image_tokens))
 
 
 async def check_request(g: Gateway, body: bytes) -> Checked:
@@ -428,7 +429,7 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
             if attempt:
                 metrics.RETRIES.inc()
             tried.add(endpoint.route.hotkey)
-            g.router.started(endpoint, observe=counted)
+            g.router.started(endpoint, cost=checked.cost, observe=counted)
             probe = endpoint.breaker.probing  # this attempt is the breaker's one probe
             outcome: Outcome | None = None
             attempt_started = g.clock()
@@ -469,7 +470,8 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
                 continue
             finally:
                 seconds = g.clock() - attempt_started
-                g.router.finished(endpoint, outcome, seconds, observe=counted, why=note.get("detail", ""))
+                g.router.finished(endpoint, outcome, seconds, cost=checked.cost, observe=counted,
+                                  why=note.get("detail", ""))
                 if outcome is None and probe:
                     unsettled.append(endpoint)
                 note["ms"] = round(1000 * seconds, 1)

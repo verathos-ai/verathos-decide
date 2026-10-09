@@ -17,7 +17,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-from verathos.protocol.api import SystemOneRequest
+from verathos.protocol.api import STATE_CHARS_PER_TOKEN, SystemOneRequest, prompt_chars
 from verathos.protocol.canonical import canonical_json
 from verathos.protocol.media import PNG
 from verathos.throughput.images import BACKGROUNDS, SEED_BYTES, draw, item, png_bound
@@ -71,6 +71,11 @@ class WorkloadImages(BaseModel):
         side = max(self.sides_px)
         return png_bound(side, side)
 
+    def mean_tokens(self, token_px: int) -> float:
+        """The image tokens of a request with images on average (``protocol.media.request_image_tokens``)."""
+        per_side = sum(side // token_px for side in self.sides_px) / len(self.sides_px)
+        return sum(self.count) / 2 * (per_side ** 2 + 2) + 1
+
 
 class Workload(BaseModel):
     """A model's standard request mix."""
@@ -107,6 +112,20 @@ class Workload(BaseModel):
             image = {"content_type": PNG, "base64": "A" * (4 * -(-self.images.max_png_bytes() // 3))}
             request.update(questions=self.image_questions(), images=[image] * self.images.count[1])
         return len(canonical_json(request))
+
+    def mean_text_tokens(self) -> float:
+        """The text tokens of the mix's requests on average, at ``STATE_CHARS_PER_TOKEN`` characters a token of their
+        state, question ids, instructions and criteria (``protocol.api.prompt_chars``)."""
+        low, high = self.state_words
+        mean_word = sum(len(w) for w in WORDS) / len(WORDS)
+        chars = len(mix_state("0" * 16, "")) - 1 + (low + high) / 2 * (mean_word + 1) + _question_chars(self.questions)
+        if self.images is not None:
+            chars += self.images.share * (_question_chars(self.image_questions()) - _question_chars(self.questions))
+        return chars / STATE_CHARS_PER_TOKEN
+
+
+def _question_chars(questions: dict[str, Any]) -> int:
+    return prompt_chars(SystemOneRequest.model_validate({"model": "m", "state": "", "questions": questions}))
 
 
 def make_request(model_id: str, workload: Workload, rng: random.Random) -> dict[str, Any]:

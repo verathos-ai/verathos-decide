@@ -118,6 +118,18 @@ class CatalogModel(BaseModel):
     def reads_images(self) -> bool:
         return "image" in self.input_modalities
 
+    def request_cost(self, image_tokens: int) -> float:
+        """What answering a request with ``image_tokens`` costs relative to the model's mix, whose requests cost 1 on
+        average: its text as the mix's text requests on average (``Workload.mean_text_tokens``; the gateway does not
+        count a request's text tokens), and each of its image tokens ``token_cost`` text tokens (the engine family's,
+        ``protocol.media.ENGINE_IMAGES``). A text request of a model whose mix has no images costs 1."""
+        engine = ENGINE_IMAGES.get(self.engine.name)
+        weight = engine.token_cost if engine is not None else 1.0
+        text = self.workload.mean_text_tokens()
+        mix = self.workload.images
+        mean = text + (mix.share * mix.mean_tokens(self.images.token_px) * weight if mix is not None else 0.0)
+        return (text + image_tokens * weight) / mean
+
     def modalities(self) -> list[str]:
         """The input the model reads that this code serves."""
         return [m for m in self.input_modalities if m in MODALITIES]
