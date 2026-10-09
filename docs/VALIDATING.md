@@ -176,8 +176,8 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--source`, `--ref`, `--dir` | as for miners (`MINING.md`) |
 
 What it does (a full validator; light, see below):
-1. installs `git`, `curl` and, in a container without systemd, `supervisor` (with `--no-service`, nothing); then
-   uv and Python 3.12 in the user's home;
+1. installs `git`, `openssh-client` (it checks release signatures), `curl` and, in a container without systemd,
+   `supervisor` (with `--no-service`, nothing); then uv and Python 3.12 in the user's home;
 2. puts the code in `~/verathos-decide` (an install from before in `~/verathos` stays there) with its Python
    environment, and `verathos-validator` on the `PATH`;
 3. checks the hotkey, its registration and validator permit, and reads the catalog the subnet owner commits;
@@ -216,9 +216,10 @@ Running it again with `--yes` keeps the mode; `--full` or `--light` changes it.
 ### Without root (pm2 or another process manager)
 
 With `--no-service` the installer needs neither root nor sudo: it installs no system packages and no services, and
-puts uv, Python, the code and its environment in the user's home. `git` and `curl` must be there (a miner also needs
-a C compiler, `build-essential`); it names what is missing before it changes anything. It ends with the commands to
-run each service under a process manager you run, which restarts it when it exits. For pm2:
+puts uv, Python, the code and its environment in the user's home. `git`, `ssh-keygen` (`openssh-client`) and `curl`
+must be there (a miner also needs a C compiler, `build-essential`); it names what is missing before it changes
+anything. It ends with the commands to run each service under a process manager you run, which restarts it when it
+exits. For pm2:
 
 ```bash
 pm2 start ~/verathos-decide/.venv/bin/verathos-validator --name verathos-validator --interpreter none \
@@ -292,14 +293,16 @@ on. A light validator has only its code to update.
 
 A validator set up by the installer also updates its code by itself (`auto_update` in `validator.json`;
 `--no-auto-update` turns it off, `--auto-update` on again; the subnet owner's validator, the auditor, is updated by
-hand). About every hour it reads the release tags (`v<version>`) of the repository its code came from. A newer
-release is installed at a random time within the next hour, so validators do not all restart at once, and between
-epochs, once the weights are set (light: between two attempts to set them): the validator checks out the tagged
-commit, installs it into its Python environment and exits, and its process manager starts the new release (systemd,
-supervisord and pm2 restart a process that exits). It does not update a checkout with local changes
-(`self-update: local changes in ...`) or to a tag whose code names another version; a failed install puts the
-previous code back. The logs say each step (`self-update: ...`). Engines, references and services stay as they
-are: a release that changes them says so, and the installer updates them.
+hand). About every hour it reads the release tags (`v<version>`) of the repository its code came from. The newest
+release whose tag is signed by a key that `release/allowed_signers` of the running code lists is installed at a
+random time within the next hour, so validators do not all restart at once, and between epochs, once the weights are
+set (light: between two attempts to set them): the validator checks out the tagged commit, installs it into its
+Python environment and exits, and its process manager starts the new release (systemd, supervisord and pm2 restart a
+process that exits). It does not update a checkout with local changes (`self-update: local changes in ...`), to a
+tag that is not signed by such a key (logged once per tag) or to a tag whose code names another version; a failed
+install puts the previous code back. While the file lists no key, it installs nothing: run the installer again. The
+installer checks release tags too (`MINING.md`). The logs say each step (`self-update: ...`). Engines, references
+and services stay as they are: a release that changes them says so, and the installer updates them.
 
 ### Uninstall
 
@@ -331,7 +334,7 @@ stay). Wallets are never touched.
 | `this validator's release is too old to set weights` | the subnet owner retired this release (`WeightsVersionKey`): update the code |
 | `the subnet's catalog is not available` | the subnet owner's axon serves it; add a mirror to `catalog_mirrors` in `validator.json` |
 | `this is the subnet owner's hotkey` | the owner's validator also serves the catalog and runs the throughput audit: set `public_host` and `port`, and build the load generator ([1. Install](#1-install)) |
-| `curl: command not found`, `coldkeypub.txt not found`, no services after a container restart, `local changes in ... stop the update`, slow downloads | as for miners (`MINING.md`) |
+| `curl: command not found`, `coldkeypub.txt not found`, no services after a container restart, `local changes in ... stop the update`, `v... is not signed ...: not installing it`, slow downloads | as for miners (`MINING.md`) |
 
 ## Manual installation
 

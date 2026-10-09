@@ -325,8 +325,9 @@ def test_install_script_without_services_installs_nothing_system_wide(tmp_path) 
                               env={"HOME": str(tmp_path), "PATH": str(bin_dir)}, timeout=60, start_new_session=True)
 
     light = run("validator", "--no-service", "--yes", "--light")
-    assert light.returncode != 0 and "missing: git curl. With --no-service nothing is installed" in light.stderr
-    assert "missing: git curl build-essential" in run("miner", "--no-service").stderr
+    assert light.returncode != 0
+    assert "missing: git openssh-client curl. With --no-service nothing is installed" in light.stderr
+    assert "missing: git openssh-client curl build-essential" in run("miner", "--no-service").stderr
     assert not calls.exists()
     if os.geteuid() != 0:
         (bin_dir / "sudo").unlink()

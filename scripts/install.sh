@@ -8,14 +8,17 @@
 # Installs the system packages it needs, uv, the code (in ~/verathos-decide) and its Python environment, then runs
 # `verathos-miner init` or `verathos-validator init`, which asks a few questions (or takes --yes and options) and
 # starts everything as system services. Run it again to update. It only uses a wallet's hotkey and coldkeypub.txt.
-# With --no-service it needs no root and no sudo: it installs nothing system-wide (git and curl must be there; a
-# miner also needs a C compiler), sets everything up in the user's home and prints the commands to run the services
-# under a process manager the user runs (pm2 or another).
+# With --no-service it needs no root and no sudo: it installs nothing system-wide (git, ssh-keygen and curl must be
+# there; a miner also needs a C compiler), sets everything up in the user's home and prints the commands to run the
+# services under a process manager the user runs (pm2 or another).
 #
 # The first argument is miner, validator or uninstall. Options:
 #   --source <src>  git URL, path to a git bundle, or path to a source tarball (default: the public repository;
 #                   when updating, where the installed code came from)
-#   --ref <ref>     branch, tag or commit to install (default: the source's default branch)
+#   --ref <ref>     branch, tag or commit to install (default: the newest release, a v<version> tag, once this
+#                   installer holds a release signing key; else the source's default branch). A tag is installed
+#                   only if it is signed by a release key (release/allowed_signers); a branch, a commit or a
+#                   tarball is installed as given
 #   --dir <dir>     where the code goes (default: the checkout this script is in, else ~/verathos if an earlier
 #                   install put this code there, else ~/verathos-decide); another checkout there is never touched
 #   --purge         with uninstall: also delete what the setups keep in ~/.verathos (configuration, state,
@@ -154,6 +157,7 @@ user_tools() {
   # Without services nothing is installed system-wide: the tools the setup uses must be there.
   local -a missing=()
   command -v git >/dev/null || missing+=(git)
+  command -v ssh-keygen >/dev/null || missing+=(openssh-client)  # verifies release signatures
   command -v uv >/dev/null || [ -x "$HOME/.local/bin/uv" ] || command -v curl >/dev/null || missing+=(curl)
   # Miners: the fused engine kernels are compiled on first use.
   [ "$1" = miner ] && ! command -v cc >/dev/null && missing+=(build-essential)
@@ -175,7 +179,7 @@ check_os() {
 }
 
 system_packages() {
-  local -a wanted=(ca-certificates curl git) missing=()
+  local -a wanted=(ca-certificates curl git openssh-client) missing=()
   # Miners: the fused engine kernels are compiled on first use.
   [ "$1" = miner ] && wanted+=(build-essential)
   # Containers without systemd run the services under supervisord.
@@ -203,10 +207,74 @@ is_tarball() {
   [ -f "$1" ] && ! head -c 32 "$1" | grep -q "git bundle" && tar -tf "$1" >/dev/null 2>&1
 }
 
+release_signers() {
+  # The keys release tags are signed with: a copy of release/allowed_signers, which the tests keep the same.
+  cat <<'EOF'
+# The keys release tags (v<version>) are signed with. The self-update and the installer install a release only when
+# `git verify-tag` accepts its tag with this file as gpg.ssh.allowedSignersFile; the self-update reads the file of
+# the code it runs. Format: ssh-keygen(1), ALLOWED SIGNERS. scripts/install.sh holds a copy (release_signers), which
+# the tests keep the same. Adding and rotating keys: docs/SUBNET_ADMIN.md, Signing releases.
+#
+# PLACEHOLDER: no release signing key yet. Until a key's line replaces the one below, no release is installed by the
+# self-update or as the installer's default.
+verathos-release namespaces="git" ssh-ed25519 REPLACE_WITH_THE_RELEASE_SIGNING_PUBLIC_KEY
+EOF
+}
+
+RELEASE_KEY='^[^#]*[[:space:]](ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+AAAA[A-Za-z0-9+/]+=*([[:space:]]|$)'
+SIGNATURE_START='^-----BEGIN (PGP SIGNATURE|PGP MESSAGE|SIGNED MESSAGE|SSH SIGNATURE)-----'
+
+has_release_key() {
+  # Whether release_signers lists a key, not only the placeholder.
+  grep -Eq "$RELEASE_KEY" <<<"$(release_signers)"
+}
+
+verify_release() {
+  # The tag $2, fetched into FETCH_HEAD of $1, signed by a key release_signers lists, as the self-update checks
+  # releases; else nothing is installed.
+  local repo="$1" tag="$2" object content signers out status=0
+  has_release_key || die "cannot verify $tag: this installer holds no release signing key yet; pass --ref <branch or commit> to install code unverified"
+  object="$(git -C "$repo" rev-parse FETCH_HEAD)"
+  [ "$(git -C "$repo" cat-file -t "$object")" = tag ] || die "$tag is not signed (a lightweight tag): not installing it"
+  content="$(git -C "$repo" cat-file tag "$object")"
+  [ "$(sed -n '/^$/q; s/^tag //p' <<<"$content")" = "$tag" ] || die "$tag names the tag object of another tag: not installing it"
+  [ "$(grep -E "$SIGNATURE_START" <<<"$content" | tail -n 1)" = "-----BEGIN SSH SIGNATURE-----" ] \
+    || die "$tag is not signed with a release key (SSH): not installing it"
+  signers="$(mktemp)"
+  release_signers > "$signers"
+  out="$(git -C "$repo" -c gpg.ssh.allowedSignersFile="$signers" -c gpg.ssh.program=ssh-keygen -c gpg.program=false \
+    -c gpg.x509.program=false verify-tag "$object" 2>&1)" || status=$?
+  rm -f "$signers"
+  [ "$status" -eq 0 ] && grep -q '^Good "git" signature for ' <<<"$out" \
+    || die "$tag is not signed by a release key this installer holds ($(tail -n 1 <<<"$out")): not installing it"
+  echo "    $tag: $(grep '^Good "git" signature for ' <<<"$out")"
+}
+
+fetch_ref() {
+  # $3 from the source $2 into FETCH_HEAD of $1: a tag once it verifies (verify_release), a branch or commit as it is.
+  local repo="$1" source="$2" ref="$3" tag="${3#refs/tags/}"
+  if git -C "$repo" ls-remote "$source" "refs/tags/$tag" | awk -v r="refs/tags/$tag" '$2 == r { f = 1 } END { exit !f }'; then
+    git -C "$repo" fetch --quiet --tags --force "$source" "refs/tags/$tag" || die "cannot fetch $ref from $source"
+    verify_release "$repo" "$tag"
+  else
+    git -C "$repo" fetch --quiet --tags --force "$source" "$ref" || die "cannot fetch $ref from $source"
+    echo "    note: $ref is not a release tag; it is installed unverified"
+  fi
+}
+
 default_ref() {
-  # The source's HEAD if it has one (a URL, or a bundle made with HEAD), else its first branch.
-  local refs
+  # The newest release (a v<version> tag) once this installer holds a release key, else the source's HEAD if it has
+  # one (a URL, or a bundle made with HEAD), else its first branch.
+  local refs newest=""
   refs="$(git -C "$1" ls-remote "$2")" || die "cannot read $2"
+  if has_release_key; then
+    newest="$(printf '%s\n' "$refs" | awk '$2 ~ /^refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+$/ { print substr($2, 11) }' \
+      | sort -t . -k 1.2,1n -k 2,2n -k 3,3n | tail -n 1)"
+  fi
+  if [ -n "$newest" ]; then
+    echo "$newest"
+    return
+  fi
   if printf '%s\n' "$refs" | awk '$2 == "HEAD" { found = 1 } END { exit !found }'; then
     echo HEAD
     return
@@ -237,7 +305,7 @@ fetch_code() {
     rm -rf "$partial"
     git clone --quiet --no-checkout "$source" "$partial" || die "cannot clone $source"
     [ -n "$ref" ] || ref="$(default_ref "$partial" "$source")"
-    git -C "$partial" fetch --quiet --tags --force "$source" "$ref" || die "cannot fetch $ref from $source"
+    fetch_ref "$partial" "$source" "$ref"
     git -C "$partial" checkout --quiet --detach FETCH_HEAD || die "cannot check out $ref"
     [ -d "$dir/.venv" ] && mv "$dir/.venv" "$partial/.venv"
     rm -rf "$dir"
@@ -245,7 +313,7 @@ fetch_code() {
   else
     git -C "$dir" remote set-url origin "$source"
     [ -n "$ref" ] || ref="$(default_ref "$dir" "$source")"
-    git -C "$dir" fetch --quiet --tags --force "$source" "$ref" || die "cannot fetch $ref from $source"
+    fetch_ref "$dir" "$source" "$ref"
     git -C "$dir" checkout --quiet --detach FETCH_HEAD \
       || die "local changes in $dir stop the update; see: git -C $dir status"
   fi

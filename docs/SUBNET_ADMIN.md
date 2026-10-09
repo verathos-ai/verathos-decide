@@ -239,12 +239,56 @@ Raise it from the subnet owner coldkey (AdminUtils `sudo_set_weights_version_key
 `btcli sudo set --netuid 96 --param weights_version --value 1000000`), and only once the validators that should keep
 setting weights run a release at or above it.
 
-To publish a release: set `__version__` to the new version in a commit, tag that commit `v<version>` (an annotated
-tag) and push the tag to the repository installs come from. Miners and validators set up by the installer
-(`auto_update`) find it within an hour and install it within the hour after, each at a random time and a quiet moment
-of its own (`MINING.md`, `VALIDATING.md`), then restart; a tag whose code names another version is never installed.
-The auditor is updated by hand. A release that changes engines or services needs the installer run again: say so
-when announcing it. Run every release on testnet first.
+To publish a release: set `__version__` to the new version in a commit, tag that commit `v<version>` with a tag
+signed by the release key ([Signing releases](#signing-releases)) and push the tag to the repository installs come
+from. Miners and validators set up by the installer (`auto_update`) find it within an hour and install it within the
+hour after, each at a random time and a quiet moment of its own (`MINING.md`, `VALIDATING.md`), then restart; a tag
+that is not signed by a key their code lists, or whose code names another version, is never installed. The auditor
+is updated by hand. A release that changes engines or services needs the installer run again: say so when announcing
+it. Run every release on testnet first.
+
+## Signing releases
+
+Miners and validators install a release only when its tag is signed by a release key: one that
+`release/allowed_signers` lists, in the code they run (the self-update) or in the installer (`scripts/install.sh`
+holds a copy, `release_signers`, which the tests keep the same as the file). A release that changes the file is
+therefore checked against the keys of the release before it. The installer checks a tag it installs, `--ref` or its
+default (the newest release); a branch, a commit or a tarball it installs as given, which is the operator's to check.
+
+Tags are signed with SSH keys (`git tag -s` with `gpg.format=ssh`) and checked by `git verify-tag` against the
+allowed signers file: git 2.34 and OpenSSH 8.2 or newer do both, as Ubuntu 22.04 and later and macOS ship them, with no
+other package. GPG is not on macOS, nor in minimal Ubuntu images.
+
+While the file lists no key, as the shipped placeholder, no release can be verified: nodes do not update by
+themselves (`self-update: ... lists no release signing key`) and the installer installs the default branch.
+
+The release key signs nothing else and is kept offline like the owner coldkey, with a passphrase (or on a hardware
+key: `-t ed25519-sk`). On the machine that keeps it:
+
+```bash
+ssh-keygen -t ed25519 -C verathos-release -f ~/.ssh/verathos-release
+printf 'verathos-release namespaces="git" %s\n' "$(cut -d' ' -f1,2 ~/.ssh/verathos-release.pub)"
+```
+
+The printed line replaces the placeholder line in `release/allowed_signers` and in `release_signers` of
+`scripts/install.sh`, committed before the first release is tagged. Sign each release, check it with the keys of the
+release before it (the ones nodes hold) and push it:
+
+```bash
+git -c gpg.format=ssh -c user.signingkey="$HOME/.ssh/verathos-release" tag -s v1.0.1 -m v1.0.1
+git show v1.0.0:release/allowed_signers > /tmp/allowed_signers
+git -c gpg.ssh.allowedSignersFile=/tmp/allowed_signers verify-tag v1.0.1   # Good "git" signature for verathos-release
+git push origin v1.0.1
+```
+
+The first release is checked against the file it carries itself (`git show v1.0.0:release/allowed_signers`). Nodes
+installed from code with the placeholder do not update by themselves: their operators run the installer once.
+
+To rotate the key: create the new key and, in a release, replace the old key's line with the new one in both
+copies; sign that release with the old key, and every later release with the new one. A node more than one release
+behind installs the rotating release first, then the next. Whoever holds a leaked release key can publish releases
+that every node trusting it installs: publish the rotating release at once and announce it; a node that installed
+another release since is reinstalled with an installer holding the new key.
 
 ## Test network first
 

@@ -83,9 +83,10 @@ src/verathos/
   subnet/      chain helpers miners and validators share, and the verathos-subnet admin CLI
   install/     guided setup: verathos-miner init, verathos-validator init, uninstall
   release.py   the release version and the weights version key
-  update.py    self-update to each release tag
+  update.py    self-update to each signed release tag
 native/loadgen/  Rust load generator the auditor drives the tests with
 scripts/       installer, miner probe
+release/       allowed_signers: the keys release tags are signed with
 docs/
 ```
 
