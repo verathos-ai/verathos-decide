@@ -642,14 +642,16 @@ def force_data(config: dict, data: Path, state: str, catalog_dir: bool = True) -
     return config
 
 
-def engine_lines(source: EngineSource, follow: bool, data: Path) -> list[str]:
+def engine_lines(source: EngineSource, follow: bool, data: Path, shipped: bool = False) -> list[str]:
     """The plan's lines on the engines: where an engine the image does not carry comes from, and whether they follow
-    the catalog while the container runs."""
+    the catalog while the container runs (``shipped``: a miner's NO_PUBLISH, serving the shipped catalog)."""
     return [("ENGINE_AUTO_INSTALL on: an engine revision the catalog pins and this image does not carry is installed "
              f"into {data / 'engines'} by the installer's code" if source.auto_install else
              "ENGINE_AUTO_INSTALL off: only the engines this image carries run"),
             ("AUTO_RESTART on: when the subnet owner commits a catalog pinning other weights or engines for these "
              "models, their engines are set up for it and restarted while the container runs" if follow else
+             "AUTO_RESTART does not apply: with NO_PUBLISH the miner serves the shipped catalog, which no commit "
+             "changes" if shipped else
              "AUTO_RESTART off: a catalog pinning other weights or engines applies at the next start (docker compose "
              "restart)")]
 
@@ -777,7 +779,7 @@ def miner(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> Ru
          "catalog has miners enforce it; the miner says at its start whether the kernel drops the others too (host "
          "network and NET_ADMIN) or its own process alone" if firewall else
          "firewall off: anyone reaches the miner's port (FIREWALL=on turns it on)")
-    for line in engine_lines(source, follow, data):
+    for line in engine_lines(source, follow, data, shipped=no_publish):
         info(line)
     info("self-update off: a release is a new image")
 

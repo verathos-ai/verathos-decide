@@ -686,14 +686,18 @@ def test_a_miner_container_runs_an_engine_per_gpu_and_the_miner_as_the_installer
                                                                      "manual": True}
 
 
-def test_a_miner_container_tries_the_machine_unregistered_only_with_no_publish(box) -> None:
+def test_a_miner_container_tries_the_machine_unregistered_only_with_no_publish(box, capsys) -> None:
     box.registered.pop("5Miner")
     with pytest.raises(SystemExit, match=r"(?s)not registered on netuid 96.*set NO_PUBLISH=1"):
         container.miner({"WALLET": "miner"}, box.data, box.home)
     box.catalog = None  # the shipped catalog, not the chain's
+    capsys.readouterr()
     run = container.miner({"WALLET": "miner", "NO_PUBLISH": "1"}, box.data, box.home)
     assert run.processes[-1].command[-1] == "--no-publish"
     assert run.follower is None  # it serves the shipped catalog: nothing to follow
+    out = capsys.readouterr().out
+    assert ("AUTO_RESTART does not apply: with NO_PUBLISH the miner serves the shipped catalog, which no commit "
+            "changes") in out and "AUTO_RESTART off" not in out
 
 
 def test_a_worker_container_and_the_variables_it_refuses(box) -> None:
