@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 
+import bittensor  # noqa: F401  (first, as the services import it: it silences the loggers that exist when it loads)
 import pytest
 
 from verathos.protocol import manifest

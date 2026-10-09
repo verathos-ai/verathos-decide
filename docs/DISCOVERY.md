@@ -94,7 +94,8 @@ need a public CA's certificate.
 
 The auditor's and the gateways' egress addresses in the catalog and the validators' in their commitments give the
 addresses miners are called from (`protocol.callers.allowlist`): the auditor, the catalog's gateways and every
-validator holding a permit and `validator_min_stake` that publishes its addresses.
+validator holding a permit and `validator_min_stake` that publishes its addresses. Miners' firewalls let them through
+and drop other connections once the catalog's `firewall` is `enforce` (`MINING.md`).
 
 ## Chain limits
 

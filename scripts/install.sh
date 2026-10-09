@@ -31,6 +31,8 @@
 #   validator mode: --light (the default, except for the subnet owner's hotkey: sets the auditor's published weights;
 #                   no GPU, no reference engines, no requests to miners) or --full (checks miners on references)
 #   miner: --public-ip <ip> --port <port> --model <id>[,<id>...] --gpus <i,j> --no-publish
+#          --no-firewall  (the miner's port answers anyone; by default it answers only the network's callers
+#                         and the hotkey's machines once the catalog has miners enforce that)
 #          --model: one model for every GPU or one per GPU in order, auto: the setup chooses (default: the
 #                   active model that pays best on each GPU, measured from the network)
 #          --worker [--name <name>]  (a worker machine of the hotkey; set up the workers first)
@@ -57,7 +59,7 @@ usage() {
 }
 
 main() {
-  local role="" source="" ref="" dir="" purge="" no_service="" home="$HOME/.verathos"
+  local role="" source="" ref="" dir="" purge="" no_service="" no_firewall="" home="$HOME/.verathos"
   local -a init_args=()
   case "${1:-}" in
     miner|validator|uninstall) role="$1"; shift ;;
@@ -74,6 +76,7 @@ main() {
       --dir=*) dir="${1#*=}" ;;
       --purge) purge=1 ;;
       --no-service) no_service=1; init_args+=("$1") ;;
+      --no-firewall) no_firewall=1; init_args+=("$1") ;;
       --home) home="${2:?--home needs a value}"; shift ;;
       --home=*) home="${1#*=}" ;;
       -h|--help) usage; exit 0 ;;
@@ -94,7 +97,7 @@ main() {
   else
     sudo_setup
     check_os
-    system_packages "$role"
+    system_packages "$role" "$no_firewall"
   fi
   install_uv
   fetch_code "$dir" "$source" "$ref"
@@ -180,8 +183,9 @@ check_os() {
 
 system_packages() {
   local -a wanted=(ca-certificates curl git openssh-client) missing=()
-  # Miners: the fused engine kernels are compiled on first use.
+  # Miners: the fused engine kernels are compiled on first use; the firewall is nftables.
   [ "$1" = miner ] && wanted+=(build-essential)
+  [ "$1" = miner ] && [ -z "${2:-}" ] && wanted+=(nftables)
   # Containers without systemd run the services under supervisord.
   [ -d /run/systemd/system ] || wanted+=(supervisor)
   local p

@@ -10,7 +10,8 @@ publishes it; a worker serves its endpoints and what it declares (``GET /v1/endp
 the first measurement is done, a machine serves what it last served.
 
 The service speaks TLS only, with the machine's certificate (``protocol.tls``, kept in ``state_dir``), whose pin the
-manifest names; the measurement reaches the endpoints through it as tests do.
+manifest names; the measurement reaches the endpoints through it as tests do. Before it starts, the firewall
+(``miner.firewall``) lets only the network's callers and the hotkey's machines reach its port.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from verathos import catalog, update
+from verathos.miner import firewall
 from verathos.miner.admission import Admission, RequestBudget
 from verathos.miner.app import caller_request_bytes, create_app
 from verathos.miner.chain import PermitAuthorizer, build_host_endpoints, build_manifest, own_endpoints, publish
@@ -166,7 +168,7 @@ class Publisher:
 
     def gateways(self) -> set[str]:
         """Callers served without the per-caller limits: the catalog's gateways and the configured ones."""
-        return {*self.config.gateway_hotkeys, *self.catalog.gateway_hotkeys()}
+        return {*(g.hotkey for g in self.config.gateways), *self.catalog.gateway_hotkeys()}
 
     def note_test_traffic(self) -> None:
         self.test_seen = time.monotonic()
@@ -457,10 +459,11 @@ def permits(config: MinerConfig, publisher: Publisher) -> PermitAuthorizer:
 
 
 def build_app(config: MinerConfig, keypair, publisher: Publisher, authorizer: PermitAuthorizer,
-              engines: dict[str, Engine]) -> FastAPI:
+              engines: dict[str, Engine], keeper: firewall.Keeper | None = None) -> FastAPI:
     """This machine's miner service, primary or worker alike: callers are those ``authorizer`` admits (``permits``)
     and the auditor's test sessions, each within its limits; a validator within the catalog's request budget per
-    endpoint and epoch."""
+    endpoint and epoch. With the firewall's ``keeper``, it reports where authenticated callers come from and refuses
+    the addresses the firewall does not allow."""
     budget = RequestBudget(lambda: publisher.catalog.scoring.request_budget(),
                            lambda: authorizer.epoch(publisher.catalog.epoch_blocks))
 
@@ -478,7 +481,8 @@ def build_app(config: MinerConfig, keypair, publisher: Publisher, authorizer: Pe
                       max_state_tokens=max_state_tokens, max_caller_request=max_caller_request,
                       on_test_traffic=publisher.note_test_traffic, testing=publisher.test_arriving,
                       gateways=publisher.gateways, catalog_digest=lambda: publisher.catalog.digest(),
-                      mechid=lambda: publisher.mechid, budget=budget)
+                      mechid=lambda: publisher.mechid, budget=budget,
+                      **({"on_verified": keeper.observe, "allows": keeper.allows} if keeper is not None else {}))
 
 
 def resolve_catalog(subtensor: bt.Subtensor, config: MinerConfig) -> catalog.Catalog:
@@ -519,10 +523,16 @@ def main() -> None:
         from verathos.install import common
 
         common.main("miner", sys.argv[1], sys.argv[2:])
+    if sys.argv[1:2] == ["firewall"]:
+        from verathos.install import firewall as firewall_setup
+
+        firewall_setup.main(sys.argv[2:])
+        return
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(epilog="Set up this machine as a miner: verathos-miner init. Remove it: "
-                                            "verathos-miner uninstall.")
+                                            "verathos-miner uninstall. Its firewall: verathos-miner firewall "
+                                            "install|status|remove.")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--remeasure", action="store_true",
                         help="Measure every endpoint's capacity again (after changing its hardware)")
@@ -542,16 +552,27 @@ def main() -> None:
              "machine by it)", identity.cert_path, identity.pin)
     publisher = Publisher(config, wallet, cat, publish_on_chain=not args.no_publish, subtensor=subtensor,
                           identity=identity)
+    keeper = firewall.start(config, args.config.expanduser().absolute(), wallet.hotkey.ss58_address,
+                            lambda: publisher.catalog, lambda: publisher.auditor,
+                            enabled=config.firewall and not args.no_publish,
+                            why_off="--no-publish" if args.no_publish else "firewall is false in the configuration")
     authorizer = permits(config, publisher)
     engines = {e.endpoint_id: HttpEngine(e.engine_url, e.engine_api_key, max_connections=e.max_concurrency,
                                          tls_pin=e.engine_tls_pin)
                for e in config.endpoints}
-    app = build_app(config, wallet.hotkey, publisher, authorizer, engines)
+    app = build_app(config, wallet.hotkey, publisher, authorizer, engines, keeper)
     # Connections beyond the descriptors left are refused, so a flood of idle connections cannot starve the rest.
     limit = max(256, raise_open_file_limit() - 256)
-    server = uvicorn.Server(uvicorn.Config(app, host=config.listen_host, port=config.port, log_level="warning",
-                                           access_log=False, limit_concurrency=limit, **tls.server_options(identity)))
-    service = threading.Thread(target=server.run, name="service", daemon=True)
+    service_config = uvicorn.Config(app, host=config.listen_host, port=config.port, log_level="warning",
+                                    access_log=False, limit_concurrency=limit, **tls.server_options(identity))
+    server = uvicorn.Server(service_config)
+    try:
+        listening = service_config.bind_socket()
+    except SystemExit:
+        raise SystemExit(f"the service could not start on port {config.port}") from None
+    if keeper is not None:
+        keeper.attach(listening)  # the firewall's filter goes with the socket
+    service = threading.Thread(target=server.run, kwargs={"sockets": [listening]}, name="service", daemon=True)
     service.start()
     while not server.started:
         if not service.is_alive():

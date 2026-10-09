@@ -9,6 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from verathos.catalog import Gateway
 from verathos.miner.engine import engine_tls
 from verathos.protocol import tls
 from verathos.protocol.manifest import MAX_HOSTS, axon_base, endpoint_url, public_ip
@@ -58,13 +59,17 @@ class MinerConfig(BaseModel):
                                                "primary, publishes nothing on chain")
     peers: list[str] = Field(default_factory=list, description="Primary only: the workers' miner base URLs "
                              "(ip:port), whose endpoints the manifest lists")
-    gateway_hotkeys: list[str] = Field(default_factory=list,
-                                       description="Extra caller hotkeys allowed besides permitted validators")
+    gateways: list[Gateway] = Field(default_factory=list, description="The miner's own gateways besides the catalog's, "
+                                    "each {hotkey, egress}: callers served like the catalog's, from the public IP "
+                                    "addresses their requests come from (egress)")
     endpoints: list[EndpointConfig] = Field(min_length=1)
     catalog_mirrors: list[str] = Field(default_factory=list, description="Catalog URL templates (https) with "
                                        "{digest}, tried after the subnet owner's axon")
     catalog_dir: Path = Path("~/.verathos/catalog")
     state_dir: Path = Path("~/.verathos/miner")
+    firewall: bool = Field(True, description="Drop connections to the port from anyone but the network's callers and "
+                           "the hotkey's machines, in the kernel (miner.firewall); takes the helper the installer sets "
+                           "up, or root")
     auto_update: bool = Field(False, description="Update the code to each new release of the repository it was "
                               "installed from (release tags), at a quiet moment, and exit for the process manager to "
                               "start it (the installer turns it on; verathos.update)")
@@ -88,6 +93,17 @@ class MinerConfig(BaseModel):
         if len(peers) >= MAX_HOSTS:
             raise ValueError(f"at most {MAX_HOSTS - 1} peers")
         return peers
+
+    @field_validator("gateways")
+    @classmethod
+    def _gateways(cls, value: list[Gateway]) -> list[Gateway]:
+        hotkeys = [g.hotkey for g in value]
+        if len(hotkeys) != len(set(hotkeys)):
+            raise ValueError("gateway hotkeys must be unique")
+        for g in value:
+            if not g.egress:
+                raise ValueError(f"gateway {g.hotkey}: name the addresses its requests come from (egress)")
+        return value
 
     @model_validator(mode="after")
     def _check(self) -> MinerConfig:

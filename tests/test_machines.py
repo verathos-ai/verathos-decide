@@ -109,7 +109,8 @@ def test_a_worker_runs_the_full_miner_service_and_reveals_no_more_than_the_manif
     floor = CATALOG.scoring.validator_min_stake
     chain = FakeSubtensor({validator.ss58_address: floor, small.ss58_address: floor - 1}, auditor.ss58_address)
     monkeypatch.setattr(miner_chain.bt, "Subtensor", lambda *a, **k: chain)
-    cfg = config("198.51.100.7", 20017, ["w-gpu0"], tmp_path, role="worker", gateway_hotkeys=[gateway.ss58_address])
+    cfg = config("198.51.100.7", 20017, ["w-gpu0"], tmp_path, role="worker",
+                 gateways=[{"hotkey": gateway.ss58_address, "egress": ["198.51.100.9"]}])
     identity = tls.identity(tmp_path / "tls")
     publisher = miner_main.Publisher(cfg, SimpleNamespace(hotkey=miner), CATALOG, publish_on_chain=True,
                                      subtensor=chain, identity=identity)
@@ -266,7 +267,8 @@ def test_a_validator_gets_its_request_budget_per_endpoint_and_epoch(tmp_path, mo
     miner, validator, gateway, auditor = kp(), kp(), kp(), kp()
     chain = FakeSubtensor({validator.ss58_address: 1e6}, auditor.ss58_address)
     monkeypatch.setattr(miner_chain.bt, "Subtensor", lambda *a, **k: chain)
-    cfg = config("198.51.100.7", 20017, ["gpu0"], tmp_path, gateway_hotkeys=[gateway.ss58_address])
+    cfg = config("198.51.100.7", 20017, ["gpu0"], tmp_path,
+                 gateways=[{"hotkey": gateway.ss58_address, "egress": ["198.51.100.9"]}])
     tight = CATALOG.model_copy(update={"scoring": CATALOG.scoring.model_copy(
         update={"validator_requests_per_epoch": 3})})
     assert CATALOG.scoring.request_budget() == 4 * CATALOG.scoring.canary_pool_size

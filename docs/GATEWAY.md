@@ -149,6 +149,8 @@ view of the miners does not take a model off the gateway. Once the current table
    the hotkey. It is the most exposed key of the subnet, so it is not the owner hotkey.
 2. List it in the catalog's `gateways` with the public addresses its requests to miners come from (`{"hotkey": ...,
    "egress": [...]}`) and commit the catalog (`SUBNET_ADMIN.md`). Miners serve it from their next catalog check.
+   Miners' firewalls drop connections from any other address once they enforce (`MINING.md`, Firewall): list every
+   address the gateway's requests leave from, and commit a catalog with the new ones before moving it.
 3. Install: `VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway]"`.
 4. PostgreSQL (SQLite only for development):
 

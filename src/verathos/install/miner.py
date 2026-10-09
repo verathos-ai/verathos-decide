@@ -24,6 +24,7 @@ from pydantic import ValidationError
 
 from verathos import catalog
 from verathos.install import common, engines, host, plan
+from verathos.install import firewall as firewall_setup
 from verathos.install.common import Prompter, info, step, warn
 from verathos.install.services import Service
 from verathos.miner.config import MinerConfig, peer_url
@@ -63,6 +64,9 @@ def parser() -> argparse.ArgumentParser:
                    "(default: from its public IP address)")
     p.add_argument("--peers", help="Primary only: the workers' public ip:port, comma-separated; replaces the list "
                    "('' for none)")
+    p.add_argument("--firewall", action=argparse.BooleanOptionalAction, default=None, help="Drop connections to the "
+                   "miner's port from anyone but the network's callers and the hotkey's machines (default: on; "
+                   "--no-firewall turns it off and removes it; a later run keeps the choice)")
     p.add_argument("--config", type=Path, help="Miner configuration (default <home>/miner.json)")
     return p
 
@@ -197,7 +201,8 @@ def choose_models(ui: Prompter, gpus: list[host.Gpu], offered: list[str], need: 
 
 def miner_config(existing: dict, *, network: str, netuid: int, wallet_name: str, hotkey_name: str, public_ip: str,
                  port: int, endpoints: dict[str, tuple[str, int]], managed_before: set[str], home: Path,
-                 role: str = "primary", peers: list[str] | None = None, auto_update: bool | None = None) -> dict:
+                 role: str = "primary", peers: list[str] | None = None, auto_update: bool | None = None,
+                 firewall: bool | None = None) -> dict:
     """The configuration to write: ``existing`` with this setup's answers and its endpoints (endpoint id -> model,
     engine port). Endpoints added by hand and settings the setup does not ask about are kept; endpoints it set up
     before and no longer serves are dropped. ``peers`` (a primary's) replace the configured ones; None keeps them."""
@@ -212,9 +217,38 @@ def miner_config(existing: dict, *, network: str, netuid: int, wallet_name: str,
         del config["peers"]
     if auto_update is not None:
         config["auto_update"] = auto_update
+    if firewall is not None:
+        config["firewall"] = firewall
     config.setdefault("state_dir", str(home / "miner"))
     config.setdefault("catalog_dir", str(home / "catalog"))
     return config
+
+
+def firewall_line(on: bool, root: bool) -> str:
+    if not on:
+        return "firewall off: anyone reaches the miner's port (--firewall turns it on)"
+    return ("firewall on: the miner's port answers only the network's callers and this hotkey's machines once the "
+            "catalog has miners enforce it (--no-firewall turns it off)"
+            + ("" if root else "; without root it filters in the miner process"))
+
+
+def set_up_firewall(on: bool, port: int, before: bool) -> bool:
+    """Set up the kernel layer of the firewall (``install.firewall``), or remove it when the firewall is off; ->
+    whether it is set up."""
+    if not on:
+        if before or firewall_setup.installed():
+            removed = firewall_setup.remove()
+            info("firewall off" + (f": removed {', '.join(removed)}" if removed else ""))
+        return False
+    try:
+        firewall_setup.setup(common.operator(), port)
+    except firewall_setup.Unavailable as exc:
+        info(f"the kernel layer is off ({exc}); connections are filtered in the miner process")
+        return False
+    info(f"kernel layer: helper {firewall_setup.HELPER}"
+         + ("" if common.operator() == "root" else f", sudo rule {firewall_setup.SUDOERS}")
+         + f"; the miner applies it to port {port} whenever it enforces")
+    return True
 
 
 def init(argv: list[str]) -> None:
@@ -326,6 +360,8 @@ def init(argv: list[str]) -> None:
         info(f"workers whose endpoints the manifest lists: {', '.join(workers)}")
     auto_update = common.auto_update(args, existing)
     info(common.update_line(auto_update))
+    firewall = args.firewall if args.firewall is not None else bool(existing.get("firewall", True))
+    info(firewall_line(firewall, manager is not None))
     info(f"configuration {config_path}; engines and weights in {home}")
     if not ui.confirm("Go ahead?"):
         raise SystemExit("stopped; nothing changed")
@@ -349,7 +385,7 @@ def init(argv: list[str]) -> None:
                           hotkey_name=hotkey_name, public_ip=public_ip, port=port,
                           endpoints={eid: (chosen[gpu], engine_ports[eid]) for gpu, eid in endpoint_ids.items()},
                           managed_before=set(record.engines), home=home, role=role, peers=peers,
-                          auto_update=auto_update)
+                          auto_update=auto_update, firewall=firewall)
     try:
         MinerConfig.model_validate(config)
     except ValidationError as exc:
@@ -394,10 +430,16 @@ def init(argv: list[str]) -> None:
             info(f"stop the engines no longer served (pm2: pm2 delete {' '.join(previous)})")
         info("the miner waits for its engines, measures its capacity (a few minutes), then "
              + ("serves its endpoints to its primary" if role == "worker" else "publishes its manifest"))
+        if firewall and not firewall_setup.installed():
+            info("the firewall filters in the miner process; its kernel layer takes root once: verathos-miner "
+                 f"firewall install --config {config_path} (as a user with sudo), then restart the miner")
         for line in common.script_commands("miner", home, " --no-service"
                                            + (" --no-publish" if args.no_publish else "")):
             info(line)
         return
+
+    step("Firewall")
+    record.firewall = set_up_firewall(firewall, port, record.firewall)
 
     step("Services")
     for name in [*names, MINER]:
@@ -419,6 +461,8 @@ def init(argv: list[str]) -> None:
                   failed=lambda line: "no endpoint could be measured" in line or "no configured endpoint" in line,
                   timeout_s=MEASURE_S,
                   hide=lambda line: "engine unreachable" in line or "waiting for the engine" in line)
+    if firewall:
+        info(firewall_setup.summary(firewall_setup.miner_state(config_path), firewall_setup.kernel_status(), port))
 
     step("Done")
     for g in gpus:
@@ -433,12 +477,14 @@ def init(argv: list[str]) -> None:
     info(f"after editing the configuration: {manager.restart_command([MINER])}")
     address = urlsplit(axon_base(public_ip, port)).netloc
     check = f"curl -sk --pinnedpubkey '{tls.curl_pin(identity.pin)}' https://{address}"  # the pin is the check
+    where = "from another machine (once the firewall enforces, only from the network's callers)" if firewall \
+        else "from another machine"
     if role == "worker":
-        info(f"check from another machine: {check}{ENDPOINTS_PATH}")
+        info(f"check {where}: {check}{ENDPOINTS_PATH}")
         info("list this machine on the primary, with every other worker (comma-separated):")
         print(f"      bash {common.INSTALLER} miner --yes --peers {address}", flush=True)
         info(f'or add "{address}" to "peers" in the primary\'s miner.json and restart its miner')
     else:
-        info(f"check from another machine: {check}/v1/manifest")
+        info(f"check {where}: {check}/v1/manifest")
     for line in common.script_commands("miner", home, " --no-publish" if args.no_publish else ""):
         info(line)

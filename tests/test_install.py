@@ -24,6 +24,7 @@ from verathos.validator.config import ValidatorConfig
 KEV = {"kev-4b": 4_659_865_088, "kev-9b": 9_653_104_368}  # parameters of the Kev models' base models
 MINER_NEED = {m: plan.miner_memory(p) for m, p in KEV.items()}
 ROOT = Path(__file__).resolve().parents[1]
+GATEWAY = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 
 
 def gpu(index: int, gib: float, name: str = "NVIDIA A100 80GB PCIe", free: float | None = None) -> Gpu:
@@ -167,7 +168,7 @@ def test_ports_are_kept_and_new_ones_skip_busy_and_taken_ports() -> None:
 
 def test_the_miner_configuration_keeps_what_the_setup_does_not_manage(tmp_path) -> None:
     existing = {"network": "finney", "netuid": 96, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5",
-                "port": 8091, "gateway_hotkeys": ["5F..."], "endpoints": [
+                "port": 8091, "gateways": [{"hotkey": GATEWAY, "egress": ["1.1.1.1"]}], "endpoints": [
                     {"endpoint_id": "gpu0", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:8008",
                      "max_concurrency": 64},
                     {"endpoint_id": "gpu1", "model_id": "kev-4b", "engine_url": "http://127.0.0.1:8009"},
@@ -179,7 +180,7 @@ def test_the_miner_configuration_keeps_what_the_setup_does_not_manage(tmp_path) 
     assert [e["endpoint_id"] for e in config["endpoints"]] == ["gpu0", "mac"]
     assert config["endpoints"][0] == {"endpoint_id": "gpu0", "model_id": "kev-9b",
                                       "engine_url": "http://127.0.0.1:8008", "max_concurrency": 64}
-    assert config["gateway_hotkeys"] == ["5F..."] and config["public_host"] == "198.51.100.7"
+    assert config["gateways"] == existing["gateways"] and config["public_host"] == "198.51.100.7"
     assert config["state_dir"] == str(tmp_path / "miner")
     MinerConfig.model_validate(config)
 
@@ -474,7 +475,7 @@ def test_install_script_parses_and_documents_its_options() -> None:
     assert usage.returncode == 0 and "--source" in usage.stdout and "uninstall" in usage.stdout
     assert "--worker" in usage.stdout and "--peers" in usage.stdout
     assert "--light" in usage.stdout and "--full" in usage.stdout and "--references" in usage.stdout
-    assert "--no-service" in usage.stdout and "--no-auto-update" in usage.stdout
+    assert "--no-service" in usage.stdout and "--no-auto-update" in usage.stdout and "--no-firewall" in usage.stdout
 
 
 def installer(home: Path, *args: str) -> subprocess.CompletedProcess:
