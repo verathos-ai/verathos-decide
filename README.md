@@ -45,6 +45,8 @@ Models of the shipped catalog (the installers read the catalog the subnet owner 
 | `kev-9b` | active | about 26 GiB | about 42 GiB or 48 GiB |
 | `clef-flash` | active | about 21 GiB | about 41 GiB or 47 GiB |
 
+Clef-Flash reads images as well as text ([Images](docs/GATEWAY.md#images)); answers to requests with images are checked against its float32 reference on a GPU.
+
 All three are active from the start: they share the emission equally while users pay for none of them, and what users
 pay moves the shares ([Models](docs/SCORING.md#models)). The scores pay the catalog's miner share of the miners'
 emission, the [usage pool](docs/SCORING.md#usage-pool) pays the hotkeys that served paying users on top when the
