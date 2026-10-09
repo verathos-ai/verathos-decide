@@ -1135,8 +1135,7 @@ class Auditor:
                 "rate_rps": self.test_rate(t, now_s, policy),
                 "max_outstanding": math.ceil(t.tested_rps * policy.request_timeout_s) + 16,
                 "headers": session_headers(session, self.keypair), "model": t.slot.model_id,
-                "state_words": list(workload.state_words), "questions": workload.questions,
-                "samples": policy.samples_per_test,
+                **loadgen.mix_plan(workload), "samples": policy.samples_per_test,
             })
         # The miner cannot know when the window opens, so it cannot time held-back answers to it.
         warmup = round(policy.warmup_s * (1 + secrets.SystemRandom().random()), 3)

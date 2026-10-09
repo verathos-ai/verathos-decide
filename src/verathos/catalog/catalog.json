@@ -204,10 +204,28 @@
             "type": "noul",
             "instructions": "Is the customer angry?"
           }
+        },
+        "images": {
+          "share": 0.25,
+          "count": [
+            1,
+            1
+          ],
+          "sides_px": [
+            256,
+            288,
+            320,
+            352,
+            384,
+            416,
+            448,
+            480,
+            512
+          ]
         }
       },
-      "first_test_rps": 45.0,
-      "relative_speed": 0.92,
+      "first_test_rps": 40.0,
+      "relative_speed": 0.85,
       "price": 0.09,
       "anchor_share": 0.333333
     }

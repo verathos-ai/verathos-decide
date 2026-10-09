@@ -14,7 +14,7 @@ Only ``active`` models are scored. ``candidate`` models may be served and checke
 ``retired`` models are ignored.
 
 A model reads what its ``input_modalities`` list: text always, and images where they list ``image``, within its
-``images`` limits (``protocol.media``).
+``images`` limits (``protocol.media``); then its request mix may carry images too (``throughput.workload``).
 """
 
 from __future__ import annotations
@@ -32,10 +32,10 @@ from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_valid
 from verathos.protocol.callers import egress_addresses
 from verathos.protocol.canonical import digest
 from verathos.protocol.http import get_json
-from verathos.protocol.media import ENGINE_IMAGES, ImageLimits
+from verathos.protocol.media import ENGINE_IMAGES, MAX_ASPECT, ImageLimits
 from verathos.protocol.tls import PIN_PATTERN, authenticated
 from verathos.throughput.policy import AuditPolicy, policy_from
-from verathos.throughput.workload import Workload
+from verathos.throughput.workload import Workload, WorkloadImages
 from verathos.validator.compare import Tolerance
 
 log = logging.getLogger(__name__)
@@ -91,6 +91,29 @@ class CatalogModel(BaseModel):
         if "text" not in value or len(set(value)) != len(value):
             raise ValueError("input_modalities lists text, and each modality once")
         return value
+
+    @model_validator(mode="after")
+    def _mix_images(self) -> CatalogModel:
+        mix = self.workload.images
+        if mix is None:
+            return self
+        if not self.reads_images():
+            raise ValueError(f"workload.images: {self.model_id} reads no images")
+        limits, sides = self.images, mix.sides_px
+        if mix.count[1] > limits.max_count:
+            raise ValueError(f"workload.images.count: {self.model_id} takes at most {limits.max_count} images")
+        if any(side % limits.token_px for side in sides):
+            raise ValueError(f"workload.images.sides_px: each a multiple of images.token_px ({limits.token_px})")
+        if min(sides) ** 2 < limits.min_pixels or max(sides) ** 2 > limits.max_pixels:
+            raise ValueError(f"workload.images.sides_px: images of {min(sides) ** 2} to {max(sides) ** 2} pixels, "
+                             f"outside images.min_pixels to images.max_pixels")
+        if max(sides) > MAX_ASPECT * min(sides):
+            raise ValueError(f"workload.images.sides_px: an aspect ratio beyond {MAX_ASPECT}:1")
+        if mix.max_png_bytes() > limits.max_bytes or mix.count[1] * mix.max_png_bytes() > limits.max_total_bytes:
+            raise ValueError("workload.images: images larger than images.max_bytes or images.max_total_bytes")
+        if self.workload.max_request_bytes(self.model_id) > limits.max_request_bytes:
+            raise ValueError("workload.images: requests larger than images.max_request_bytes")
+        return self
 
     def reads_images(self) -> bool:
         return "image" in self.input_modalities
@@ -342,8 +365,8 @@ class Catalog(BaseModel):
         return {m.model_id: m.anchor_share / total for m in active}
 
     def unknown_settings(self) -> list[str]:
-        """Keys of the document this code does not know (the catalog's own, its scoring's, its models'): nodes ignore
-        them, so a publisher must not mistype one."""
+        """Keys of the document this code does not know (the catalog's own, its scoring's, its models', their images'
+        and request mixes'): nodes ignore them, so a publisher must not mistype one."""
         doc = self._document or {}
         unknown = [k for k in doc if k not in type(self).model_fields]
         scoring = doc.get("scoring") or {}
@@ -358,6 +381,13 @@ class Catalog(BaseModel):
             if isinstance(m.get("images"), dict):
                 unknown += [f"models.{m.get('model_id', '?')}.images.{k}" for k in m["images"]
                             if k not in ImageLimits.model_fields]
+            workload = m.get("workload")
+            if isinstance(workload, dict):
+                unknown += [f"models.{m.get('model_id', '?')}.workload.{k}" for k in workload
+                            if k not in Workload.model_fields]
+                if isinstance(workload.get("images"), dict):
+                    unknown += [f"models.{m.get('model_id', '?')}.workload.images.{k}" for k in workload["images"]
+                                if k not in WorkloadImages.model_fields]
         if isinstance(doc.get("auditor"), dict):
             unknown += [f"auditor.{k}" for k in doc["auditor"] if k not in AuditorIdentity.model_fields]
         for g in doc.get("gateways") or []:

@@ -1,0 +1,345 @@
+{
+ "vectors": [
+  {
+   "seed": "6eb86407b172ae96c70da16edb8aac2fc5348e723212850e52ff60a1280fba67",
+   "count": [
+    1,
+    1
+   ],
+   "sides_px": [
+    256,
+    288,
+    320,
+    352,
+    384,
+    416,
+    448,
+    480,
+    512
+   ],
+   "images": [
+    {
+     "width": 512,
+     "height": 384,
+     "bytes": 4899,
+     "sha256": "92d0213355ec15177b592402ffaa853e1b0d68f71974b07e6b3f6f57c560ccd2"
+    }
+   ]
+  },
+  {
+   "seed": "1c803af40a78dcf725901061a6878ea57b725e9d4461adc6067d8ee2d4f84862",
+   "count": [
+    1,
+    1
+   ],
+   "sides_px": [
+    256,
+    288,
+    320,
+    352,
+    384,
+    416,
+    448,
+    480,
+    512
+   ],
+   "images": [
+    {
+     "width": 448,
+     "height": 416,
+     "bytes": 5101,
+     "sha256": "785049a1d31b0bad7efcb3246f97dc066a0176aa50f1a88062b50f915709911e"
+    }
+   ]
+  },
+  {
+   "seed": "639be73efce38a81dced424ec11b93598c39aacfd6769ef8199db6f32036f545",
+   "count": [
+    1,
+    1
+   ],
+   "sides_px": [
+    256,
+    288,
+    320,
+    352,
+    384,
+    416,
+    448,
+    480,
+    512
+   ],
+   "images": [
+    {
+     "width": 320,
+     "height": 288,
+     "bytes": 2708,
+     "sha256": "1b91b2604919d7036ae855eaa3c315030730a2648f05daf3b64ae8021b499a31"
+    }
+   ]
+  },
+  {
+   "seed": "f1319b2e72b8fb0f854b6bd90b2a276f45844c242a56ed96524ca30a62f1b797",
+   "count": [
+    1,
+    1
+   ],
+   "sides_px": [
+    256,
+    288,
+    320,
+    352,
+    384,
+    416,
+    448,
+    480,
+    512
+   ],
+   "images": [
+    {
+     "width": 256,
+     "height": 448,
+     "bytes": 3440,
+     "sha256": "395f4b036c242d0ee76bd58dd787f3aa02333a2247cee955b33ba114c40223d1"
+    }
+   ]
+  },
+  {
+   "seed": "569daa5b521c1c47c5048b3fc1b41c5a83d7055bef5960a5950b75ab4b2eb2d5",
+   "count": [
+    1,
+    1
+   ],
+   "sides_px": [
+    256,
+    288,
+    320,
+    352,
+    384,
+    416,
+    448,
+    480,
+    512
+   ],
+   "images": [
+    {
+     "width": 384,
+     "height": 288,
+     "bytes": 3179,
+     "sha256": "60cb00477708b13e886e5fcdcc7c1886a9f645770994c133e69fe09053779378"
+    }
+   ]
+  },
+  {
+   "seed": "9ed1109dcc67913017b331c89623698fcd8aec77559c265df02733a815933f7e",
+   "count": [
+    1,
+    1
+   ],
+   "sides_px": [
+    256,
+    288,
+    320,
+    352,
+    384,
+    416,
+    448,
+    480,
+    512
+   ],
+   "images": [
+    {
+     "width": 480,
+     "height": 512,
+     "bytes": 6486,
+     "sha256": "16509469067b3f76a4a1d2c9089742c5e27a2382d3162ca09bbf1985433f66d3"
+    }
+   ]
+  },
+  {
+   "seed": "b6edefd3c0466db28a26c4e1589a4d72a3ba113c50bf368951d5c8de9d79f953",
+   "count": [
+    1,
+    4
+   ],
+   "sides_px": [
+    256,
+    288,
+    320,
+    352,
+    384,
+    416,
+    448,
+    480,
+    512
+   ],
+   "images": [
+    {
+     "width": 320,
+     "height": 384,
+     "bytes": 3585,
+     "sha256": "cc3b3159f8cd996e450df4d352ec5cffcf523e12ba70e1b17e42c40326ca8c4d"
+    },
+    {
+     "width": 384,
+     "height": 352,
+     "bytes": 3851,
+     "sha256": "de6877574c25841aa1dfc1099e6c2b5b63cf8da5bfe5788695b4b8b6088fa0e8"
+    },
+    {
+     "width": 480,
+     "height": 288,
+     "bytes": 3645,
+     "sha256": "a09a0b7f38116eeda4acbcb29661e38023cfa26dba7b704dcc75c6db2417caef"
+    }
+   ]
+  },
+  {
+   "seed": "c5e629bb5735ace8224c24a94b64a395922be49f8f1cdcc38ff99e49d1b501a5",
+   "count": [
+    1,
+    4
+   ],
+   "sides_px": [
+    256,
+    288,
+    320,
+    352,
+    384,
+    416,
+    448,
+    480,
+    512
+   ],
+   "images": [
+    {
+     "width": 256,
+     "height": 448,
+     "bytes": 3488,
+     "sha256": "ecf73e49a7b1e760d6c7784302d4c34260d787a2d9af3e6afe0e4a089c547273"
+    },
+    {
+     "width": 512,
+     "height": 384,
+     "bytes": 4833,
+     "sha256": "5244f5cc0cff1d6ab67bdcffed372cf0b8efee76a21066b11bf43b1fba3f2dfc"
+    },
+    {
+     "width": 480,
+     "height": 384,
+     "bytes": 4863,
+     "sha256": "603a8986ef9921d76e46881f1b53abc2d2028f5aa346a348a3b33f2a0f0d0153"
+    }
+   ]
+  },
+  {
+   "seed": "d9d2d9089aaed7c2c692b94d9c5d56346a00b736827c34fc26b8e349de5cd878",
+   "count": [
+    1,
+    4
+   ],
+   "sides_px": [
+    256,
+    288,
+    320,
+    352,
+    384,
+    416,
+    448,
+    480,
+    512
+   ],
+   "images": [
+    {
+     "width": 448,
+     "height": 384,
+     "bytes": 4730,
+     "sha256": "1862db70e27ad822c5478e11f316e4e1223655fe8cfad71eb1d41160ed84746d"
+    },
+    {
+     "width": 480,
+     "height": 256,
+     "bytes": 3249,
+     "sha256": "0e8f27fb0a5fa8e2d4d85d2a2f5bdcb141de1d5aeb3246dc299ce41a7b710e1d"
+    },
+    {
+     "width": 320,
+     "height": 352,
+     "bytes": 3339,
+     "sha256": "e6d5fd8329c85d777899eb8fc31d3797f305b345e440eba4092f362aad55a091"
+    }
+   ]
+  },
+  {
+   "seed": "752e7fc133e47a4677ee1ecd26029e766e64085c2b71e41b7db7109678113939",
+   "count": [
+    2,
+    3
+   ],
+   "sides_px": [
+    1,
+    2,
+    3,
+    7
+   ],
+   "images": [
+    {
+     "width": 3,
+     "height": 2,
+     "bytes": 80,
+     "sha256": "67a9fcd5f55ad6010fb066415350a7d160273d65526f0a7474b3d7420942e344"
+    },
+    {
+     "width": 1,
+     "height": 2,
+     "bytes": 73,
+     "sha256": "e3e7b3f93e1e7be102837f588b46718ae8b883dc14b348de1dde1d7560f4aff2"
+    },
+    {
+     "width": 1,
+     "height": 7,
+     "bytes": 94,
+     "sha256": "32e866e99510d80127de9f090d1eb41f117eda16f68c31b4517631a3e1fcf150"
+    }
+   ]
+  },
+  {
+   "seed": "f23701c0a82e2883289cc5ad89bb0898f731d24fda9f4b80855e116dfa216ebc",
+   "count": [
+    1,
+    2
+   ],
+   "sides_px": [
+    87,
+    173
+   ],
+   "images": [
+    {
+     "width": 87,
+     "height": 87,
+     "bytes": 575,
+     "sha256": "9d35d5c496a863b96da3e7c00839896568aae760bbef891154c8819c4121cc5c"
+    }
+   ]
+  },
+  {
+   "seed": "5a147c9de3414905f0958fd47bb15af4e923baa7b2e3c58fe02e807650a92b16",
+   "count": [
+    1,
+    1
+   ],
+   "sides_px": [
+    1024,
+    2048
+   ],
+   "images": [
+    {
+     "width": 2048,
+     "height": 2048,
+     "bytes": 85384,
+     "sha256": "960555fd23e1f2755968e1744456f47dbbca97e6964e94544b47e1fa03bd5f1e"
+    }
+   ]
+  }
+ ]
+}

@@ -1,5 +1,6 @@
 """The load generator's contract (``native/loadgen``) in Python, for tests against in-process miners: each target
-over https, accepting the certificate its pin names."""
+over https, accepting the certificate its pin names, its requests with images drawn as ``throughput.images`` draws
+them."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from typing import Any
 import httpx
 
 from verathos.protocol import tls
+from verathos.throughput.images import SEED_BYTES, draw, item
 from verathos.throughput.loadgen import LoadResult
 from verathos.throughput.policy import HDR_REQUEST_ID
 
@@ -52,6 +54,9 @@ async def _target(client: httpx.AsyncClient, target: dict[str, Any], plan: dict[
         words = " ".join(rng.choice(plan["words"]) for _ in range(rng.randint(*target["state_words"])))
         body = {"model": target["model"], "state": f"Ticket {secrets.token_hex(8)}. {words}.",
                 "questions": target["questions"]}
+        if (images := target.get("images")) is not None and rng.random() < images["share"]:
+            pngs = draw(rng.randbytes(SEED_BYTES), tuple(images["count"]), images["sides_px"])
+            body.update(questions=images["questions"], images=[item(png) for png in pngs])
         request_id = secrets.token_hex(16)
         sent = time.time()
         try:

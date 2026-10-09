@@ -2,10 +2,12 @@
 //!
 //! Request `k` of target `i` draws all its randomness from its own ChaCha stream, keyed by the plan
 //! seed and numbered by `(i, k)`. A plan therefore reproduces its requests exactly, requests can be
-//! built in any order on any thread, and no two requests of a run share randomness.
+//! built in any order on any thread, and no two requests of a run share randomness. For a target
+//! whose mix has images, the stream then draws whether the request carries images and, if it does,
+//! the seed of its images (`images`) and the questions of a request with images.
 
 use crate::{
-    hex,
+    hex, images,
     plan::{Target, MAX_RATE_RPS, MAX_RUN_S, MAX_TARGETS},
 };
 use bytes::Bytes;
@@ -18,6 +20,8 @@ pub const REQUEST_ID_BYTES: usize = 16;
 pub const TICKET_BYTES: usize = 8;
 /// Length of `{"model":"","state":"","questions":}`.
 const BODY_OVERHEAD: usize = 36;
+const IMAGES_OVERHEAD: usize = r#","images":[]"#.len();
+const IMAGE_OVERHEAD: usize = r#"{"content_type":"image/png","base64":""}"#.len();
 /// Low bits of a request's stream number: its position in the target's schedule. The bits above
 /// hold the target index.
 const POSITION_BITS: u32 = 40;
@@ -44,6 +48,14 @@ struct Body<'a> {
     model: &'a str,
     state: &'a str,
     questions: &'a RawValue,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    images: Vec<Image>,
+}
+
+#[derive(Serialize)]
+struct Image {
+    content_type: &'static str,
+    base64: String,
 }
 
 impl Generator {
@@ -69,15 +81,42 @@ impl Generator {
             state.push_str(&self.words[rng.random_range(0..self.words.len())]);
         }
         state.push('.');
+        let (questions, items) = match &target.images {
+            Some(mix) if rng.random::<f64>() < mix.share => {
+                let mut seed = [0u8; images::SEED_BYTES];
+                rng.fill_bytes(&mut seed);
+                let items = images::draw(seed, &mix.count, &mix.sides)
+                    .iter()
+                    .map(|png| Image {
+                        content_type: "image/png",
+                        base64: images::base64(png),
+                    })
+                    .collect();
+                (&*mix.questions, items)
+            }
+            _ => (&*target.questions, Vec::new()),
+        };
+        let images_len = match items.len() {
+            0 => 0,
+            count => {
+                IMAGES_OVERHEAD + count - 1
+                    + items
+                        .iter()
+                        .map(|image| IMAGE_OVERHEAD + image.base64.len())
+                        .sum::<usize>()
+            }
+        };
+        // Sized for text without escapes, which base64 never holds: a kept body holds no spare
+        // capacity.
+        let mut body = Vec::with_capacity(
+            BODY_OVERHEAD + target.model.len() + state.len() + questions.get().len() + images_len,
+        );
         let fields = Body {
             model: &target.model,
             state: &state,
-            questions: &target.questions,
+            questions,
+            images: items,
         };
-        // Sized for text without escapes: a kept body holds no spare capacity.
-        let mut body = Vec::with_capacity(
-            BODY_OVERHEAD + target.model.len() + state.len() + target.questions.get().len(),
-        );
         serde_json::to_writer(&mut body, &fields)
             .expect("string fields and a raw JSON value always serialize");
         GeneratedRequest {
@@ -103,6 +142,7 @@ mod tests {
     use super::*;
     use crate::plan::{tests::plan_json, Plan};
     use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
     use std::collections::HashSet;
 
     fn plan(state_words: (u32, u32)) -> Plan {
@@ -116,6 +156,21 @@ mod tests {
 
     fn generator(plan: &Plan) -> Generator {
         Generator::new(plan.key, plan.words.clone())
+    }
+
+    /// A plan whose second target's mix has images.
+    fn plan_with_images(share: f64) -> Plan {
+        let mut plan = plan_json();
+        let mut second = plan["targets"][0].clone();
+        second["id"] = json!("hotkey/gpu1");
+        second["images"] = json!({
+            "share": share,
+            "count": [1, 2],
+            "sides_px": [32, 64],
+            "questions": {"intent": {"type": "noul"}, "background": {"type": "noul"}},
+        });
+        plan["targets"].as_array_mut().unwrap().push(second);
+        Plan::parse(plan.to_string().as_bytes(), crate::plan::tests::NOW_MS).unwrap()
     }
 
     #[test]
@@ -172,6 +227,81 @@ mod tests {
                 assert!(tickets.insert(body["state"].as_str().unwrap()[7..23].to_owned()));
             }
         }
+    }
+
+    /// The requests of a mix without images, as this plan gives them, pinned by their digest.
+    #[test]
+    fn text_requests_keep_their_bytes() {
+        let plan = Plan::parse(
+            plan_json().to_string().as_bytes(),
+            crate::plan::tests::NOW_MS,
+        )
+        .unwrap();
+        let generator = generator(&plan);
+        let mut digest = Sha256::new();
+        for position in 0..1000 {
+            let request = generator.request(0, position, &plan.targets[0]);
+            digest.update(request.id.as_bytes());
+            digest.update(&request.body);
+        }
+        assert_eq!(
+            hex::encode(&digest.finalize()),
+            "36264aa34bb2d630b9b674a92f3b8bfae861e61210bf6714825cd96941c2c2c5"
+        );
+    }
+
+    #[test]
+    fn a_share_of_requests_carries_images_and_asks_about_them() {
+        let plan = plan_with_images(0.25);
+        let generator = generator(&plan);
+        let (text, mix) = (&plan.targets[0], &plan.targets[1]);
+        let mut pngs = HashSet::new();
+        let mut with_images = 0;
+        for position in 0..4000 {
+            let request = generator.request(1, position, mix);
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let plain: Value =
+                serde_json::from_slice(&generator.request(1, position, text).body).unwrap();
+            // the text is drawn first, so it is the text a target without images gets
+            assert_eq!(body["state"], plain["state"]);
+            let Some(images) = body.get("images") else {
+                assert_eq!(body["questions"], plain["questions"]);
+                assert_eq!(body.as_object().unwrap().len(), 3);
+                continue;
+            };
+            with_images += 1;
+            assert_eq!(body.as_object().unwrap().len(), 4);
+            let questions = mix.images.as_ref().unwrap().questions.get();
+            assert_eq!(
+                body["questions"],
+                serde_json::from_str::<Value>(questions).unwrap()
+            );
+            let images = images.as_array().unwrap();
+            assert!((1..=2).contains(&images.len()));
+            for image in images {
+                assert_eq!(image.as_object().unwrap().len(), 2);
+                assert_eq!(image["content_type"], "image/png");
+                let encoded = image["base64"].as_str().unwrap();
+                assert!(encoded.starts_with("iVBORw0KGgo"), "{encoded}"); // the PNG signature
+                assert!(pngs.insert(encoded.to_owned()), "an image twice");
+            }
+        }
+        assert!(
+            (850..1150).contains(&with_images),
+            "{with_images} of 4000 with images"
+        );
+    }
+
+    #[test]
+    fn every_request_carries_images_at_a_share_of_one() {
+        let plan = plan_with_images(1.0);
+        let generator = generator(&plan);
+        assert!((0..200).all(|position| {
+            let body: Value =
+                serde_json::from_slice(&generator.request(1, position, &plan.targets[1]).body)
+                    .unwrap();
+            body.get("images").is_some()
+        }));
     }
 
     #[test]

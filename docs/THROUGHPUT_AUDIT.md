@@ -16,7 +16,7 @@ in the catalog the subnet owner commits on chain.
 | | Code |
 |---|---|
 | Schedule, policy, test sessions | `src/verathos/throughput/policy.py`, `throughput/follow.py` |
-| Standard request mix | `throughput/workload.py` |
+| Standard request mix, its images | `throughput/workload.py`, `throughput/images.py` |
 | The miner's measurement | `throughput/measure.py`, `miner/timing.py` (when), `miner/shortfall.py` (after tests fell short) |
 | Admission on the miner (tests yield to other traffic) | `miner/admission.py`, `miner/app.py` |
 | Auditor and load generator | `throughput/auditor.py`, `throughput/loadgen.py`, `native/loadgen` |
@@ -25,9 +25,15 @@ in the catalog the subnet owner commits on chain.
 
 ## Declared capacity
 
-Each catalog model defines a standard request mix (`workload`): a range of words per state and a set of questions.
+Each catalog model defines a standard request mix (`workload`): a range of words per state and a set of questions,
+and for a model that reads images the share of its requests that carry images (`workload.images`, `SUBNET_ADMIN.md`).
 Every request of the mix is unique (a random ticket id and random words from a fixed vocabulary), so nothing can be
-served from a cache.
+served from a cache. A request with images carries canonical PNGs drawn from a seed of its own (a background colour
+and one to three rectangles in other colours, sides from the mix's), the same bytes from the same seed in the
+miner's measurement and in the auditor's load generator, so no image comes twice; besides the mix's questions it asks
+what colour the background is, so an answer that did not read the images is wrong. Capacity is then requests/s of
+the mix with its requests with images among them: the miner measures and declares it, and the tests ask and credit
+it.
 
 The miner measures its own capacity. It starts its service first and sends the measurement traffic through it,
 the path test traffic takes (under sessions it signs itself), so the service's own limits count too. Once every
@@ -199,9 +205,10 @@ is logged as relayed: some miner forwards what it is sent to the gateway (`throu
 A sampled request with images is held in the auditor's memory only, never in its database, until its check (at most
 2 GiB of images at once; a sample beyond is not kept); the row keeps the receipt and the other columns. Once it is
 checked, skipped or given up it is dropped, and a restart gives such samples up as unchecked. A proof with images needs
-no recompute: its request is kept without its images. The auditor's process writes no core dump. The tests' request mix
-has no images, so capacity is proven on text; what an endpoint does with images shows in these checks, in validators'
-image canaries (`SCORING.md`) and in what users get from it.
+no recompute: its request is kept without its images. The auditor's process writes no core dump. For a model whose
+request mix carries images, the tests' requests carry them too ([Declared capacity](#declared-capacity)), so capacity
+is proven with images; what an endpoint does with users' images shows in these checks, in validators' image canaries
+(`SCORING.md`) and in what users get from it.
 
 The gateway also reports, per endpoint and by the second each request was sent, how many user requests it sent the
 endpoint and how many of them it answered (a report is taken once, even if the gateway posts it again). Miners
@@ -321,7 +328,7 @@ recognisable by its session, so hardware used for other work between tests could
 | `gateway_checks_per_epoch` | 2 | sampled gateway answers the auditor recomputes per endpoint and epoch (0: none) |
 | `gateway_image_checks_per_epoch` | 1 | besides those, sampled answers to requests with images (0: none) |
 
-Per model: `workload` (the request mix) and `first_test_rps`.
+Per model: `workload` (the request mix, with its images for a model that reads them) and `first_test_rps`.
 
 ## Running the auditor
 
@@ -339,7 +346,10 @@ The auditor needs:
   runs on a GPU, beside the model's screen (`VALIDATING.md`): every recompute must answer within 30 s;
 - a public IP and port for its service, which serves TLS with the certificate the catalog's `auditor.tls` pins
   (`SUBNET_ADMIN.md`), and an uplink for the whole network's test traffic in one burst: about
-  6 KB per request, so 1,000 endpoints at 20,000 requests/s take about 1 Gbit/s, and 2-3 CPU cores;
+  6 KB per request, so 1,000 endpoints at 20,000 requests/s take about 1 Gbit/s, and 2-3 CPU cores. In the shipped
+  Clef-Flash mix a request with an image is 5.8 KB larger (a PNG of 2.0 to 6.5 KB in base64, and its question), and a
+  quarter of the requests carry one: their bodies average 7.0 KB against 5.5 KB without images. The load generator draws an
+  image in about 30 microseconds (an i9-14900K);
 - with a usage pool in `burned` mode, a node that holds the state of the last 200 blocks: the auditor reads every
   block's events as it is finalized, over a connection of its own; blocks it falls further behind on are recorded as
   unscanned. In `revenue` mode it reads TAO's price in USD from CoinGecko once per period.

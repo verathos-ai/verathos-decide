@@ -51,8 +51,9 @@ follows what its users pay (`SCORING.md`). `anchor_share` is the model's share w
 there is no user demand; the active models' anchors must sum to 1 (`commit-catalog` refuses a catalog whose do not).
 Activating a model means giving it an anchor and lowering the others'; every active model keeps at least
 `min_model_share`, whatever its anchor. `commit-catalog` also refuses settings this code does not know (it checks the
-keys of a model's `images`, not those inside its `tolerance`, `engine` and `workload`). `first_test_rps` caps the rate
-of an endpoint's first test, and of all a new hotkey's endpoints together; later tests grow from what was delivered.
+keys of a model's `images`, of its `workload` and of the workload's `images`, not those inside its `tolerance` and
+`engine`). `first_test_rps` caps the rate of an endpoint's first test, and of all a new hotkey's endpoints together;
+later tests grow from what was delivered.
 
 `input_modalities` lists what a model reads: `["text"]`, the default and the shipped Kev models', or `["text",
 "image"]`, the shipped Clef-Flash's, which opens a model to images (`GATEWAY.md`, Images) within its `images` limits;
@@ -79,6 +80,29 @@ miners run a release that reads them, with engines that serve them (`MINING.md`;
 refuse a validator's image canary as larger than it takes from validators), and the auditor's reference and screen of
 the model run on a GPU (`VALIDATING.md`).
 
+`workload` is a model's standard request mix: miners measure and declare their capacity with it, and the auditor's
+tests send it (`THROUGHPUT_AUDIT.md`). `state_words` is the range of words of a request's state and `questions` its
+questions; for a model that reads images, `images` sets which of its requests carry images, here the shipped
+Clef-Flash's:
+
+```json
+"images": {"share": 0.25, "count": [1, 1], "sides_px": [256, 288, 320, 352, 384, 416, 448, 480, 512]}
+```
+
+`share` of the requests carry `count[0]` to `count[1]` images each, every image of a width and a height drawn from
+`sides_px`: canonical PNGs drawn for the request (`throughput/images.py`; a background colour and one to three
+rectangles), and such a request also asks what colour the background is (the question `background`, which the mix's
+own questions may not take), so its answers depend on its images. Every node refuses images in the mix of a model
+that does not read them, more than the model's `images.max_count`, sides that are not multiples of its
+`images.token_px` or whose images fall outside its `min_pixels` to `max_pixels`, and images or requests beyond its
+byte limits. Capacity is requests/s of the whole mix, so the share sets how much images weigh in an endpoint's
+capacity. A quarter, as for the validators' image canaries, keeps an endpoint that refuses images below `pass_fraction`
+(it delivers at most 75% of what it is asked), puts a request with images among the two answers a test recomputes in
+44% of an endpoint's tests, and adds 1.5 KB to the tests' average request (`THROUGHPUT_AUDIT.md`, Running the
+auditor); sides of 256 to 512 px, as the image canaries', keep an image at 66 to 258 tokens and its PNG at 2.0 to 6.5
+KB. A changed mix makes its model's miners measure again: publish its `relative_speed` and `first_test_rps` for the
+new mix with it.
+
 `relative_speed` is the model's speed relative to the other models: the requests/s of its standard mix one GPU
 serves within `max_latency_s`, measured for every model on the same reference GPU and divided by one model's (1.0;
 positive, 1.0 when absent). Miners' setups choose each GPU's model by what it would pay there (`MINING.md`), and
@@ -90,7 +114,7 @@ values, on an H100 80GB, relative to kev-4b:
 |---|---|---|
 | `kev-4b` | 1.0 | 28.1 requests/s of the standard mix within 2 s (28-30 in earlier runs) |
 | `kev-9b` | 0.92 | 25.8 requests/s in the same session (24.5-27 before); 0.82 on an A100 80GB SXM4, 0.68 on an A100 80GB PCIe, 0.55 on an RTX 5090 |
-| `clef-flash` | 0.92 | 25.8 requests/s in the same session; 0.65 on an A100 80GB SXM4 (9.5 against kev-4b's 14.2-15.1) |
+| `clef-flash` | 0.85 | derived, not measured: 23.8 requests/s of its mix with images, from 25.8 of its mix without them in the same session and the GPU time of its requests with images measured on an H100 (`MINING.md`); without images 0.65 on an A100 80GB SXM4 (9.5 against kev-4b's 14.2-15.1) |
 
 The ratio differs by GPU: a larger model costs relatively less on a larger GPU. Re-measure on the reference GPU when
 an engine gets faster, and replace an estimate once the model's standard mix is measured.
