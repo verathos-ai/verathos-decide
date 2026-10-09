@@ -26,6 +26,7 @@ from verathos.miner.app import IDENTITY_DOMAIN, identity_payload
 from verathos.protocol import signing, tls
 from verathos.protocol.http import request_document, request_json
 from verathos.protocol.manifest import (
+    AnotherHotkeysManifest,
     Endpoint,
     Manifest,
     ManifestRejected,
@@ -106,7 +107,8 @@ class ManifestCache:
     """The last manifest each hotkey's axon served that was accepted. While the axon serves none that is (it is down,
     or restarting), the hotkey's endpoints are taken from this one, for at most ``hold_s`` after it was last fetched
     and only while the hotkey's commitment still names it: endpoints on the miner's other machines keep their
-    traffic while the machine serving its manifest is out."""
+    traffic while the machine serving its manifest is out. An axon that serves another hotkey's manifest is not out:
+    the machine serves that hotkey now, and the old manifest does not stand in."""
 
     def __init__(self, hold_s: float) -> None:
         self.hold_s = hold_s
@@ -145,6 +147,9 @@ async def _fetch_manifest(n: Neuron, netuid: int, client: httpx.AsyncClient, cat
                                                 timeout=FETCH_TIMEOUT_S, tls=tls.ANY)
         manifest = accept(document, hotkey=n.hotkey, netuid=netuid, commitment=n.commitment, catalogs=catalogs,
                           axon=base, seen=seen)
+    except AnotherHotkeysManifest as e:  # the machine moved to another hotkey: its old manifest does not stand in
+        log.info("uid %d manifest not accepted: %s", n.uid, e)
+        return None
     except Exception as e:  # whatever a neuron serves, it only costs that neuron its discovery
         held = cache.get(n, catalogs) if cache is not None else None
         if held is None:

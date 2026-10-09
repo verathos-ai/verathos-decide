@@ -158,6 +158,10 @@ class ManifestRejected(Exception):
     pass
 
 
+class AnotherHotkeysManifest(ManifestRejected):
+    """The axon serves a manifest that another hotkey signed: the machine there serves that hotkey now."""
+
+
 def axon_base(ip: str, port: int) -> str:
     """The base URL of a service at ``ip:port``: a miner's axon or another of its machines, a validator's axon
     (``https://ip:port``)."""
@@ -227,6 +231,9 @@ def accept(document: Any, *, hotkey: str, netuid: int, commitment: str | None, c
         raise ManifestRejected("not a signed manifest")
     raw = document["manifest"]
     if not signing.verify(hotkey, MANIFEST_DOMAIN, raw, document.get("signature")):
+        other = raw.get("hotkey")
+        if other != hotkey and signing.verify(other, MANIFEST_DOMAIN, raw, document.get("signature")):
+            raise AnotherHotkeysManifest(f"the axon serves the manifest of another hotkey, {other}")
         raise ManifestRejected("signature does not verify against the axon's hotkey")
     expected = committed_digest(commitment)
     if expected is None:
