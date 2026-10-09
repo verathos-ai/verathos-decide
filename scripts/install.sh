@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
-# Install or update a Verathos miner or validator (Ubuntu 22.04 or 24.04), then set it up.
+# Install or update a Verathos miner, validator or reference machine (Ubuntu 22.04 or 24.04), then set it up.
 #
 #   curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
 #   curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator [--full]
+#   curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- reference \
+#       --allow <validator ip>
 #   bash ~/verathos-decide/scripts/install.sh uninstall [--purge]
 #
 # Installs the system packages it needs, uv, the code (in ~/verathos-decide) and its Python environment, then runs
-# `verathos-miner init` or `verathos-validator init`, which asks a few questions (or takes --yes and options) and
-# starts everything as system services. Run it again to update. It only uses a wallet's hotkey and coldkeypub.txt.
+# `verathos-miner init`, `verathos-validator init` or `verathos-reference init`, which asks a few questions (or takes
+# --yes and options) and starts everything as system services. Run it again to update. It only uses a wallet's hotkey
+# and coldkeypub.txt; a reference machine uses no wallet.
 # With --no-service it needs no root and no sudo: it installs nothing system-wide (git, ssh-keygen and curl must be
 # there; a miner also needs a C compiler), sets everything up in the user's home and prints the commands to run the
 # services under a process manager the user runs (pm2 or another).
 #
-# The first argument is miner, validator or uninstall. Options:
+# The first argument is miner, validator, reference or uninstall. Options:
 #   --source <src>  git URL, path to a git bundle, or path to a source tarball (default: the public repository;
 #                   when updating, where the installed code came from)
 #   --ref <ref>     branch, tag or commit to install (default: the newest release, a v<version> tag, once this
@@ -41,6 +44,11 @@
 #              --references resident|sequential  (full: every reference running, or one at a time, which needs
 #                                                 memory for the largest only; default: resident if they fit)
 #              --egress-ip <ip>  (full: an address its requests to miners come from; default: detected)
+#              --remote-engines <file>  (full: the references, and the auditor's screens, a reference machine
+#                                        serves it: the file its setup writes; repeat for several machines)
+#   reference: a GPU machine serving float32 references and bfloat16 screens to validators on other machines
+#              --allow <ip>[,<ip>...]  (the validator machines' addresses; every other address is dropped)
+#              --model <id>[,<id>...] --no-screens --device auto|cpu|gpu --public-ip <ip> --port <port>
 set -euo pipefail
 
 PUBLIC_REPOSITORY="https://github.com/<org>/verathos.git"
@@ -55,14 +63,14 @@ usage() {
   if [ -f "${BASH_SOURCE[0]:-}" ]; then
     sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
   fi
-  echo "usage: install.sh miner|validator|uninstall [options]"
+  echo "usage: install.sh miner|validator|reference|uninstall [options]"
 }
 
 main() {
   local role="" source="" ref="" dir="" purge="" no_service="" no_firewall="" home="$HOME/.verathos"
   local -a init_args=()
   case "${1:-}" in
-    miner|validator|uninstall) role="$1"; shift ;;
+    miner|validator|reference|uninstall) role="$1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
@@ -162,8 +170,8 @@ user_tools() {
   command -v git >/dev/null || missing+=(git)
   command -v ssh-keygen >/dev/null || missing+=(openssh-client)  # verifies release signatures
   command -v uv >/dev/null || [ -x "$HOME/.local/bin/uv" ] || command -v curl >/dev/null || missing+=(curl)
-  # Miners: the fused engine kernels are compiled on first use.
-  [ "$1" = miner ] && ! command -v cc >/dev/null && missing+=(build-essential)
+  # Miners and reference machines (their screens are the miners' engine): kernels are compiled on first use.
+  [ "$1" != validator ] && ! command -v cc >/dev/null && missing+=(build-essential)
   [ ${#missing[@]} -eq 0 ] && return
   die "missing: ${missing[*]}. With --no-service nothing is installed system-wide: have them installed (apt-get install -y ${missing[*]}), or run this without --no-service as root or with sudo"
 }
@@ -183,8 +191,9 @@ check_os() {
 
 system_packages() {
   local -a wanted=(ca-certificates curl git openssh-client) missing=()
-  # Miners: the fused engine kernels are compiled on first use; the firewall is nftables.
-  [ "$1" = miner ] && wanted+=(build-essential)
+  # Miners and reference machines (their screens are the miners' engine): kernels are compiled on first use. The
+  # miner's firewall is nftables.
+  [ "$1" != validator ] && wanted+=(build-essential)
   [ "$1" = miner ] && [ -z "${2:-}" ] && wanted+=(nftables)
   # Containers without systemd run the services under supervisord.
   [ -d /run/systemd/system ] || wanted+=(supervisor)
@@ -355,7 +364,7 @@ link_commands() {
   local dir="$1" bin c
   bin="$(command_dir)"
   mkdir -p "$bin"
-  for c in verathos-miner verathos-validator; do
+  for c in verathos-miner verathos-validator verathos-reference; do
     ln -sf "$dir/.venv/bin/$c" "$bin/$c"
   done
 }
@@ -364,7 +373,7 @@ uninstall() {
   local dir="$1" home="$2" purge="$3" role bin c
   local -a home_arg=()
   [ "$home" = "$HOME/.verathos" ] || home_arg=(--home "$home")
-  for role in miner validator; do
+  for role in miner validator reference; do
     if [ -f "$home/install/$role.json" ]; then
       [ -x "$dir/.venv/bin/verathos-$role" ] || die "the $role was set up from another directory: pass its --dir"
       say "Removing the $role"
@@ -372,7 +381,7 @@ uninstall() {
     fi
   done
   bin="$(command_dir)"
-  for c in verathos-miner verathos-validator; do
+  for c in verathos-miner verathos-validator verathos-reference; do
     if [ -L "$bin/$c" ] && [ "$(readlink "$bin/$c")" = "$dir/.venv/bin/$c" ]; then
       rm -f "$bin/$c"
     fi
@@ -385,7 +394,8 @@ uninstall() {
   fi
   if [ -n "$purge" ]; then
     # What the setups keep there; other programs may keep files in the same directory.
-    for c in install catalog engines hf miner validator miner.json validator.json; do
+    for c in install catalog engines hf miner validator reference miner.json validator.json reference.json \
+      reference-engines.json; do
       rm -rf "${home:?}/$c"
     done
     if rmdir "$home" 2>/dev/null; then

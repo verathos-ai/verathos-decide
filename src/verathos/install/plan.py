@@ -304,6 +304,60 @@ def choice_lines(gpus: list[Gpu], chosen: Mapping[int, Choice], offered: list[st
                     f"{','.join(example)}"]
 
 
+@dataclass(frozen=True)
+class Need:
+    """What an engine needs to run: memory on a GPU, and in RAM; None where it may not run."""
+
+    gpu: int | None
+    ram: int | None
+
+
+def reference_need(parameters: int, device: str) -> Need:
+    """A float32 reference's need where ``device`` lets it run: on a GPU ("auto" or "gpu"), in RAM ("auto" or
+    "cpu")."""
+    if device not in ("auto", "cpu", "gpu"):
+        raise PlanError(f"unknown device {device!r}")
+    return Need(reference_memory(parameters, "gpu") if device != "cpu" else None,
+                reference_memory(parameters, "cpu") if device != "gpu" else None)
+
+
+def place(needs: Mapping[str, Need], order: list[str], gpu_free: dict[int, int], ram_free: int,
+          keep: Mapping[str, str], optional: Collection[str] = (),
+          what: Callable[[str], str] = lambda key: f"the {key} reference") -> dict[str, str]:
+    """Where each engine of ``needs`` runs: ``"cpu"`` or ``"cuda:<index>"``.
+
+    An engine an earlier setup placed (``keep``) stays where it is if it may run there (its memory is already taken).
+    The others go in ``order``, each on the GPU with the most free memory while one has room, else in RAM. The
+    ``optional`` ones are left out (absent from the result) where they do not fit. Raises PlanError if another fits
+    nowhere (``what`` names it)."""
+    placement: dict[str, str] = {}
+    for key, where in keep.items():
+        need = needs.get(key)
+        on_gpu = where.startswith("cuda:") and int(where.split(":", 1)[1]) in gpu_free
+        if need is not None and ((where == "cpu" and need.ram is not None) or (on_gpu and need.gpu is not None)):
+            placement[key] = where
+    free, ram = dict(gpu_free), ram_free
+    for key in (k for k in order if k not in placement):
+        need = needs[key]
+        if need.gpu is not None and free:
+            index = max(free, key=lambda i: (free[i], -i))
+            if free[index] >= need.gpu:
+                placement[key] = f"cuda:{index}"
+                free[index] -= need.gpu
+                continue
+        if need.ram is not None and ram >= need.ram:
+            placement[key] = "cpu"
+            ram -= need.ram
+            continue
+        if key in optional:
+            continue
+        places = [f"{n / GiB:.0f} GiB {where}" for n, where in ((need.gpu, "on a GPU"), (need.ram, "of RAM"))
+                  if n is not None]
+        raise PlanError(f"{what(key)} needs about {' or '.join(places)}; not enough is free (RAM {ram / GiB:.0f} GiB"
+                        + "".join(f", GPU {i} {f / GiB:.0f} GiB" for i, f in sorted(free.items())) + ")")
+    return placement
+
+
 def place_references(parameters: dict[str, int], gpu_free: dict[int, int], ram_free: int, device: str,
                      keep: dict[str, str], optional: Collection[str] = ()) -> dict[str, str]:
     """Where the reference engine of each model (model -> parameters) runs: ``"cpu"`` or ``"cuda:<index>"``.
@@ -315,36 +369,43 @@ def place_references(parameters: dict[str, int], gpu_free: dict[int, int], ram_f
     model fits nowhere."""
     if device not in ("auto", "cpu", "gpu"):
         raise PlanError(f"unknown device {device!r}")
-    placement: dict[str, str] = {}
-    for model, where in keep.items():
-        on_gpu = where.startswith("cuda:") and int(where.split(":", 1)[1]) in gpu_free
-        if model in parameters and ((where == "cpu" and device != "gpu") or (on_gpu and device != "cpu")):
-            placement[model] = where
-    free, ram = dict(gpu_free), ram_free
-    for model in sorted((m for m in parameters if m not in placement),
-                        key=lambda m: (m in optional, parameters[m], m)):
-        gpu_need, cpu_need = reference_memory(parameters[model], "gpu"), reference_memory(parameters[model], "cpu")
-        if device != "cpu" and free:
-            index = max(free, key=lambda i: (free[i], -i))
-            if free[index] >= gpu_need:
-                placement[model] = f"cuda:{index}"
-                free[index] -= gpu_need
-                continue
-        if device != "gpu" and ram >= cpu_need:
-            placement[model] = "cpu"
-            ram -= cpu_need
-            continue
-        if model in optional:
-            continue
-        needs = {"auto": f"{gpu_need / GiB:.0f} GiB on a GPU or {cpu_need / GiB:.0f} GiB of RAM",
-                 "cpu": f"{cpu_need / GiB:.0f} GiB of RAM", "gpu": f"{gpu_need / GiB:.0f} GiB on a GPU"}[device]
-        raise PlanError(f"the {model} reference needs about {needs}; not enough is free (RAM {ram / GiB:.0f} GiB"
-                        + "".join(f", GPU {i} {f / GiB:.0f} GiB" for i, f in sorted(free.items())) + ")")
-    return placement
+    needs = {m: reference_need(p, device) for m, p in parameters.items()}
+    order = sorted(parameters, key=lambda m: (m in optional, parameters[m], m))
+    return place(needs, order, gpu_free, ram_free, keep, optional)
+
+
+REFERENCE, SCREEN = "reference", "screen"
+
+
+def engine_key(kind: str, model: str) -> str:
+    """A reference machine's engine: ``reference/<model>`` (float32) or ``screen/<model>`` (bfloat16)."""
+    return f"{kind}/{model}"
+
+
+def place_engines(parameters: dict[str, int], families: Mapping[str, str], screens: Collection[str],
+                  gpu_free: dict[int, int], ram_free: int, device: str, keep: Mapping[str, str]) -> dict[str, str]:
+    """Where a reference machine runs its engines (``engine_key`` -> ``"cpu"`` or ``"cuda:<index>"``): each model's
+    float32 reference (model -> parameters), and the bfloat16 screen of the ``screens`` models (``families``: model ->
+    engine family, ``miner_memory``).
+
+    As ``place_references``, smallest first, on the GPU with the most free memory while one has room: a reference
+    that fits no GPU runs in RAM (``device`` "auto"), or only in RAM ("cpu") or only on a GPU ("gpu", the references
+    placed before the screens); a screen runs on a GPU only and is left out where none has room. Engines placed
+    before keep their place. Raises PlanError if a reference fits nowhere."""
+    if device not in ("auto", "cpu", "gpu"):
+        raise PlanError(f"unknown device {device!r}")
+    needs = {engine_key(REFERENCE, m): reference_need(p, device) for m, p in parameters.items()}
+    needs |= {engine_key(SCREEN, m): Need(miner_memory(parameters[m], families[m]), None) for m in screens}
+    gpu_size = {engine_key(REFERENCE, m): reference_memory(p, "gpu") for m, p in parameters.items()}
+    gpu_size |= {engine_key(SCREEN, m): miner_memory(parameters[m], families[m]) for m in screens}
+    order = sorted(needs, key=lambda k: (device == "gpu" and k.startswith(SCREEN), gpu_size[k], k))
+    optional = [k for k in needs if k.startswith(SCREEN)]
+    return place(needs, order, gpu_free, ram_free, keep, optional,
+                 what=lambda key: "the {1} {0}".format(*key.split("/", 1)))
 
 
 def place_one_at_a_time(parameters: dict[str, int], gpu_free: dict[int, int], ram_free: int, device: str,
-                        keep: dict[str, str], optional: Collection[str] = ()) -> dict[str, str]:
+                        keep: Mapping[str, str], optional: Collection[str] = ()) -> dict[str, str]:
     """Where each reference runs when the validator runs them one at a time (``reference_mode`` sequential): each
     alone in the free memory, so the memory needs only the largest. A placement an earlier setup chose stays where
     ``device`` allows it; the others go on the GPU with the most free memory if it holds them (``device`` "auto" or

@@ -25,6 +25,11 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 
 # a full validator: it checks the miners' answers itself on reference models, on GPUs or in RAM
 curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --full
+
+# a reference machine: a GPU machine serving a full validator's engines over TLS, to its address only; the validator
+# then runs on a machine without a GPU (validator --full --remote-engines reference-engines.json)
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- reference \
+    --allow <validator ip>
 ```
 
 Light validators follow the auditor's results; full validators check answers independently
@@ -64,7 +69,7 @@ memory for the largest only; `--candidates` adds the candidates' references wher
 | | |
 |---|---|
 | [Mining](docs/MINING.md) | hardware, one-command and manual install, engines, configuration, running a miner |
-| [Validating](docs/VALIDATING.md) | light and full mode, one-command and manual install, reference engines, configuration, the auditor |
+| [Validating](docs/VALIDATING.md) | light and full mode, one-command and manual install, reference engines (on the machine or a GPU machine of their own), configuration, the auditor |
 | [Scoring](docs/SCORING.md) | how answers are verified and scored |
 | [Throughput audit](docs/THROUGHPUT_AUDIT.md) | declared capacity, the network-wide tests, verdicts, policy |
 | [Gateway](docs/GATEWAY.md) | user traffic: keys, limits, routing, answer checks, running it |
@@ -83,7 +88,8 @@ src/verathos/
   gateway/     verathos-gateway: user traffic to the proven capacity
   engine/      verathos-engine for model families served from their repository code (Clef)
   subnet/      chain helpers miners and validators share, and the verathos-subnet admin CLI
-  install/     guided setup: verathos-miner init, verathos-validator init, uninstall
+  reference/   a reference machine's front: its engines over TLS to its callers' addresses, with a key
+  install/     guided setup: verathos-miner init, verathos-validator init, verathos-reference init, uninstall
   release.py   the release version and the weights version key
   update.py    self-update to each signed release tag
 native/loadgen/  Rust load generator the auditor drives the tests with

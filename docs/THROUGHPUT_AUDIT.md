@@ -342,8 +342,9 @@ The auditor needs:
 - the answer recomputes: `answer_checks_per_test` per endpoint and test, within 15 minutes of the traffic. On an
   A100 with Kev-4B's request mix, fp32 recomputes about 2 per second and bf16 about 6, so a bf16 screen covers
   1,000 endpoints in about 6 minutes, with the fp32 reference (CPU is enough) confirming only what it flags. The
-  screen can run on another machine over https (its `tls_pin`, or a public CA's certificate) with a key; while it
-  is unreachable, recomputes are skipped and receipts are still checked. For a model that reads images, the reference
+  screen and the reference can run on a GPU machine of their own over https, with its pin and key (a reference
+  machine, `VALIDATING.md`). An answer the screen cannot recompute (it is down, or refuses the request) the fp32
+  reference recomputes; one neither can stays unchecked, and receipts are still checked. For a model that reads images, the reference
   runs on a GPU, beside the model's screen (`VALIDATING.md`): every recompute must answer within 30 s;
 - a public IP and port for its service, which serves TLS with the certificate the catalog's `auditor.tls` pins
   (`SUBNET_ADMIN.md`), and an uplink for the whole network's test traffic in one burst: about

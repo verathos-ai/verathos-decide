@@ -41,6 +41,10 @@ class ReferenceEngine(BaseModel):
         except ValueError:
             return False
 
+    def remote(self) -> bool:
+        """Whether the engine is reached over TLS, as an engine on another machine is (``verathos.reference``)."""
+        return urlsplit(self.url).scheme == "https"
+
     @model_validator(mode="after")
     def _remote_needs_tls(self) -> ReferenceEngine:
         engine_tls(self.url, self.tls_pin)

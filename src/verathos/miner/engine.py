@@ -15,6 +15,10 @@ from pydantic import ValidationError
 from verathos.protocol import tls
 from verathos.protocol.api import SystemOneResponse
 
+GATEWAY_ERRORS = (502, 503, 504)
+REFUSED = {401: "refuses the key", 403: "refuses this machine's address", 404: "serves no such engine",
+           **dict.fromkeys(GATEWAY_ERRORS, "its engine does not answer")}
+
 
 class EngineError(Exception):
     pass
@@ -68,18 +72,29 @@ class HttpEngine:
             return None
 
     async def reachable(self) -> bool:
-        """Whether the engine answers HTTP at all (any reply: it is up)."""
+        """Whether the engine is up: it answers HTTP, with anything but a gateway error (502-504), which a front
+        before it (``verathos.reference``) answers while the engine behind does not."""
         try:
-            await self._client.get(self._base + "/v1/models", headers=self._headers, extensions=self._extensions)
+            r = await self._client.get(self._base + "/v1/models", headers=self._headers, extensions=self._extensions)
         except httpx.HTTPError:
             return False
-        return True
+        return r.status_code not in GATEWAY_ERRORS
+
+    async def problem(self) -> str | None:
+        """Why the engine does not serve now (its ``GET /v1/models`` is not answered 200), or None if it does."""
+        try:
+            r = await self._client.get(self._base + "/v1/models", headers=self._headers, extensions=self._extensions)
+        except httpx.HTTPError as exc:
+            return f"unreachable ({type(exc).__name__}{': ' + str(exc).splitlines()[0] if str(exc) else ''})"
+        if r.status_code == 200:
+            return None
+        return f"{REFUSED.get(r.status_code, 'answers')} (HTTP {r.status_code})"
 
     async def answer(self, request: dict[str, Any]) -> dict[str, Any]:
         try:
             r = await self._client.post(self._url, json=request, headers=self._headers, extensions=self._extensions)
         except httpx.HTTPError as e:
-            raise EngineError(f"engine unreachable: {e}") from e
+            raise EngineError(f"engine unreachable: {type(e).__name__}{': ' + str(e) if str(e) else ''}") from e
         if r.status_code != 200:
             raise EngineError(f"engine returned {r.status_code}: {r.text[:200]}")
         try:

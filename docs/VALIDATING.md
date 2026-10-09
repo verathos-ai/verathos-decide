@@ -9,7 +9,7 @@ runs in one of two modes (`mode` in `validator.json`; `--light` or `--full` for 
 |---|---|---|
 | What it does | sets the weights the subnet owner's validator (the auditor) publishes each epoch, once their signature verifies | discovers miners, sends every endpoint canary requests, compares the answers with its own float32 references, applies the auditor's signed throughput verdicts, scores, sets weights |
 | Requests to miners | none | identity challenges and canaries to every endpoint |
-| Hardware | a small Linux machine, no GPU | a float32 reference engine per active model, in RAM or on GPUs: all resident (Kev-4B, Kev-9B and Clef-flash: about 103 GiB of RAM) or one at a time (about 42 GiB, for the largest) |
+| Hardware | a small Linux machine, no GPU | a float32 reference engine per active model, in RAM or on GPUs: all resident (Kev-4B, Kev-9B and Clef-flash: about 103 GiB of RAM) or one at a time (about 42 GiB, for the largest); or a machine without a GPU, its engines on a GPU machine of their own ([Engines on a GPU machine of their own](#engines-on-a-gpu-machine-of-their-own)) |
 | Stake | a validator permit | a validator permit and the catalog's `validator_min_stake` (10,000), or miners refuse it |
 | Download | the code | the code, the engines and the model weights (tens of GB) |
 
@@ -41,8 +41,10 @@ A full validator also needs:
   `scoring.validator_requests_per_epoch` requests per endpoint and epoch (by default 4 x `canary_pool_size`, 64),
   more than three times what an epoch's canaries and identity challenges take; a refusal for it in the log is a
   fault of the validator.
-- One reference engine per active catalog model, and optionally per candidate model to check its endpoints too. The
-  reference is the model run in fp32; CPU is enough because each canary is computed once per epoch and reused for every
+- One reference engine per active catalog model, and optionally per candidate model to check its endpoints too, on
+  the validator's machine or on a GPU machine of their own
+  ([Engines on a GPU machine of their own](#engines-on-a-gpu-machine-of-their-own)). The reference is the model run in
+  fp32; CPU is enough because each canary is computed once per epoch and reused for every
   endpoint, so the reference work does not grow with the number of miners: 16 canaries per model and epoch
   (`canary_pool_size`). They are computed within 30% of the canaries' time, about 6.5 minutes per epoch: resident
   references side by side (a candidate's reference on the same CPU shares it with the active ones), or one at a time
@@ -177,6 +179,7 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 | `--candidates` | also run references for the catalog's candidate models, in the memory the active ones leave; a later run keeps them, `--no-candidates` removes them |
 | `--dry-run` | compute weights without setting them; `--no-dry-run` sets them again |
 | `--egress-ip` | full: a public address its requests to miners come from (repeat for several); default: as configured, else the machine's detected public IPv4 address |
+| `--remote-engines` | full: the file a reference machine writes: its references, and the auditor's screens, replace local ones ([Engines on a GPU machine of their own](#engines-on-a-gpu-machine-of-their-own)); repeat for several machines; a later run keeps them, `''` removes them |
 | `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), a `wss://` subtensor node, or a node on this machine (`local`, `ws://127.0.0.1:<port>`) |
 | `--no-auto-update` | the validator does not update its code by itself to each new release; `--auto-update` turns that on again (off for the subnet owner's validator) ([Update](#update)) |
 | `--no-service` | no root, no system packages and no services: print the commands to run under a process manager you run ([Without root](#without-root-pm2-or-another-process-manager)) |
@@ -188,7 +191,8 @@ What it does (a full validator; light, see below):
 2. puts the code in `~/verathos-decide` (an install from before in `~/verathos` stays there) with its Python
    environment, and `verathos-validator` on the `PATH`;
 3. checks the hotkey, its registration and validator permit, and reads the catalog the subnet owner commits;
-4. places a float32 reference engine for every `active` model in the free memory, smallest first: on the GPU with
+4. places a float32 reference engine for every `active` model whose reference is not on a reference machine
+   (`--remote-engines`) in the free memory, smallest first: on the GPU with
    the most free memory while one has room, otherwise in RAM. With `--candidates` it then places the `candidate`
    models (checked, scored zero) in what is left, and leaves out one that does not fit. When the active models'
    references do not all fit at once, it runs them one at a time, each placed alone in the free memory
@@ -345,11 +349,112 @@ stay). Wallets are never touched.
 | `references one at a time: checked ...; taken from ...` | the reference time held only the models checked; every model is checked at least once every `2k` epochs ([Coverage](#references-resident-or-one-at-a-time)). Resident references (more memory) or a faster machine check more each epoch |
 | `the kev-9b reference did not start: ...` | its log, `~/.verathos/validator/references/kev-9b.log`; `another process holds its port`: a reference service of a resident setup still runs, run the installer again |
 | `the kev-9b reference needs about ..., even one at a time` | the largest reference needs that much free memory: free or add some, or `--device` for a GPU |
-| `no reference engine configured for the active models` | the catalog activated a model: run the command again |
+| `no reference engine configured for the active models` | the catalog activated a model: run the command again (with a reference machine: install the model there, then run this with its new file) |
+| `engines on other machines not serving: ... unreachable (ConnectTimeout)` | the reference machine is gone, or its front drops this machine's address: `--allow` there must list the address this validator's requests leave from ([When the GPU machine is gone](#when-the-gpu-machine-is-gone)) |
+| `... refuses the key (HTTP 401)`, `... certificate pin ... is not the pinned ...` | the reference machine has another key or certificate (set up again, or a new machine): take its new file with `--remote-engines` |
+| `... its engine does not answer (HTTP 502)` | the engine behind the front is starting or down: its log on the reference machine (`supervisorctl status`, `/var/log/verathos/verathos-reference-<model>.log`) |
+| `engines on other machines run other engine code than this validator's release` | the reference machine runs another release than this validator: `install.sh reference --yes` there updates it and restarts those engines ([Engines on a GPU machine of their own](#engines-on-a-gpu-machine-of-their-own)) |
 | `this validator's release is too old to set weights` | the subnet owner retired this release (`WeightsVersionKey`): update the code |
 | `the subnet's catalog is not available` | the subnet owner's axon serves it; add a mirror to `catalog_mirrors` in `validator.json` |
 | `this is the subnet owner's hotkey` | the owner's validator also serves the catalog and runs the throughput audit: set `public_host` and `port`, and build the load generator ([1. Install](#1-install)) |
 | `curl: command not found`, `coldkeypub.txt not found`, no services after a container restart, `local changes in ... stop the update`, `v... is not signed ...: not installing it`, slow downloads | as for miners (`MINING.md`) |
+
+## Engines on a GPU machine of their own
+
+A full validator, the auditor included, can run on a machine without a GPU, its engines on a GPU machine of their
+own (a reference machine): the float32 references and, for the auditor, the bfloat16 screens. The reference machine
+runs no validator and holds no wallet: it lends its GPUs, serving its engines over TLS, with a key, to the validators'
+addresses only. It can be a rented GPU machine, a container without systemd too; the validator and its keys stay on
+the validator's machine.
+
+On the GPU machine (Ubuntu 22.04 or 24.04 with the NVIDIA driver and one open TCP port), as root or with sudo:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- reference \
+    --allow 203.0.113.9 --port 8443
+```
+
+| Option | Meaning |
+|---|---|
+| `--allow` | the validator machines' public addresses, comma-separated, the addresses their requests leave from; required the first time, a later run keeps them and `--allow` replaces them |
+| `--model` | the models to serve, comma-separated; default: the catalog's active models, or those named before (`auto`: the active models again) |
+| `--no-screens` | the references only (a validator other than the auditor uses no screens); `--screens` runs them again |
+| `--device` | where the references run: `auto` (on GPUs while they fit, the smallest engines first, else in RAM), `cpu` (in RAM, the GPUs left to the screens) or `gpu` (on GPUs, before the screens) |
+| `--public-ip`, `--port` | the address the validators reach it at (default: detected) and the front's TCP port (default 8443) |
+| `--network`, `--netuid` | the chain whose committed catalog pins the models: `finney` and 96 by default, `test` and 405 |
+| `--no-service`, `--source`, `--ref`, `--dir` | as for validators |
+
+What it does:
+1. installs `git`, `openssh-client`, `curl`, `build-essential` (the screens compile their GPU kernels on first use)
+   and, in a container without systemd, `supervisor`; then uv, Python 3.12 and the code, as for validators;
+2. reads the catalog the subnet owner commits and installs, per model, its float32 reference (the validators' engine,
+   without the fused kernels) and its bfloat16 screen (the miners' engine), and downloads the pinned weights;
+3. places the engines as a validator places its references, the smallest first, each on the GPU with the most free
+   memory while one has room: a reference that fits no GPU runs in RAM, a screen that fits no GPU is left out (the
+   reference then recomputes that model's checks itself). On one A100 80 GB with 216 GiB of RAM, for Kev-4B, Kev-9B
+   and Clef-flash, the three screens share the GPU and the references run in RAM (about 104 GiB). Measured there:
+   the screens, placed at about 62 GiB, held 77 GB after their first checks and peaked at 79.5 GB of the 80 GB under
+   bursts of 64 requests each at once (the auditor sends at most 4 at once); a screen answered in 0.1 to 0.2 s, a
+   reference in RAM in 15 to 22 s with the three busy on the machine's 24 cores, Clef-flash's test requests with an
+   image in about 25 s, so for the auditor give Clef-flash's reference a GPU
+   ([The auditor's GPU](#the-auditors-gpu-for-a-model-that-reads-images));
+4. runs each engine as a service on `127.0.0.1` (`verathos-reference-<model>`, `verathos-screen-<model>`) and the front
+   (`verathos-reference`) on the port. The front serves TLS with a certificate of its own
+   (`~/.verathos/reference/tls.crt`), which validators accept by its pin, needs the callers' bearer key
+   (`~/.verathos/reference/api.key`; 401 without it) and routes `/reference/<model>` and `/screen/<model>` to the
+   engines. Only the `--allow` addresses reach it: a filter on its listening socket drops every other address before
+   TCP answers, which needs no root and no firewall rule (a container cannot set one), and the front refuses (403) one
+   that gets through; the machine's own loopback always passes;
+5. checks each engine through the front, as a validator reaches it, and writes `~/.verathos/reference-engines.json`
+   (mode 600) and prints it: per model the URLs of its reference and screen, the front's TLS pin and the key, as
+   `validator.json` takes them (`references` and `audit_screens`).
+
+Copy the file to the validator machine (`scp root@<gpu machine>:.verathos/reference-engines.json .`) and run the
+validator's installer there with it:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --full \
+    --remote-engines reference-engines.json
+```
+
+It writes the file's references into `validator.json`, and for the subnet owner's validator (the auditor) its screens
+into `audit_screens`; shows what each serves as the validator reaches it (its pin and key); and installs no engine and
+no weights for those models: with every active model in the file, it installs the validator alone. The active models
+the file does not hold get references on the validator's machine as usual. Running the installer again keeps them;
+`--remote-engines` replaces them (repeat it for several GPU machines, each model on one; `''` removes them).
+
+Each engine runs the code of the release installed on the GPU machine: the screens and Clef-flash's reference are
+that code (`verathos-engine`), the Kev engines the revision the catalog pins. The installer shows, through the front,
+each engine's revision and the engine code it names, against its own release's, and keeps them in
+`~/.verathos/install/reference.json`. Install the GPU machine from the release the validators run. It does not update
+itself: running `install.sh reference` again updates it in place (the same certificate, so the same pin, and key) to
+the newest release, and restarts the engines whose code or pinned revision changed. Run it after the validators
+update, as each logs one line per epoch while an engine on another machine runs other engine code than its own
+release, and when the catalog pins other weights; when the catalog activates a model, run it and then the validator's
+installer with the new file. `install.sh uninstall` removes the engines and the front; `--purge` also deletes the
+certificate, the key and the file.
+
+### When the GPU machine is gone
+
+Rented machines end. While an engine on another machine does not serve, the validator logs one line per epoch:
+
+```
+epoch 45470: engines on other machines not serving: the clef-flash reference at https://198.51.100.7:8443/reference/clef-flash: unreachable (ConnectTimeout); what they check stays unchecked, not penalized, until they serve again (docs/VALIDATING.md, When the GPU machine is gone)
+```
+
+and `the engines on other machines serve again` once they do. Meanwhile what they check stays unchecked, never
+penalized, as with a local reference that is down: the model's endpoints get no canaries and keep their averages (at
+most 3 epochs in a row, `SCORING.md`); the auditor recomputes an answer its screen cannot on the fp32 reference, and
+with the reference gone too leaves it unchecked (receipts are still checked); a full validator applies a proven wrong
+answer in the auditor's verdicts on the auditor's word. To replace the machine:
+
+1. rent a GPU machine with an open TCP port;
+2. on it: `install.sh reference --allow <the validator's address> --port <port>`;
+3. copy its `reference-engines.json` to the validator machine;
+4. there: `install.sh validator --yes --remote-engines reference-engines.json`, which restarts the validator (with
+   `--no-service`, restart it yourself); the auditor's restart voids a test it runs, so restart it between tests.
+
+The validator uses the new engines from its next epoch.
 
 ## Manual installation
 
@@ -450,7 +555,7 @@ of a full validator:
 | `mode` | `full` | `light` or `full` ([Two modes](#two-modes)); the subnet owner's validator does not start in light mode |
 | `source_hotkey` | the subnet owner's | light: the validator whose published weights to set; full with references one at a time: the validator whose results the models not checked take. Another validator must hold a validator permit and serve its results (a full validator with `public_host`) |
 | `mechid` | the catalog's | mechanism the weights are set on and manifests are accepted for, instead of the catalog's `mechanism`; leave it unset to follow the catalog |
-| `references` | {} | full: model id -> the model's fp32 reference engine: a URL (plain http on `127.0.0.1` only), or `{"url", "api_key", "tls_pin"}` for a remote engine over https, accepted by its certificate's pin or, without one, by a public CA's certificate for its hostname (the Kev server takes its key from `KEV_API_KEY`), or for references one at a time `{"url", "command", "directory", "environment"}`: the command that serves it at the URL on `127.0.0.1`, which the validator runs when it checks the model (the installer writes them; a reference without a command is taken as running). Every `active` model needs one: the validator does not start without, and stops when a new catalog activates a model it has none for; `candidate` models without one are not audited by this validator. Light validators ignore it |
+| `references` | {} | full: model id -> the model's fp32 reference engine: a URL (plain http on `127.0.0.1` only), or `{"url", "api_key", "tls_pin"}` for a remote engine over https, accepted by its certificate's pin or, without one, by a public CA's certificate for its hostname (the Kev server takes its key from `KEV_API_KEY`), or for references one at a time `{"url", "command", "directory", "environment"}`: the command that serves it at the URL on `127.0.0.1`, which the validator runs when it checks the model (the installer writes them; a reference without a command is taken as running). A reference machine's file holds the remote form ([Engines on a GPU machine of their own](#engines-on-a-gpu-machine-of-their-own)). Every `active` model needs one: the validator does not start without, and stops when a new catalog activates a model it has none for; `candidate` models without one are not audited by this validator. Light validators ignore it |
 | `reference_mode` | `resident` | full: `resident` or `sequential` (one at a time, [References](#references-resident-or-one-at-a-time)); the subnet owner's validator does not start one at a time |
 | `audit_screens` | {} | auditor only: model id -> a bf16 engine (same forms) that screens the sampled answers, with their images for a model that reads them (the miners' engine reads them); an answer it flags counts as wrong only once the fp32 reference confirms it |
 | `state_dir` | `~/.verathos/validator` | scores, the canary secret, the auditor database; references one at a time: their times (`references.json`) and logs (`references/`); light: the last epoch whose weights it set |
@@ -650,13 +755,11 @@ four images of 256 to 1024 px), half of them answers given without the images. T
 1.5 s; the reference confirmed each of the 136 flags within 10.4 s, four of them queued at once (alone, the largest
 request, four images of 1 MP and about 1,000 tokens of text, takes it 2.6 s); no correct answer was flagged.
 
-**The reference on a GPU of its own, on another machine**: `verathos-engine` as above (`--dtype float32`) on that
-machine's loopback, behind nginx with TLS (a certificate whose pin the auditor names), a check of the bearer key and an
-allowlist of the auditor's addresses, and in `validator.json`
-`"references": {"clef-flash": {"url": "https://<host>:<port>", "api_key": "<key>", "tls_pin": "<pin>"}}`. A screen can
-run on the auditor's GPU as above, or remotely in the same form under `audit_screens`; without one, the reference
-recomputes every check itself. The 30 s include the request's way there: a request with images is at most
+**On a reference machine** ([Engines on a GPU machine of their own](#engines-on-a-gpu-machine-of-their-own)): its
+references and screens over TLS, with the auditor's machine needing no GPU. Give the model's reference a GPU there:
+a machine for that model alone (`--model clef-flash`: on one 80 GB GPU its reference and screen fit side by side), or
+`--device gpu` where the GPUs hold every reference; without a screen, the reference recomputes every check itself. The 30 s include the request's way there: a request with images is at most
 `images.max_request_bytes`, mostly far less (four canonical photos of 1 MP are about 2 MB).
 
-The installer places the references on the auditor's machine; the screen and a remote reference are set up by hand,
-as above.
+The installer places the references on the auditor's machine, or takes them and the screens from reference machines
+(`--remote-engines`); a screen on the auditor's own machine is set up by hand, as above.

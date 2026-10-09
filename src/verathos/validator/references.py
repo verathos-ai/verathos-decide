@@ -32,6 +32,14 @@ def served_revisions(info: Any) -> set[str]:
     return out
 
 
+def served_code(info: Any) -> set[str]:
+    """The engine code versions an engine's ``GET /v1/models`` document names (``verathos-engine`` names the digest of
+    its source, ``verathos.engine.code_version``); none for an engine that names none (the Kev server)."""
+    models = (info.get("data") or info.get("models")) if isinstance(info, dict) else None
+    return {m["code"] for m in models if isinstance(m, dict) and isinstance(m.get("code"), str)} if isinstance(
+        models, list) else set()
+
+
 async def wrong_revision(engine: Engine, model: CatalogModel) -> str | None:
     """Why ``engine`` must not answer for ``model`` now: it names the weights it serves, and they are not the pinned
     ones. None if it may."""
