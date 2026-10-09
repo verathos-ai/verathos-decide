@@ -129,7 +129,7 @@ Each epoch logs one line with the models checked and those taken from the source
 warning when one was not:
 
 ```
-epoch 45406: references one at a time: checked kev-4b, clef-flash; taken from the subnet owner's validator 5D...: kev-9b (not drawn)
+epoch 45406: references one at a time: checked clef-flash, kev-4b; taken from the subnet owner's validator 5D...: kev-9b (not drawn)
 ```
 
 and, without the source's results,
@@ -245,7 +245,7 @@ A light validator's setup ends with its first line, and each epoch, once the aud
 
 ```
 light mode: setting the weights the subnet owner's validator publishes each epoch, once its document verifies; no requests to miners
-epoch 45406: set the weights of the subnet owner's validator 5D...: 41 UIDs, top 12: 0.081, 3: 0.074, 27: 0.069, 8: 0.052, 30: 0.047
+epoch 45406: set the weights of the subnet owner's validator 5D...: 41 UIDs, top 0: 0.410, 12: 0.081, 3: 0.074, 27: 0.069, 8: 0.052
 ```
 
 A full validator's setup ends with its first lines:
@@ -255,7 +255,8 @@ throughput tests are run by 5D...; applying its verdicts
 epoch 45406: 3 miners, 3 open endpoints
 ```
 
-At the end of each epoch it logs the emission shares, the miner share, a line per endpoint checked and the weights:
+At the end of each epoch it logs the emission shares, the miner share, a line per endpoint checked and the weights it
+sets (`set_weights mechid=0 uids=3 -> True`; in a dry run the weights themselves):
 
 ```
   emission shares: clef-flash 33.3%, kev-4b 33.3%, kev-9b 33.3%
@@ -272,7 +273,7 @@ A validator restarted in an epoch it already scored (or, light, whose weights it
 
 | | systemd | supervisord (containers) |
 |---|---|---|
-| status | `systemctl status verathos-validator` (full, resident: and `verathos-reference-kev-4b verathos-reference-kev-9b`) | `supervisorctl status` |
+| status | `systemctl status verathos-validator` (full, resident: and `verathos-reference-kev-4b verathos-reference-kev-9b verathos-reference-clef-flash`) | `supervisorctl status` |
 | validator log | `journalctl -u verathos-validator -f` | `tail -f /var/log/verathos/verathos-validator.log` |
 | reference log | `journalctl -u verathos-reference-kev-4b -f`; one at a time: `~/.verathos/validator/references/kev-4b.log` | `tail -f /var/log/verathos/verathos-reference-kev-4b.log`; one at a time: as with systemd |
 | restart after editing `validator.json` | `systemctl restart verathos-validator` | `supervisorctl restart verathos-validator` |
@@ -324,12 +325,12 @@ stay). Wallets are never touched.
 | `no egress_ips configured` | full: set the public addresses its requests to miners come from (`--egress-ip`, or `egress_ips` in `validator.json`) |
 | `this is the subnet owner's hotkey: its validator is the auditor ... runs in full mode` | the owner's validator is never light: `install.sh validator --full` |
 | `miners refuse validators below validator_min_stake` | add stake to the hotkey until its `S` reaches the catalog's minimum; miners see it within 10 minutes |
-| `the kev-9b reference needs about 42 GiB ...; not enough is free` | free memory or add some; `--device` chooses between GPU and RAM |
+| `the kev-9b reference needs about ...; not enough is free` | free memory or add some; `--device` chooses between GPU and RAM |
 | `<model> (candidate ...): no reference, not enough memory left` | a candidate's reference is optional: free memory and run the command again, or leave it to other validators |
 | `... of 16 canaries without a reference answer this epoch` | the reference's log: it is down, or too slow to compute the canaries within the epoch's reference time ([Requirements](#requirements)) |
 | `references one at a time: checked ...; taken from ...` | the reference time held only the models checked; every model is checked at least once every `2k` epochs ([Coverage](#references-resident-or-one-at-a-time)). Resident references (more memory) or a faster machine check more each epoch |
 | `the kev-9b reference did not start: ...` | its log, `~/.verathos/validator/references/kev-9b.log`; `another process holds its port`: a reference service of a resident setup still runs, run the installer again |
-| `the kev-9b reference needs about 42 GiB of RAM, even one at a time` | the largest reference needs that much free memory: free or add some, or `--device` for a GPU |
+| `the kev-9b reference needs about ..., even one at a time` | the largest reference needs that much free memory: free or add some, or `--device` for a GPU |
 | `no reference engine configured for the active models` | the catalog activated a model: run the command again |
 | `this validator's release is too old to set weights` | the subnet owner retired this release (`WeightsVersionKey`): update the code |
 | `the subnet's catalog is not available` | the subnet owner's axon serves it; add a mirror to `catalog_mirrors` in `validator.json` |
@@ -419,7 +420,8 @@ of a full validator:
   "wallet_name": "<wallet>",
   "hotkey_name": "<hotkey>",
   "mode": "full",
-  "references": {"kev-4b": "http://127.0.0.1:8101", "kev-9b": "http://127.0.0.1:8102"}
+  "references": {"kev-4b": "http://127.0.0.1:8101", "kev-9b": "http://127.0.0.1:8102",
+                 "clef-flash": "http://127.0.0.1:8103"}
 }
 ```
 
@@ -531,9 +533,9 @@ capacities, up to the model's `first_test_rps`, and fetches nothing.
 
 Validators that run a service (the subnet owner's, which is the auditor, and full validators with `public_host`) also
 serve each hotkey's status for its miners at `GET /v1/status/<hotkey>`: the UID and its share of the weights set, per
-endpoint the state in the last epoch (scored, qualifying, candidate, drifted, failed, invalid, probation), its
-checks, declared and proven capacity, how ready users found it, its latency factor and scores, and the hotkey's
-results in the auditor's last 10 tests (at most 64 endpoints each). `GET /v1/network` serves every hotkey's status of
+endpoint the state in the last epoch (scored, qualifying, candidate, drifted, failed, invalid, probation,
+unanswered, not_audited), its checks, declared and proven capacity, how ready users found it, its latency factor and
+scores, and, from the auditor, the hotkey's results in its last 10 tests (at most 64 endpoints each). `GET /v1/network` serves every hotkey's status of
 the last epoch at once (without the test results, built once per epoch), `weights`, per UID exactly the weights the
 validator set after the epoch (the subnet owner's UID's included), `mechanism`, the mechanism they are set on,
 `miner_share`, the epoch's miner share, and `usage_share`, the usage pool's (`SCORING.md`), for network dashboards and
