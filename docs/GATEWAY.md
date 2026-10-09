@@ -261,9 +261,9 @@ systemctl restart verathos-gateway;         until curl -sf http://127.0.0.1:8080
 On SIGTERM a process stops accepting connections, so the proxy sends new requests to the other one; it finishes
 the requests in flight (their checks and `request_timeout_s`), writes usage, samples and served counts (10 s each
 at most; what cannot be written is logged), and exits. A request whose process fails before answering goes to the
-other process once, unless nginx already passed its body on. A process is ready as soon as it has started: it serves the routes it kept on disk while it
-fetches new ones. A restart of the auditor does not reach users: the gateways keep their routes until it serves new
-ones. A key's rate limit starts afresh on the other process.
+other process once, unless nginx already passed its body on. A process is ready as soon as it has started: it serves
+the routes it kept on disk while it fetches new ones. A restart of the auditor does not reach users: the gateways keep
+their routes until it serves new ones. A key's rate limit starts afresh on the other process.
 
 ### More than one process
 
