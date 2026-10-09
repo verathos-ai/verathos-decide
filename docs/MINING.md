@@ -438,7 +438,7 @@ Clef-flash on one GPU, requests of about 525 tokens with one or two questions, s
 | RTX 5090 | 18 | 96 ms |
 
 The backbone's matrix multiplications are most of the work, so a GPU's bfloat16 throughput sets these figures; GeForce
-cards accumulate bfloat16 in fp32 at half their fp16 rate. Answers from all of them stay within 0.014 of the float32
+cards accumulate bfloat16 in fp32 at half their fp16 rate. Answers from all of them stay within 0.016 of the float32
 reference.
 
 A model whose catalog entry lists `image` in its `input_modalities` also gets requests with images, which the gateway
@@ -446,28 +446,37 @@ has made canonical (`GATEWAY.md`, Images); no model of the shipped catalog does 
 passes of their own, without CUDA graphs: their images through the release's vision tower, whose features take the
 image tokens' places, and the rest as for text, with image tokens counted in a pass's token budget. The tower runs in
 float16: in bfloat16, as released, answers with images drift from the float32 reference about twice as far as text
-answers, in float16 no further. A pass whose float16 features are not all finite (an activation beyond float16's range;
-the largest of the images measured reach about a fifth of it) runs its images through the tower again in bfloat16, as
-released, and the engine logs it. The float32 engine (`--dtype float32`) runs the release's own code on them. Either engine gives the release
-only a request's model, state and questions, and images only as decoded pixels: nothing fetches a URL or opens a path.
+answers on average, in float16 no further. A pass whose float16 features are not all finite (an activation beyond
+float16's range; the largest of the images measured reach about a fifth of it) runs its images through the tower again
+in bfloat16, as released, and the engine logs it. The float32 engine (`--dtype float32`) runs the release's own code on
+them. Either engine gives the release only a request's model, state and questions, and images only as decoded pixels:
+nothing fetches a URL or opens a path.
 
-Clef-flash with images on an H100 80 GB, requests of 500 to 580 tokens of text with four or five questions and square
-images, 64 at once:
+Clef-flash with images, requests of 500 to 580 tokens of text with four or five questions and square images, 64 at
+once (requests per second) and one alone:
 
-| Images per request | Image tokens | Requests per second | One request alone |
+| Images per request | Image tokens | H100 80 GB | RTX 5090 |
 |---|---|---|---|
-| one of 256 x 256 px | 67 | 45 | 62 ms |
-| four of 256 x 256 px | 265 | 33 | 64 ms |
-| one of 512 x 512 px | 259 | 36 | 60 ms |
-| four of 512 x 512 px | 1,033 | 16 | 75 ms |
-| one of 1024 x 1024 px | 1,027 | 15 | 79 ms |
-| four of 1024 x 1024 px | 4,105 | 4.1 | 240 ms |
+| one of 256 x 256 px | 67 | 49/s, 60 ms | 17/s, 140 ms |
+| four of 256 x 256 px | 265 | 33/s, 60 ms | 11/s, 140 ms |
+| one of 512 x 512 px | 259 | 36/s, 58 ms | 12/s, 138 ms |
+| four of 512 x 512 px | 1,033 | 15.5/s, 77 ms | 4.9/s, 221 ms |
+| one of 1024 x 1024 px | 1,027 | 14/s, 87 ms | 5.0/s, 215 ms |
+| four of 1024 x 1024 px | 4,105 | 4.1/s, 241 ms | 1.5/s, 681 ms |
 
-An image token takes about twice the GPU time of a text token (1.7 to 2.0 times for images of 512 px a side or more;
-an image of 256 px adds about 2 ms besides). The vision tower adds 0.9 GB of weights: PyTorch's memory peaked at 21.4
-GB allocated and 22.9 GB reserved with images (21.2 GB and 22.9 GB with text alone), and at 22.5 GB and 23.8 GB for one
-request at the 16,384-token limit, with or without images. Answers with images stay within 0.067 of the float32
-reference, with a mean difference of 0.002.
+The RTX 5090 ran in an older host (PCIe 3.0 x8, a 2016 Xeon), where the vision tower's many small host-side steps cost
+more than its GPU work for a 256 px image: a faster CPU serves small images faster.
+
+An image token takes about twice the GPU time of a text token (1.7 to 2.1 times on the H100 for images of 512 px a side
+or more, 1.6 to 1.8 on the RTX 5090; an image of 256 px adds about 2 ms besides on the H100). The vision tower adds 0.9
+GB of weights: on the H100 PyTorch's memory peaked at 21.4 GB allocated and 22.8 GB reserved with images (21.2 GB and
+22.9 GB with text alone), and at 22.5 GB and 24.0 GB for one request at the 16,384-token limit with four 1 MP images
+(22.3 GB and 23.9 GB with text only). On the RTX 5090 the engine holds 19.4 GB allocated and 20.2 GB reserved once
+loaded, and the CUDA context and libraries 1.2 GB besides. A 24 GB card has 25.8 GB (24,564 MiB), of which the driver
+keeps about 0.5 GB on a Blackwell GeForce: with PyTorch's allocator capped at 23.9 GB, what such a card leaves it,
+everything ran, the requests at the 16,384-token limit at 23.4 GB reserved and 24.6 GB on the device in all, and
+capped at 22.9 GB those requests and requests with four 1 MP images ran as well. Answers with images stay within 0.034
+of the float32 reference on both GPUs, with a mean difference of 0.0009, about that of text answers.
 
 ### 4. Configure
 

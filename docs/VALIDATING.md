@@ -639,6 +639,12 @@ and in `validator.json` `"references": {"clef-flash": "http://127.0.0.1:8103", .
 {"clef-flash": "http://127.0.0.1:8010"}`. The other models' references go to another GPU or to RAM: a third engine
 does not fit beside these two.
 
+Measured on an H100 80 GB: the reference held 36.1 GiB once loaded and the screen 20.5 GiB beside it, and the device
+peaked at 75.6 GiB of its 79.6 GiB while the auditor's own checks ran on 272 answers with images at once (from one to
+four images of 256 to 1024 px), half of them answers given without the images. The screen answered every check within
+1.5 s; the reference confirmed each of the 136 flags within 10.4 s, four of them queued at once (alone, the largest
+request, four images of 1 MP and about 1,000 tokens of text, takes it 2.6 s); no correct answer was flagged.
+
 **The reference on a GPU of its own, on another machine**: `verathos-engine` as above (`--dtype float32`) on that
 machine's loopback, behind nginx with TLS (a certificate whose pin the auditor names), a check of the bearer key and an
 allowlist of the auditor's addresses, and in `validator.json`
