@@ -169,7 +169,7 @@ class Supervisor:
         self.due.pop(p.name, None)
         copier = threading.Thread(target=self._copy, args=(p.name, child.stdout), name=f"log-{p.name}", daemon=True)
         copier.start()
-        self._copiers.append(copier)
+        self._copiers = [c for c in self._copiers if c.is_alive()] + [copier]
 
     def round(self) -> None:
         """Note what exited, and start again what is due."""

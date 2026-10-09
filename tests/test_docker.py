@@ -167,6 +167,29 @@ def test_the_containers_get_the_hotkey_and_coldkeypub_read_only_and_never_a_cold
         assert sorted(wallet_mounts) == ([] if role == "reference" else sorted(WALLET_TARGETS)), role
 
 
+def test_a_hotkey_loads_from_the_read_only_files_the_containers_mount(tmp_path, monkeypatch) -> None:
+    """The wallet's two files and directories read-only, as the bind mounts are; the rest of ~/.bittensor writable, as a
+    container's own filesystem is."""
+    import bittensor_wallet as bw
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    wallet = bw.Wallet(name="w", hotkey="h", path=str(tmp_path / ".bittensor" / "wallets"))
+    wallet.create_new_hotkey(n_words=12, use_password=False, overwrite=True, suppress=True)
+    coldkey = bw.Keypair.create_from_mnemonic(bw.Keypair.generate_mnemonic())  # only its public key is kept
+    wallet.set_coldkeypub(coldkey, overwrite=True)
+    root = tmp_path / ".bittensor" / "wallets" / "w"
+    paths = sorted(root.rglob("*"), reverse=True) + [root]
+    try:
+        for path in paths:
+            path.chmod(0o500 if path.is_dir() else 0o400)
+        loaded = common.load_hotkey("w", "h")
+        assert loaded.hotkey.ss58_address == wallet.hotkey.ss58_address
+        assert loaded.coldkeypub.ss58_address == coldkey.ss58_address
+    finally:
+        for path in paths:
+            path.chmod(0o700 if path.is_dir() else 0o600)
+
+
 @pytest.mark.parametrize("role, image, gpus, network, caps", [
     ("miner", "verathos-engines", True, "host", ["NET_ADMIN"]),
     ("validator", "verathos", False, None, None),
@@ -461,7 +484,9 @@ def test_a_miner_container_runs_an_engine_per_gpu_and_the_miner_as_the_installer
                                                                    ("python", "kev-9b", box.data / "hf")]
     assert tls.stored_pin(box.data / "miner") is not None
     out = capsys.readouterr().out
-    assert "self-update off: a release is a new image" in out and "MODEL=" not in out.split("Plan")[0]
+    assert "self-update off: a release is a new image" in out
+    assert "GPU 0: kev-9b, as MODEL asks" in out and "another choice: MODEL=<id> for every GPU" in out
+    assert "--model" not in out  # the installer's option, as it is set here
 
     # again: hand-made settings stay, the endpoints keep their engine ports, the variables decide the rest
     document = json.loads((box.data / "miner.json").read_text())
@@ -474,7 +499,8 @@ def test_a_miner_container_runs_an_engine_per_gpu_and_the_miner_as_the_installer
     assert config.firewall is False and config.peers == ["https://203.0.113.8:8091"]
     assert [p.command for p in again[:2]] == [p.command for p in processes[:2]]
     assert common.Record.load(box.data, "miner").engines["gpu0"] == {"gpu": 0, "model": "kev-9b",
-                                                                     "port": int(config.endpoints[0].engine_url[-4:]),
+                                                                     "port": int(config.endpoints[0].engine_url
+                                                                                 .rsplit(":", 1)[1]),
                                                                      "manual": True}
 
 
