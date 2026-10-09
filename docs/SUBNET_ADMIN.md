@@ -50,7 +50,8 @@ Miners and validators use whichever catalog the owner hotkey commits; publishing
 follows what its users pay (`SCORING.md`). `anchor_share` is the model's share while
 there is no user demand; the active models' anchors must sum to 1 (`commit-catalog` refuses a catalog whose do not).
 Activating a model means giving it an anchor and lowering the others'; every active model keeps at least
-`min_model_share`, whatever its anchor. `commit-catalog` also refuses settings this code does not know. `first_test_rps` caps the rate of an endpoint's first test, and of all a new hotkey's
+`min_model_share`, whatever its anchor. `commit-catalog` also refuses settings this code does not know (it does not
+check the keys inside a model's `tolerance`, `engine` and `workload`). `first_test_rps` caps the rate of an endpoint's first test, and of all a new hotkey's
 endpoints together; later tests grow from what was delivered.
 
 `relative_speed` is the model's speed relative to the other models: the requests/s of its standard mix one GPU
@@ -95,16 +96,18 @@ endpoint per epoch (by default 4 x `canary_pool_size`, more than three times wha
 challenges take). Together they keep stakers from using miners as a free inference service; the auditor is answered
 whatever its stake, and its test traffic is not counted.
 
-The auditor is the validator of the subnet owner hotkey. After the subnet owner hotkey changes on chain, every
+The auditor is the validator of the subnet owner hotkey. After the subnet owner hotkey changes on chain, every full
 validator exits at the start of its next epoch so that its supervisor restarts it under the new auditor (the new
-owner's validator then runs the tests); miners follow within a minute.
+owner's validator then runs the tests); light validators take the new owner's validator as their source at their
+next fetch, and miners follow within a minute.
 
 Activate a model only once its reference engine reports `usage.input_tokens` (the auditor logs a warning for one that
 does not): the input tokens miners sign set the model's demand, and only the reference's count checks them.
 
 Model status: `active` models are scored; `candidate` models can be served and are checked but weighted zero, which
 lets a new model run on the network before it is scored; `retired` models are skipped, and miners withdraw endpoints
-serving them from their manifests (a miner with no other endpoint stops).
+serving them from their manifests (a miner with no other endpoint logs an error every minute and stops at its next
+start).
 
 New weights or a new reference engine for a model are a new model: add it as a `candidate` under a new `model_id`,
 activate it, then retire the old one. Changing a model's `hf_revision` or `engine.revision` in place leaves its
@@ -128,7 +131,7 @@ To publish a catalog:
    not have), fills in `auditor.tls` and `auditor.egress` where the file names none, from the auditor's
    configuration on this machine (`--validator-config`, default `~/.verathos/validator.json`: the certificate in
    its `state_dir` and its `egress_ips`), refuses an `auditor.tls` other than that certificate's, stores the result
-   in `catalog_dir` and commits its digest. Mirrors (`catalog_mirrors` in miner and validator
+   in the owner validator's `catalog_dir` (`--catalog-dir`, default `~/.verathos/catalog`) and commits its digest. Mirrors (`catalog_mirrors` in miner and validator
    configs) can serve the same file; every copy is checked against the digest.
 
 Miners and validators check the commitment every minute: miners re-publish their manifests (measuring again if a
@@ -168,9 +171,9 @@ The share is `from` until `start_epoch`, then moves linearly to `to` over `epoch
 epoch number (block // `epoch_blocks`) alone, rounded to 6 decimals, logs it each epoch, and the auditor publishes it
 in `GET /v1/network` (`miner_share`); light validators set the auditor's weights as published.
 
-To start the step-down, set `start_epoch` to the epoch it starts at, no earlier than the epoch after the one the
-commit falls in (each epoch is scored under the catalog committed at its first block; an earlier one makes the share
-jump), and commit the catalog. `status` shows the current epoch and its share, and `commit-catalog` prints the share
+To start the step-down, set `start_epoch` to the epoch it starts at, no earlier than the epoch the commit falls in
+(each epoch is scored under the catalog committed at its first block; an earlier one makes the share jump), and
+commit the catalog. `status` shows the current epoch and its share, and `commit-catalog` prints the share
 in the current epoch and when the change ends. Keep `start_epoch` and `epochs` in later catalogs, or the share jumps
 to what the new values give; changing `epoch_blocks` renumbers the epochs, so it moves the change too.
 

@@ -94,7 +94,7 @@ docs/
 
 ```bash
 uv venv -p 3.12 .venv
-VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway,test]"
+VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway,test]" ruff
 .venv/bin/python -m pytest
 .venv/bin/ruff check src tests scripts
 (cd native/loadgen && cargo test)
