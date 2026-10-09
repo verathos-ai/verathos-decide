@@ -17,7 +17,7 @@
 #   --registry <r>  the registry and owner the tags name (default: local, for this machine; with --push,
 #                   ghcr.io/verathos-ai)
 #   --only <target> node or engines
-#   --jobs <n>      parallel jobs of the compilers and installers in the build (default: theirs)
+#   --jobs <n>      parallel downloads and installs of the build's installer, uv (default: uv's)
 #   --dry-run       print the commands instead of running them
 set -euo pipefail
 

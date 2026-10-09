@@ -1,5 +1,6 @@
-# A full validator, or the auditor (the subnet owner's), its engines on reference machines (compose.reference.yml): it
-# checks the miners' answers itself; no GPU here (docs/DOCKER.md).
+# A full validator, its references on a reference machine (compose.reference.yml, on this machine or another): it
+# checks the miners' answers itself; no GPU here (docs/DOCKER.md). The subnet owner's validator, the auditor, runs
+# from the installer.
 #   cp .env.example .env    then set WALLET and COMPOSE_FILE=compose.validator-full.yml, and put each reference
 #                           machine's reference-engines.json into REMOTE_ENGINES_DIR
 #   docker compose up -d
@@ -11,8 +12,8 @@ services:
     command: ["validator"]
     restart: unless-stopped
     stop_grace_period: 60s
-    # The host's network: requests to miners leave from the host's address, the one the validator publishes, and the
-    # auditor's service sees its callers' addresses as they are.
+    # The host's network: requests to miners leave from the host's address, the one the validator publishes; a
+    # reference machine's front on this machine is on its loopback.
     network_mode: host
     cap_drop: [NET_RAW]
     security_opt: ["no-new-privileges:true"]

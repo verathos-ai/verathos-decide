@@ -21,7 +21,7 @@ to serve more requests per GPU for one, installs with the installer.
 
 | Image | Holds | Runs |
 |---|---|---|
-| `ghcr.io/verathos-ai/verathos:<version>` | the release's code, with the auditor's load generator | a light validator; a full validator or the auditor whose engines run on reference machines |
+| `ghcr.io/verathos-ai/verathos:<version>` | the release's code | a light validator; a full validator whose references run on a reference machine |
 | `ghcr.io/verathos-ai/verathos-engines:<version>` | the code and the engines its shipped catalog pins: the Kev engine at its pinned revision and `verathos-engine` for Clef models, each for miners (bfloat16, with the fused kernels) and for references (float32), installed as the installer installs them | a miner; a reference machine |
 
 Each image is tagged with its release's version (`1.0.0` for `v1.0.0`) and nothing else: there is no `latest` tag. The
@@ -77,17 +77,41 @@ Copy the hotkey and `coldkeypub.txt` as for a miner. In `.env`: `COMPOSE_FILE=co
 ... light mode: setting the weights the subnet owner's validator publishes each epoch, once its document verifies; no requests to miners
 ```
 
-### Full validator or the auditor
+### Full validator
 
-The container runs the validator; its references (and the auditor's screens) run on a reference machine
+The container runs the validator; its references run on a reference machine
 ([Engines on a GPU machine of their own](VALIDATING.md#engines-on-a-gpu-machine-of-their-own)), which can be a
-container too (below). In `.env`: `COMPOSE_FILE=compose.validator-full.yml`, `WALLET`, `HOTKEY`; put the reference
-machine's `reference-engines.json` into `REMOTE_ENGINES_DIR` (`./reference-engines`; one file per reference machine).
-`EGRESS_IPS` names the addresses its requests to miners leave from if detection does not find them
-([Egress addresses](VALIDATING.md#egress-addresses-and-miners-firewalls)). The auditor (the subnet owner's hotkey) also
-serves its verdicts and the catalog on `PORT` at `PUBLIC_IP` (default 8091, the detected address); a full validator
-serves its status there too when `PUBLIC_IP` is set. A full validator whose references run on its own machine
-installs with the installer.
+container too, on another machine or on this one ([below](#full-validator-with-its-own-gpu)). In `.env`:
+`COMPOSE_FILE=compose.validator-full.yml`, `WALLET`, `HOTKEY`; put the reference machine's `reference-engines.json`
+into `REMOTE_ENGINES_DIR` (`./reference-engines`; one file per reference machine). `EGRESS_IPS` names the addresses its
+requests to miners leave from if detection does not find them
+([Egress addresses](VALIDATING.md#egress-addresses-and-miners-firewalls)). With `PUBLIC_IP` set, it serves its status
+on `PORT` (default 8091).
+
+The subnet owner's validator, the auditor, does not run in a container: with the subnet owner's hotkey the container
+stops (`the subnet owner's validator is the auditor: install it with the installer`)
+([Throughput audit](VALIDATING.md#throughput-audit)).
+
+### Full validator with its own GPU
+
+On a machine with GPUs, a reference machine's container and the full validator's run side by side, each from a
+directory of its own. The validator reaches the reference machine's front on this machine's loopback, which the front
+always admits:
+
+```bash
+mkdir -p reference validator/reference-engines
+# reference/.env: COMPOSE_FILE=compose.reference.yml, PUBLIC_IP=127.0.0.1, ALLOW=127.0.0.1, SCREENS=off
+(cd reference && docker compose up -d)
+# once it logs "into the REMOTE_ENGINES_DIR of each validator machine":
+sudo cp reference/data/reference-engines.json validator/reference-engines/
+# validator/.env: COMPOSE_FILE=compose.validator-full.yml, WALLET, HOTKEY
+(cd validator && docker compose up -d)
+```
+
+`PUBLIC_IP=127.0.0.1` puts this machine's loopback into the file's URLs, and `ALLOW=127.0.0.1` drops every other
+address, so the front's port stays closed to the network. The screens are the auditor's: `SCREENS=off` leaves the GPUs
+to the references. Both containers use the host's network; the reference machine's port (8443) and the validator's
+(8091, with `PUBLIC_IP`) differ.
 
 ### Reference machine
 
@@ -134,7 +158,7 @@ coldkey, and `docker compose up` stops when either file is missing.
 |---|---|
 | `miner.json`, `validator.json`, `reference.json` | the configuration |
 | `miner/` | the machine's TLS key and certificate (its pin: a new key is a new pin), capacity measurements and the caps tests set, the last manifest, the firewall's state |
-| `validator/` | the canary secret, the score history, its TLS key and certificate with a service, the auditor's database |
+| `validator/` | the canary secret, the score history, its TLS key and certificate with a service |
 | `reference/`, `reference-engines.json` | the front's TLS key and certificate and the callers' key; the file for the validators (mode 600) |
 | `hf/`, `catalog/`, `cache/` | model weights, catalogs, compiled GPU kernels |
 | `install/` | what the next start keeps: each GPU's model and the engines' ports |
@@ -148,8 +172,8 @@ engines and weights in `~/.verathos`).
 
 The miner, the full validator and the reference machine use the host's network (`network_mode: host`): they listen on
 the host's port, with no address translation in between, and see their callers' addresses as they are, which the
-miner's firewall, the reference machine's front and the auditor's limits go by. Open the port for inbound TCP in the
-host's firewall. The light validator opens no port and uses Docker's own network.
+miner's firewall and the reference machine's front go by. Open the port for inbound TCP in the host's firewall. The
+light validator opens no port and uses Docker's own network.
 
 The miner's firewall ([Firewall](MINING.md#firewall)) works in both of its layers, as for a miner the installer runs
 as root: with `NET_ADMIN` (in `compose.miner.yml`) the miner keeps its nftables table on the host, and its own process

@@ -1,25 +1,15 @@
 # syntax=docker/dockerfile:1
 # A release's images (docs/DOCKER.md); docker/build.sh builds and tags them from a release:
-#   verathos          target node:    the code; a light validator, a full validator or the auditor with its engines on
-#                                     reference machines (the load generator built in)
+#   verathos          target node:    the code; a light validator, a full validator with its references on reference
+#                                     machines
 #   verathos-engines  target engines: the code and the engines its shipped catalog pins; a miner, a reference machine
+# The subnet owner's validator, the auditor, runs from the installer: no image carries its load generator.
 # Build context: the repository root, docker build -f docker/Dockerfile --target <node|engines> .
 
 ARG UBUNTU=ubuntu:24.04
 ARG UV=ghcr.io/astral-sh/uv:0.10.9
-# The load generator's toolchain: the channel native/loadgen/rust-toolchain.toml names
-ARG RUST=rust:1.85-slim-bookworm
 
 FROM ${UV} AS uv
-
-FROM ${RUST} AS loadgen
-ARG JOBS=
-WORKDIR /loadgen
-COPY native/loadgen/ ./
-# The image's toolchain is the pinned channel; naming it keeps rustup from fetching that channel again.
-RUN toolchain="$(rustup default)" \
-    && RUSTUP_TOOLCHAIN="${toolchain%% *}" cargo build --release --locked ${JOBS:+--jobs "$JOBS"} \
-    && cp target/release/verathos-loadgen /verathos-loadgen
 
 FROM ${UBUNTU} AS base
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -91,7 +81,6 @@ COPY . ./
 RUN VIRTUAL_ENV=/opt/verathos/.venv uv pip install --quiet -e "/opt/verathos[server,chain]" \
     && verathos-container engines \
     && rm -rf /root/.cache/uv
-COPY --from=loadgen /verathos-loadgen /opt/verathos/src/verathos/throughput/verathos-loadgen
 WORKDIR /data
 ARG VERSION=
 ARG REVISION=
@@ -111,12 +100,11 @@ RUN uv venv --quiet -p 3.12 .venv \
 COPY . ./
 RUN VIRTUAL_ENV=/opt/verathos/.venv uv pip install --quiet -e "/opt/verathos[server,chain]" \
     && rm -rf /root/.cache/uv
-COPY --from=loadgen /verathos-loadgen /opt/verathos/src/verathos/throughput/verathos-loadgen
 WORKDIR /data
 ARG VERSION=
 ARG REVISION=
 LABEL org.opencontainers.image.title="verathos" \
-      org.opencontainers.image.description="Verathos: the code, for validators and the auditor" \
+      org.opencontainers.image.description="Verathos: the code, for validators" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.licenses="MIT"

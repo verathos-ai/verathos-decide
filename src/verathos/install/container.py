@@ -1,14 +1,15 @@
 """``verathos-container``: a miner, a validator or a reference machine as a Docker container (``docker/``).
 
-A release is two images: ``verathos``, its code (a light validator; a full validator or the auditor whose engines run
-on a reference machine, with the auditor's load generator built in), and ``verathos-engines``, its code and the engines
-of its shipped catalog at their pinned revisions, installed by the installer's own code (``install_engines``, run when
-the image is built). At each start the container sets its role up from its environment, which the compose file takes
-from the operator's ``.env``, as ``verathos-<role> init --yes`` sets up a machine: the catalog the subnet owner
-commits, the models and where their engines run, the pinned weights (downloaded once, into ``<data>/hf``) and the
-configuration (``<data>/<role>.json``, which keeps what the operator added to it). A miner or a reference machine
-then runs its engines and its service as children of this process (``Supervisor``): each started again ``RESTART_S``
-after it exits, their output in the container's log behind their names. A validator replaces this process.
+A release is two images: ``verathos``, its code (a light validator; a full validator whose references run on a
+reference machine), and ``verathos-engines``, its code and the engines of its shipped catalog at their pinned
+revisions, installed by the installer's own code (``install_engines``, run when the image is built). The subnet owner's
+validator, the auditor, runs from the installer, never here. At each start the container sets its role up from its
+environment, which the compose file takes from the operator's ``.env``, as ``verathos-<role> init --yes`` sets up a
+machine: the catalog the subnet owner commits, the models and where their engines run, the pinned weights (downloaded
+once, into ``<data>/hf``) and the configuration (``<data>/<role>.json``, which keeps what the operator added to it).
+A miner or a reference machine then runs its engines and its service as children of this process (``Supervisor``):
+each started again ``RESTART_S`` after it exits, their output in the container's log behind their names. A validator
+replaces this process.
 Everything that persists is under ``<data>``: the configuration, the TLS identity (so the pin stays), measurements,
 scores and caches. The container never updates its code: a release is a new image.
 
@@ -465,15 +466,15 @@ def miner(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> li
 
 def validator(env: Mapping[str, str], data: Path = DATA, remote_dir: Path = REMOTE_ENGINES) -> Process:
     """Set the validator up as ``verathos-validator init --yes`` does, from ``env``: light (``MODE=light``), or full
-    with its references on reference machines (their files in ``remote_dir``); -> the validator."""
+    with its references on reference machines (their files in ``remote_dir``); -> the validator. The subnet owner's
+    hotkey is refused: its validator is the auditor, which the installer sets up."""
     from pydantic import ValidationError
 
     from verathos import catalog
-    from verathos.install import common, host
+    from verathos.install import common
     from verathos.install import validator as setup
     from verathos.install.common import info, step, warn
     from verathos.subnet.chain import current_catalog
-    from verathos.throughput import loadgen
     from verathos.validator.config import ValidatorConfig
 
     config_path = data / "validator.json"
@@ -489,6 +490,9 @@ def validator(env: Mapping[str, str], data: Path = DATA, remote_dir: Path = REMO
     wallet_name, hotkey_name = wallet_names(env)
     hotkey = common.load_hotkey(wallet_name, hotkey_name).hotkey.ss58_address
     st = common.connect(network)
+    if hotkey == st.get_subnet_owner_hotkey(netuid):
+        raise SystemExit(f"hotkey {hotkey} is the subnet owner's on netuid {netuid}, and the subnet owner's "
+                         "validator is the auditor: install it with the installer (docs/VALIDATING.md)")
     neuron = st.get_neuron_for_pubkey_and_subnet(hotkey, netuid)
     if neuron is None or neuron.is_null:
         message = (f"hotkey {hotkey} is not registered on netuid {netuid}. Register it on the machine holding the "
@@ -501,10 +505,6 @@ def validator(env: Mapping[str, str], data: Path = DATA, remote_dir: Path = REMO
              "with one (it follows the stake)")
     else:
         info(f"registered on netuid {netuid} as UID {neuron.uid}, with a validator permit")
-    owner = hotkey == st.get_subnet_owner_hotkey(netuid)
-    if owner and mode == "light":
-        raise SystemExit("this is the subnet owner's hotkey: its validator is the auditor and runs full "
-                         "(compose.validator-full.yml)")
     try:
         cat = current_catalog(st, netuid, catalog.CatalogStore(data / "catalog"), existing.get("catalog_mirrors", []))
     except catalog.CatalogUnavailable as exc:
@@ -512,7 +512,7 @@ def validator(env: Mapping[str, str], data: Path = DATA, remote_dir: Path = REMO
     info(f"catalog {cat.revision} ({cat.digest()[:12]})")
 
     step("Plan")
-    for line in setup.mode_lines(mode, cat, owner):
+    for line in setup.mode_lines(mode, cat, owner=False):
         info(line)
     remote = screens = egress = None
     if mode == "full":
@@ -522,12 +522,13 @@ def validator(env: Mapping[str, str], data: Path = DATA, remote_dir: Path = REMO
                              f"reference machine writes (reference-engines.json) into {remote_dir} (REMOTE_ENGINES_DIR "
                              "in .env)")
         remote, screens = from_options(lambda: setup.read_remote_engines([str(p) for p in files]))
-        if screens and not owner:
+        if screens:
             info(f"the screens of {', '.join(sorted(screens))} are the auditor's: not configured here")
             screens = {}
         if missing := sorted(m.model_id for m in cat.models if m.status == "active" and m.model_id not in remote):
             raise SystemExit(f"no reference for the active models {', '.join(missing)} in {remote_dir}: serve them on "
-                             "a reference machine and put its file there (references on this machine: the installer)")
+                             "a reference machine (compose.reference.yml, on this machine or another) and put its file "
+                             "there")
         for line in asyncio.run(setup.remote_lines(remote, screens, cat)):
             info(line)
         egress = from_options(lambda: setup.egress_ips(argparse.Namespace(egress_ip=listed(env, "EGRESS_IPS") or None),
@@ -535,11 +536,8 @@ def validator(env: Mapping[str, str], data: Path = DATA, remote_dir: Path = REMO
         if not egress:
             warn("no public egress address detected (set EGRESS_IPS): miners that admit callers by address would not "
                  "admit this validator")
-        info(f"egress address(es) {', '.join(egress) or 'none'}: "
-             + ("the catalog's auditor.egress names them" if owner else "published in this validator's chain "
-                "commitment, for miners to admit its requests"))
-        if owner and not loadgen.BINARY_PATH.exists():
-            raise SystemExit(f"{loadgen.BINARY_PATH} is missing: the auditor runs an image with its load generator")
+        info(f"egress address(es) {', '.join(egress) or 'none'}: published in this validator's chain commitment, for "
+             "miners to admit its requests")
     info(f"validator with hotkey {wallet_name}/{hotkey_name}" + (", dry run: no weights set" if dry_run else ""))
     info("self-update off: a release is a new image")
 
@@ -553,10 +551,6 @@ def validator(env: Mapping[str, str], data: Path = DATA, remote_dir: Path = REMO
     if not config["audit_screens"]:
         del config["audit_screens"]
     public_ip = value(env, "PUBLIC_IP") or existing.get("public_host")
-    if mode == "full" and owner and not public_ip:
-        public_ip = host.detect_public_ip()
-        if not public_ip:
-            raise SystemExit("the auditor serves the catalog and its verdicts: set PUBLIC_IP, its public address")
     if mode == "full" and public_ip:
         config["public_host"] = public_ip
         config["port"] = port_number(env, "PORT") or existing.get("port") or 8091

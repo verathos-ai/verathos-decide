@@ -4,6 +4,7 @@ environment and runs it."""
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import inspect
 import io
@@ -25,18 +26,20 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 import verathos
+from tests.mock_engine import MockEngine
 from tests.test_install import CLEF, KEV, gpu
-from tests.test_reference import engines_file
+from tests.test_reference import REQUEST, engines_file, machine
 from tests.tlsfake import free_port, serving
 from verathos import catalog
 from verathos.install import common, container, engines, host, plan
 from verathos.install import miner as miner_setup
+from verathos.install import reference as reference_setup
 from verathos.install import validator as validator_setup
 from verathos.install.host import GiB
 from verathos.miner.config import MinerConfig
 from verathos.protocol import tls
-from verathos.reference.config import ReferenceConfig, api_key
-from verathos.throughput import loadgen
+from verathos.reference import front
+from verathos.reference.config import ReferenceConfig, api_key, engines_document
 from verathos.validator.config import ValidatorConfig
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +50,7 @@ PARAMETERS = {**KEV, "clef-flash": CLEF}
 WALLET_TARGETS = ("/root/.bittensor/wallets/${WALLET}/hotkeys/${HOTKEY:-default}",
                   "/root/.bittensor/wallets/${WALLET}/coldkeypub.txt")
 REGISTRY = "ghcr.io/verathos-ai"
+REMOTE_LINES = validator_setup.remote_lines  # what a validator's setup sees of each remote engine, as it reaches it
 
 
 def compose(name: str) -> dict:
@@ -118,15 +122,11 @@ def test_the_dockerfile_fills_each_environment_where_the_installer_runs_it() -> 
     assert text.count('uv pip install --quiet -e "/opt/verathos[server,chain]"') == 2
     assert text.count("--extra server --extra chain") == 2
     assert "&& verathos-container engines" in text  # then the installer's code installs every engine
-    # the auditor's load generator where verathos-build-loadgen puts it, in both images
-    built = "/opt/verathos/" + loadgen.BINARY_PATH.relative_to(ROOT).as_posix()
-    assert text.count(f"COPY --from=loadgen /verathos-loadgen {built}") == 2
-    toolchain = tomllib.loads((ROOT / "native" / "loadgen" / "rust-toolchain.toml").read_text())["toolchain"]
-    assert f"ARG RUST=rust:{toolchain['channel']}-slim-bookworm" in text
+    assert "loadgen" not in text and "cargo" not in text  # the auditor's load generator: the installer's alone
     assert re.search(r"^ARG UV=ghcr\.io/astral-sh/uv:\d+\.\d+\.\d+$", text, re.M)  # a pinned uv
     assert 'ENTRYPOINT ["/usr/bin/tini", "--", "verathos-container"]' in text
     stages = re.findall(r"^FROM \S+ AS (\w+)$", text, re.M)
-    assert stages == ["uv", "loadgen", "base", "pins", "engines", "node"]
+    assert stages == ["uv", "base", "pins", "engines", "node"]
     engines_stage, node_stage = text.split("FROM base AS engines")[1].split("FROM base AS node")
     assert 'CMD ["miner"]' in engines_stage and 'CMD ["validator"]' in node_stage
     assert "verathos-container engines" not in node_stage and "nftables" in engines_stage
@@ -137,9 +137,8 @@ def test_the_images_take_the_code_and_nothing_else_of_the_repository() -> None:
              if line and not line.startswith("#")]
     assert lines[0] == "**"  # everything is left out, then the code is let in
     let_in = {line[1:].rstrip("/") for line in lines if line.startswith("!")}
-    assert let_in == {"pyproject.toml", "LICENSE", "README.md", "src", "scripts", "release", "native/loadgen",
-                      "docker/pins.py"}
-    assert {"native/loadgen/target/", "**/__pycache__/"} <= set(lines)
+    assert let_in == {"pyproject.toml", "LICENSE", "README.md", "src", "scripts", "release", "docker/pins.py"}
+    assert {"src/verathos/throughput/verathos-loadgen", "**/__pycache__/"} <= set(lines)  # a local build stays out
     text = (DOCKER / "Dockerfile").read_text()
     for sources in re.findall(r"^COPY (?!--from)(.+) \S+$", text, re.M):
         for source in sources.split():
@@ -272,6 +271,45 @@ def test_docker_compose_renders_each_file_with_the_example_env(tmp_path) -> None
                            text=True, capture_output=True, env={**home, "IMAGE_REGISTRY": "local"}, timeout=60)
     (s,) = json.loads(local.stdout)["services"].values()  # the images docker/build.sh built on this machine
     assert s["image"] == f"local/verathos-engines:{verathos.__version__}"
+
+
+@pytest.mark.skipif(not docker_compose(), reason="needs docker compose")
+def test_a_reference_container_and_a_full_validator_run_side_by_side_on_one_machine(tmp_path) -> None:
+    """Each from a directory of its own, its .env naming its compose file: two projects on the host's network, so the
+    validator reaches the front on this machine's loopback; their data, GPUs and ports apart."""
+    home = {**os.environ, "HOME": str(tmp_path)}
+    if not docker_compose(home):
+        pytest.skip("docker compose is installed in the user's home")
+    example = (DOCKER / ".env.example").read_text()
+    rendered = {}
+    for role, name, values in (("reference", COMPOSE["reference"], {"PUBLIC_IP": "127.0.0.1", "ALLOW": "127.0.0.1",
+                                                                     "SCREENS": "off"}),
+                               ("validator", COMPOSE["validator-full"], {"WALLET": "w"})):
+        directory = tmp_path / role
+        directory.mkdir()
+        shutil.copy(DOCKER / name, directory / name)
+        env = re.sub(r"^COMPOSE_FILE=.*$", f"COMPOSE_FILE={name}", example, flags=re.M)
+        for key, value in values.items():
+            env = re.sub(rf"^{key}=.*$", f"{key}={value}", env, flags=re.M)
+        (directory / ".env").write_text(env)
+        result = subprocess.run(["docker", "compose", "config", "--format", "json"], cwd=directory,
+                                capture_output=True, text=True, timeout=60, env=home)
+        assert result.returncode == 0, result.stderr
+        rendered[role] = json.loads(result.stdout)
+    assert rendered["reference"]["name"] != rendered["validator"]["name"]  # neither replaces the other's container
+    (reference,), (validator,) = (rendered[r]["services"].values() for r in ("reference", "validator"))
+    assert reference["network_mode"] == validator["network_mode"] == "host"
+    assert {k: reference["environment"][k] for k in ("PUBLIC_IP", "ALLOW", "SCREENS")} == {
+        "PUBLIC_IP": "127.0.0.1", "ALLOW": "127.0.0.1", "SCREENS": "off"}
+    assert validator["environment"]["MODE"] == "full"
+    volumes = {r: {v["target"]: v for v in s["volumes"]} for r, s in (("reference", reference),
+                                                                      ("validator", validator))}
+    assert volumes["reference"]["/data"]["source"] == str(tmp_path / "reference" / "data")
+    assert volumes["validator"]["/data"]["source"] == str(tmp_path / "validator" / "data")
+    files = volumes["validator"]["/etc/verathos/remote-engines"]
+    assert files["source"] == str(tmp_path / "validator" / "reference-engines") and files["read_only"]
+    assert "deploy" in reference and "deploy" not in validator  # the GPUs are the reference machine's
+    assert reference_setup.DEFAULT_PORT == 8443 != 8091  # the front's port and the validator's service
 
 
 # ---- the build script ----
@@ -614,10 +652,7 @@ def test_a_light_validator_container_sets_the_auditors_weights_with_the_hotkey_a
     config = ValidatorConfig.load(box.data / "validator.json")
     assert (config.mode, config.auto_update, config.netuid, config.references) == ("light", False, 405, {})
     assert (config.state_dir, config.catalog_dir) == (box.data / "validator", box.data / "catalog")
-    box.owner = "5Validator"
-    with pytest.raises(SystemExit, match="the subnet owner's hotkey: its validator is the auditor and runs full"):
-        container.validator({"WALLET": "v", "MODE": "light"}, box.data, box.remote)
-    box.owner, box.registered = "5Owner", {}
+    box.registered = {}
     with pytest.raises(SystemExit, match="is not registered on netuid 405"):  # the network configured before
         container.validator({"WALLET": "v"}, box.data, box.remote)
     container.validator({"WALLET": "v", "DRY_RUN": "1"}, box.data, box.remote)  # a dry run tries it first
@@ -626,8 +661,7 @@ def test_a_light_validator_container_sets_the_auditors_weights_with_the_hotkey_a
         container.validator({"WALLET": "v", "MODE": "half"}, box.data, box.remote)
 
 
-def test_a_full_validator_container_takes_its_references_from_the_reference_machines_files(box, capsys,
-                                                                                         monkeypatch) -> None:
+def test_a_full_validator_container_takes_its_references_from_the_reference_machines_files(box, capsys) -> None:
     box.hotkey = "5Validator"
     env = {"WALLET": "v", "MODE": "full"}
     with pytest.raises(SystemExit, match="put the file a reference machine writes"):
@@ -656,15 +690,68 @@ def test_a_full_validator_container_takes_its_references_from_the_reference_mach
     config = ValidatorConfig.load(box.data / "validator.json")
     assert (config.public_host, config.port, config.egress_ips) == ("203.0.113.9", 20099, ["203.0.113.9"])
 
-    box.owner = "5Validator"  # the auditor: the screens, its service and its load generator
-    monkeypatch.setattr(loadgen, "BINARY_PATH", box.data / "verathos-loadgen")
-    with pytest.raises(SystemExit, match="verathos-loadgen is missing"):
-        container.validator({"WALLET": "v", "MODE": "full"}, box.data, box.remote)
-    (box.data / "verathos-loadgen").touch()
-    (box.data / "validator.json").unlink()
-    container.validator({"WALLET": "v", "MODE": "full"}, box.data, box.remote)
-    config = ValidatorConfig.load(box.data / "validator.json")
-    assert list(config.audit_screens) == ["kev-4b"] and (config.public_host, config.port) == ("203.0.113.7", 8091)
+
+def test_a_full_validator_reaches_a_reference_container_on_its_own_machine_on_the_loopback(box, tmp_path, monkeypatch,
+                                                                                         capsys) -> None:
+    """A full validator with its own GPU: the reference container, its PUBLIC_IP and ALLOW this machine's loopback,
+    writes a file whose URLs are on the loopback and admits the loopback alone; the validator's container takes that
+    file, and its references answer through a front on the loopback over TLS, with the pin and the key."""
+    container.reference({"ALLOW": "127.0.0.1", "PUBLIC_IP": "127.0.0.1", "SCREENS": "off"}, box.data, box.home)
+    document = json.loads((box.data / common.ENGINES_FILE).read_text())
+    base = f"https://127.0.0.1:{reference_setup.DEFAULT_PORT}"
+    assert {m: e["url"] for m, e in document["references"].items()} == {
+        m: f"{base}/reference/{m}" for m in ("clef-flash", "kev-4b", "kev-9b")}
+    assert document["audit_screens"] == {}
+    allowed = front.allows(frozenset(ReferenceConfig.load(box.data / "reference.json").allow))
+    assert allowed("127.0.0.1") and allowed("::1") and not allowed("203.0.113.9")
+
+    models = [{**m, "status": "candidate"} if m["model_id"] == "clef-flash" else m
+              for m in catalog.load().document()["models"]]
+    box.catalog = catalog.Catalog.parse({**catalog.load().document(), "models": models})
+    box.hotkey, validator_data = "5Validator", tmp_path / "validator-data"
+    validator_data.mkdir()
+    box.remote.mkdir()
+    monkeypatch.setattr(validator_setup, "remote_lines", REMOTE_LINES)
+    capsys.readouterr()
+    with machine(tmp_path, ["127.0.0.1"], listen="0.0.0.0") as reference:  # the front, its socket filtered
+        common.write_json(box.remote / common.ENGINES_FILE, engines_document(reference.config, reference.pin,
+                                                                             reference.key), private=True)
+        container.validator({"WALLET": "v", "MODE": "full"}, validator_data, box.remote)
+        out = capsys.readouterr().out
+        assert f"kev-4b: float32 reference on another machine, {reference.base}/reference/kev-4b" in out
+        assert "serves revision fp32-revis" in out  # it reached the engine through the front
+        config = ValidatorConfig.load(validator_data / "validator.json")
+        assert {m: e.url for m, e in config.references.items()} == {
+            m: f"{reference.base}/reference/{m}" for m in ("kev-4b", "kev-9b")}
+
+        async def ask() -> dict:
+            engine = config.references["kev-4b"].engine(timeout_s=5.0)
+            try:
+                return await engine.answer(REQUEST)
+            finally:
+                await engine.close()
+
+        assert asyncio.run(ask()) == asyncio.run(MockEngine("kev-4b", "fp32").answer(REQUEST))
+
+
+@pytest.mark.parametrize("mode", ["light", "full"])
+def test_the_subnet_owners_hotkey_is_refused_its_validator_is_the_auditor_which_the_installer_sets_up(box, mode,
+                                                                                                    capsys) -> None:
+    """The auditor runs from the installer, never in a container: whatever the mode, the setup stops before it writes
+    anything, and the container says why at each try."""
+    box.hotkey = box.owner
+    box.remote.mkdir()
+    engines_file(box.remote / "a.json", "ab" * 32, "k" * 43)
+    with pytest.raises(SystemExit) as stopped:
+        container.validator({"WALLET": "owner", "MODE": mode}, box.data, box.remote)
+    assert "the subnet owner's validator is the auditor: install it with the installer" in str(stopped.value.code)
+    assert f"hotkey {box.owner} is the subnet owner's on netuid 96" in str(stopped.value.code)
+    assert not (box.data / "validator.json").exists()
+    slept = []
+    assert container.run("validator", {"WALLET": "owner", "MODE": mode}, box.data, box.home, box.remote,
+                         sleep=slept.append) == 1
+    assert slept == [container.SETUP_RETRY_S]
+    assert "the subnet owner's validator is the auditor: install it with the installer" in capsys.readouterr().err
 
 
 def test_a_reference_container_runs_each_engine_and_the_front_and_writes_the_validators_file(box, capsys) -> None:
