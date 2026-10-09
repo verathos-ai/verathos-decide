@@ -62,7 +62,7 @@ from verathos.throughput.feed import VERDICTS_PATH
 from verathos.validator.status import StatusBoard
 
 log = logging.getLogger(__name__)
-INTAKE_BODY_S = 10.0
+INTAKE_BODY_S = 30.0  # a post of samples, at most MAX_SAMPLES_BYTES, arrives within it
 INTAKE_CONCURRENCY = 4
 STATUS_CACHE_S = 30.0
 STATUS_CACHE_ENTRIES = 1024  # hotkeys whose signed status is kept at once (a subnet has 256 UIDs)

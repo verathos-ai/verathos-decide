@@ -331,6 +331,25 @@ def test_the_sampler_keeps_answers_with_images_apart_from_text_answers() -> None
     assert len(picks) == 2 and sorted(bool(e.request.get("images")) for e in picks) == [False, True]
 
 
+def test_the_images_held_for_the_auditor_are_bounded_with_one_proof_with_images_per_endpoint(monkeypatch) -> None:
+    from verathos.gateway import sampler as sampler_module
+
+    monkeypatch.setattr(sampler_module, "IMAGES_HELD_BYTES", 2500)
+    sampler = Sampler(kp(), httpx.AsyncClient(), auditor=None, auditor_hotkey="a", window_s=600,
+                      rng=random.Random(5))
+    with_image = {**REQUEST, "images": [{"content_type": "image/png", "base64": "A" * 1000}]}
+    a, b, c, d = ("5F" + x * 46 for x in "abcd")
+    sampler.proof(exchange(with_image, a))
+    sampler.proof(exchange(with_image, a))  # the same endpoint's: one proves it
+    sampler.proof(exchange(REQUEST, a))
+    sampler.offer(exchange(with_image, b))  # 2,000 bytes of images held
+    sampler.proof(exchange(with_image, c))  # 3,000 would be beyond
+    sampler.offer(exchange(with_image, d))
+    sampler.offer(exchange(REQUEST, d))  # text is not bounded
+    assert [bool(e.request.get("images")) for e in sampler._proofs] == [True, False]
+    assert sorted(sampler._picked) == [(f"{b}/gpu0", True), (f"{d}/gpu0", False)]
+
+
 def test_the_largest_request_an_image_model_takes_fits_a_sample_post() -> None:
     request = {**REQUEST, "images": [{"content_type": "image/png", "base64": ""}]}
     request["images"][0]["base64"] = "A" * (MAX_IMAGE_REQUEST_BYTES - len(canonical_json(request)))

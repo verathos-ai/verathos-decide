@@ -90,10 +90,11 @@ The gateway's hotkey is listed in the catalog (`gateways`), so a miner can tell 
 keep it from answering users with a cheaper model, the gateway keeps per endpoint and sampling window
 (`sample_window_s`, 10 minutes) one exchange of a request without images and one of a request with images, each drawn
 uniformly from the window's answers after they are in, so answers with images reach the auditor however few they are
-(the picks held at once carry at most 2 GiB of images; one beyond is not taken), and sends the window's picks to the
-auditor. The auditor keeps up to 8 per endpoint and epoch, and 2 with images, and recomputes a random
-`gateway_checks_per_epoch` (2) of them, and besides those `gateway_image_checks_per_epoch` (1) with images, between
-tests:
+(what it holds for the auditor, its picks and signed malformed answers, carries at most 2 GiB of images at once, and one
+signed malformed answer with images per endpoint; one beyond is not kept), and sends the window's picks to the auditor,
+serialized off the event loop. The auditor keeps up to 8 per endpoint and epoch, and 2 with images, and recomputes a
+random `gateway_checks_per_epoch` (2) of them, and besides those `gateway_image_checks_per_epoch` (1) with images,
+between tests:
 - a wrong answer is evidence: the auditor publishes the miner's signed receipt (not the request), every validator
   checks that the receipt was issued to a catalog gateway, and the hotkey is reset and put on probation
   (`SCORING.md`);
