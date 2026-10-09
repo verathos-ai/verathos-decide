@@ -444,9 +444,12 @@ reference.
 A model whose catalog entry lists `image` in its `input_modalities` also gets requests with images, which the gateway
 has made canonical (`GATEWAY.md`, Images); no model of the shipped catalog does yet. The bfloat16 engine runs them in
 passes of their own, without CUDA graphs: their images through the release's vision tower, whose features take the
-image tokens' places, and the rest as for text, with image tokens counted in a pass's token budget. The float32 engine
-(`--dtype float32`) runs the release's own code on them. Either engine gives the release only a request's model, state
-and questions, and images only as decoded pixels: nothing fetches a URL or opens a path.
+image tokens' places, and the rest as for text, with image tokens counted in a pass's token budget. The tower runs in
+float16: in bfloat16, as released, answers with images drift from the float32 reference about twice as far as text
+answers, in float16 no further. A pass whose float16 features are not all finite (an activation beyond float16's range;
+the largest of the images measured reach about a fifth of it) runs its images through the tower again in bfloat16, as
+released, and the engine logs it. The float32 engine (`--dtype float32`) runs the release's own code on them. Either engine gives the release
+only a request's model, state and questions, and images only as decoded pixels: nothing fetches a URL or opens a path.
 
 Clef-flash with images on an H100 80 GB, requests of 500 to 580 tokens of text with four or five questions and square
 images, 64 at once:

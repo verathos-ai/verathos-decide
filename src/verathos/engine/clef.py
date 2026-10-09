@@ -12,7 +12,7 @@ Two paths:
   kind and length under a token budget that counts image tokens. Text passes replay CUDA graphs
   (``verathos.engine.graphs``); passes of requests with images run eagerly as the release's forward computes them: the
   images through the release's vision tower, its features in place of the image tokens' embeddings, and the release's
-  3-axis positions.
+  3-axis positions. The vision tower runs in float16 (``Float16Tower``), the rest in bfloat16.
 
 Both give the release a record built from the request (``Prepared.body``): its model, state and questions, never
 another field of it, and its images, which must be canonical (``protocol.media``): they are decoded to RGB here and
@@ -26,14 +26,18 @@ from __future__ import annotations
 import importlib.util
 import logging
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from verathos.gateway.logs import Throttle
 from verathos.protocol.api import REFUSED_FIELDS
 from verathos.protocol.media import canonical_pixels
 
 log = logging.getLogger(__name__)
+_throttled = Throttle()
 
 QUESTION_TYPES = ("noul", "choice", "score")
 MEDIA_KWARGS = {"do_resize": False}  # the processor arguments of a record with images: canonical images keep their size
@@ -43,7 +47,8 @@ MEDIA_KWARGS = {"do_resize": False}  # the processor arguments of a record with 
 class Media:
     """The images of a request as the fast path's passes take them, made when the request is prepared."""
 
-    pixel_values: Any  # [patches, values per patch] in the vision tower's dtype, as the release's processor made them
+    pixel_values: Any  # [patches, values per patch] in the dtype the vision tower reads (float16)
+    processed: Any  # the same in float32, as the release's processor made them (its record holds them)
     grid: Any  # [images, 3]: each image's patches in time, height and width (the release's image_grid_thw)
     positions: Any  # [3, tokens]: the release's 3-axis positions of the request's tokens
 
@@ -101,6 +106,44 @@ def image_bounds(processor: Any) -> dict[str, int]:
             "max_pixels": images.size["longest_edge"]}
 
 
+class Float16Tower:
+    """A release's vision tower with its weights in float16, three more bits of precision than bfloat16 and a narrower
+    range; its buffers (the rotary frequencies, float32) stay as loaded. With the tower in float16, answers to requests
+    with images drift from the float32 reference about as far as text answers do; in bfloat16, as released, about
+    twice as far. ``released`` runs the tower with the release's weights in their dtype, for a pass whose float16
+    features are not all finite (an activation beyond 65,504): the weights float16 does not hold (beyond or below its
+    range) are kept apart for it."""
+
+    def __init__(self, tower: Any) -> None:
+        import torch
+
+        self.tower, self.torch = tower, torch
+        self._kept: dict[str, tuple[Any, Any, Any]] = {}  # name -> (released dtype, flat indexes, released values)
+        with torch.no_grad():
+            for name, parameter in tower.named_parameters():
+                half = parameter.data.half()
+                lost = (half.to(parameter.dtype) != parameter.data).flatten().nonzero().squeeze(1)
+                self._kept[name] = (parameter.dtype, lost, parameter.data.flatten()[lost])
+                parameter.data = half
+
+    @contextmanager
+    def released(self) -> Iterator[None]:
+        """The tower with the release's weights in their dtype while the context lasts, in float16 again after."""
+        torch = self.torch
+        try:
+            with torch.inference_mode(False), torch.no_grad():
+                for name, parameter in self.tower.named_parameters():
+                    dtype, lost, values = self._kept[name]
+                    weights = parameter.data.to(dtype)
+                    weights.view(-1)[lost] = values
+                    parameter.data = weights
+            yield
+        finally:
+            with torch.inference_mode(False), torch.no_grad():
+                for parameter in self.tower.parameters():
+                    parameter.data = parameter.data.half()
+
+
 class ReferenceEngine:
     """The release's ``systemone``, one request per pass, so each is answered as soon as it is computed."""
 
@@ -129,7 +172,7 @@ class ReferenceEngine:
 
 
 class FastEngine:
-    """Batched CUDA bfloat16 serving of a Clef release."""
+    """Batched CUDA serving of a Clef release: the backbone and the head in bfloat16, the vision tower in float16."""
 
     def __init__(
         self,
@@ -158,6 +201,8 @@ class FastEngine:
         self.head = model.head
         self.output_embedding = base.get_output_embeddings().weight
         self.vision = base.model  # the release's vision tower (get_image_features) and positions (get_rope_index)
+        self.tower = Float16Tower(self.vision.visual)
+        self.pixel_dtype = torch.float16  # the tower's input, cast as a request is prepared
         self.image_token_id = base.config.image_token_id
         self.backbone = Backbone(base.model.language_model)
         torch.cuda.empty_cache()
@@ -194,8 +239,8 @@ class FastEngine:
         offset, values = media["token_offset"], media["mm_token_type_ids"]
         types[0, offset : offset + len(values)] = torch.tensor(values)
         positions, _ = self.vision.get_rope_index(ids, types, image_grid_thw=grid)
-        # cast as the release's tower casts them first, here so a waiting request holds half the bytes
-        return Media(media["pixel_values"].to(self.vision.visual.dtype), grid, positions[:, 0])
+        # cast here, off the device's thread, so a pass sends the GPU half the bytes
+        return Media(media["pixel_values"].to(self.pixel_dtype), media["pixel_values"], grid, positions[:, 0])
 
     def passes(self, items: list[Prepared]) -> list[list[int]]:
         """Indexes grouped by kind and length: requests with images and text requests in passes of their own, each
@@ -235,14 +280,30 @@ class FastEngine:
         lengths = mask.sum(1).to(self.device, non_blocking=True)
         return batched_head(self.head, hidden, ids, lengths, records, self.output_embedding)
 
+    def _features(self, media: list[Media]) -> Any:
+        """The merged features of a pass's images from the float16 vision tower (attention within each image), or,
+        where any is not finite, of all of them from the release's tower on the processor's pixel values
+        (``Float16Tower``)."""
+        torch = self.torch
+        grid = torch.cat([m.grid for m in media]).to(self.device, non_blocking=True)
+        pixels = torch.cat([m.pixel_values for m in media]).to(self.device, non_blocking=True)
+        features = torch.cat(self.vision.get_image_features(pixels, grid, return_dict=True).pooler_output)
+        if bool(torch.isfinite(features).all()):
+            return features
+        if times := _throttled("float16 tower"):
+            log.warning("vision features not finite in float16 in %d passes since last logged, the last of %d "
+                        "requests with images: their images ran through the vision tower again in bfloat16, as "
+                        "released", times, len(media))
+        pixels = torch.cat([m.processed for m in media]).to(self.device, non_blocking=True)
+        with self.tower.released():
+            return torch.cat(self.vision.get_image_features(pixels, grid, return_dict=True).pooler_output)
+
     def _media_forward(self, ids: Any, media: list[Media]) -> Any:
         """Last hidden states of a pass of requests with images, as the release's forward computes them: the images'
-        features from its vision tower (attention within each image) in place of the image tokens' embeddings, in
-        order, and its 3-axis positions (padding after a request keeps position 0: it never reaches the request)."""
+        features (``_features``) in place of the image tokens' embeddings, in order, and its 3-axis positions (padding
+        after a request keeps position 0: it never reaches the request)."""
         torch = self.torch
-        pixels = torch.cat([m.pixel_values for m in media]).to(self.device, non_blocking=True)
-        grid = torch.cat([m.grid for m in media]).to(self.device, non_blocking=True)
-        features = torch.cat(self.vision.get_image_features(pixels, grid, return_dict=True).pooler_output)
+        features = self._features(media)
         embeds = torch.nn.functional.embedding(ids, self.backbone.embed)
         embeds = embeds.masked_scatter((ids == self.image_token_id)[..., None], features.to(embeds.dtype))
         positions = torch.zeros((3, *ids.shape), dtype=torch.long)

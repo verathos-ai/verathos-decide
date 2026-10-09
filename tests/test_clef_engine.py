@@ -341,7 +341,7 @@ def tiny_fast(tiny):
     engine.output_embedding = base.get_output_embeddings().weight
     engine.vision, engine.image_token_id = base.model, base.config.image_token_id
     engine.backbone = TextModelBackbone(base.model.language_model)
-    engine.device, engine.max_length = torch.device("cpu"), 16384
+    engine.device, engine.max_length, engine.pixel_dtype = torch.device("cpu"), 16384, torch.float32
     engine.max_batch_tokens, engine.max_rows, engine.length_step = 1024, 8, 32
     engine.forward = GraphedForward(engine.backbone.forward, HIDDEN, torch.float32, engine.device, max_tokens=0)
     return engine
@@ -524,6 +524,113 @@ def test_canonical_images_need_no_resizing_and_some_could_not_take_it(tiny, tiny
     assert answer(tiny_fast, wide)["usage"] == answer(tiny, wide)["usage"]
 
 
+def in_bfloat16(module) -> None:
+    """``module``'s weights in bfloat16, its buffers as they are: as a release's tower loads in bfloat16."""
+    import torch
+
+    with torch.no_grad():
+        for parameter in module.parameters():
+            parameter.data = parameter.data.to(torch.bfloat16)
+
+
+def test_the_float16_tower_runs_as_released_while_asked_and_in_float16_again_after(tiny) -> None:
+    """The tower's weights in float16 and its rotary frequencies in float32 as loaded; while asked, every weight as
+    released, those float16 does not hold among them (one beyond its range, one below), and in float16 again after."""
+    import copy
+
+    import torch
+
+    from verathos.engine.clef import Float16Tower
+
+    tower = copy.deepcopy(tiny.model.language_model.model.visual)
+    in_bfloat16(tower)
+    with torch.no_grad():
+        tower.merger.linear_fc2.weight[0, 0] = 2.0 ** 17
+        tower.blocks[0].mlp.linear_fc1.weight[0, 0] = 2.0 ** -26
+    weights = {name: p.detach().clone() for name, p in tower.named_parameters()}
+    frequencies = tower.rotary_pos_emb.inv_freq.clone()
+    float16 = Float16Tower(tower)
+    assert {p.dtype for p in tower.parameters()} == {torch.float16}
+    assert tower.rotary_pos_emb.inv_freq.dtype == torch.float32
+    assert torch.isinf(tower.merger.linear_fc2.weight[0, 0]) and tower.blocks[0].mlp.linear_fc1.weight[0, 0] == 0
+    halves = {name: p.detach().clone() for name, p in tower.named_parameters()}
+    for _ in range(2):  # and again: nothing drifts
+        with torch.inference_mode(), float16.released():
+            assert all(p.dtype == torch.bfloat16 and torch.equal(p, weights[name])
+                       for name, p in tower.named_parameters())
+        assert all(p.dtype == torch.float16 and torch.equal(p, halves[name]) for name, p in tower.named_parameters())
+    assert torch.equal(tower.rotary_pos_emb.inv_freq, frequencies)
+
+
+def tiny_tower_engine(tiny, pixel_dtype) -> FastEngine:
+    """A fast engine as ``tiny_fast``, on a copy of the tiny model whose vision tower is in bfloat16, as a release's
+    tower loads, sending the tower pixel values in ``pixel_dtype``."""
+    import copy
+
+    import torch
+
+    from verathos.engine.graphs import GraphedForward
+
+    engine = object.__new__(FastEngine)
+    base = tiny.model.language_model
+    engine.torch, engine.module, engine.processor = torch, tiny.module, tiny.processor
+    engine.tokenizer, engine.pad_id = tiny.processor.tokenizer, tiny.processor.tokenizer.pad_token_id
+    engine.image_bounds, engine.head = tiny.image_bounds, tiny.model.head
+    engine.output_embedding = base.get_output_embeddings().weight
+    engine.vision = copy.deepcopy(base.model)
+    in_bfloat16(engine.vision.visual)
+    engine.image_token_id = base.config.image_token_id
+    engine.backbone = TextModelBackbone(engine.vision.language_model)
+    engine.device, engine.max_length, engine.pixel_dtype = torch.device("cpu"), 16384, pixel_dtype
+    engine.max_batch_tokens, engine.max_rows, engine.length_step = 1024, 8, 32
+    engine.forward = GraphedForward(engine.backbone.forward, HIDDEN, torch.float32, engine.device, max_tokens=0)
+    return engine
+
+
+def test_a_pass_whose_float16_vision_features_are_not_finite_runs_the_tower_again_as_released(
+        tiny, monkeypatch, caplog) -> None:
+    """An activation beyond float16's range (as a crafted image could cause) leaves the float16 tower's features not
+    finite: the pass's images run through the release's bfloat16 tower again, and its requests are answered as by an
+    engine whose tower runs in bfloat16 throughout; a warning says how many requests the pass had (and nothing of
+    their images), and the next pass runs in float16."""
+    import logging
+
+    import torch
+
+    from verathos.engine import clef
+    from verathos.gateway.logs import Throttle
+
+    monkeypatch.setattr(clef, "_throttled", Throttle())
+    released, engine = tiny_tower_engine(tiny, torch.bfloat16), tiny_tower_engine(tiny, torch.float16)
+    engine.tower = clef.Float16Tower(engine.vision.visual)
+    bodies = [{**REQUEST, "state": f"Request {i}", "images": images} for i, images in enumerate(IMAGES[:2])]
+    items, released_items = [engine.prepare(body) for body in bodies], [released.prepare(body) for body in bodies]
+    assert all(torch.equal(item.media.pixel_values, item.media.processed.half())
+               and item.media.processed is item.encoded.media["pixel_values"] for item in items)
+    media = [item.media for item in items]
+
+    def overflow(module, inputs, output):  # an activation beyond float16's range, in float16 only
+        return output * 1e6 if output.dtype == torch.float16 else output
+
+    def warnings() -> list[logging.LogRecord]:
+        return [r for r in caplog.records if r.name == clef.__name__]
+
+    with caplog.at_level(logging.INFO, logger=clef.__name__), torch.inference_mode():
+        assert engine._features(media).dtype == torch.float16 and not warnings()
+        hook = engine.vision.visual.blocks[-1].register_forward_hook(overflow)
+        features = engine._features(media)
+        expected = released._features([item.media for item in released_items])
+        assert features.dtype == torch.bfloat16 and torch.equal(features, expected)
+        answers = engine.run(items)
+        hook.remove()
+        assert engine._features(media).dtype == torch.float16
+    assert answers == released.run(released_items)
+    first, *_ = warnings()  # one line per minute, however many passes
+    assert len(warnings()) == 1 and first.levelno == logging.WARNING
+    assert "1 passes since last logged, the last of 2 requests with images" in first.getMessage()
+    assert not any(image["base64"][:64] in first.getMessage() for body in bodies for image in body["images"])
+
+
 def test_the_catalog_restates_the_clef_processors_image_tokens() -> None:
     from verathos.protocol.media import ENGINE_IMAGES, ImageLimits
 
@@ -556,15 +663,22 @@ def test_a_float32_reference_on_a_gpu_computes_without_tf32(monkeypatch) -> None
 
 # ---- on a CUDA GPU with the pinned weights ----
 
-def test_fast_engine_answers_stay_within_the_catalog_tolerances_of_the_float32_reference() -> None:
+def test_fast_engine_answers_stay_within_the_catalog_tolerances_of_the_float32_reference(monkeypatch,
+                                                                                          caplog) -> None:
     """The 30 tickets ``scripts/probe_miner.py`` sends and requests with images of every kind the gateway forwards
     (shapes, a chart, a screenshot, a receipt, a photo, a drawing; one to three images), against the release's own code
     in float32 on CPU without flash-linear-attention (as validators run it), answered together and one at a time; text
-    and images each within the model's mean, and the images' input tokens as the reference counts them."""
+    and images each within the model's mean, and the images' input tokens as the reference counts them. The vision
+    tower runs in float16; with an activation beyond float16's range forced in its last block, each request with images
+    runs its tower again in bfloat16 and stays within the tolerances, and the next passes answer in float16 as
+    before."""
+    import logging
+
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available() or os.environ.get("VERATHOS_GPU_TESTS") != "1":
         pytest.skip("set VERATHOS_GPU_TESTS=1 on a CUDA GPU with the pinned clef-flash weights downloaded")
     from verathos.engine import clef
+    from verathos.gateway.logs import Throttle
 
     model = catalog.load().get("clef-flash")
     tickets, images = json.loads(FIXTURE.read_text()), json.loads(IMAGES_FIXTURE.read_text())
@@ -574,16 +688,37 @@ def test_fast_engine_answers_stay_within_the_catalog_tolerances_of_the_float32_r
                for r in images]
     reference = [distributions(r["answers"]) for r in tickets + images]
     engine = clef.load(model.hf_repo, model.hf_revision, device="cuda", dtype="bfloat16")
+    assert engine.vision.visual.dtype == torch.float16
     items = [engine.prepare(body) for body in bodies]
     together = engine.run(items)
     alone = [engine.run([item])[0] for item in items]
     assert [a["usage"]["input_tokens"] for a in together[len(tickets):]] == [r["input_tokens"] for r in images]
     tolerance = model.tolerance
-    for answers in (together, alone):
+
+    def within(answers: list[dict], expected: list[dict]) -> None:
         comparisons = [compare_request(ref, distributions(a["answers"]), tolerance)
-                       for ref, a in zip(reference, answers)]
+                       for ref, a in zip(expected, answers)]
         assert not [c for c in comparisons if c.hard_fail(tolerance)]
-        for part in (comparisons[: len(tickets)], comparisons[len(tickets) :]):
-            assert sum(c.sum_abs for c in part) / sum(c.count for c in part) <= tolerance.mean_abs
+        assert sum(c.sum_abs for c in comparisons) / sum(c.count for c in comparisons) <= tolerance.mean_abs
+
+    for answers in (together, alone):
+        within(answers[: len(tickets)], reference[: len(tickets)])
+        within(answers[len(tickets):], reference[len(tickets):])
+    # a pass of several requests runs kernels of other shapes than one alone, whose rounding differs: by up to 0.028
+    # measured (a ticket on an RTX 5090); another request's answers would differ by more
     assert max(compare_request(distributions(a["answers"]), distributions(t["answers"]), tolerance).max_abs
-               for a, t in zip(alone, together)) < 0.02
+               for a, t in zip(alone, together)) < 0.04
+
+    def overflow(module, inputs, output):  # an activation beyond float16's range, in float16 only
+        return output * 1e6 if output.dtype == torch.float16 else output
+
+    monkeypatch.setattr(clef, "_throttled", Throttle())
+    hook = engine.vision.visual.blocks[-1].register_forward_hook(overflow)
+    with caplog.at_level(logging.WARNING, logger=clef.__name__):
+        try:
+            again = [engine.run([item])[0] for item in items[len(tickets):]]
+        finally:
+            hook.remove()
+    assert [r.name for r in caplog.records].count(clef.__name__) == 1
+    within(again, reference[len(tickets):])
+    assert [engine.run([item])[0] for item in items[len(tickets):]] == alone[len(tickets):]
