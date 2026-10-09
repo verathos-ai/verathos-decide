@@ -210,13 +210,19 @@ class BoundedEngine:
 @dataclass(frozen=True)
 class Checks:
     """Answer checks per model: the fp32 reference, and optionally a faster screen whose flags the reference must
-    confirm before an answer counts as wrong."""
+    confirm before an answer counts as wrong. A screen (the miners' bfloat16 engine) serves text requests: answers to
+    requests with images are recomputed on the reference alone."""
 
     references: dict[str, Engine]
     screens: dict[str, Engine]
 
     def for_test(self, budget_s: float = RECOMPUTE_BUDGET_S) -> Recomputes:
         return Recomputes(self, time.monotonic() + budget_s)
+
+    def can_check(self, model_id: str, request: dict[str, Any]) -> bool:
+        """Whether an answer to ``request`` can be recomputed: on the model's reference, or for a request without
+        images on its screen."""
+        return model_id in self.references or (not request.get("images") and model_id in self.screens)
 
     async def usable(self, cat: catalog_module.Catalog, transitioning: Collection[str]) -> Checks:
         """The checks that may run now: none for a model in transition (``validator.references``), and none on an
@@ -312,7 +318,7 @@ class Recomputes:
         if got is None:
             return MALFORMED, None
         reference = self.checks.references.get(model_id)
-        screen = self.checks.screens.get(model_id)
+        screen = None if request.get("images") else self.checks.screens.get(model_id)
         first = screen or reference
         if not recompute_answers or first is None:
             return None, None
@@ -1311,8 +1317,7 @@ class Auditor:
         fault, comparison = await recomputes.check(slot.model_id, request, parsed["answers"], model.tolerance,
                                                    recompute_answers=True, claimed=claimed_tokens(parsed), rank=rank)
         if fault is None and comparison is None:
-            checks = recomputes.checks
-            return None if slot.model_id in checks.references or slot.model_id in checks.screens else ""
+            return None if recomputes.checks.can_check(slot.model_id, request) else ""
         evidence = None if fault is None else _gateway_evidence(slot.hotkey, slot.endpoint_id, slot.model_id,
                                                                 request_id, fault, parsed)
         await asyncio.to_thread(self._finish_checked, sample_id, fault, evidence, comparison)
@@ -1381,7 +1386,7 @@ class Auditor:
             if self._tests_running:
                 return  # a test's checks come first; still pending
             model = cat.get(model_id)
-            if model is None or (model_id not in checks.references and model_id not in checks.screens):
+            if model is None or not checks.can_check(model_id, request):
                 self.store.finish_sample(sample_id, "unchecked", "no reference for the model")
                 return
             parsed = json.loads(response)

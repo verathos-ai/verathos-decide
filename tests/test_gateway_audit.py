@@ -1077,3 +1077,40 @@ def test_a_tests_pick_with_images_is_checked_from_memory(tmp_path) -> None:
     assert auditor.store.test_sample("ab" * 32, "hk", "gpu0") == ("t", "n", request, "{}")
     auditor.store.finish_sample("t", "checked")
     assert held(auditor.store) == (0, 0) and auditor.store.test_sample("ab" * 32, "hk", "gpu0") is None
+
+
+def test_answers_with_images_are_recomputed_on_the_reference_never_on_a_screen(tmp_path) -> None:
+    from verathos.miner.engine import EngineError
+
+    class TextScreen(Seeing):
+        """A bfloat16 screen, which serves text requests only."""
+
+        async def answer(self, request):
+            if request.get("images"):
+                raise EngineError("engine returned 422: images are not served by this engine")
+            return await super().answer(request)
+
+    gateway, miner_kp = kp(), kp()
+    app = miner(miner_kp, MockEngine("clef-flash"), gateway, "clef-flash")
+    samples = image_samples(app, miner_kp, gateway, [image_request(1), image_request(2)])
+    samples += image_samples(app, miner_kp, gateway, [{**image_request(i), "images": []} for i in (3, 4)])
+    auditor = _auditor(tmp_path, gateway_image_checks_per_epoch=2)
+    auditor.follower.poll()
+    auditor.update_slots([Slot(miner_kp.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)])
+    assert auditor.accept_samples(gateway.ss58_address, samples) == 4
+    screen, reference = TextScreen("clef-flash"), Seeing("clef-flash")
+    asyncio.run(auditor.check_samples(Checks({"clef-flash": reference}, {"clef-flash": screen})))
+    states = sorted(auditor.store._query("SELECT media, state FROM samples"))
+    assert states == [(0, "checked"), (0, "checked"), (1, "checked"), (1, "checked")]
+    assert not any(r.get("images") for r in screen.asked) and len(screen.asked) == 2
+    assert sum(bool(r.get("images")) for r in reference.asked) == 2
+    # without a reference, a screen cannot check an answer with images: it is given up, not tried on the screen
+    (tmp_path / "other").mkdir()
+    other = _auditor(tmp_path / "other", gateway_image_checks_per_epoch=2)
+    other.follower.poll()
+    other.update_slots([Slot(miner_kp.ss58_address, "gpu0", "https://x/e/gpu0", "clef-flash", 40.0, tls=PIN)])
+    assert other.accept_samples(gateway.ss58_address, samples[:1]) == 1
+    screen = TextScreen("clef-flash")
+    asyncio.run(other.check_samples(Checks({}, {"clef-flash": screen})))
+    assert other.store._query("SELECT state, reason FROM samples") == [("unchecked", "no reference for the model")]
+    assert screen.asked == []
