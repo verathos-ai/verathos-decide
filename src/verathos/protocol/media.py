@@ -56,6 +56,7 @@ _DATA_URL = re.compile(r"data:(image/[a-z]+);base64,", re.IGNORECASE)
 _HEADER_STEPS = 1024  # markers and fill bytes a JPEG header is read through, at most
 _NOT_BASE64 = "not base64: the standard alphabet with its padding, without whitespace"
 _PR_SET_DUMPABLE = 4
+BASE64_ALPHABET = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
 
 
 class ImageLimits(BaseModel):

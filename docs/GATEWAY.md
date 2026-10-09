@@ -197,6 +197,7 @@ view of the miners does not take a model off the gateway. Once the current table
    | `request_timeout_s`, `attempt_timeout_s`, `max_attempts` | 10, 4, 3 | the miners' deadline per request, per attempt, attempts |
    | `max_in_flight` | 4096 | requests in flight per process; more get 503 |
    | `max_body_bytes` | 1 MiB | the body of a request to a model that reads text only (at most 1 MiB); a model that reads images takes its catalog's `images.max_request_bytes` |
+   | `body_timeout_s` | 60 | receiving a request's body, at most, once its key, rate, quota and credit pass; slower gets 408 |
    | `max_in_flight_bytes` | 256 MiB | request bodies held in this process at once, and requests with their images made canonical; more get 503 |
    | `media_workers`, `max_media_in_flight`, `media_timeout_s` | 4, 8, 2 | image decode workers, requests decoded or waiting for one at once (more get 503 `busy`), the most one image may take ([Images](#images)) |
    | `sample_window_s` | 600 | one exchange per endpoint and window goes to the auditor |
@@ -243,6 +244,8 @@ location / {
     proxy_next_upstream error timeout non_idempotent;
     proxy_next_upstream_tries 2;
     proxy_connect_timeout 1s;
+    client_max_body_size 14m;
+    proxy_request_buffering off;
 }
 ```
 
@@ -256,7 +259,7 @@ systemctl restart verathos-gateway;         until curl -sf http://127.0.0.1:8080
 On SIGTERM a process stops accepting connections, so the proxy sends new requests to the other one; it finishes
 the requests in flight (their checks and `request_timeout_s`), writes usage, samples and served counts (10 s each
 at most; what cannot be written is logged), and exits. A request whose process fails before answering goes to the
-other process once. A process is ready as soon as it has started: it serves the routes it kept on disk while it
+other process once, unless nginx already passed its body on. A process is ready as soon as it has started: it serves the routes it kept on disk while it
 fetches new ones. A restart of the auditor does not reach users: the gateways keep their routes until it serves new
 ones. A key's rate limit starts afresh on the other process.
 
@@ -337,6 +340,7 @@ Every response to `POST /v1/systemone` carries `X-Request-Id` (the client's, if 
 | 401 | `unauthorized` | missing, unknown, revoked or expired key, or a suspended account |
 | 402 | `insufficient_credit` | a prepaid account's balance is used up |
 | 404 | `model_not_found` | not an active model of the catalog |
+| 408 | `timeout` | the body took longer than `body_timeout_s` to arrive |
 | 413 | `too_large` | body, state, images, or the answers the questions would need, over the limits |
 | 429 | `rate_limited` | over the key's rate, or too many invalid keys from the address; `Retry-After` |
 | 429 | `quota_exceeded` | the month's quota is used up; `Retry-After` until the next month |
@@ -413,13 +417,10 @@ forwarded. An image that takes a worker longer than `media_timeout_s` (2 s) gets
 is after 256 images. At most `max_media_in_flight` requests are decoded or wait for a worker at once; more get 503
 `busy`.
 
-Behind nginx, let image bodies through, and keep them in memory (by default nginx writes a larger body to a temporary
-file), in the server block that terminates TLS:
-
-```nginx
-client_max_body_size 14m;
-client_body_buffer_size 14m;
-```
+Behind nginx, `client_max_body_size 14m` lets image bodies through and `proxy_request_buffering off` passes a body on
+as it arrives ([Restarts without downtime](#restarts-without-downtime)): nginx then holds no body whole, in memory or
+in a temporary file on disk, and the gateway reads a body only once its key, rate, quota and credit pass, within
+`body_timeout_s` (60 s; 408 beyond). Beyond `max_body_bytes`, a body may hold more only as its images' base64.
 
 ## Accounts and keys
 
@@ -447,12 +448,12 @@ correction, the only kind that may be negative) and a `reference` naming the pay
 reference is recorded once: adding the same entry again changes nothing, and a reference already used for another
 entry is refused. So a payment processor's retries never add a payment twice.
 
-Each process reads a prepaid account's balance at most 5 s before using it and subtracts what it charged since and
-what its requests in flight may cost at most (one token per byte of the request without its images, and the images'
-tokens), reserved when a request is accepted
-and settled to its real cost when it ends. New credit therefore applies within 5 s (at once when recorded through
-this process), and other processes' charges within about 10 s (they write every 5 s). A request is accepted while
-that remainder is positive, so a balance ends below zero by at most one request's cost per process.
+Each process reads a prepaid account's balance at most 5 s before using it and subtracts what it charged since and what
+its requests in flight may cost at most (one token per byte of the request without its images, and the most image tokens
+the model's limits allow), reserved when a request is accepted, before its images are decoded, and settled to its real
+cost when it ends. New credit therefore applies within 5 s (at once when recorded through this process), and other
+processes' charges within about 10 s (they write every 5 s). A request is accepted while that remainder is positive, so
+a balance ends below zero by at most one request's cost per process.
 
 ## Admin API
 

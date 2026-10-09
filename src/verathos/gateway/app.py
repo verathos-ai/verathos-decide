@@ -19,6 +19,7 @@ month).
     401 unauthorized        missing, unknown, revoked or expired key, or a suspended account
     402 insufficient_credit a prepaid account's balance is used up
     404 model_not_found     not an active model of the catalog
+    408 timeout             the body took longer than ``body_timeout_s`` to arrive
     413 too_large           body, state, images, or the answers the questions would need, over the limits
     429 rate_limited        over the key's rate (or too many invalid keys from one address)
     429 quota_exceeded      over the account's monthly quota
@@ -81,7 +82,7 @@ from verathos.protocol.api import (
 )
 from verathos.protocol.canonical import canonical_json, sha256_hex
 from verathos.protocol.gateway import Routes
-from verathos.protocol.media import ImageRefused, request_image_tokens, sent_image
+from verathos.protocol.media import BASE64_ALPHABET, ImageRefused, request_image_tokens, sent_image
 from verathos.throughput.workload import in_mix_form
 from verathos.validator.canaries import canary_like
 
@@ -231,10 +232,16 @@ class Checked:
 class Screened:
     """A request that passed the checks made before its images are decoded."""
 
-    raw: dict[str, Any]
     parsed: SystemOneRequest
     model: catalog_module.CatalogModel
+    forwarded: dict[str, Any]  # what is forwarded of it besides its images: its model, state and questions
+    text_body: bytes  # their canonical JSON
     images: list[tuple[str, str]]  # (media type, base64) of each image as sent
+
+    def most_tokens(self) -> int:
+        """The most input tokens it can be billed: one per byte of it without its images, and the most image tokens
+        its model's limits allow."""
+        return len(self.text_body) + (self.model.images.max_tokens() if self.images else 0)
 
 
 NO_ANSWER = {  # why a forwarded request got no answer -> the API error
@@ -253,17 +260,34 @@ def validation_message(exc: ValidationError) -> str:
     return f"{where + ': ' if where else ''}{first['msg']}{more}"[:300]
 
 
+def model_body_limit(g: Gateway, model_id: Any) -> int:
+    """The most a request's body may hold for the model it names: its catalog's ``images.max_request_bytes`` for an
+    active model that reads images, ``max_body_bytes`` for any other."""
+    cat = g.catalog()
+    model = cat.get(model_id) if cat is not None and isinstance(model_id, str) else None
+    if model is not None and model.status == "active" and model.reads_images():
+        return model.images.max_request_bytes
+    return g.config.max_body_bytes
+
+
 def screen(g: Gateway, body: bytes) -> Screened:
-    """The checks made before any image is decoded: strict JSON, a SystemOne request without videos or media_kwargs
-    for an active model miners serve now, within the model's body limit and prompt limit (``prompt_chars``), with
-    answers that fit a response, whose state is not one of the subnet's test requests or canaries (a miner relaying
-    them through the gateway would have its answers counted as users'), and with images only to a model that reads
-    them, within its limits as far as they can be checked undecoded (``protocol.media.sent_image``). Raises
-    Rejected."""
+    """The checks made before any image is decoded: within the body limit of the model it names, beyond the text
+    limit (``max_body_bytes``) only by base64 (so parsing a large body costs no more than a text one), strict JSON, a
+    SystemOne request without videos or media_kwargs for an active model miners serve now, within the model's prompt
+    limit (``prompt_chars``) and ``MAX_REQUEST_BYTES`` without its images, with answers that fit a response, whose
+    state is not one of the subnet's test requests or canaries (a miner relaying them through the gateway would have
+    its answers counted as users'), and with images only to a model that reads them, within its limits as far as they
+    can be checked undecoded (``protocol.media.sent_image``). Raises Rejected."""
+    text_limit = g.config.max_body_bytes
+    if len(body) > text_limit and len(body.translate(None, BASE64_ALPHABET)) > text_limit:
+        raise Rejected(413, "too_large", f"the body exceeds {text_limit} bytes besides its images' base64")
     try:
         raw = json.loads(body, parse_constant=_no_constants)
-        if isinstance(raw, dict) and (refused := [why for field, why in REFUSED_FIELDS.items() if field in raw]):
-            raise Rejected(400, "invalid_request", refused[0])
+        if isinstance(raw, dict):
+            if refused := [why for field, why in REFUSED_FIELDS.items() if field in raw]:
+                raise Rejected(400, "invalid_request", refused[0])
+            if len(body) > (limit := model_body_limit(g, raw.get("model"))):
+                raise Rejected(413, "too_large", f"the body exceeds {limit} bytes")
         parsed = SystemOneRequest.model_validate(raw)
         prompt = prompt_chars(parsed)
     except ValidationError as exc:
@@ -280,10 +304,6 @@ def screen(g: Gateway, body: bytes) -> Screened:
         raise Rejected(404, "model_not_found", f"{parsed.model} is not served")
     if parsed.images and not model.reads_images():
         raise Rejected(400, "invalid_request", f"{model.model_id} reads text only", model=model.model_id)
-    limit = model.images.max_request_bytes if model.reads_images() else g.config.max_body_bytes
-    if len(body) > limit:
-        raise Rejected(413, "too_large", f"the body exceeds {limit} bytes, {model.model_id}'s limit",
-                       model=model.model_id)
     if parsed.model not in g.router.models():
         raise Rejected(503, "unavailable", f"no miner serves {parsed.model} right now", 30, parsed.model)
     if prompt > STATE_CHARS_PER_TOKEN * model.max_state_tokens:
@@ -292,7 +312,15 @@ def screen(g: Gateway, body: bytes) -> Screened:
     if answer_bytes(parsed) > MAX_RESPONSE_BYTES:
         raise Rejected(413, "too_large", "the answers to these questions would exceed a response's size limit",
                        model=parsed.model)
-    return Screened(raw, parsed, model, sent_images(parsed.images or [], model))
+    forwarded = {"model": raw["model"], "state": raw["state"], "questions": raw["questions"]}
+    try:
+        text_body = canonical_json(forwarded)
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise Rejected(400, "invalid_request", f"not a SystemOne request: {exc}"[:500]) from None
+    if len(text_body) > MAX_REQUEST_BYTES:
+        raise Rejected(413, "too_large", f"the request without its images exceeds {MAX_REQUEST_BYTES} bytes",
+                       model=model.model_id)
+    return Screened(parsed, model, forwarded, text_body, sent_images(parsed.images or [], model))
 
 
 def sent_images(images: list[Any], model: catalog_module.CatalogModel) -> list[tuple[str, str]]:
@@ -328,11 +356,10 @@ def with_images(text_body: bytes, images: list[CanonicalImage]) -> bytes:
     return b'{"images":[' + items + b"]," + text_body[1:]
 
 
-async def check_request(g: Gateway, body: bytes) -> Checked:
-    """A body the gateway can forward (``screen``), with its images made canonical by the decoders: the request as
-    forwarded, at most ``MAX_REQUEST_BYTES`` without its images and the model's ``max_request_bytes`` with them, and
-    the bounds of the input tokens it is billed. Raises Rejected."""
-    screened = screen(g, body)
+async def made_canonical(g: Gateway, screened: Screened) -> Checked:
+    """A screened request with its images made canonical by the decoders: the request as forwarded, at most the
+    model's ``max_request_bytes`` with its images, and the bounds of the input tokens it is billed. Raises
+    Rejected."""
     model, model_id = screened.model, screened.model.model_id
     images: list[CanonicalImage] = []
     if screened.images:
@@ -344,27 +371,24 @@ async def check_request(g: Gateway, body: bytes) -> Checked:
             raise Rejected(503, "unavailable", "the gateway cannot decode images right now", 5, model_id) from None
         except ImageRefused as refused:
             raise rejection(refused, str(refused), model_id) from None
-    raw = screened.raw
-    forwarded = {"model": raw["model"], "state": raw["state"], "questions": raw["questions"]}
-    try:
-        text_body = canonical_json(forwarded)
-    except (ValueError, TypeError, RecursionError) as exc:
-        raise Rejected(400, "invalid_request", f"not a SystemOne request: {exc}"[:500]) from None
-    if len(text_body) > MAX_REQUEST_BYTES:
-        raise Rejected(413, "too_large", f"the request without its images exceeds {MAX_REQUEST_BYTES} bytes",
-                       model=model_id)
     image_tokens = request_image_tokens([(i.width, i.height) for i in images], model.images.token_px)
-    forwarded_body = text_body
+    forwarded, body = screened.forwarded, screened.text_body
     if images:
         forwarded = {"images": [{"base64": i.base64, "content_type": i.content_type} for i in images], **forwarded}
-        forwarded_body = with_images(text_body, images)
-        if len(forwarded_body) > model.images.max_request_bytes:
+        body = with_images(body, images)
+        if len(body) > model.images.max_request_bytes:
             raise Rejected(413, "too_large", f"with its images made canonical the request exceeds "
                                              f"{model.images.max_request_bytes} bytes, {model_id}'s limit",
                            model=model_id)
     min_tokens = len(text(screened.parsed.state)) // STATE_CHARS_PER_BILLED_TOKEN + image_tokens
-    return Checked(forwarded, forwarded_body, screened.parsed, sha256_hex(forwarded_body), model.price, min_tokens,
-                   len(text_body) + image_tokens, image_tokens)
+    return Checked(forwarded, body, screened.parsed, sha256_hex(body), model.price, min_tokens,
+                   len(screened.text_body) + image_tokens, image_tokens)
+
+
+async def check_request(g: Gateway, body: bytes) -> Checked:
+    """A body the gateway can forward (``screen``), with its images made canonical (``made_canonical``). Raises
+    Rejected."""
+    return await made_canonical(g, screen(g, body))
 
 
 async def forward(g: Gateway, checked: Checked, started: float, attempts: list[dict[str, Any]] | None = None, *,
@@ -630,19 +654,21 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         if not funded:
             return reject(402, "insufficient_credit", "the account's credit is used up", request_id)
         body, limit = bytearray(), g.body_limit()
-        async for chunk in request.stream():
-            body += chunk
-            if len(body) > limit:
-                return reject(413, "too_large", f"the body exceeds {limit} bytes", request_id)
-            if not hold(request, len(chunk)):
-                return reject(503, "busy", "the gateway is at capacity", request_id, 1)
         try:
-            checked = await check_request(g, bytes(body))
+            async with asyncio.timeout(g.config.body_timeout_s):
+                async for chunk in request.stream():
+                    body += chunk
+                    if len(body) > limit:
+                        return reject(413, "too_large", f"the body exceeds {limit} bytes", request_id)
+                    if not hold(request, len(chunk)):
+                        return reject(503, "busy", "the gateway is at capacity", request_id, 1)
+        except TimeoutError:
+            return reject(408, "timeout", f"the body took longer than {g.config.body_timeout_s:g} s", request_id)
+        try:
+            screened = screen(g, bytes(body))
         except Rejected as r:
             return reject(r.status, r.kind, r.message, request_id, r.retry_after, model=r.model)
-        if checked.image_tokens and not hold(request, len(checked.body)):  # the request with its canonical images
-            return reject(503, "busy", "the gateway is at capacity", request_id, 1, model=checked.parsed.model)
-        most = checked.max_tokens * checked.price  # the most the answer may cost
+        most = screened.most_tokens() * screened.model.price  # the most the answer may cost
         try:
             funded = await bounded("balance lookup", g.meter.reserve(principal, most))
         except Unchecked:
@@ -650,6 +676,12 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         if not funded:
             return reject(402, "insufficient_credit", "the account's credit is used up", request_id)
         try:
+            try:
+                checked = await made_canonical(g, screened)
+            except Rejected as r:
+                return reject(r.status, r.kind, r.message, request_id, r.retry_after, model=r.model)
+            if checked.image_tokens and not hold(request, len(checked.body)):  # the request with its canonical images
+                return reject(503, "busy", "the gateway is at capacity", request_id, 1, model=checked.parsed.model)
             return await answer(principal, checked, started, request_id)
         finally:
             g.meter.release(principal, most)

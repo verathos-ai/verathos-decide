@@ -50,6 +50,8 @@ class GatewayConfig(BaseModel):
     max_body_bytes: int = Field(1 << 20, ge=1024, le=1 << 20, description="The body of a request to a model that "
                                 "reads text only; a model that reads images takes its catalog's "
                                 "images.max_request_bytes")
+    body_timeout_s: float = Field(60.0, gt=0, description="Receiving a request's body, at most (it is read once its "
+                                  "key, rate, quota and credit are checked); slower bodies get 408")
     max_in_flight_bytes: int = Field(256 << 20, ge=1 << 20, description="Request bodies held in this process at "
                                      "once, and requests with their images made canonical (they are parsed into "
                                      "several copies); more get 503")

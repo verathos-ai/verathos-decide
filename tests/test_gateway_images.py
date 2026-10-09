@@ -42,10 +42,11 @@ QUESTIONS = {"corner": {"type": "noul", "instructions": "Is there a green corner
 REQUEST = {"model": "clef-flash", "state": "Look at the image.", "questions": QUESTIONS}
 
 
-def reading_images(**limits) -> catalog.Catalog:
+def reading_images(max_state_tokens: int | None = None, **limits) -> catalog.Catalog:
     """The shipped catalog with clef-flash reading images."""
     document = catalog.load().document()
-    entry = {"input_modalities": ["text", "image"], **({"images": limits} if limits else {})}
+    entry = {"input_modalities": ["text", "image"], **({"images": limits} if limits else {}),
+             **({"max_state_tokens": max_state_tokens} if max_state_tokens else {})}
     return catalog.Catalog.parse({**document, "models": [{**m, **entry} if m["model_id"] == "clef-flash" else m
                                                           for m in document["models"]]})
 
@@ -162,18 +163,91 @@ def test_images_beyond_the_limits_are_refused(tmp_path, setups, images, status, 
     assert engine.received == []
 
 
-def test_the_body_limit_is_the_models(tmp_path, setups) -> None:
+def test_the_body_limit_is_the_models_and_beyond_the_text_limit_a_body_holds_base64(tmp_path, setups) -> None:
     from tests.test_miner_app import REQUEST as TEXT
 
-    s = setups(tmp_path, Recording("clef-flash"), cat=reading_images(max_total_bytes=12 << 20, max_bytes=4 << 20))
+    engine = Recording("clef-flash")
+    s = setups(tmp_path, engine, cat=reading_images(max_total_bytes=12 << 20, max_bytes=4 << 20))
     big = [item(os.urandom(3 << 20), "image/png")] * 3  # undecodable, but the body is read in full for clef-flash
     assert s.gateway.body_limit() == 13 << 20
     assert "images.0" in error(asyncio.run(s.post({**REQUEST, "images": big})))[2]
-    padded = json.dumps({**TEXT, "state": "x" * 1000}).encode() + b" " * (2 << 20)
-    assert error(asyncio.run(s.post(content_override=padded))) == (
-        413, "too_large", f"the body exceeds {1 << 20} bytes, kev-4b's limit")
+    # a text model's limit holds first, as it did when bodies were read up to it: before kev-4b's 503 here
+    long = json.dumps({**TEXT, "state": "x" * (2 << 20)}).encode()
+    assert error(asyncio.run(s.post(content_override=long))) == (413, "too_large", f"the body exceeds {1 << 20} bytes")
+    # beyond the text limit, a body is base64 but for what a text body may hold: no costly structure is parsed
+    for junk in (b"[" + b"{}," * (1 << 20) + b"{}]", json.dumps({**REQUEST, "state": " " * (2 << 20)}).encode()):
+        assert error(asyncio.run(s.post(content_override=junk))) == (
+            413, "too_large", f"the body exceeds {1 << 20} bytes besides its images' base64")
     over = json.dumps({**REQUEST, "images": [item(b"x" * (10 << 20), "image/png")]}).encode()
     assert error(asyncio.run(s.post(content_override=over)))[:2] == (413, "too_large")
+    assert engine.received == []
+
+
+def test_the_request_without_its_images_is_held_to_the_text_limit_before_any_image_is_decoded(tmp_path,
+                                                                                               setups) -> None:
+    class Untouched:
+        async def canonical(self, images, limits):
+            raise AssertionError("decoded")
+
+        def close(self) -> None:
+            pass
+
+    s = setups(tmp_path, Recording("clef-flash"), cat=reading_images(max_state_tokens=1 << 20))
+    s.gateway.decoders.close()
+    s.gateway.decoders = Untouched()
+    state = "\u0007" * ((1 << 20) // 6 + 100)  # each character canonical JSON as six bytes
+    r = asyncio.run(s.post({**REQUEST, "state": state, "images": [item(encoded(256, 256), "image/png")]}))
+    assert error(r) == (413, "too_large", f"the request without its images exceeds {1 << 20} bytes")
+
+
+def test_credit_is_reserved_before_images_are_decoded(tmp_path, setups) -> None:
+    """A request reserves the most its images may cost before they are decoded, so a prepaid account whose credit the
+    requests in flight hold is refused before its next request's images are."""
+
+    class Holding:
+        calls = 0
+        go = asyncio.Event()
+
+        async def canonical(self, images, limits):
+            Holding.calls += 1
+            await Holding.go.wait()
+            raise ImageRefused(400, "images.0: refused here")
+
+        def close(self) -> None:
+            pass
+
+    s = setups(tmp_path, Recording("clef-flash"))
+    s.gateway.decoders.close()
+    s.gateway.decoders = Holding()
+    asyncio.run(s.accounts.set_account("acme", prepaid=True))
+    asyncio.run(s.accounts.add_credit("acme", 100, kind="grant", reference="100 micro-USD"))
+    request = {**REQUEST, "images": [item(encoded(256, 256), "image/png")]}
+
+    async def two():
+        first = asyncio.create_task(s.post(request))
+        while not Holding.calls:
+            await asyncio.sleep(0.01)
+        second = await s.post(request)  # the first holds more than the account's 100 micro-USD
+        Holding.go.set()
+        return await first, second
+
+    first, second = asyncio.run(two())
+    assert (first.status_code, second.status_code, Holding.calls) == (400, 402, 1)
+
+
+def test_a_body_that_arrives_too_slowly_gets_408(tmp_path, setups) -> None:
+    s = setups(tmp_path, Recording("clef-flash"), body_timeout_s=0.2)
+
+    async def slow():
+        yield json.dumps(REQUEST).encode()[:10]
+        await asyncio.sleep(1.0)
+        yield json.dumps(REQUEST).encode()[10:]
+
+    async def post():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=s.app), base_url="http://gw") as c:
+            return await c.post("/v1/systemone", content=slow(), headers={"Authorization": f"Bearer {s.key}"})
+
+    assert error(asyncio.run(post())) == (408, "timeout", "the body took longer than 0.2 s")
 
 
 def test_busy_decoders_and_ones_that_cannot_start_answer_503(tmp_path, setups) -> None:
