@@ -102,7 +102,7 @@ What it does:
 |---|---|---|---|---|
 | `kev-4b` | active | about 15 GiB | Kev | 1.0 |
 | `kev-9b` | active | about 26 GiB | Kev | 0.92 |
-| `clef-flash` | active | about 21 GiB | `verathos-engine` (Clef) | 0.85 |
+| `clef-flash` | active | about 21 GiB | `verathos-engine` (Clef) | 0.72 |
 
 These are the shipped catalog's models; the installer reads the catalog on chain and lists its models with the memory
 each needs. All three are active from the start and share the miners' emission equally while users pay for none of them
@@ -110,10 +110,9 @@ each needs. All three are active from the start and share the miners' emission e
 validators but scores zero until the subnet owner activates it: serving one helps measure it and earns nothing yet. The
 relative speed is the catalog's `relative_speed`: the requests/s of the model's standard mix one GPU serves, relative to
 the other models, as the subnet owner measured them on one reference GPU (`SUBNET_ADMIN.md`). How the models compare
-differs by GPU: kev-9b serves 0.92 times kev-4b's requests on an H100, and clef-flash 0.92 times without images and
-about 0.85 times its mix with images (derived from the figures with images in
-[3. Start one engine per GPU](#3-start-one-engine-per-gpu)); on an A100 kev-9b serves 0.68-0.82 times and clef-flash
-0.65 times without images, on an RTX 5090 kev-9b 0.55 times.
+differs by GPU: kev-9b serves 0.92 times kev-4b's requests on an H100, and clef-flash 0.72 times (its mix with
+images; 0.79 times the same mix without them); on an A100 kev-9b serves 0.68-0.82 times and clef-flash 0.65 times
+without images, on an RTX 5090 kev-9b 0.55 times.
 
 Each GPU serves one model: by default the active model that pays best on it now. The setup reads the auditor's
 network status (`GET /v1/network` on the subnet owner's axon, built once per epoch) and uses it only if the subnet
@@ -135,8 +134,8 @@ active model that adds most, and the GPUs after it count it, so a machine with s
 where that pays more. For example, with each model at a third of the scores (0.197 of the emission at the shipped
 miner share of 0.59) and 300, 120 and 400 requests/s proven on kev-4b, kev-9b and clef-flash, an A100 whose
 measurement declares 13.9 requests/s of kev-4b adds about `0.197 x 13.9 / 313.9 = 0.87%` there,
-`0.197 x 12.8 / 132.8 = 1.9%` on kev-9b (12.8 = 13.9 x 0.92) and `0.197 x 11.8 / 411.8 = 0.56%` on clef-flash
-(11.8 = 13.9 x 0.85): it serves kev-9b.
+`0.197 x 12.8 / 132.8 = 1.9%` on kev-9b (12.8 = 13.9 x 0.92) and `0.197 x 10.0 / 410.0 = 0.48%` on clef-flash
+(10.0 = 13.9 x 0.72): it serves kev-9b.
 
 On an update, a GPU keeps the model it serves unless another pays at least 1.2 times as much: a switch downloads the
 model and measures again, and the numbers move with every epoch. When another pays at least 1.1 times as much, the
@@ -145,7 +144,7 @@ plan says so and how to switch:
 ```
 the network in the auditor's epoch 45412: kev-4b 19.7% of the emission, 300.0 requests/s proven; kev-9b 19.7% of the emission, 240.0 requests/s proven; clef-flash 19.7% of the emission, 400.0 requests/s proven; the median endpoint 14.6 requests/s at relative speed 1
 GPU 0 (NVIDIA A100 80GB PCIe, 80 GiB): kev-4b, endpoint gpu0, engine on 127.0.0.1:8008
-GPU 0: kev-4b, as set up before: about 0.87% of the emission (its share 19.7%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 0.99%, clef-flash 0.56%. kev-9b would pay about 1.14x as much on GPU 0: --model kev-9b to switch
+GPU 0: kev-4b, as set up before: about 0.87% of the emission (its share 19.7%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 0.99%, clef-flash 0.48%. kev-9b would pay about 1.14x as much on GPU 0: --model kev-9b to switch
 another choice: --model <id> for every GPU, or one per GPU in order, as in --model kev-9b
 ```
 
@@ -482,8 +481,9 @@ of the float32 reference on both GPUs, with a mean difference of 0.0009, about t
 
 In the shipped catalog a quarter of Clef-Flash's request mix carries an image of 256 to 512 px a side ([Throughput
 tests](#throughput-tests)). From the figures above, such a request takes about 450 text tokens of GPU time more on the
-H100 (about 310 for the image, 139 for its question), and the mix runs at about 23.8 requests per second against 25.8
-without images, on the RTX 5090 at about 7.9 against 8.5: derived from these figures, not measured on the mix itself.
+H100 (about 310 for the image, 139 for its question). The miner's own measurement of the mix on an H100 gave 23.0
+requests per second (22.6-23.3 in three measurements) against 25.0 for the same mix without images (24.8-25.8) in one
+session; on the RTX 5090 the figures above give about 7.9 against 8.5 (derived, not measured on the mix).
 
 ### 4. Configure
 
