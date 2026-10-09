@@ -53,16 +53,19 @@ class EngineImages:
     """The images an engine family's processor takes as they are: each side a multiple of ``token_px`` (its patch
     size times its merge size), its pixels within [``min_pixels``, ``max_pixels``]; ``image_token``, the text of one
     image token in its prompts, which the text of a request with images may not hold (the processor would count it
-    as one of the images')."""
+    as one of the images'); ``token_cost``, the GPU time of an image token in text tokens, as measured on the miners'
+    engine."""
 
     token_px: int
     min_pixels: int
     max_pixels: int
     image_token: str
+    token_cost: float
 
 
-# the engine families whose models read images
-ENGINE_IMAGES = {"clef": EngineImages(32, 65_536, 16_777_216, "<|image_pad|>")}
+# the engine families whose models read images; Clef's image token takes 1.6 to 2.1 text tokens of GPU time from
+# 512 px a side, more below (H100 and RTX 5090)
+ENGINE_IMAGES = {"clef": EngineImages(32, 65_536, 16_777_216, "<|image_pad|>", 2.0)}
 _ORIENTATION = 0x0112  # the EXIF orientation tag; 5 to 8 swap width and height
 _DATA_URL = re.compile(r"data:(image/[a-z]+);base64,", re.IGNORECASE)
 _HEADER_STEPS = 1024  # markers and fill bytes a JPEG header is read through, at most

@@ -145,7 +145,7 @@ def test_a_models_relative_speed_is_positive_and_one_when_absent() -> None:
 
     document = catalog.load().document()
     assert {m.model_id: m.relative_speed for m in catalog.load().models} == {"kev-4b": 1.0, "kev-9b": 0.92,
-                                                                            "clef-flash": 0.92}
+                                                                            "clef-flash": 0.85}
     without = [{k: v for k, v in m.items() if k != "relative_speed"} for m in document["models"]]
     assert {m.relative_speed for m in catalog.Catalog.parse({**document, "models": without}).models} == {1.0}
     for speed in (0, -1.0):
@@ -233,3 +233,38 @@ def test_input_this_code_does_not_serve_is_found_before_publishing() -> None:
             catalog.Catalog.parse(with_models(**{"clef-flash": {"input_modalities": modalities}}))
     with pytest.raises(ValidationError, match="max_pixels"):
         catalog.Catalog.parse(with_models(**{"clef-flash": {"images": {"max_pixels": 32 << 20}}}))
+
+
+def test_a_request_mix_carries_images_only_for_a_model_that_reads_them_and_within_its_limits() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    shipped = catalog.load()
+    mix = shipped.get("clef-flash").workload.document()
+    assert mix["images"] == {"share": 0.25, "count": [1, 1], "sides_px": list(range(256, 513, 32))}
+    assert all("images" not in m["workload"] for m in shipped.document()["models"] if m["model_id"] != "clef-flash")
+
+    def with_mix(mix_images: dict, model_id: str = "clef-flash", **fields) -> catalog.Catalog:
+        workload = {**catalog.load().get(model_id).workload.document(), "images": mix_images}
+        return catalog.Catalog.parse(with_models(**{model_id: {"workload": workload, **fields}}))
+
+    assert with_mix({**mix["images"], "count": [1, 4]}).get("clef-flash").workload.images.count == (1, 4)
+    for images, fields, why in (
+            (mix["images"], {"input_modalities": ["text"]}, "clef-flash reads no images"),
+            ({**mix["images"], "count": [1, 3]}, {"images": {"max_count": 2}}, "takes at most 2 images"),
+            ({**mix["images"], "sides_px": [256, 300]}, {}, "multiple of images.token_px"),
+            ({**mix["images"], "sides_px": [224, 256]}, {}, "outside images.min_pixels"),
+            ({**mix["images"], "sides_px": [2048]}, {}, "outside images.min_pixels"),
+            ({**mix["images"], "sides_px": [512]}, {"images": {"max_bytes": 4096, "max_total_bytes": 4096}},
+             "images.max_bytes"),
+            ({**mix["images"], "sides_px": [16, 201 * 16]},
+             {"images": {"token_px": 16, "min_pixels": 256, "max_pixels": (201 * 16) ** 2}}, "aspect ratio")):
+        with pytest.raises(ValidationError, match=why):
+            with_mix(images, **fields)
+    with pytest.raises(ValidationError, match="kev-4b reads no images"):
+        with_mix(mix["images"], "kev-4b")
+    mistyped = with_mix({**mix["images"], "side_px": [256]})
+    assert mistyped.unknown_settings() == ["models.clef-flash.workload.images.side_px"]
+    assert catalog.Catalog.parse(with_models(**{"kev-4b": {"workload": {
+        **catalog.load().get("kev-4b").workload.document(), "image": {}}}})).unknown_settings() == [
+        "models.kev-4b.workload.image"]

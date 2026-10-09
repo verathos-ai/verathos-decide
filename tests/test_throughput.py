@@ -32,13 +32,14 @@ from verathos.throughput.policy import (
     eligible_range,
     policy_from,
 )
-from verathos.throughput.workload import Workload, make_request
+from verathos.throughput.workload import IMAGE_QUESTIONS, Workload, make_request
 from verathos.validator.throughput import Throughput, slots
 
 pytestmark = pytest.mark.usefixtures("lab_network")
 PIN = "ab" * 32  # a certificate pin, for endpoints no request reaches
 
 KEV = catalog.load().get("kev-4b")
+CLEF = catalog.load().get("clef-flash")
 
 
 def kp() -> Keypair:
@@ -75,6 +76,46 @@ class CapacityEngine:
         async with self._slots:
             await asyncio.sleep(self.service_s)
             return await self.engine.answer(request)
+
+
+class ReadingImages(MockEngine):
+    """Answers as the mock engine, but a request's answers depend on its images too."""
+
+    async def answer(self, request):
+        if not request.get("images"):
+            return await super().answer(request)
+        seen = hashlib.sha256(json.dumps(request["images"]).encode()).hexdigest()
+        return await MockEngine(self.model, salt=f"{self.salt}|{seen}").answer(request)
+
+
+class RefusingImages(MockEngine):
+    """An engine that serves no images."""
+
+    async def answer(self, request):
+        from verathos.miner.engine import EngineError
+
+        if request.get("images"):
+            raise EngineError("images are not served")
+        return await super().answer(request)
+
+
+class Seen:
+    """Keeps the requests an engine receives."""
+
+    def __init__(self, engine) -> None:
+        self.engine, self.requests = engine, []
+
+    async def answer(self, request):
+        self.requests.append(request)
+        return await self.engine.answer(request)
+
+
+def image_share(share: float) -> catalog.Catalog:
+    """The shipped catalog with ``share`` of clef-flash's mix carrying images."""
+    document = catalog.load().document()
+    models = [{**m, "workload": {**m["workload"], "images": {**m["workload"]["images"], "share": share}}}
+              if m["model_id"] == "clef-flash" else m for m in document["models"]]
+    return catalog.Catalog.parse({**document, "models": models})
 
 
 # ---- schedule and policy ----
@@ -265,6 +306,22 @@ def test_measurement_finds_capacity_and_shares_of_one_engine(tmp_path) -> None:
     assert m["alone"].declared(0.95) == round(m["alone"].measured_rps * 0.95, 2)
 
 
+def test_an_image_models_capacity_is_measured_on_its_mix_with_images() -> None:
+    from verathos.protocol.media import canonical_sizes
+
+    engine = Seen(CapacityEngine(ReadingImages("clef-flash"), rps=200))
+    measured, failures = asyncio.run(measure_all([Target("gpu0", "clef-flash", engine, CLEF.workload, 8, "f")], 1.0,
+                                                 run_s=0.25))
+    assert failures == {} and measured["gpu0"].measured_rps == pytest.approx(200, rel=0.2)
+    with_images = [r for r in engine.requests if "images" in r]
+    assert 0.15 < len(with_images) / len(engine.requests) < 0.35  # the mix's share, 0.25
+    limits = CLEF.images
+    for request in with_images:
+        assert request["questions"] == {**CLEF.workload.questions, **IMAGE_QUESTIONS}
+        canonical_sizes(request["images"], token_px=limits.token_px, min_pixels=limits.min_pixels,
+                        max_pixels=limits.max_pixels)
+
+
 def test_fingerprint_ignores_engine_counters() -> None:
     from verathos.throughput.measure import fingerprint
 
@@ -316,19 +373,23 @@ HostRouter = Presenting  # in-process apps by host, each presenting its host's c
 
 
 def miner_app(host: str, keypair: Keypair, auditor: Keypair, engines: dict[str, object], declared: float,
-              port: int = 80, tls_pin: str | None = None):
-    """A miner service on ``host``, whose certificate has ``tls_pin`` (default: the host's in ``tlsfake``)."""
+              port: int = 80, tls_pin: str | None = None, model: str = "kev-4b"):
+    """A miner service on ``host`` serving ``model``, whose certificate has ``tls_pin`` (default: the host's in
+    ``tlsfake``)."""
+    entry = catalog.load().get(model)
+    limits = entry.images if entry.reads_images() else None
     config = MinerConfig.model_validate({
         "netuid": 405, "mechid": 1, "wallet_name": "w", "hotkey_name": "h", "public_host": host, "port": port,
-        "endpoints": [{"endpoint_id": e, "model_id": "kev-4b", "engine_url": "http://127.0.0.1:1",
+        "endpoints": [{"endpoint_id": e, "model_id": model, "engine_url": "http://127.0.0.1:1",
                        "max_concurrency": 64} for e in engines]})
     signed = SignedManifest.create(Manifest(
         netuid=405, mechid=1, hotkey=keypair.ss58_address, catalog_digest=catalog.load().digest(),
-        endpoints=[Endpoint(endpoint_id=e, url=config.endpoint_url(e), model_id="kev-4b", capacity_rps=declared)
+        endpoints=[Endpoint(endpoint_id=e, url=config.endpoint_url(e), model_id=model, capacity_rps=declared)
                    for e in engines], tls={config.base_url: tls_pin or pin(host)}), keypair)
     app = create_app(config=config, keypair=keypair, manifest=lambda: signed, engines=engines,
                      authorized=lambda hk: False, auditors=lambda: {auditor.ss58_address}, testing=lambda: True,
-                     max_caller_request=lambda m: caller_request_bytes(m, KEV.workload))
+                     max_caller_request=lambda m: caller_request_bytes(m, entry.workload, limits),
+                     image_limits=lambda m: limits)
     return app, signed.manifest
 
 
@@ -411,6 +472,51 @@ def test_auditor_credits_what_each_endpoint_delivers_and_proves_wrong_answers(tm
     assert last[over][2] and not last[honest][2]
     rates = {t.slot.key: t.tested_rps for t in auditor.targets(auditor.policy)}
     assert rates[over] == pytest.approx(min(1.1 * last[over][1], 80.0), rel=0.02)
+
+
+def test_the_auditor_tests_an_image_model_with_requests_with_images(tmp_path) -> None:
+    """Every request of this mix carries images: an endpoint that answers without reading them is proven wrong by
+    their background question, and one that refuses them delivers nothing."""
+    from verathos.throughput.loadgen import mix_plan
+    from verathos.validator.discovery import DiscoveredMiner
+
+    auditor_kp = kp()
+    keys = {name: kp() for name in ("honest", "blind", "refusing")}
+    hosts = {name: f"10.0.1.{i}" for i, name in enumerate(keys, start=1)}
+    policy = dataclasses.replace(AuditPolicy(), max_latency_s=0.5, warmup_s=0.5, test_s=2.0, samples_per_test=5)
+    chain, cat, plans = FakeChain(head=3 * 180 + 40), image_share(1.0), []
+
+    async def run():
+        engines = {"honest": ReadingImages("clef-flash"), "blind": MockEngine("clef-flash"),
+                   "refusing": RefusingImages("clef-flash")}
+        apps, miners = {}, []
+        for uid, name in enumerate(keys, start=1):
+            engine = {"gpu0": CapacityEngine(engines[name], rps=80)}
+            apps[hosts[name]], manifest = miner_app(hosts[name], keys[name], auditor_kp, engine, 20.0,
+                                                    model="clef-flash")
+            miners.append(DiscoveredMiner(uid, keys[name].ss58_address, f"https://{hosts[name]}:80", manifest))
+        runner = make_runner(HostRouter(apps))
+
+        async def recorded(plan, *, timeout_s):
+            plans.append(plan)
+            return await runner(plan, timeout_s=timeout_s)
+
+        auditor = Auditor(netuid=405, keypair=auditor_kp, chain=chain, policy=policy, catalog=lambda: cat,
+                          references={}, db_path=tmp_path / "throughput.sqlite", runner=recorded)
+        auditor.update_slots(slots(miners))
+        selection = chain.head_block - policy.lead_blocks
+        auditor.follower.poll()
+        await auditor.run_test(ScheduledTest(3, selection, block_hash(selection).hex(), chain.head_block),
+                               Checks({"clef-flash": ReadingImages("clef-flash")}, {}))
+        return auditor
+
+    auditor = asyncio.run(run())
+    (plan,) = plans
+    assert [t["images"] for t in plan["targets"]] == [mix_plan(cat.get("clef-flash").workload)["images"]] * 3
+    honest, blind, refusing = (auditor.outcomes(keys[name].ss58_address)[0] for name in keys)
+    assert honest.outcome == "passed" and honest.credited_rps == pytest.approx(20.0, rel=0.05)
+    assert blind.outcome == "invalid" and blind.credited_rps == 0.0
+    assert refusing.outcome == "partial" and refusing.credited_rps == 0.0
 
 
 def test_the_auditor_tests_an_endpoint_only_once_it_proved_control_at_its_url(tmp_path) -> None:
@@ -530,6 +636,56 @@ def test_auditor_with_the_load_generator_over_tcp(tmp_path) -> None:
     assert honest.outcome == "passed" and honest.credited_rps == pytest.approx(40.0, rel=0.05), honest
     # delivers what is left after the warmup backlog, about 17 of 40, and is credited 17 x 17 / 40
     assert over.outcome == "partial" and 3 < over.credited_rps < 12, over
+
+
+@pytest.mark.skipif(not loadgen.BINARY_PATH.exists(), reason="verathos-build-loadgen has not been run")
+def test_the_load_generators_images_pass_the_miners_checks_over_tcp(tmp_path) -> None:
+    """The real load generator against a miner service of an image model: a share of its requests carries images,
+    canonical as the miner checks them, and the endpoint passes."""
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+
+    from verathos.protocol.media import canonical_pixels
+    from verathos.validator.discovery import DiscoveredMiner
+
+    auditor_kp, keypair, identity = kp(), kp(), tls.identity(tmp_path / "miner")
+    policy = dataclasses.replace(AuditPolicy(), max_latency_s=0.5, warmup_s=1.0, test_s=3.0, samples_per_test=5)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    engine = Seen(CapacityEngine(ReadingImages("clef-flash"), rps=80))
+    app, manifest = miner_app("127.0.0.1", keypair, auditor_kp, {"gpu0": engine}, 30.0, port=port,
+                              tls_pin=identity.pin, model="clef-flash")
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
+                                           **tls.server_options(identity)))
+    threading.Thread(target=server.run, daemon=True).start()
+    while not server.started:
+        time.sleep(0.05)
+    chain = FakeChain(head=3 * 180 + 40)
+    auditor = Auditor(netuid=405, keypair=auditor_kp, chain=chain, policy=policy, catalog=catalog.load,
+                      references={}, db_path=tmp_path / "throughput.sqlite")
+    auditor.update_slots(slots([DiscoveredMiner(1, keypair.ss58_address, f"https://127.0.0.1:{port}", manifest)]))
+    selection = chain.head_block - policy.lead_blocks
+    auditor.follower.poll()
+    try:
+        asyncio.run(auditor.run_test(ScheduledTest(3, selection, block_hash(selection).hex(), chain.head_block),
+                                     Checks({"clef-flash": ReadingImages("clef-flash")}, {})))
+    finally:
+        server.should_exit = True
+    (outcome,) = auditor.store.outcomes(keypair.ss58_address)
+    assert outcome.outcome == "passed" and outcome.credited_rps == pytest.approx(30.0, rel=0.05), outcome
+    with_images = [r for r in engine.requests if "images" in r]
+    assert 0.1 < len(with_images) / len(engine.requests) < 0.4  # the mix's share, 0.25, of about 150 requests
+    limits = CLEF.images
+    for request in with_images:
+        assert request["questions"] == {**CLEF.workload.questions, **IMAGE_QUESTIONS}
+        (image,) = canonical_pixels(request["images"], token_px=limits.token_px, min_pixels=limits.min_pixels,
+                                    max_pixels=limits.max_pixels)
+        assert image.width in CLEF.workload.images.sides_px and image.height in CLEF.workload.images.sides_px
+    assert len({r["images"][0]["base64"] for r in with_images}) == len(with_images)
 
 
 def test_a_screen_flag_counts_only_once_the_fp32_reference_confirms_it() -> None:

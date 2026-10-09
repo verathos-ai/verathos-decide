@@ -47,9 +47,14 @@ digest proves, are fetched accepting any certificate.
    Requests no miner could answer are refused here, so they cannot count against miners. A request is forwarded as
    its model, state and questions, with its canonical images (other top-level fields are dropped): its canonical JSON
    is the body every miner receives and its receipt binds.
-4. **Endpoint.** Two endpoints of the model are drawn in proportion to their proven capacity; the one with fewer
-   requests in flight per unit of capacity takes the request. In this process an endpoint takes at most
-   `credited rps x max_latency_s / instances` requests at once, what it serves within the latency bound.
+4. **Endpoint.** Two endpoints of the model are drawn in proportion to their proven capacity; the one with less load
+   in flight per unit of capacity takes the request. Load is counted in requests of the model's request mix, the
+   unit capacity is proven in: a text request counts as one of the mix's text requests, its images add their tokens at
+   twice a text token's cost (the GPU time of an image token, `MINING.md`), and a request of the mix counts 1 on
+   average. Every request to a model that reads text only counts 1; for Clef-Flash, whose mix carries an image in a
+   quarter of its requests, a text request counts 0.95, one with an image of 512 x 512 px 1.32 and one with four 1 MP
+   images 6.9. In this process an endpoint takes load up to `credited rps x max_latency_s / instances` at once, what it
+   serves within the latency bound, and a request goes to it while it holds less.
 5. **Miner.** The request is signed with the gateway's hotkey for that miner. The answer counts only if the miner's
    receipt binds this request and these answers and names the gateway as caller, and the answers are well formed:
    one distribution per question over its options, the `noul`, `choice` and `score` users read derived from it (p(true),
@@ -488,7 +493,7 @@ account unlimited service nor mint more than the hourly cap.
 | Call | Returns |
 |---|---|
 | `GET /admin/v1/state` | the routes in use (epoch, age, endpoints, catalog), the models routed, limits, and what waits to be written or sent (usage rows, samples, served counts) |
-| `GET /admin/v1/routes` | every routable endpoint as the router sees it: credited rate, latency, cap, in flight, busy time, breaker, its latest failure |
+| `GET /admin/v1/routes` | every routable endpoint as the router sees it: credited rate, latency, cap, in flight (requests, and their load in requests of the mix), busy time, breaker, its latest failure |
 | `POST /admin/v1/systemone` | a SystemOne request, served as described below |
 | `POST /admin/v1/accounts` | `{"name", "rate_rps", "burst", "monthly_quota", "prepaid"}` -> 201 and the account; 409 if the name is taken. Names: `[A-Za-z0-9_.:@-]{1,128}` |
 | `GET /admin/v1/accounts/{name}` | the account: limits, status, `prepaid`, `balance` (micro-USD, as written) |

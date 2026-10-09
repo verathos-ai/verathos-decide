@@ -1,12 +1,12 @@
 """A miner measures the capacity it declares.
 
-For each endpoint: warm the engine with the model's standard request mix until two runs agree, find the lowest
-concurrency that reaches nearly the highest throughput with latency within the policy's ``max_latency_s``, measure
-several runs there, and declare ``capacity_margin`` times the median. Requests take the path test traffic takes,
-through the miner's own service (sessions the miner signs itself), so the service's own limits are measured too. All
-endpoints of a miner are measured in the same rounds, so endpoints sharing hardware each measure their real share, as
-a network-wide test sees them. Results are stored with a fingerprint of what they depend on and reused until that
-changes.
+For each endpoint: warm the engine with the model's standard request mix (its requests with images among them, for a
+model whose mix has images) until two runs agree, find the lowest concurrency that reaches nearly the highest
+throughput with latency within the policy's ``max_latency_s``, measure several runs there, and declare
+``capacity_margin`` times the median. Requests take the path test traffic takes, through the miner's own service
+(sessions the miner signs itself), so the service's own limits are measured too. All endpoints of a miner are measured
+in the same rounds, so endpoints sharing hardware each measure their real share, as a network-wide test sees them.
+Results are stored with a fingerprint of what they depend on and reused until that changes.
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ def engine_identity(info: Any) -> Any:
 def fingerprint(endpoint_config: dict[str, Any], engine_info: Any, workload: Workload) -> str:
     """What a measurement depends on: the endpoint's configuration, the engine's identity and the mix."""
     return digest({"endpoint": endpoint_config, "engine": engine_identity(engine_info),
-                   "workload": workload.model_dump(mode="json")})
+                   "workload": workload.document()})
 
 
 class ServicePath:

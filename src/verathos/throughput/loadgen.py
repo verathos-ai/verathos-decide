@@ -2,12 +2,12 @@
 ``verathos-build-loadgen``.
 
 It reads one plan as JSON on stdin (targets with their https URL, the pin of their certificate, open-loop rate, headers
-and request mix), sends every target its traffic at once over TLS, accepting exactly the pinned certificate, and writes
-per-target counts, latencies and a random sample of completed requests as JSON on stdout. Targets with the same pin (one
-machine) share its keep-alive connections; a handshake with another certificate counts as a ``tls`` error. A reply
-counts as delivered when it arrives inside the measured window (HTTP 200, a JSON object of at most the plan's
-``max_response_bytes``), to a request scheduled no earlier than ``grace_s`` before the window opened; ``sent`` and
-``late_sends`` count the sends scheduled inside the window.
+and request mix, ``mix_plan``), sends every target its traffic at once over TLS, accepting exactly the pinned
+certificate, and writes per-target counts, latencies and a random sample of completed requests as JSON on stdout.
+Targets with the same pin (one machine) share its keep-alive connections; a handshake with another certificate counts
+as a ``tls`` error. A reply counts as delivered when it arrives inside the measured window (HTTP 200, a JSON object of
+at most the plan's ``max_response_bytes``), to a request scheduled no earlier than ``grace_s`` before the window
+opened; ``sent`` and ``late_sends`` count the sends scheduled inside the window.
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+from verathos.throughput.workload import Workload
 
 BINARY_PATH = Path(__file__).resolve().parent / "verathos-loadgen"
 CRATE = Path(__file__).resolve().parents[3] / "native" / "loadgen"
@@ -59,6 +61,17 @@ class LoadResult(BaseModel):
     started_at_ms: int
     late_start_ms: int = 0
     targets: list[TargetResult]
+
+
+def mix_plan(workload: Workload) -> dict[str, Any]:
+    """A target's request mix as a plan gives it: the words of a state and the questions, and for a mix with images
+    their share, count and sides and the questions of a request with images. The load generator draws each request
+    from its own randomness as ``throughput.workload.make_request`` does, and its images as ``throughput.images``."""
+    plan: dict[str, Any] = {"state_words": list(workload.state_words), "questions": workload.questions}
+    if workload.images is not None:
+        plan["images"] = {"share": workload.images.share, "count": list(workload.images.count),
+                          "sides_px": workload.images.sides_px, "questions": workload.image_questions()}
+    return plan
 
 
 async def run(plan: dict[str, Any], *, binary: Path = BINARY_PATH, timeout_s: float) -> LoadResult:

@@ -20,6 +20,9 @@ pub const MAX_RATE_RPS: u32 = 1_000_000;
 pub const MAX_RUN_S: u32 = 3_600;
 pub const MAX_TIMEOUT_S: u32 = 3_600;
 pub const MAX_STATE_WORDS: u32 = 100_000;
+pub const MAX_IMAGES: u32 = 16;
+/// Pixels of the largest image a request may carry.
+pub const MAX_IMAGE_PIXELS: u64 = 1 << 24;
 pub const MAX_SAMPLES: usize = 10_000;
 pub const MAX_START_DELAY_MS: u64 = 3_600_000;
 pub const MIN_SEED_BYTES: usize = 16;
@@ -64,7 +67,18 @@ struct TargetInput {
     model: String,
     state_words: (u32, u32),
     questions: Box<RawValue>,
+    #[serde(default)]
+    images: Option<ImagesInput>,
     samples: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImagesInput {
+    share: f64,
+    count: (u32, u32),
+    sides_px: Vec<u32>,
+    questions: Box<RawValue>,
 }
 
 #[derive(Debug)]
@@ -96,7 +110,21 @@ pub struct Target {
     pub model: String,
     pub state_words: RangeInclusive<u32>,
     pub questions: Box<RawValue>,
+    /// The target's requests with images, if its mix has them.
+    pub images: Option<Images>,
     pub samples: usize,
+}
+
+#[derive(Debug)]
+pub struct Images {
+    /// Share of the requests that carry images.
+    pub share: f64,
+    /// Images per request that carries them.
+    pub count: RangeInclusive<u32>,
+    /// The sides an image's width and height are each drawn from, in pixels.
+    pub sides: Vec<u32>,
+    /// The questions of a request with images.
+    pub questions: Box<RawValue>,
 }
 
 impl Plan {
@@ -197,6 +225,7 @@ impl Target {
         if input.samples > MAX_SAMPLES {
             return Err(format!("samples must be at most {MAX_SAMPLES}"));
         }
+        let images = input.images.map(Images::validate).transpose()?;
         Ok(Self {
             headers: static_headers(&input.headers)?,
             id: input.id,
@@ -207,7 +236,40 @@ impl Target {
             model: input.model,
             state_words: low..=high,
             questions: input.questions,
+            images,
             samples: input.samples,
+        })
+    }
+}
+
+impl Images {
+    fn validate(input: ImagesInput) -> Result<Self, String> {
+        if !(input.share > 0.0 && input.share <= 1.0) {
+            return Err("images.share must be greater than 0 and at most 1".into());
+        }
+        let (low, high) = input.count;
+        if !(1 <= low && low <= high && high <= MAX_IMAGES) {
+            return Err(format!(
+                "images.count must be a range [low, high] with 1 <= low <= high <= {MAX_IMAGES}"
+            ));
+        }
+        let largest = input.sides_px.iter().max().copied().unwrap_or(0);
+        if input.sides_px.contains(&0)
+            || largest == 0
+            || u64::from(largest).pow(2) > MAX_IMAGE_PIXELS
+        {
+            return Err(format!(
+                "images.sides_px must be positive sides, the largest squared at most {MAX_IMAGE_PIXELS}"
+            ));
+        }
+        if !input.questions.get().starts_with('{') {
+            return Err("images.questions must be a JSON object".into());
+        }
+        Ok(Self {
+            share: input.share,
+            count: low..=high,
+            sides: input.sides_px,
+            questions: input.questions,
         })
     }
 }
@@ -436,6 +498,41 @@ pub(crate) mod tests {
             target("headers", json!({"x-a": "line\nbreak"})),
             "invalid value",
         );
+    }
+
+    #[test]
+    fn takes_a_mix_with_images_and_checks_it() {
+        let mut plan = plan_json();
+        plan["targets"][0]["images"] = json!({
+            "share": 0.25,
+            "count": [1, 2],
+            "sides_px": [256, 512],
+            "questions": {"background": {"type": "noul"}},
+        });
+        let images = parse(&plan).unwrap().targets.remove(0).images.unwrap();
+        assert_eq!(images.share, 0.25);
+        assert_eq!(images.count, 1..=2);
+        assert_eq!(images.sides, [256, 512]);
+        assert_eq!(images.questions.get(), r#"{"background":{"type":"noul"}}"#);
+        assert!(parse(&plan_json()).unwrap().targets[0].images.is_none());
+
+        let images = |field: &'static str, value: Value| {
+            let mut plan = plan.clone();
+            move |p: &mut Value| {
+                plan["targets"][0]["images"][field] = value;
+                *p = plan;
+            }
+        };
+        rejects(images("share", json!(0.0)), "images.share");
+        rejects(images("share", json!(1.5)), "images.share");
+        rejects(images("count", json!([0, 1])), "images.count");
+        rejects(images("count", json!([2, 1])), "images.count");
+        rejects(images("count", json!([1, MAX_IMAGES + 1])), "images.count");
+        rejects(images("sides_px", json!([])), "images.sides_px");
+        rejects(images("sides_px", json!([256, 0])), "images.sides_px");
+        rejects(images("sides_px", json!([8192])), "images.sides_px");
+        rejects(images("questions", json!([])), "images.questions");
+        rejects(images("pixels", json!(1)), "unknown field");
     }
 
     #[test]

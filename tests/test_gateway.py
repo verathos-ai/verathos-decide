@@ -542,6 +542,34 @@ def test_the_router_spreads_by_capacity_and_respects_caps_and_breakers() -> None
     assert router._pools["kev-4b"].endpoints == [b]  # kept with its state
 
 
+def test_the_router_counts_load_in_requests_of_the_mix() -> None:
+    """A request with images weighs what it costs: an endpoint full of them takes no more, however few they are,
+    and its load returns to nothing exactly once they end."""
+    clock = Clock()
+    router = Router(share=1.0, max_latency_s=2.0, rng=random.Random(4), clock=clock)
+    heavy, other = kp(), kp()
+    router.update(Routes(netuid=405, auditor="a", epoch=3, issued_ms=1, catalog_digest="0" * 64,
+                         routes=[route(heavy, "10.0.0.1", 5.0, "clef-flash"),
+                                 route(other, "10.0.0.2", 5.0, "clef-flash")]))
+    h, o = router._pools["clef-flash"].endpoints
+    assert h.cap == 10
+    cost = catalog.load().get("clef-flash").request_cost(4 * 1026 + 1)  # four 1 MP images
+    for _ in range(2):
+        router.started(h, cost=cost)
+    assert h.full and h.in_flight == 2 and router.describe()[0]["in_flight_cost"] == round(2 * cost, 3)
+    assert all(router.pick("clef-flash") is o for _ in range(50))
+    assert h.load > o.load
+    for _ in range(2):
+        router.finished(h, Outcome.ANSWERED, 0.5, cost=cost)
+    assert (h.in_flight, h.cost, h.full) == (0, 0.0, False)
+    text = catalog.load().get("clef-flash").request_cost(0)
+    for _ in range(10):
+        router.started(h, cost=text)  # ten text requests weigh a little less than ten of the mix
+    assert not h.full and h.in_flight == 10
+    router.started(h, cost=text)
+    assert h.full
+
+
 def test_a_probe_that_times_out_doubles_the_open_time_once_another_miner_answers() -> None:
     clock = Clock()
     router = Router(share=1.0, max_latency_s=2.0, rng=random.Random(3), clock=clock)

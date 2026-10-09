@@ -7,6 +7,7 @@
 
 mod client;
 mod hex;
+mod images;
 mod plan;
 mod report;
 mod reservoir;

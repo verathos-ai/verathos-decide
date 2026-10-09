@@ -466,6 +466,43 @@ async fn delivered_rate_tracks_the_offered_rate_up_to_capacity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_with_images_are_sent_on_time_and_carry_their_images() {
+    let server = serve(Behavior::answer(5)).await;
+    let image_questions = json!({"intent": {"type": "noul"}, "background": {"type": "noul"}});
+    let mut mix = target("images", server, 400.0, 20);
+    mix["images"] = json!({
+        "share": 1.0,
+        "count": [1, 2],
+        "sides_px": [256, 384, 512],
+        "questions": image_questions,
+    });
+    let result = run_plan(&plan(now_ms() + 300, 0.5, 1.5, 20.0, vec![mix])).await;
+    let target = &result["targets"][0];
+    assert_eq!(target["late_sends"], 0, "{target}");
+    assert_eq!(target["errors"], json!({}));
+    assert_near(
+        target["completed"].as_f64().unwrap(),
+        600.0,
+        0.05,
+        "completed",
+    );
+    let samples = target["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 20);
+    for sample in samples {
+        let request = &sample["request"];
+        assert_eq!(request.as_object().unwrap().len(), 4);
+        assert_eq!(request["questions"], image_questions);
+        let images = request["images"].as_array().unwrap();
+        assert!((1..=2).contains(&images.len()), "{request}");
+        for image in images {
+            assert_eq!(image["content_type"], "image/png");
+            // the PNG signature, in base64
+            assert!(image["base64"].as_str().unwrap().starts_with("iVBORw0KGgo"));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failures_are_counted_by_kind() {
     let rate = 20.0;
     let (warmup_s, test_s) = (0.5, 1.5);

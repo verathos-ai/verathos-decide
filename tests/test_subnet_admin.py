@@ -181,7 +181,9 @@ def test_commit_catalog_needs_the_catalogs_mechanism_on_chain_and_says_when_the_
     assert "moves" not in capsys.readouterr().out
 
 
-def test_commit_catalog_publishes_images_only_for_models_whose_engine_reads_them(tmp_path) -> None:
+def test_commit_catalog_publishes_images_only_where_the_model_and_its_engine_read_them(tmp_path) -> None:
+    from pydantic import ValidationError
+
     chain = Chain()
 
     def with_input(model_id: str, **fields) -> object:
@@ -191,15 +193,21 @@ def test_commit_catalog_publishes_images_only_for_models_whose_engine_reads_them
         path.write_text(json.dumps(document))
         return path
 
+    mix = catalog.load().get("clef-flash").workload.document()
+    text_mix = {k: v for k, v in mix.items() if k != "images"}
     for model_id, fields, why in (
             ("kev-4b", {"input_modalities": ["text", "image"]}, "kev-4b: its kev engine reads no images"),
-            ("clef-flash", {"input_modalities": ["text", "video"]}, "video is not served"),
-            ("clef-flash", {"input_modalities": ["text", "image"], "images": {"token_px": 64, "min_pixels": 65_536}},
-             "images.token_px"),
+            ("kev-9b", {"input_modalities": ["text", "video"]}, "video is not served"),
+            ("clef-flash", {"input_modalities": ["text", "image"], "images": {"token_px": 64, "min_pixels": 65_536},
+                            "workload": text_mix}, "images.token_px"),
             ("clef-flash", {"input_modalities": ["text", "image"], "images": {"max_count": 4, "canary": 1}},
-             "models.clef-flash.images.canary")):
+             "models.clef-flash.images.canary"),
+            ("clef-flash", {"workload": {**mix, "images": {**mix["images"], "pixels": [256, 512]}}},
+             "models.clef-flash.workload.images.pixels")):
         with pytest.raises(SystemExit, match=why):
             commit(chain, with_input(model_id, **fields), tmp_path)
+    with pytest.raises(ValidationError, match="kev-4b reads no images"):
+        commit(chain, with_input("kev-4b", workload={**text_mix, "images": mix["images"]}), tmp_path)
     assert chain.commitments == []
     path = with_input("clef-flash", input_modalities=["text", "image"])
     commit(chain, path, tmp_path)

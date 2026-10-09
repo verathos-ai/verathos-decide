@@ -124,7 +124,17 @@ def test_a_request_with_images_whose_text_holds_the_image_token_is_refused(tmp_p
 
 
 def test_images_are_forwarded_canonical_and_billed_their_exact_tokens(tmp_path, setups) -> None:
-    engine = Recording("clef-flash")
+    class Watching(Recording):
+        """Also notes the load the router counts on the miner while it answers."""
+
+        loads: list[tuple[int, float]] = []
+
+        async def answer(self, request):
+            (endpoint,) = s.router._pools["clef-flash"].endpoints
+            self.loads.append((endpoint.in_flight, endpoint.cost))
+            return await super().answer(request)
+
+    engine = Watching("clef-flash")
     s = setups(tmp_path, engine)
     photo, screenshot = encoded(4032, 3024, "JPEG"), encoded(800, 600, "PNG")
     request = {**REQUEST, "images": [data_url(photo, "image/jpeg"), item(screenshot, "image/png")], "extra": 1}
@@ -144,6 +154,8 @@ def test_images_are_forwarded_canonical_and_billed_their_exact_tokens(tmp_path, 
     assert receipt.binds(forwarded, body["answers"]) and not receipt.binds(request, body["answers"])
     usage = body["usage"]
     assert usage["image_tokens"] == tokens and usage["input_tokens"] >= tokens  # what the miner signed, within bounds
+    assert engine.loads == [(1, s.gateway.catalog().get("clef-flash").request_cost(tokens))]
+    assert [(e.in_flight, e.cost) for e in s.router._pools["clef-flash"].endpoints] == [(0, 0.0)]
 
 
 def test_the_signed_input_tokens_are_bounded_by_the_exact_image_tokens(tmp_path, setups) -> None:
@@ -326,6 +338,9 @@ def test_check_request_gives_the_bounds_of_what_is_billed(tmp_path, setups) -> N
     assert checked.request_sha256 == digest(checked.raw) and checked.body == canonical_json(checked.raw)
     text = asyncio.run(check_request(s.gateway, json.dumps({**REQUEST, "images": []}).encode()))
     assert (text.image_tokens, text.max_tokens, text.raw) == (0, len(canonical_json(REQUEST)), REQUEST)
+    model = s.gateway.catalog().get("clef-flash")  # the load each puts on an endpoint
+    assert (checked.cost, text.cost) == (model.request_cost(259), model.request_cost(0))
+    assert text.cost < 1 < checked.cost
     with pytest.raises(Rejected, match="reads text only"):
         asyncio.run(check_request(s.gateway, json.dumps({**REQUEST, "model": "kev-4b", "images": [
             item(encoded(512, 512), "image/png")]}).encode()))
