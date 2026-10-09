@@ -22,7 +22,8 @@ up is paid once its grants are used. Only paid usage moves the models' emission 
 
 The network's totals (``totals``) and their series per day or week (``series``) count every account's answered
 requests. Their paid usage is stricter, money that came in: each account's usage cost beyond its free credit (counted
-as spent first), up to what it bought (``paid_cost``).
+as spent first), up to what it bought (``paid_cost``). One account's own series (``account_series``) has its
+answered and failed requests, input tokens and cost per model, over the same buckets.
 """
 
 from __future__ import annotations
@@ -92,6 +93,27 @@ def well_formed_key(key: str | None) -> bool:
 def bucket_start(day: dt.date, bucket: str) -> dt.date:
     """The first day of the series bucket (``SERIES_BUCKETS``) holding ``day``: itself, or its week's Monday."""
     return day - dt.timedelta(days=day.weekday()) if bucket == "week" else day
+
+
+def series_starts(days: int | None, bucket: str, today: dt.date, first: dt.date | None) -> list[dt.date]:
+    """The first days of a usage series' buckets (``SERIES_BUCKETS``): those that hold the last ``days`` days, whole,
+    up to today's; without ``days``, from the one holding ``first`` (today's without it), at most
+    ``SERIES_MAX_BUCKETS``, the latest. Raises ValueError for an unknown bucket, under a day or more buckets than
+    that."""
+    if bucket not in SERIES_BUCKETS:
+        raise ValueError(f"bucket is one of {tuple(SERIES_BUCKETS)}")
+    step, last = SERIES_BUCKETS[bucket], bucket_start(today, bucket)
+    if days is None:
+        start = min(last, max(bucket_start(first or today, bucket),
+                              last - dt.timedelta(days=step * (SERIES_MAX_BUCKETS - 1))))
+    elif days < 1:
+        raise ValueError("days is at least 1")
+    else:
+        start = bucket_start(today - dt.timedelta(days=days - 1), bucket)
+    count = (last - start).days // step + 1
+    if count > SERIES_MAX_BUCKETS:
+        raise ValueError(f"at most {SERIES_MAX_BUCKETS} buckets")
+    return [start + dt.timedelta(days=step * i) for i in range(count)]
 
 
 def paid_cost(cost: int, grants: int, topups: int) -> int:
@@ -251,6 +273,34 @@ class Accounts:
         async with self.engine.connect() as conn:
             return [dict(r._mapping) for r in await conn.execute(query)]
 
+    async def account_series(self, account: str, days: int | None = None, bucket: str = "day",
+                             now: dt.datetime | None = None) -> dict[str, Any] | None:
+        """One account's usage over time, per UTC day or week (Monday to Sunday), over the buckets ``series`` gives
+        (all time: from its first usage): per model, its answered and failed requests, input tokens and cost
+        (micro-USD). None for an unknown account. Raises ValueError for an unknown bucket or more buckets than
+        ``SERIES_MAX_BUCKETS`` (``series_starts``)."""
+        now = now or dt.datetime.now(dt.UTC)
+        usage = usage_daily.c
+        kinds = ("requests", "failed", "input_tokens", "cost")
+        async with self.engine.connect() as conn:
+            account_id = (await conn.execute(select(accounts.c.id).where(accounts.c.name == account))).scalar()
+            if account_id is None:
+                return None
+            first = (await conn.execute(select(func.min(usage.day)).where(usage.account_id == account_id))).scalar()
+            first = None if first is None else _date(first)
+            starts = series_starts(days, bucket, now.date(), first)
+            rows = [(model, _date(day), [int(n or 0) for n in counts]) for model, day, *counts in await conn.execute(
+                select(usage.model_id, usage.day, *(func.sum(getattr(usage, kind)) for kind in kinds))
+                .where(usage.account_id == account_id, usage.day >= starts[0])
+                .group_by(usage.model_id, usage.day))]
+        models = sorted({model for model, _, _ in rows})
+        buckets = {s: {"start": s.isoformat(), **{kind: dict.fromkeys(models, 0) for kind in kinds}} for s in starts}
+        for model, day, counts in rows:
+            if (b := buckets.get(bucket_start(day, bucket))) is not None:
+                for kind, n in zip(kinds, counts):
+                    b[kind][model] += n
+        return {"as_of": now.isoformat(timespec="seconds"), "bucket": bucket, "since": starts[0].isoformat(),
+                "first_day": first and first.isoformat(), "models": models, "buckets": list(buckets.values())}
 
     async def totals(self, now: dt.datetime | None = None) -> dict[str, Any]:
         """The network's totals: answered requests and input tokens of every account, in all and per model, all time,
@@ -308,32 +358,23 @@ class Accounts:
         """The network's usage over time, per UTC day or week (Monday to Sunday): every account's answered requests and
         input tokens per model, paid usage and top-ups (micro-USD). The buckets that hold the last ``days`` days,
         whole, up to the current one; without ``days``, from the first holding usage or a top-up, at most
-        ``SERIES_MAX_BUCKETS`` (the latest). Raises ValueError for an unknown bucket or more buckets than that.
+        ``SERIES_MAX_BUCKETS`` (the latest). Raises ValueError for an unknown bucket or more buckets than that
+        (``series_starts``).
 
         Paid usage is allocated to days per account, as the totals count it (``paid_cost``): of its usage cost in day
         order, the first part, as much as its grants, is free, and the next, as much as its top-ups, is paid on the
         days it was spent. The days add up to the totals' paid usage; a grant recorded after paid spending makes the
         earliest of it free."""
-        if bucket not in SERIES_BUCKETS:
-            raise ValueError(f"bucket is one of {tuple(SERIES_BUCKETS)}")
         now = now or dt.datetime.now(dt.UTC)
-        step, last = SERIES_BUCKETS[bucket], bucket_start(now.date(), bucket)
         utc_day = self._utc_day
         topups = credits.c.kind == "topup"
-        if days is not None:
-            if days < 1:
-                raise ValueError("days is at least 1")
-            start = bucket_start(now.date() - dt.timedelta(days=days - 1), bucket)
-            if (last - start).days // step + 1 > SERIES_MAX_BUCKETS:
-                raise ValueError(f"at most {SERIES_MAX_BUCKETS} buckets")
         async with self.engine.connect() as conn:
             first = min((_utc(t).astimezone(dt.UTC).date() for t in (
                 (await conn.execute(select(func.min(usage_hourly.c.hour)))).scalar(),
                 (await conn.execute(select(func.min(credits.c.created_at)).where(topups))).scalar())
                 if t is not None), default=None)
-            if days is None:
-                start = max(bucket_start(first or now.date(), bucket),
-                            last - dt.timedelta(days=step * (SERIES_MAX_BUCKETS - 1)))
+            starts = series_starts(days, bucket, now.date(), first)
+            start = starts[0]
             since = dt.datetime.combine(start, dt.time(), dt.UTC)
             answered_on = utc_day(usage_hourly.c.hour)
             answered = await conn.execute(
@@ -370,7 +411,6 @@ class Accounts:
                 paid.append((_date(day), max(0, min(after, limit) - max(before, free))))
 
         models = sorted({model for model, *_ in per_model})
-        starts = [start + dt.timedelta(days=step * i) for i in range((last - start).days // step + 1)]
         buckets = {s: {"start": s.isoformat(), "requests": dict.fromkeys(models, 0),
                        "input_tokens": dict.fromkeys(models, 0), "paid_usage_micros": 0, "topups_micros": 0}
                    for s in starts}
