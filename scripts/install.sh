@@ -58,6 +58,7 @@ SOURCE_FILE=".install-source"  # where a checkout installed from a tarball came 
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nerror: %s\n' "$*" >&2; exit 1; }
+shown() { sed -E 's#^(https?://)[^/]*@#\1#' <<<"$1"; }  # a source as printed: a URL without its credentials
 
 usage() {
   if [ -f "${BASH_SOURCE[0]:-}" ]; then
@@ -267,10 +268,10 @@ fetch_ref() {
   # $3 from the source $2 into FETCH_HEAD of $1: a tag once it verifies (verify_release), a branch or commit as it is.
   local repo="$1" source="$2" ref="$3" tag="${3#refs/tags/}"
   if git -C "$repo" ls-remote "$source" "refs/tags/$tag" | awk -v r="refs/tags/$tag" '$2 == r { f = 1 } END { exit !f }'; then
-    git -C "$repo" fetch --quiet --tags --force "$source" "refs/tags/$tag" || die "cannot fetch $ref from $source"
+    git -C "$repo" fetch --quiet --tags --force "$source" "refs/tags/$tag" || die "cannot fetch $ref from $(shown "$source")"
     verify_release "$repo" "$tag"
   else
-    git -C "$repo" fetch --quiet --tags --force "$source" "$ref" || die "cannot fetch $ref from $source"
+    git -C "$repo" fetch --quiet --tags --force "$source" "$ref" || die "cannot fetch $ref from $(shown "$source")"
     echo "    note: $ref is not a release tag; it is installed unverified"
   fi
 }
@@ -279,7 +280,7 @@ default_ref() {
   # The newest release (a v<version> tag) once this installer holds a release key, else the source's HEAD if it has
   # one (a URL, or a bundle made with HEAD), else its first branch.
   local refs newest=""
-  refs="$(git -C "$1" ls-remote "$2")" || die "cannot read $2"
+  refs="$(git -C "$1" ls-remote "$2")" || die "cannot read $(shown "$2")"
   if has_release_key; then
     newest="$(printf '%s\n' "$refs" | awk '$2 ~ /^refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+$/ { print substr($2, 11) }' \
       | sort -t . -k 1.2,1n -k 2,2n -k 3,3n | tail -n 1)"
@@ -316,7 +317,7 @@ fetch_code() {
   local partial="$dir.partial"
   if [ ! -d "$dir/.git" ]; then
     rm -rf "$partial"
-    git clone --quiet --no-checkout "$source" "$partial" || die "cannot clone $source"
+    git clone --quiet --no-checkout "$source" "$partial" || die "cannot clone $(shown "$source")"
     [ -n "$ref" ] || ref="$(default_ref "$partial" "$source")"
     fetch_ref "$partial" "$source" "$ref"
     git -C "$partial" checkout --quiet --detach FETCH_HEAD || die "cannot check out $ref"
@@ -330,7 +331,7 @@ fetch_code() {
     git -C "$dir" checkout --quiet --detach FETCH_HEAD \
       || die "local changes in $dir stop the update; see: git -C $dir status"
   fi
-  say "Installed the code from $source ($ref) in $dir"
+  say "Installed the code from $(shown "$source") ($ref) in $dir"
   echo "    $(git -C "$dir" log -1 --format='%h %s')"
 }
 

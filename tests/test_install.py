@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from tests.lineups import two_active_and_a_candidate
 from verathos import catalog
@@ -158,6 +159,13 @@ def test_a_reference_placed_before_stays_where_it_is() -> None:
     assert plan.place_references(KEV, {0: 1 * GiB}, 1 * GiB, "auto", keep) == keep
     assert plan.place_references(KEV, {0: 1 * GiB}, 100 * GiB, "cpu", keep) == {"kev-4b": "cpu", "kev-9b": "cpu"}
     assert plan.place_references(KEV, {}, 100 * GiB, "auto", {"kev-4b": "cuda:3"})["kev-4b"] == "cpu"
+
+
+def test_the_memory_of_engines_that_stop_is_free_for_the_others() -> None:
+    held = [("cpu", 20 * GiB), ("cuda:1", 30 * GiB), ("cuda:1", 10 * GiB), ("cuda:3", 50 * GiB)]  # GPU 3 is gone
+    assert plan.freed({0: 5 * GiB, 1: 2 * GiB}, 7 * GiB, held) == ({0: 5 * GiB, 1: 42 * GiB}, 27 * GiB)
+    assert plan.engine_memory("screen/kev-4b", "cuda:0", KEV, {"kev-4b": "kev"}) == plan.miner_memory(KEV["kev-4b"])
+    assert plan.engine_memory("reference/kev-4b", "cpu", KEV, {}) == plan.reference_memory(KEV["kev-4b"], "cpu")
 
 
 def test_ports_are_kept_and_new_ones_skip_busy_and_taken_ports() -> None:
@@ -449,6 +457,96 @@ def test_the_record_round_trips_and_defaults_to_nothing_installed(tmp_path) -> N
     assert common.Record.load(tmp_path, "validator") == record
 
 
+def test_a_configuration_that_would_not_be_valid_is_refused_without_its_values(tmp_path) -> None:
+    """The stop names each problem's place and reason, never the values: they may hold an engine's key."""
+    key = "k" * 43
+    with pytest.raises(ValidationError) as caught:
+        ValidatorConfig.model_validate({"netuid": 405, "wallet_name": "w", "hotkey_name": "h", "references": {
+            "kev-4b": {"url": "https://203.0.113.7:8443/reference/kev-4b", "api_key": key}}})
+    stop = common.invalid(tmp_path / "validator.json", caught.value)
+    assert stop.code == (f"{tmp_path / 'validator.json'} would not be valid; fix or remove it:\n  references.kev-4b: "
+                         "Value error, https://203.0.113.7:8443/reference/kev-4b: an https engine at an IP address "
+                         "needs its TLS pin (no public CA certifies an address)")
+    assert "kkkk" not in stop.code
+
+
+def test_a_reinstall_of_a_miner_or_validator_takes_the_network_from_the_kept_configuration(tmp_path, monkeypatch,
+                                                                                         capsys) -> None:
+    """uninstall keeps the configuration, which holds the network and netuid, and ends with the installer's command
+    that sets the role up again with it: with --no-service as set up, the tarball the code came from, the home. That
+    setup takes them from the configuration, as an update does, unless they are given."""
+    from types import SimpleNamespace
+
+    from verathos.install import firewall, host, miner, validator
+
+    connected: list[str] = []
+
+    def connect(network: str):
+        connected.append(network)
+        raise SystemExit("connected")  # far enough
+
+    monkeypatch.setattr(common, "connect", connect)
+    monkeypatch.setattr(common, "manager_for", lambda args, record: None)
+    monkeypatch.setattr(common, "load_hotkey", lambda w, h: SimpleNamespace(hotkey=SimpleNamespace(ss58_address="5H")))
+    monkeypatch.setattr(common, "code_source", lambda: "/srv/verathos-decide.tar.gz")
+    monkeypatch.setattr(host, "wallets", lambda: [])
+    monkeypatch.setattr(firewall, "installed", lambda: False)
+    for role, setup in (("miner", miner), ("validator", validator)):
+        config = tmp_path / f"{role}.json"
+        common.write_json(config, {"network": "test", "netuid": 405, "wallet_name": "w", "hotkey_name": "h"})
+        common.Record(role=role, config=str(config), services=[f"verathos-{role}"]).save(tmp_path)
+        common.uninstall(role, ["--home", str(tmp_path)])
+        assert capsys.readouterr().out.endswith(
+            f"again with them:\n      install.sh {role} --yes --no-service --source /srv/verathos-decide.tar.gz "
+            f"--home {tmp_path}\n")
+        assert config.exists() and not common.Record.path(tmp_path, role).exists()
+        for given, network, netuid in (((), "test", 405), (("--netuid", "406"), "test", 406),
+                                       (("--network", "finney"), "finney", 96)):
+            with pytest.raises(SystemExit, match="connected"):
+                setup.init(["--yes", "--no-service", "--home", str(tmp_path), *given])
+            assert connected[-1] == network and f"network {network}, netuid {netuid}\n" in capsys.readouterr().out
+    common.Record(role="validator", config="/etc/verathos/validator.json").save(tmp_path)
+    common.uninstall("validator", ["--home", str(tmp_path)])
+    assert "install.sh validator --yes --source /srv/verathos-decide.tar.gz --config /etc/verathos/validator.json " \
+           f"--home {tmp_path}\n" in capsys.readouterr().out
+
+
+def test_the_code_source_is_where_the_installer_took_the_code_from(tmp_path) -> None:
+    """A git checkout's origin (a URL without its credentials, or a git bundle), else the tarball the installer
+    recorded; scripts/install.sh records the tarball in the same file."""
+    assert f'SOURCE_FILE="{common.SOURCE_FILE}"' in (ROOT / "scripts" / "install.sh").read_text()
+    tarball = this_code(tmp_path / "from-tarball")
+    (tarball / common.SOURCE_FILE).write_text("/srv/verathos-decide.tar.gz\n")
+    assert common.code_source(tarball) == "/srv/verathos-decide.tar.gz"
+    assert common.code_source(this_code(tmp_path / "copied")) is None
+    checkout = this_code(tmp_path / "checkout")
+    subprocess.run(["git", "init", "--quiet", str(checkout)], check=True)
+    assert common.code_source(checkout) is None
+    for origin, shown in (("https://x-access-token:ghp_secret@github.com/org/verathos.git",
+                           "https://github.com/org/verathos.git"),
+                          ("/root/verathos-decide.bundle", "/root/verathos-decide.bundle"),
+                          ("git@github.com:org/verathos.git", "git@github.com:org/verathos.git")):
+        subprocess.run(["git", "-C", str(checkout), "remote", "remove", "origin"], capture_output=True)
+        subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", origin], check=True)
+        assert common.code_source(checkout) == shown
+
+
+def test_the_installer_never_prints_the_credentials_of_its_source(tmp_path) -> None:
+    """A source URL is printed without the user name and password it carries; git's own messages leave them out
+    too."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "uv").write_text("#!/bin/sh\nexit 0\n")  # present: nothing to install
+    (bin_dir / "uv").chmod(0o755)
+    failed = subprocess.run(["bash", "-s", "--", "validator", "--no-service", "--yes", "--source",
+                             "https://x-access-token:ghp_secret@127.0.0.1:1/verathos.git"],
+                            input=(ROOT / "scripts" / "install.sh").read_text(), capture_output=True, text=True,
+                            env={**os.environ, "HOME": str(tmp_path), "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+                            timeout=60)
+    assert failed.returncode != 0 and "cannot clone https://127.0.0.1:1/verathos.git" in failed.stderr
+    assert "ghp_secret" not in failed.stdout + failed.stderr and "x-access-token" not in failed.stderr
+
+
 def test_network_and_netuid_defaults() -> None:
     args = argparse.Namespace(network=None, netuid=None)
     assert common.network_and_netuid(args, {}) == ("finney", 96)
@@ -580,7 +678,7 @@ def test_a_validator_is_light_unless_full_is_asked_for_or_set_up_before_and_the_
 
 
 class ServiceManager(FakeManager):
-    """A service manager that records what the setup installs and removes."""
+    """A service manager that records what the setup installs and removes, and runs what it installs."""
 
     name = "systemd"
 
@@ -588,16 +686,22 @@ class ServiceManager(FakeManager):
         super().__init__(batches, [101])
         self.applied: list[services.Service] = []
         self.removed: list[str] = []
+        self.running: set[str] = set()
 
     def mark(self, name: str) -> None:
         pass
 
     def apply(self, applied: list[services.Service], restart: set[str]) -> set[str]:
         self.applied += applied
+        self.running |= {s.name for s in applied}
         return {s.name for s in applied}
 
     def remove(self, names: list[str]) -> None:
         self.removed += names
+        self.running -= set(names)
+
+    def active(self, name: str) -> bool:
+        return name in self.running
 
     def status_command(self, names: list[str]) -> str:
         return "systemctl status " + " ".join(names)
