@@ -354,7 +354,7 @@ Every response to `POST /v1/systemone` carries `X-Request-Id` (the client's, if 
 
 A model whose catalog entry lists `image` in its `input_modalities` takes images with a request, in Cloudflare Clef's
 shape (its `images` extension of the SystemOne API), so Clef clients switch by their base URL. `GET /v1/models` says
-which models do, and their limits; no model of the shipped catalog does.
+which models do, and their limits; in the shipped catalog, Clef-Flash does, with the limits below.
 
 ```bash
 curl -s https://<gateway>/v1/systemone -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d '{

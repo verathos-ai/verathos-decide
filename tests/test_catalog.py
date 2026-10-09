@@ -195,8 +195,11 @@ def test_models_read_text_until_their_entry_lists_image() -> None:
     from verathos.protocol.media import ImageLimits
 
     shipped = catalog.load()
-    assert all(m.input_modalities == ["text"] and not m.reads_images() for m in shipped.models)
-    assert all("input_modalities" not in m and "images" not in m for m in shipped.document()["models"])
+    assert {m.model_id: m.reads_images() for m in shipped.models} == {"kev-4b": False, "kev-9b": False,
+                                                                       "clef-flash": True}
+    assert shipped.get("clef-flash").images == ImageLimits()  # the defaults, written out
+    assert all("input_modalities" not in m and "images" not in m for m in shipped.document()["models"]
+               if m["model_id"] != "clef-flash")
     seeing = catalog.Catalog.parse(with_models(**{"clef-flash": {"input_modalities": ["text", "image"],
                                                                   "images": {"max_count": 2}}}))
     model = seeing.get("clef-flash")

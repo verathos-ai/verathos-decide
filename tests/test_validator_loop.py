@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 
 import httpx
 import pytest
@@ -478,6 +479,31 @@ def test_a_manifest_accepted_before_stands_in_while_the_axon_is_out() -> None:
     assert epoch(3, commitment_value("1" * 64))[0] == []  # the hotkey committed another manifest
     cache.hold_s = 0.0
     assert epoch(4)[0] == []  # held long enough
+
+
+def test_a_manifest_accepted_before_does_not_stand_in_once_the_machine_serves_another_hotkey(caplog) -> None:
+    """A miner moves its machine to another hotkey: the axon the old hotkey names serves the new hotkey's manifest.
+    The machine is not out, so the old manifest does not stand in (its endpoints would be the new hotkey's twice)."""
+    from verathos.validator.discovery import ManifestCache
+
+    caplog.set_level(logging.INFO, logger="verathos.validator.discovery")
+    validator, old, new = kp(), kp(), kp()
+    axon = "10.0.6.1"
+    old_apps, old_commit = multi_host_miner(old, validator, {axon: ["gpu0"]}, {"gpu0": axon})
+    new_apps, _ = multi_host_miner(new, validator, {axon: ["gpu0"]}, {"gpu0": axon})
+    cache = ManifestCache(hold_s=3600.0)
+
+    def found(apps):
+        async def run():
+            async with httpx.AsyncClient(transport=HostRouter(apps)) as client:
+                return await discover([Neuron(1, old.ss58_address, axon, 80, old_commit)], 405, client,
+                                      {catalog.load().digest(): 1}, cache)
+        return asyncio.run(run())
+
+    assert [m.uid for m in found(old_apps)] == [1]
+    assert found(new_apps) == []
+    moved = f"uid 1 manifest not accepted: the axon serves the manifest of another hotkey, {new.ss58_address}"
+    assert moved in caplog.messages
 
 
 def test_a_validator_notices_when_the_subnet_owner_hotkey_moves() -> None:
