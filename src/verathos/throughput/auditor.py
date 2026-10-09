@@ -907,14 +907,17 @@ class Store:
     def add_referrals(self, gateway: str, block: int, codes: list[tuple[str, str, str]],
                       moves: list[tuple[str, str, str, str]], entries: list[tuple[str, str, int, int]]
                       ) -> tuple[int, int, int, list[str]]:
-        """Keep what a gateway reported, at ``block``, or at the end of the last period recorded if that is later (a
-        period once recorded takes nothing more): registrations (code, hotkey, signed), the first per code, then
+        """Keep what a gateway reported, at ``block``, or at the end of the last period recorded or the block of the
+        last item taken if either is later (a period once recorded takes nothing more, and what arrives later never
+        has an earlier block): registrations (code, hotkey, signed), the first per code, then
         moves (signature, from, to, signed), each numbered in the order taken, and entries (id, code, micro-USD,
         credited ms) of codes registered, each once. -> (registrations, moves and entries new, the codes of entries
         not registered)."""
         with self._lock:
             self._db.execute("BEGIN")
-            block = max(block, int(self._db.execute("SELECT MAX(end_block) FROM referral").fetchone()[0] or 0))
+            block = max(block, *(int(self._db.execute(query).fetchone()[0] or 0) for query in (
+                "SELECT MAX(end_block) FROM referral", "SELECT MAX(block) FROM referral_codes",
+                "SELECT MAX(block) FROM referral_moves", "SELECT MAX(block) FROM referral_entries")))
             seq = 1 + max(int(self._db.execute(f"SELECT MAX(seq) FROM {table}").fetchone()[0] or 0)
                           for table in ("referral_codes", "referral_moves"))
             new_codes = new_moves = 0

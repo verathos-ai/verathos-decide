@@ -63,7 +63,7 @@ def test_codes_signed_by_the_hotkey_are_registered_and_moved_through_the_web_app
     assert "refused: 409 conflict: 'a1ice' reads as the code 'alice', which is taken" in capsys.readouterr().err
     assert run(new, action("move", from_hotkey=miner.ss58_address)) == 0
     assert capsys.readouterr().out.strip() == (f"the codes of {miner.ss58_address} moved to {new.ss58_address}, which "
-                                               f"holds now: {', '.join(sorted(['alice', random]))}")
+                                               f"holds now: alice, {random}")  # oldest first
     assert calls == [cli.CODES_PATH] * 4 + [cli.MOVE_PATH]
 
     assert run(new, action("status", days=7)) == 0

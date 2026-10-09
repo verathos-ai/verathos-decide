@@ -487,10 +487,10 @@ web app (`MINING.md`, Referrals).
 **Codes.** A code is random, 8 characters of `abcdefghjkmnpqrstuvwxyz23456789` (no 0, o, 1, l or i), or readable, 4 to
 24 characters of a-z, digits and single hyphens, starting with a letter. Codes are unique after folding: lower case,
 hyphens dropped, `0` read as `o`, `1` as `l`, `5` as `s`, so `a1ice` cannot be taken beside `alice`, and a look-up
-reads a code the same way (`A1ICE` finds `alice`). Read as it looks (digits as the letters they look like: 0 o, 1 l or
-i, 3 e, 4 a, 5 s, 7 t, 8 b), no code contains `verathos`, `decide`, `bittensor`, `opentensor`, `taostats`, a model id
-of the catalog or a name of `referral_reserved`, nor is `official`, `support`, `admin`, `team` or `help` or has one of
-them as a hyphen-separated part. A hotkey holds at most 3 codes not revoked. A code is never deleted, so it is never
+reads a code the same way (`A1ICE` finds `alice`). Read as it looks (0 as o; 1, i and l alike; 3 e, 4 a, 5 s, 7 t,
+8 b), no code contains `verathos`, `decide`, `bittensor`, `opentensor`, `taostats`, a model id of the catalog or a name
+of `referral_reserved`, nor is `official`, `support`, `admin`, `team` or `help` or has one of them as a
+hyphen-separated part. A hotkey holds at most 3 codes not revoked. A code is never deleted, so it is never
 given out twice.
 
 **Signed messages** (`protocol/referral.py`). The hotkey signs `<domain>`, a line break and the message's canonical

@@ -286,7 +286,7 @@ def contradiction(record: ReferralRecord, st: Any, netuid: int,
         owners = {}
     for code, c in sorted(moved.items()):
         owner = owners.get(before[code])
-        if owner is not None and owner != c.coldkey:
+        if owner is not None and c.coldkey is not None and owner != c.coldkey:  # unknown: cannot tell
             return (f"it moves code {code} from {before[code]} to {c.hotkey}, a hotkey of another coldkey than "
                     f"{before[code]}'s at block {block}")
     return None

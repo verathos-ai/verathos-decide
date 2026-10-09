@@ -275,6 +275,8 @@ def test_a_full_validator_refuses_a_record_that_moves_a_code_to_another_coldkey(
     assert contradiction(swapped, node({"hkA": COLD_B, "hkB": COLD_B}), 405, before) is None
     rotated = rec(3, history, hotkeys={"alice": "hkN"}, coldkeys={"hkN": COLD_A})
     assert contradiction(rotated, node({"hkA": None, "hkN": COLD_A}), 405, before) is None
+    gone = rec(3, history, hotkeys={"alice": "hkN"}, coldkeys={})  # its new hotkey swapped away since: unknown
+    assert contradiction(gone, node({"hkA": COLD_A}), 405, before) is None
     assert contradiction(stolen, node({"hkA": COLD_A, "hkX": COLD_B}), 405, rec(0, history)) is None  # no overlap
     assert rewrites(before, stolen) is None  # the sums are as they were: the chain tells a move apart
 
@@ -619,3 +621,17 @@ def test_with_the_owner_hotkey_holding_no_uid_the_pools_are_never_scaled_up(capl
     assert w == pytest.approx({1: 0.75 * 0.95, 2: 0.25 * 0.95 + 0.05}) and parts["referral"] == {2: 0.05}
     assert weight_parts({}, unowned, "owner", 0.59, None, {2: 0.05})[0] == {}  # nothing to put the rest on
     assert "no weights set" in caplog.text
+
+
+def test_arrival_blocks_never_go_back(tmp_path) -> None:
+    """A chain head that drops back (another node, a reorganisation) never gives an item an earlier block than one
+    taken before it."""
+    chain = ReferralChain(2 * L + 50)
+    auditor = referral_auditor(tmp_path, CAT, chain)
+    auditor.follower.poll()
+    auditor.accept_referrals("gw", ReferralReport(codes=[signed_code(kp(), "alice")]))
+    chain.head_block = 2 * L - 10
+    auditor.follower.poll()
+    assert auditor.follower.head == 2 * L - 10
+    auditor.accept_referrals("gw", ReferralReport(entries=[entry("alice", 1, 1)]))
+    assert auditor.store.referral_entries(0, 10**9) == [("alice", 2 * L + 50, 1 * USD)]

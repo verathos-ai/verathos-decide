@@ -4,7 +4,7 @@ they count for the catalog's referral pool, reported to the auditor.
 Codes (``protocol.referral``). A hotkey has a code by its signed registration, which the account service (the web
 app) forwards after checking on chain that the hotkey holds a UID and is not the subnet owner's. The gateway takes it
 when the hotkey's signature verifies, it was signed for this netuid and ``referral_site`` within the last 5 minutes,
-the code is well formed, no code folds to the same form, read as it looks (digits as the letters they look like) it
+the code is well formed, no code folds to the same form, read as it looks (``looks``: digits as letters) it
 contains no reserved name (``RESERVED_NAMES``, the catalog's model ids and ``referral_reserved``) and is not a reserved
 word nor has one as a hyphen-separated part (``RESERVED_WORDS``), and its hotkey holds fewer than ``MAX_CODES`` codes
 not revoked. A code is never deleted, so it is never given out twice. A move takes every code of one hotkey to another
@@ -90,24 +90,22 @@ class Refused(Exception):
         self.status, self.kind, self.message = status, kind, message
 
 
-_LOOKS = (str.maketrans("0134578", "oleastb"), str.maketrans("0134578", "oieastb"))  # digits as the letters they
-# look like, 1 as l or i
+_LOOKS = str.maketrans("01i34578", "olleastb")  # digits read as the letters they look like; 1, i and l alike
 
 
-def looks(text: str) -> set[str]:
-    """``text`` as it reads: lower case, hyphens dropped, digits read as the letters they look like."""
-    plain = text.lower().replace("-", "")
-    return {plain.translate(table) for table in _LOOKS}
+def looks(text: str) -> str:
+    """``text`` as it reads: lower case, hyphens dropped, digits as the letters they look like, 1, i and l alike."""
+    return text.lower().replace("-", "").translate(_LOOKS)
 
 
 def reserved(code: str, names: Iterable[str] = ()) -> str | None:
     """The reserved name or word ``code`` holds, if any (see the module), read as it looks (``looks``)."""
-    readings = looks(code)
+    reading = looks(code)
     for name in (*RESERVED_NAMES, *names):
-        if any(form and form in reading for form in looks(name) for reading in readings):
+        if looks(name) and looks(name) in reading:
             return name
-    words = {form for word in RESERVED_WORDS for form in looks(word)}
-    return next((part for part in (code, *code.split("-")) if looks(part) & words), None)
+    words = {looks(word) for word in RESERVED_WORDS}
+    return next((part for part in (code, *code.split("-")) if looks(part) in words), None)
 
 
 @dataclass(frozen=True)
@@ -213,8 +211,9 @@ class Referrals:
                         referral_codes.c.hotkey == r.hotkey, referral_codes.c.revoked_at.is_(None)))).scalar()
                     if held >= MAX_CODES:
                         raise Refused(409, "conflict", f"the hotkey holds {MAX_CODES} codes already")
-                    await conn.execute(insert(referral_codes).values(
-                        code=r.code, folded=fold(r.code), hotkey=r.hotkey, registration=signed.model_dump_json()))
+                    await conn.execute(insert(referral_codes).values(  # its time taken under the hotkey's lock
+                        code=r.code, folded=fold(r.code), hotkey=r.hotkey, registration=signed.model_dump_json(),
+                        created_at=dt.datetime.now(dt.UTC)))
                 return await self.code(r.code), True
             except IntegrityError:  # registered at the same time by another call: as it stands now
                 if last:
@@ -265,9 +264,9 @@ class Referrals:
                         referral_codes.c.hotkey == m.from_hotkey).values(hotkey=m.to_hotkey))).rowcount
                     if not moved:
                         raise Refused(404, "not_found", f"{m.from_hotkey} holds no referral code")
-                    await conn.execute(insert(referral_moves).values(
+                    await conn.execute(insert(referral_moves).values(  # its time taken under the hotkeys' locks
                         from_hotkey=m.from_hotkey, to_hotkey=m.to_hotkey, move=signed.model_dump_json(),
-                        signature=signed.signature))
+                        signature=signed.signature, created_at=dt.datetime.now(dt.UTC)))
         except IntegrityError:  # the same move made at the same time by another call
             created = False
         return {"from_hotkey": m.from_hotkey, "to_hotkey": m.to_hotkey,
@@ -436,6 +435,8 @@ class Referrals:
         """Post what the auditor has not taken (see the module) with ``post``, which returns the auditor's answer or
         raises; mark what it took. -> the items posted (0 if none, or another process reports)."""
         async with self.engine.begin() as conn:
+            if conn.dialect.name == "postgresql":  # codes and moves read from one snapshot
+                await conn.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
             if not await self._locked(conn):
                 return 0
             pending = (await conn.execute(select(

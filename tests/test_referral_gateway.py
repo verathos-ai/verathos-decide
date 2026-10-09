@@ -110,8 +110,10 @@ def test_codes_are_random_or_readable_and_unique_after_folding() -> None:
         assert well_formed(code) and len(code) == 8 and not set(code) & set("01oil")
     assert reserved("verathos-fan") == "verathos" and reserved("decideai") == "decide"
     for look_alike, name in (("v3rathos", "verathos"), ("dec1de", "decide"), ("b1ttensor", "bittensor"),
-                             ("adm1n", "adm1n"), ("off1cial", "off1cial"), ("t3am-x", "t3am"), ("h3lp", "h3lp")):
+                             ("adm1n", "adm1n"), ("off1cial", "off1cial"), ("off1c1a1", "off1c1a1"),
+                             ("t3am-x", "t3am"), ("h3lp", "h3lp"), ("deciide", None)):
         assert reserved(look_alike) == name, look_alike  # digits read as the letters they look like
+    assert reserved("11um", ["lium"]) == "lium" and reserved("he1ium", ["lium"]) == "lium"
     assert reserved("team") == "team" and reserved("the-team") == "team" and reserved("te-am") == "te-am"
     assert reserved("steamboat") is None and reserved("helpful") is None  # words only whole or as a part
     assert reserved("kev4bfan", ["kev-4b"]) == "kev-4b" and reserved("chutesfan", ["chutes"]) == "chutes"
