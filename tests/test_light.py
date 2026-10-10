@@ -544,6 +544,32 @@ def test_weights_wait_out_the_rate_limit_of_their_own_mechanism(tmp_path, monkey
     assert validator_main.set_weights(settings, chain, wallet, WEIGHTS, 1) and slept == [] and len(chain.set) == 2
 
 
+
+def test_a_chain_error_while_setting_weights_is_retried_in_the_next_block(tmp_path, monkeypatch, caplog) -> None:
+    """The node failing a read or the submission (a dropped connection, a refusal under load) is the node's trouble:
+    the next attempt, a block later, sets the weights, where the error ended the epoch's setting at once."""
+    from verathos.validator import __main__ as validator_main
+
+    caplog.set_level(logging.INFO, logger="verathos.validator")
+    owner, own = kp(), kp()
+    chain = Chain(owner.ss58_address, own.ss58_address, 100 * BLOCKS + OFFSET + 5)
+    chain.last_update = {1: [0] * 6}
+    slept: list[float] = []
+    monkeypatch.setattr(validator_main.time, "sleep", slept.append)
+    failures = iter([ConnectionError("the connection to the node closed")])
+    wait = validator_main.chain.weights_wait
+
+    def flaky(*args):
+        if (failure := next(failures, None)) is not None:
+            raise failure
+        return wait(*args)
+
+    monkeypatch.setattr(validator_main.chain, "weights_wait", flaky)
+    assert validator_main.set_weights(config(tmp_path), chain, SimpleNamespace(hotkey=own), WEIGHTS, 1)
+    assert len(chain.set) == 1 and slept == [light.BLOCK_TIME_S]
+    assert ("setting weights failed (attempt 1 of 10) (ConnectionError: the connection to the node closed); retrying "
+            "in one block") in caplog.messages
+
 def test_a_validator_whose_release_the_subnet_retired_sets_no_weights_and_says_why(tmp_path, monkeypatch,
                                                                                     caplog) -> None:
     """The chain refuses weights below the subnet's WeightsVersionKey: a validator of an older release does not try,

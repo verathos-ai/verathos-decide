@@ -38,7 +38,7 @@ from verathos.engine import code_version
 from verathos.protocol import tls
 from verathos.protocol.callers import ValidatorIdentity
 from verathos.protocol.manifest import axon_base
-from verathos.subnet.chain import connect
+from verathos.subnet.chain import CHAIN_ERRORS, connect, one_line
 from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.throughput.referral import contradiction as referral_contradiction
@@ -527,11 +527,12 @@ def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: di
         log.warning("weights not set: this hotkey holds no UID on netuid %d", cfg.netuid)
         return False
     for attempt in range(1, WEIGHT_ATTEMPTS + 1):
-        if wait := chain.weights_wait(st, cfg.netuid, mechid, uid):
-            log.info("the chain allows this UID's next weights on mechanism %d in %d blocks; setting them then",
-                     mechid, wait)
-            time.sleep(wait * BLOCK_TIME_S)
+        why = ""
         try:
+            if wait := chain.weights_wait(st, cfg.netuid, mechid, uid):
+                log.info("the chain allows this UID's next weights on mechanism %d in %d blocks; setting them then",
+                         mechid, wait)
+                time.sleep(wait * BLOCK_TIME_S)
             if chain.submit_weights(st, wallet, cfg.netuid, mechid, w):
                 return True
         except chain.ReleaseTooOld as exc:
@@ -542,7 +543,10 @@ def set_weights(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, w: di
             log.log(logging.DEBUG if said in _SAID_UNREVEALED else logging.WARNING, "weights not set: %s", exc)
             _SAID_UNREVEALED.add(said)
             return False
-        log.warning("setting weights failed (attempt %d of %d); retrying in one block", attempt, WEIGHT_ATTEMPTS)
+        except CHAIN_ERRORS as exc:  # the node's trouble, not the weights': the next attempt may get through
+            why = f" ({one_line(exc)})"
+        log.warning("setting weights failed (attempt %d of %d)%s; retrying in one block", attempt, WEIGHT_ATTEMPTS,
+                    why)
         time.sleep(BLOCK_TIME_S)
     return False
 
