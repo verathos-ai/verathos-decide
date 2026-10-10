@@ -154,10 +154,13 @@ async def serve(config: GatewayConfig) -> None:
     tests = TestFollower(sampler, ScheduleFollower(chain, AuditPolicy()),
                          lambda: current[0].audit_policy() if current[0] is not None else None)
     router = Router(share=1 / config.instances, max_latency_s=2.0, observer=served)
+    key = read_token(config.referral_key_file, "the referral key").encode() if config.referral_key_file else None
+    referrals = Referrals(engine, netuid=config.netuid, site=config.referral_site,
+                         reserved_names=config.referral_reserved, catalog=lambda: current[0], key=key)
     gateway = Gateway(config=config, hotkey=keypair.ss58_address, catalog=lambda: current[0], accounts=accounts,
                       meter=meter, router=router, sampler=sampler, served=served, routes=lambda: routes.table,
                       upstream=Upstream(keypair, client, netuid=config.netuid),
-                      limiter=RateLimiter())
+                      limiter=RateLimiter(), referrals=referrals)
     reporter = ReferralReporter(gateway.referrals, keypair, client, auditor=auditor, auditor_hotkey=auditor_hotkey,
                                 catalog=lambda: current[0])
 
@@ -193,7 +196,8 @@ async def serve(config: GatewayConfig) -> None:
     sockets = [listen(config.listen_host, config.port)]
     if config.admin_port is not None:
         token = read_token(config.admin_token_file)
-        accounts_token = read_token(config.accounts_token_file) if config.accounts_token_file else None
+        accounts_token = (read_token(config.accounts_token_file, "the account service's token")
+                          if config.accounts_token_file else None)
         if accounts_token == token:
             raise SystemExit("the account service's token must differ from the admin token")
         app = ByPort(app, config.admin_port, admin_app(gateway, token=token, accounts_token=accounts_token))

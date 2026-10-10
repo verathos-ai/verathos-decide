@@ -25,9 +25,11 @@ once (``referral_reports``) and reported once.
 The reporter. Every ``REPORT_S`` one gateway process (PostgreSQL's advisory lock ``LOCK_KEY``; the others skip the
 round) decides the new credits of referred accounts, then posts what the auditor has not taken, signed by the gateway:
 registrations and moves in the order they happened, then, once every registration is out, entries
-(``protocol.gateway.ReferralReport``). An entry's id is drawn at random when its credit is decided and kept with it,
-so it leads back to no credit or payment. The auditor takes every item once, so a post whose answer was lost is sent
-again as it is. If it no longer knows a code an entry names (its database started over), every registration and move
+(``protocol.gateway.ReferralReport``). An entry's id is the keyed hash of its credit's reference (``entry_id``, with
+the gateway's ``referral_key_file``): without the key it leads back to no credit or payment, and a credit recorded
+again under its reference (the database restored from a backup, then the payment credited again) goes under the same
+id. The auditor takes every item once, so a post whose answer was lost is sent again as it is, and such a credit
+counts once. If it no longer knows a code an entry names (its database started over), every registration and move
 goes again, then those entries. An entry counts at most ``MAX_REFERRAL_MICROS``.
 """
 
@@ -36,9 +38,9 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import hashlib
+import hmac
 import json
 import logging
-import secrets
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
@@ -82,6 +84,7 @@ REPORT_S = 30.0
 BATCH = 1000  # credits decided per round
 LOCK_KEY = 0x7665726174686F73
 MAX_DAYS = 400  # of a referrer's figures
+ENTRY_DOMAIN = b"verathos/referral-entry/v1\n"
 
 
 class Refused(Exception):
@@ -145,6 +148,12 @@ def counted(kind: str, amount: int, refund_of: str | None, created: dt.datetime,
 CREDITED_GRAIN_MS = 3_600_000  # credit times go to the hour: with the amount, a finer one could find the payment
 
 
+def entry_id(key: bytes, reference: str) -> str:
+    """The id a credit's entry goes to the auditor under: HMAC-SHA256 of its reference with the gateway's referral key,
+    in hex."""
+    return hmac.new(key, ENTRY_DOMAIN + reference.encode(), hashlib.sha256).hexdigest()
+
+
 def credited_hour_ms(created_at: dt.datetime) -> int:
     """When a credit was made, as sent to the auditor: the start of its UTC hour, in milliseconds."""
     ms = int(_utc(created_at).timestamp() * 1000)
@@ -153,13 +162,15 @@ def credited_hour_ms(created_at: dt.datetime) -> int:
 
 class Referrals:
     """The referral ledger in the gateway's database (see the module). ``catalog`` gives the catalog followed: its
-    model ids are reserved, and its referral pool decides what counts."""
+    model ids are reserved, and its referral pool decides what counts. ``key``: the referral key entries' ids are
+    derived with (``entry_id``); without one nothing is decided."""
 
     def __init__(self, engine: AsyncEngine, *, netuid: int, site: str | None, reserved_names: Iterable[str] = (),
                  catalog: Callable[[], Catalog | None] = lambda: None,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time, key: bytes | None = None) -> None:
         self.engine, self.netuid, self.site, self.catalog, self.clock = engine, netuid, site, catalog, clock
-        self.reserved_names = tuple(reserved_names)
+        self.reserved_names, self.key = tuple(reserved_names), key
+        self._keyless_said = False
 
     # ---- codes ----
 
@@ -407,6 +418,11 @@ class Referrals:
         """Decide what the credits of referred accounts not decided yet count (see the module), at most ``BATCH`` of
         them, oldest first. -> the micro-USD each counts (empty if there were none, or another process decides)."""
         window_s = pool.window_s(epoch_blocks, BLOCK_TIME_S) if pool is not None else 0.0
+        if self.key is None:
+            if not self._keyless_said:
+                log.error("referrals: no referral key (referral_key_file): no top-up or refund is decided")
+                self._keyless_said = True
+            return []
         async with self.engine.begin() as conn:
             if not await self._locked(conn):
                 return []
@@ -435,7 +451,7 @@ class Referrals:
                                  pool, window_s)
                 earlier[r.account_id].append(Decided(r.kind, r.reference, r.refund_of, created, amount))
                 decided.append({"credit_id": r.id, "code": r.code, "amount": amount,
-                                "entry_id": secrets.token_hex(32)})  # its id at the auditor, kept for every post
+                                "entry_id": entry_id(self.key, r.reference)})  # its id at the auditor
             if decided:
                 await conn.execute(insert(referral_reports), decided)
         if decided:

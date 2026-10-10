@@ -127,7 +127,8 @@ def test_codes_are_random_or_readable_and_unique_after_folding() -> None:
 def admin(tmp_path, **config):
     from verathos.gateway.admin import ByPort, admin_app
 
-    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")}, **({"referral_site": SITE} | config))
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")},
+              **({"referral_site": SITE, "referral_key_file": tmp_path / "referral.key"} | config))
     s.app = ByPort(s.app, 9999, admin_app(s.gateway, token=ADMIN_TOKEN, accounts_token=ACCOUNTS_TOKEN))
     return s
 
@@ -305,16 +306,19 @@ POOL = with_referrals({"period_epochs": 2, "window_periods": 3, "term_days": 30,
 WINDOW_S = POOL.window_s(180, 12.0)  # 3 periods of 2 epochs: 3.6 hours
 
 
+REFERRAL_KEY = bytes(range(32))  # the gateway's referral key (``referral_key_file``)
+
+
 class Ledger:
     """The referral ledger on its own database: accounts, codes, referrals and credits at chosen times."""
 
-    def __init__(self, tmp_path) -> None:
+    def __init__(self, tmp_path, key: bytes = REFERRAL_KEY) -> None:
         tmp_path.mkdir(parents=True, exist_ok=True)
         url = f"sqlite+aiosqlite:///{tmp_path}/gateway.db"
         db.upgrade(url)
         self.engine = db.create_engine(url)
         self.accounts = Accounts(self.engine)
-        self.referrals = Referrals(self.engine, netuid=405, site=SITE, catalog=catalog.load)
+        self.referrals = Referrals(self.engine, netuid=405, site=SITE, catalog=catalog.load, key=key)
         self.miner = kp()
         self.t0 = dt.datetime(2026, 10, 1, tzinfo=dt.UTC)
 
@@ -540,12 +544,17 @@ def test_what_counts_is_reported_once_with_the_codes_registrations_and_moves(tmp
             [e.amount_micros for e in posted[-1].entries]) == (["alice"], 1, [7 * USD])
 
 
-def test_an_entry_is_named_by_a_random_id_drawn_once_and_kept_for_every_post(tmp_path) -> None:
-    """An entry's id is drawn at random when its credit is decided and kept with it: the same credit in another
-    ledger gets another id, so nothing of the credit gives it, and every post of the entry names it alike, after a
-    failed post or an auditor that started over."""
-    def named(path) -> str:
-        ledger = Ledger(path)
+def test_an_entry_is_named_by_the_keyed_hash_of_its_credits_reference_in_every_post_and_after_a_restore(
+        tmp_path) -> None:
+    """An entry's id is the HMAC of its credit's reference with the gateway's referral key: every post of the entry
+    names it alike, after a failed post or an auditor that started over; a gateway whose database was restored from a
+    backup, which records the payment again under its reference, names it alike too, so the auditor, which took the
+    id before, counts it once; under another key the id is another, and without the key nothing links it to the
+    credit."""
+    from verathos.gateway.referrals import entry_id
+
+    def named(path, key: bytes = REFERRAL_KEY) -> str:
+        ledger = Ledger(path, key)
         ledger.code("alice")
         ledger.account("u_1", "alice")
         reference = ledger.credit("u_1", 5, at_s=10, reference="tao:5120344:7")
@@ -565,8 +574,9 @@ def test_an_entry_is_named_by_a_random_id_drawn_once_and_kept_for_every_post(tmp
         assert [[e.id for e in r.entries] for r in posted] == [[kept]] * 3
         assert ledger.entry_ids() == {reference: kept} and ledger.run(ledger.referrals.report(post)) == 0
         return kept
-    first, second = named(tmp_path / "a"), named(tmp_path / "b")
-    assert first != second and all(re.fullmatch(r"[0-9a-f]{64}", id_) for id_ in (first, second))
+    first, restored = named(tmp_path / "a"), named(tmp_path / "restored")  # a fresh database, the same key
+    assert first == restored == entry_id(REFERRAL_KEY, "tao:5120344:7") and re.fullmatch(r"[0-9a-f]{64}", first)
+    assert named(tmp_path / "other", bytes(32)) != first
 
 
 def hashes(text: str) -> set[str]:
@@ -703,7 +713,7 @@ def test_the_operator_refunds_a_top_up_and_revokes_a_code_from_the_command_line(
     url = f"sqlite+aiosqlite:///{tmp_path}/admin.db"
     config = tmp_path / "gateway.json"
     config.write_text(json.dumps({"netuid": 405, "wallet_name": "w", "hotkey_name": "h", "database_url": url,
-                                  "referral_site": SITE}))
+                                  "referral_site": SITE, "referral_key_file": str(tmp_path / "referral.key")}))
 
     def cli(*args: str):
         sys.argv = ["verathos-gateway", "--config", str(config), *args]
@@ -811,3 +821,22 @@ def test_registrations_and_moves_are_posted_in_the_order_they_happened(tmp_path)
     assert [([c.registration.code for c in r.codes], [m.move.to_hotkey for m in r.moves]) for r in posted] == [
         (["alice"], [b.ss58_address]), (["anna"], [])]
 
+
+
+def test_without_a_referral_key_nothing_is_decided_and_a_site_needs_one(tmp_path, caplog) -> None:
+    import logging
+
+    from pydantic import ValidationError
+
+    from verathos.gateway.config import GatewayConfig
+
+    ledger = Ledger(tmp_path, key=None)
+    ledger.code("alice")
+    ledger.account("u_1", "alice")
+    ledger.credit("u_1", 5, at_s=10)
+    with caplog.at_level(logging.ERROR, logger="verathos.gateway.referrals"):
+        assert ledger.decide() == [] and ledger.decide() == []
+    assert caplog.messages == ["referrals: no referral key (referral_key_file): no top-up or refund is decided"]
+    with pytest.raises(ValidationError, match="referral_site needs referral_key_file"):
+        GatewayConfig(netuid=405, wallet_name="w", hotkey_name="h", database_url="sqlite+aiosqlite://",
+                      referral_site=SITE)

@@ -66,6 +66,11 @@ class GatewayConfig(BaseModel):
                                    "auditor")
     referral_site: str | None = Field(None, description="The origin of the web app referral codes and moves are "
                                       "signed for (https://host); none: no referral codes are taken")
+    referral_key_file: Path | None = Field(None, description="File holding the referral key (at least 32 characters, "
+                                           "readable by the gateway's user only) the ids of referred top-ups and "
+                                           "refunds sent to the auditor are derived from: the same file for every "
+                                           "gateway process, kept with the database's backups; needed with "
+                                           "referral_site")
     referral_reserved: list[str] = Field(default_factory=list, max_length=256, description="Names no referral code "
                                          "may contain, besides the built-in ones and the catalog's model ids (other "
                                          "subnets' products, for example)")
@@ -117,6 +122,8 @@ class GatewayConfig(BaseModel):
             raise ValueError("accounts_token_file needs admin_port")
         if self.admin_port is not None and self.admin_port == self.port:
             raise ValueError("admin_port must differ from port")
+        if self.referral_site is not None and self.referral_key_file is None:
+            raise ValueError("referral_site needs referral_key_file")
         if (self.tls_cert_file is None) != (self.tls_key_file is None):
             raise ValueError("tls_cert_file and tls_key_file go together")
         if self.tls_cert_file is None and self.plain_listeners_off_loopback():

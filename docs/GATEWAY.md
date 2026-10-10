@@ -213,6 +213,7 @@ view of the miners does not take a model off the gateway. Once the current table
    | `accounts_token_file`, `accounts_prefix` | -, `u_` | the account service's token and the accounts it reaches (see below) |
    | `accounts_max_credit`, `accounts_max_credit_per_hour` | 100 USD, 1,000 USD | the account service's credit caps, in micro-USD (per process) |
    | `referral_site` | - | the web app's origin referral codes and moves are signed for (`https://host`); none: no codes are registered ([Referrals](#referrals)) |
+   | `referral_key_file` | - | the referral key, at least 32 characters, mode 600 (`umask 077; openssl rand -hex 32 > referral.key`): the ids of referred top-ups and refunds sent to the auditor are derived from it; the same file for every process, kept with the database's backups; needed with `referral_site` |
    | `referral_reserved` | [] | names no referral code may contain, besides the built-in ones and the catalog's model ids (other subnets' products, for example) |
    | `state_dir`, `catalog_dir` | `~/.verathos/gateway`, `~/.verathos/catalog` | last routes, catalogs |
 
@@ -532,14 +533,17 @@ no top-up: its first top-up fixes its referrer. Grants, the referred user's bonu
 
 Every 30 s the gateway posts to the auditor what it has not taken yet (`POST /v1/gateway/referrals`, signed by the
 gateway's hotkey as served counts are): `{"codes": [signed registrations], "moves": [signed moves], "entries": [{"id"
-(32 random bytes in hex, one per entry), "code", "amount_micros", "credited_ms" (the start of the UTC hour it was
-credited in)}]}`, up to 1,000 registrations or moves and 5,000 entries per post, an entry counting at most 1,000,000
+(HMAC-SHA256 of the credit's reference with the referral key, in hex), "code", "amount_micros", "credited_ms" (the
+start of the UTC hour it was credited in)}]}`, up to 1,000 registrations or moves and 5,000 entries per post, an entry counting at most 1,000,000
 USD. Registrations and moves go in the order they happened (the auditor takes a post's registrations before its moves),
 and entries once every registration is out. The auditor takes every item once, so a post whose answer was lost goes
 again as it was; if it answers with codes it does not know (its database started over), every registration and move goes
 again, then those entries. It counts each entry in the period in which it arrives (`THROUGHPUT_AUDIT.md`). No account,
-address or reference leaves the gateway, nor a hash of one: an entry's id is random and links to no credit or payment,
-and the auditor sees codes, amounts and the hour they were credited in. One gateway database serves the subnet's gateway
+address or reference leaves the gateway, nor a plain hash of one: an entry's id is keyed with the referral key
+(`referral_key_file`), so without the key it links to no credit or payment, and the auditor sees codes, amounts and the
+hour they were credited in. A payment credited again under its reference (the database restored from a backup, then
+the deposits after it credited again) goes under the same id, which the auditor counts once: keep the key with the
+database's backups, and give every gateway process the same file. Without a referral key nothing is decided. One gateway database serves the subnet's gateway
 processes; a second one would keep codes of its own.
 
 ## Admin API

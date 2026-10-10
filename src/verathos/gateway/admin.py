@@ -96,14 +96,14 @@ MAX_CREDIT = 10**15  # micro-USD in one entry, either sign (a billion USD): bala
 Rate = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 
 
-def read_token(path: Path) -> str:
-    """The admin token from its file; refuses a short token, and a file others can read."""
+def read_token(path: Path, what: str = "the admin token") -> str:
+    """A token (``what``) from its file; refuses a short token, and a file others can read."""
     path = path.expanduser()
     if path.stat().st_mode & 0o077:
         raise SystemExit(f"{path} is readable by others: chmod 600 it")
     token = path.read_text().strip()
     if len(token) < MIN_TOKEN_CHARS:
-        raise SystemExit(f"the admin token in {path} is shorter than {MIN_TOKEN_CHARS} characters")
+        raise SystemExit(f"{what} in {path} is shorter than {MIN_TOKEN_CHARS} characters")
     return token
 
 
