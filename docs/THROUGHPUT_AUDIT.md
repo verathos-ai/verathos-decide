@@ -263,10 +263,10 @@ start for it, then come without it. The record lists:
   alpha out per block, the owner cut if the subnet has it on, the mechanism count and split; miners get half of what
   the owner cut leaves), and `period_emission`, that over the period's blocks in alpha;
 - `burned` mode: `burns`, every `AlphaBurned` event of `buyback_coldkey` on the subnet in the period (block, position
-  among the block's events, hotkey, amount in rao), and `unscanned`, block ranges the auditor's node no longer held
-  when it read them (their burns do not count); `revenue` mode: `prices` per model, `revenue_usd`, `tao_usd` (TAO in
-  USD, read from CoinGecko when the period closed) and `alpha_tao` (the subnet's `SubnetMovingPrice` at the end
-  block);
+  among the block's events, hotkey, amount in rao), and `unscanned`, block ranges the auditor's node no longer held when
+  it read them (their burns do not count); `revenue` mode: `prices` per model, `revenue_usd`, `tao_usd` (TAO in USD, the
+  first price between 10 and 10,000 USD from CoinGecko, Kraken and Coinbase when the period closed) and `alpha_tao` (the
+  subnet's `SubnetMovingPrice` at the end block);
 - `basis` (alpha), `fraction` and `share`, the period's usage share.
 
 A validator recomputes `period_emission`, `basis` and `share` from these, and checks against its own node the burns
@@ -290,7 +290,7 @@ first verdicts of a period wait up to 20 blocks after its start for it, then com
 - `referrers`: per hotkey, `referred_micros` (its codes' sums over the window, at least 0), `cap` and `share`;
 - `share`: the caps' sum, at most `max_share` (the catalog's `share`);
 - the inputs: `payout_per_usd`, `max_share`, `window_periods`; `emission` and `period_emission` as in the usage record;
-  `tao_usd` (TAO in USD, read from CoinGecko when the period closed, if anything was referred) and `alpha_tao` (the
+  `tao_usd` (TAO in USD, as in the usage record, if anything was referred) and `alpha_tao` (the
   subnet's `SubnetMovingPrice` at the end block); `owner_hotkey` and `owner_coldkey`, the subnet owner at the end block.
 
 A validator recomputes the sums, caps and shares from these, checks the end block's state its node still holds, and
@@ -383,8 +383,8 @@ The auditor needs:
   image in about 30 microseconds (an i9-14900K);
 - with a usage pool in `burned` mode, a node that holds the state of the last 200 blocks: the auditor reads every
   block's events as it is finalized, over a connection of its own; blocks it falls further behind on are recorded as
-  unscanned. In `revenue` mode, and with a referral pool once anything was referred, it reads TAO's price in USD from
-  CoinGecko once per period.
+  unscanned. In `revenue` mode, and with a referral pool once anything was referred, it reads TAO's price in USD once per period
+  from CoinGecko, Kraken or Coinbase, the first between 10 and 10,000 USD.
 
 Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers, without the
 requests with images), `verdicts` (as served), `demand` (users' input tokens per model), `shares` (the models'

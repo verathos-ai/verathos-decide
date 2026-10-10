@@ -168,7 +168,7 @@ class ReferralEntry(BaseModel):
     """A referred account's top-up or refund as it counts for its code: a top-up within the account's term and cap,
     a refund (negative) at most what its top-up counted."""
 
-    id: str = Field(pattern=r"^[0-9a-f]{64}$")  # random, drawn once per entry: the auditor takes it once
+    id: str = Field(pattern=r"^[0-9a-f]{64}$")  # keyed with the gateway's secret: the auditor takes it once
     code: str = Field(min_length=1, max_length=READABLE_LENGTH[1])
     amount_micros: int = Field(ge=-MAX_REFERRAL_MICROS, le=MAX_REFERRAL_MICROS)
     credited_ms: int = Field(ge=0)  # the start of the UTC hour the gateway credited it in
