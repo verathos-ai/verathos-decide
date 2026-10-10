@@ -54,6 +54,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from starlette.requests import ClientDisconnect
 
 from verathos import catalog as catalog_module
 from verathos.gateway import metrics
@@ -680,6 +681,8 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
                         return reject(503, "busy", "the gateway is at capacity", request_id, 1)
         except TimeoutError:
             return reject(408, "timeout", f"the body took longer than {g.config.body_timeout_s:g} s", request_id)
+        except ClientDisconnect:  # the client left: nobody reads the answer, and it is no fault of the gateway
+            return reject(400, "invalid_request", "the client left before its body arrived", request_id)
         try:
             screened = screen(g, bytes(body))
         except Rejected as r:

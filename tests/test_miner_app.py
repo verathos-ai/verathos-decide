@@ -448,3 +448,30 @@ def test_a_body_is_held_to_its_models_limit(seeing) -> None:
     assert post(client, validator, miner, "/e/gpu1/v1/systemone", {**REQUEST, "state": long_state}).status_code == 413
     assert post(client, validator, miner, "/e/gpu0/v1/systemone",
                 {**IMAGE_REQUEST, "state": long_state}).status_code == 200
+
+
+def test_a_caller_that_leaves_mid_body_gets_no_500_and_the_miner_shows_no_api_documents(setup, caplog) -> None:
+    """A claimed caller is enough to have the body read: one that leaves before it is whole would otherwise log an
+    error with a traceback each time, which anyone can repeat. The miner serves no API documents either."""
+    import logging
+
+    from tests.disconnect import left_mid_body
+    from verathos.protocol.requests import HDR_HOTKEY
+
+    client, miner, validator, _, _ = setup
+    with caplog.at_level(logging.ERROR):
+        status = asyncio.run(left_mid_body(client.app, "/e/gpu0/v1/systemone",
+                                           {HDR_HOTKEY: validator.ss58_address, "content-type": "application/json"}))
+    assert status == 413 and not caplog.records
+    assert [client.get(path).status_code for path in ("/docs", "/redoc", "/openapi.json")] == [404, 404, 404]
+
+
+def test_a_timestamp_longer_than_a_time_is_malformed_not_an_error() -> None:
+    from verathos.protocol.requests import NonceCache, RequestRejected, verify_request
+
+    caller, receiver = (Keypair.create_from_mnemonic(Keypair.generate_mnemonic()) for _ in range(2))
+    headers = sign_request(caller, "POST", "/e/gpu0/v1/systemone", b"{}", receiver.ss58_address)
+    stamp = next(k for k in headers if k.lower().endswith("timestamp"))
+    with pytest.raises(RequestRejected, match="malformed timestamp"):
+        verify_request({**headers, stamp: "9" * 5000}, "POST", "/e/gpu0/v1/systemone", b"{}", receiver.ss58_address,
+                       NonceCache())

@@ -26,6 +26,7 @@ HDR_TIMESTAMP = "X-Verathos-Timestamp"
 HDR_NONCE = "X-Verathos-Nonce"
 HDR_RECEIVER = "X-Verathos-Receiver"
 MAX_SKEW_MS = 60_000
+MAX_TIMESTAMP_DIGITS = 15  # milliseconds since 1970 have 13 digits
 
 
 def signing_message(method: str, path: str, body: bytes, timestamp_ms: str, nonce: str, receiver: str) -> bytes:
@@ -89,7 +90,7 @@ def verify_request(headers: dict[str, str], method: str, path: str, body: bytes,
         raise RequestRejected(f"missing header {e.args[0]}") from None
     if signed_for != receiver:
         raise RequestRejected("request was signed for another receiver")
-    if not ts.isdecimal() or not (16 <= len(nonce) <= 64):
+    if not ts.isdecimal() or len(ts) > MAX_TIMESTAMP_DIGITS or not (16 <= len(nonce) <= 64):
         raise RequestRejected("malformed timestamp or nonce")
     now = int(time.time() * 1000) if now_ms is None else now_ms
     if abs(now - int(ts)) > MAX_SKEW_MS:

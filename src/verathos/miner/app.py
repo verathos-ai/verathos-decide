@@ -42,6 +42,7 @@ from bittensor_wallet import Keypair
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
+from starlette.requests import ClientDisconnect
 
 from verathos.miner.admission import BEHIND_TESTS, REGULAR, TEST, Admission, RequestBudget
 from verathos.miner.config import MinerConfig
@@ -144,7 +145,7 @@ def create_app(
     send an endpoint per epoch (default: no limit); ``on_verified`` is called with the hotkey and source address of
     each request authenticated as a caller (a signature, or the auditor's test session), and ``allows`` decides which
     source addresses are served at all (``SourceGate``; default: all)."""
-    app = FastAPI(title="Verathos miner")
+    app = FastAPI(title="Verathos miner", docs_url=None, redoc_url=None, openapi_url=None)
     if allows is not None:
         app.add_middleware(SourceGate, allows=allows)
     nonces = NonceCache()
@@ -161,7 +162,8 @@ def create_app(
         return JSONResponse(status_code=status, content={"error": message})
 
     async def read_body(request: Request, limit: int) -> bytes | None:
-        """The request body, or None if it exceeds ``limit`` bytes or takes longer than BODY_TIMEOUT_S."""
+        """The request body, or None if it exceeds ``limit`` bytes, takes longer than BODY_TIMEOUT_S or the client
+        leaves before it is whole."""
         declared = request.headers.get("content-length", "")
         if declared.isdigit() and int(declared) > limit:
             return None
@@ -172,7 +174,7 @@ def create_app(
                     body += chunk
                     if len(body) > limit:
                         return None
-        except TimeoutError:
+        except (TimeoutError, ClientDisconnect):
             return None
         return bytes(body)
 

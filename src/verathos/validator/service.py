@@ -37,6 +37,7 @@ from bittensor_wallet import Keypair
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
+from starlette.requests import ClientDisconnect
 
 from verathos.catalog import CATALOG_PATH, CatalogStore
 from verathos.protocol.gateway import (
@@ -212,6 +213,8 @@ def add_gateway_routes(app: FastAPI, auditor: Auditor, *, probation: Callable[[]
                         return None, JSONResponse({"error": "body longer than declared"}, status_code=413)
         except TimeoutError:
             return None, JSONResponse({"error": "body too slow"}, status_code=408)
+        except ClientDisconnect:
+            return None, JSONResponse({"error": "the client left before its body arrived"}, status_code=400)
         try:
             caller = verify_request(dict(request.headers), "POST", request.url.path, bytes(body), auditor.hotkey,
                                     nonces)

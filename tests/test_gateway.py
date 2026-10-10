@@ -2068,3 +2068,33 @@ def test_a_database_from_before_credit_is_upgraded_in_place(tmp_path) -> None:
     account = asyncio.run(Accounts(engine).account("old"))
     assert (account["prepaid"], account["balance"]) == (False, 0)
     asyncio.run(engine.dispose())
+
+
+def test_a_client_that_leaves_mid_body_gets_no_500(tmp_path, caplog) -> None:
+    """Users cancel uploads: a body that stops arriving because its client left is no fault of the gateway and logs
+    no error."""
+    import logging
+
+    from tests.disconnect import left_mid_body
+
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    with caplog.at_level(logging.ERROR):
+        status = asyncio.run(left_mid_body(s.app, "/v1/systemone", {"authorization": f"Bearer {s.key}",
+                                                                    "content-type": "application/json"}))
+    assert status == 400 and not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_a_gateway_post_the_auditor_gets_half_of_is_no_500(caplog) -> None:
+    import logging
+    from types import SimpleNamespace
+
+    from tests.disconnect import left_mid_body
+    from verathos.protocol.gateway import SERVED_PATH
+    from verathos.protocol.requests import HDR_HOTKEY
+    from verathos.validator.service import add_gateway_routes
+
+    app = FastAPI()
+    add_gateway_routes(app, SimpleNamespace(hotkey="5Auditor"), probation=list, gateways=lambda: ["5Gateway"])
+    with caplog.at_level(logging.ERROR):
+        status = asyncio.run(left_mid_body(app, SERVED_PATH, {HDR_HOTKEY: "5Gateway", "content-length": "4096"}))
+    assert status == 400 and not caplog.records
