@@ -10,3 +10,6 @@ dist/
 *.dylib
 native/loadgen/target/
 src/verathos/throughput/verathos-loadgen
+docker/.env
+docker/data/
+docker/reference-engines/

@@ -1,0 +1,52 @@
+# A reference machine: each model's float32 reference and bfloat16 screen on its GPUs (or the references in RAM),
+# served over TLS to the validator machines' addresses only; it holds no wallet (docs/DOCKER.md).
+#   cp .env.example .env    then set ALLOW and COMPOSE_FILE=compose.reference.yml
+#   docker compose up -d    it writes DATA_DIR/reference-engines.json, for the validators
+name: verathos-reference
+
+services:
+  reference:
+    image: ${IMAGE_REGISTRY:-ghcr.io/verathos-ai}/verathos-engines:${VERATHOS_VERSION:?set VERATHOS_VERSION in .env}
+    command: ["reference"]
+    restart: unless-stopped
+    stop_grace_period: 60s
+    # The host's network: the front sees its callers' addresses as they are, which it admits by.
+    network_mode: host
+    cap_drop: [NET_RAW]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      ALLOW: ${ALLOW:?set ALLOW in .env, the validator machines' addresses}
+      NETWORK: ${NETWORK:-finney}
+      NETUID: ${NETUID:-}
+      PUBLIC_IP: ${PUBLIC_IP:-}
+      PORT: ${PORT:-}
+      MODEL: ${MODEL:-}
+      SCREENS: ${SCREENS:-on}
+      DEVICE: ${DEVICE:-auto}
+      ENGINE_AUTO_INSTALL: ${ENGINE_AUTO_INSTALL:-on}
+      AUTO_RESTART: ${AUTO_RESTART:-on}
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    healthcheck:
+      test: ["CMD", "verathos-container", "health", "reference"]
+      interval: 1m
+      timeout: 30s
+      retries: 3
+      start_period: 2h
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"

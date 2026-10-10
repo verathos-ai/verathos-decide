@@ -34,6 +34,7 @@ verathos-build-loadgen = "verathos.throughput.loadgen:build"
 verathos-subnet = "verathos.subnet.admin:main"
 verathos-engine = "verathos.engine.__main__:main"
 verathos-gateway = "verathos.gateway.__main__:main"
+verathos-container = "verathos.install.container:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "verathos.__version__"}

@@ -161,6 +161,10 @@ curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install
 curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --full
 ```
 
+On a machine of your own with Docker, a light or full validator and the reference machine its references run on also
+run as containers, side by side on a machine with GPUs ([Docker](DOCKER.md)); the subnet owner's validator, the
+auditor, installs as here.
+
 It asks for the wallet/hotkey (default: the hotkey on the machine, or the one set up before) and the mode (default:
 the one set up before, else light), shows its plan with the mode and what it needs, and asks to go ahead. Without
 questions:

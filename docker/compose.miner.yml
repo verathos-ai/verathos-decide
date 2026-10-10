@@ -1,0 +1,71 @@
+# A miner: one engine per GPU and the miner service, the engines this release ships (docs/DOCKER.md).
+#   cp .env.example .env    then set WALLET (and COMPOSE_FILE=compose.miner.yml)
+#   docker compose up -d
+name: verathos-miner
+
+services:
+  miner:
+    image: ${IMAGE_REGISTRY:-ghcr.io/verathos-ai}/verathos-engines:${VERATHOS_VERSION:?set VERATHOS_VERSION in .env}
+    command: ["miner"]
+    restart: unless-stopped
+    stop_grace_period: 60s
+    # The host's network: callers reach the miner at the host's address and port as they are (no NAT, no proxy, IPv6
+    # too), and with NET_ADMIN the miner keeps its firewall's kernel table there.
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    cap_drop: [NET_RAW]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      WALLET: ${WALLET:?set WALLET in .env}
+      HOTKEY: ${HOTKEY:-default}
+      NETWORK: ${NETWORK:-finney}
+      NETUID: ${NETUID:-}
+      PUBLIC_IP: ${PUBLIC_IP:-}
+      PORT: ${PORT:-}
+      MODEL: ${MODEL:-}
+      GPUS: ${GPUS:-}
+      FIREWALL: ${FIREWALL:-on}
+      NO_PUBLISH: ${NO_PUBLISH:-}
+      WORKER: ${WORKER:-}
+      NAME: ${NAME:-}
+      PEERS: ${PEERS:-}
+      ENGINE_AUTO_INSTALL: ${ENGINE_AUTO_INSTALL:-on}
+      AUTO_RESTART: ${AUTO_RESTART:-on}
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      # The hotkey and the coldkey's public key, read-only, which must exist; never the coldkey.
+      - type: bind
+        source: ${WALLETS_DIR:-~/.bittensor/wallets}/${WALLET}/hotkeys/${HOTKEY:-default}
+        target: /root/.bittensor/wallets/${WALLET}/hotkeys/${HOTKEY:-default}
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WALLETS_DIR:-~/.bittensor/wallets}/${WALLET}/coldkeypub.txt
+        target: /root/.bittensor/wallets/${WALLET}/coldkeypub.txt
+        read_only: true
+        bind:
+          create_host_path: false
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    healthcheck:
+      test: ["CMD", "verathos-container", "health", "miner"]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 2h
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"

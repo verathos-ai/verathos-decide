@@ -1,0 +1,61 @@
+# A full validator, its references on a reference machine (compose.reference.yml, on this machine or another): it
+# checks the miners' answers itself; no GPU here (docs/DOCKER.md). The subnet owner's validator, the auditor, runs
+# from the installer.
+#   cp .env.example .env    then set WALLET and COMPOSE_FILE=compose.validator-full.yml, and put each reference
+#                           machine's reference-engines.json into REMOTE_ENGINES_DIR
+#   docker compose up -d
+name: verathos-validator
+
+services:
+  validator:
+    image: ${IMAGE_REGISTRY:-ghcr.io/verathos-ai}/verathos:${VERATHOS_VERSION:?set VERATHOS_VERSION in .env}
+    command: ["validator"]
+    restart: unless-stopped
+    stop_grace_period: 60s
+    # The host's network: requests to miners leave from the host's address, the one the validator publishes; a
+    # reference machine's front on this machine is on its loopback.
+    network_mode: host
+    cap_drop: [NET_RAW]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      MODE: full
+      WALLET: ${WALLET:?set WALLET in .env}
+      HOTKEY: ${HOTKEY:-default}
+      NETWORK: ${NETWORK:-finney}
+      NETUID: ${NETUID:-}
+      EGRESS_IPS: ${EGRESS_IPS:-}
+      PUBLIC_IP: ${PUBLIC_IP:-}
+      PORT: ${PORT:-}
+      DRY_RUN: ${DRY_RUN:-}
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      # The reference machines' files: the engines' URLs, pins and keys.
+      - ${REMOTE_ENGINES_DIR:-./reference-engines}:/etc/verathos/remote-engines:ro
+      # The hotkey and the coldkey's public key, read-only, which must exist; never the coldkey.
+      - type: bind
+        source: ${WALLETS_DIR:-~/.bittensor/wallets}/${WALLET}/hotkeys/${HOTKEY:-default}
+        target: /root/.bittensor/wallets/${WALLET}/hotkeys/${HOTKEY:-default}
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WALLETS_DIR:-~/.bittensor/wallets}/${WALLET}/coldkeypub.txt
+        target: /root/.bittensor/wallets/${WALLET}/coldkeypub.txt
+        read_only: true
+        bind:
+          create_host_path: false
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    healthcheck:
+      test: ["CMD", "verathos-container", "health", "validator"]
+      interval: 1m
+      timeout: 15s
+      retries: 3
+      start_period: 30m
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"

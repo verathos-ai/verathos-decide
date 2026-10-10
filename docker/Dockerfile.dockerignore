@@ -1,0 +1,14 @@
+# What docker/Dockerfile takes from the repository: the code, its scripts and release keys, and docker/pins.py.
+# Nothing else reaches an image: no git history, environments, tests, the load generator or local builds.
+**
+!pyproject.toml
+!LICENSE
+!README.md
+!src/
+!scripts/
+!release/
+!docker/pins.py
+src/verathos/throughput/verathos-loadgen
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
