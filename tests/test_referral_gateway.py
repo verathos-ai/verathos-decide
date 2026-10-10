@@ -8,6 +8,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import json
+import logging
 import re
 import time
 
@@ -197,6 +198,20 @@ def test_codes_move_to_another_hotkey_signed_by_it_never_by_the_old_one(tmp_path
     assert nothing.status_code == 404
     same = call(s, "POST", "/admin/v1/referral-codes/move", move(new, new.ss58_address, new.ss58_address))
     assert same.status_code == 400
+
+
+def test_a_move_logs_the_codes_it_moved_not_the_ones_the_hotkey_held_before(tmp_path, caplog) -> None:
+    s = admin(tmp_path)
+    old, new = kp(), kp()
+    for keypair, code in ((old, "alice"), (new, "bobby")):
+        assert call(s, "POST", "/admin/v1/referral-codes", registration(keypair, code)).status_code == 201
+    caplog.set_level(logging.INFO, logger="verathos.gateway.admin")
+    signed = move(new, old.ss58_address, new.ss58_address)
+    assert call(s, "POST", "/admin/v1/referral-codes/move", signed).json()["codes"] == ["alice", "bobby"]
+    assert call(s, "POST", "/admin/v1/referral-codes/move", signed).status_code == 200  # again: nothing moves
+    logged = [r.getMessage() for r in caplog.records if " moved from " in r.getMessage()]
+    assert logged == [f"referral codes alice moved from {old.ss58_address} to {new.ss58_address} by the accounts "
+                      "token from 127.0.0.1"]
 
 
 def test_an_accounts_referrer_is_set_once_and_fixed_by_its_first_top_up(tmp_path) -> None:

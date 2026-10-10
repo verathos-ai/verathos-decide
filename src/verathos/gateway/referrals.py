@@ -236,15 +236,17 @@ class Referrals:
                                                                                         referral_codes.c.code))
             return [dict(r._mapping) for r in rows]
 
-    async def move(self, signed: SignedMove) -> tuple[dict[str, Any], bool]:
+    async def move(self, signed: SignedMove) -> tuple[dict[str, Any], list[str]]:
         """Move every code of ``from_hotkey`` to ``to_hotkey``. -> ({from_hotkey, to_hotkey, codes: the codes
-        to_hotkey holds now}, whether the move is new); the same signed move again is not made twice. Raises Refused."""
+        to_hotkey holds now}, the codes this call moved, oldest first: none for a move made before); the same signed
+        move again is not made twice. Raises Refused."""
         m = signed.move
         self._check(m.netuid, m.site, m.issued_ms)
         if not signed.verify():
             raise Refused(400, "invalid_request", "the signature does not verify against the hotkey the codes move to")
         if m.from_hotkey == m.to_hotkey:
             raise Refused(400, "invalid_request", "from_hotkey and to_hotkey are the same hotkey")
+        moved: list[str] = []
         try:
             async with self.engine.begin() as conn:
                 await self._lock_hotkeys(conn, m.from_hotkey, m.to_hotkey)
@@ -257,17 +259,20 @@ class Referrals:
                             referral_codes.c.revoked_at.is_(None)).group_by(referral_codes.c.hotkey))).all())
                     if sum(held.values()) > MAX_CODES:
                         raise Refused(409, "conflict", f"{m.to_hotkey} would hold more than {MAX_CODES} codes")
-                    moved = (await conn.execute(update(referral_codes).where(
-                        referral_codes.c.hotkey == m.from_hotkey).values(hotkey=m.to_hotkey))).rowcount
+                    moved = list((await conn.execute(select(referral_codes.c.code).where(
+                        referral_codes.c.hotkey == m.from_hotkey).order_by(referral_codes.c.created_at,
+                                                                           referral_codes.c.code))).scalars())
                     if not moved:
                         raise Refused(404, "not_found", f"{m.from_hotkey} holds no referral code")
+                    await conn.execute(update(referral_codes).where(referral_codes.c.code.in_(moved))
+                                       .values(hotkey=m.to_hotkey))
                     await conn.execute(insert(referral_moves).values(  # its time taken under the hotkeys' locks
                         from_hotkey=m.from_hotkey, to_hotkey=m.to_hotkey, move=signed.model_dump_json(),
                         signature=signed.signature, created_at=dt.datetime.now(dt.UTC)))
         except IntegrityError:  # the same move made at the same time by another call
-            created = False
+            moved = []
         return {"from_hotkey": m.from_hotkey, "to_hotkey": m.to_hotkey,
-                "codes": [c["code"] for c in await self.codes(m.to_hotkey)]}, created
+                "codes": [c["code"] for c in await self.codes(m.to_hotkey)]}, moved
 
     async def revoke(self, code: str) -> dict[str, Any] | None:
         """Revoke the code ``code`` reads as (once); None if there is none."""

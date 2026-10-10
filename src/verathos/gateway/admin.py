@@ -450,13 +450,13 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
         if isinstance(signed, JSONResponse):
             return signed
         try:
-            moved, created = await referrals.move(signed)
+            answer, moved = await referrals.move(signed)
         except Refused as r:
             return error(r.status, r.kind, r.message)
-        if created:
-            log.info("referral codes %s moved from %s to %s by the %s", ", ".join(moved["codes"]),
-                     moved["from_hotkey"], moved["to_hotkey"], request.state.caller)
-        return moved
+        if moved:
+            log.info("referral codes %s moved from %s to %s by the %s", ", ".join(moved), answer["from_hotkey"],
+                     answer["to_hotkey"], request.state.caller)
+        return answer
 
     @app.get("/admin/v1/referral-codes/{code}")
     async def get_code(code: str):
