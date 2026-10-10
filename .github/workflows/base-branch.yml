@@ -1,0 +1,26 @@
+name: Base branch
+
+# Pull requests go to dev; maintainers move main to commits of dev. A pull request against main fails this check, and
+# changing its base to dev runs it again (edited). Pushes pass, so main can require it of the commits it moves to.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  base-branch:
+    name: base-branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        run: |
+          echo "::error title=Pull request against main::Pull requests go to dev. Change the base branch of this pull request to dev (Edit, next to its title); maintainers merge dev into main for releases."
+          exit 1
