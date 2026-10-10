@@ -204,8 +204,17 @@ system_packages() {
   done
   [ ${#missing[@]} -eq 0 ] && return
   say "Installing system packages: ${missing[*]}"
-  "${SUDO[@]+"${SUDO[@]}"}" env DEBIAN_FRONTEND=noninteractive apt-get update -qq
-  "${SUDO[@]+"${SUDO[@]}"}" env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}" >/dev/null
+  # A new machine's security updates hold apt's locks for its first minutes: apt waits for them, and an update that
+  # fails anyway is tried again.
+  local tries=1
+  until "${SUDO[@]+"${SUDO[@]}"}" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update -qq; do
+    [ "$tries" -lt 10 ] || die "apt-get update keeps failing: another apt may hold its lock, or the network is down"
+    echo "    apt-get update failed; trying again in 30 s"
+    tries=$((tries + 1))
+    sleep 30
+  done
+  "${SUDO[@]+"${SUDO[@]}"}" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -qq \
+    --no-install-recommends "${missing[@]}" >/dev/null
 }
 
 install_uv() {

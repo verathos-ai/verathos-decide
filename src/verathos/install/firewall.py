@@ -56,8 +56,8 @@ def _quiet(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
 def _apt_install(package: str) -> None:
     if not shutil.which("apt-get"):
         raise Unavailable(f"{package} is not installed and there is no apt-get to install it")
-    result = _quiet(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-qq",
-                     "--no-install-recommends", package])
+    result = _quiet(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "install",
+                     "-y", "-qq", "--no-install-recommends", package])  # another apt's lock is waited for
     if result.returncode != 0:
         raise Unavailable(f"{package} could not be installed: {(result.stderr or result.stdout).strip()[-300:]}")
 

@@ -986,3 +986,30 @@ def test_an_invalid_configuration_says_what_is_wrong_without_its_values(tmp_path
     (tmp_path / "broken.json").write_text('{"netuid": 96,')
     with pytest.raises(SystemExit, match="broken.json is not JSON: line 1"):
         MinerConfig.load(tmp_path / "broken.json")
+
+
+def test_the_installer_waits_for_another_apt_holding_its_lock(tmp_path) -> None:
+    """A new machine runs its security updates in its first minutes, holding apt's locks: the installer's apt waits
+    for them (DPkg::Lock::Timeout) and an update that fails anyway is tried again, where the setup stopped."""
+    import stat
+
+    tools, log = tmp_path / "bin", tmp_path / "apt.log"
+    tools.mkdir()
+    (tools / "apt-get").write_text(f'#!/bin/bash\necho "$*" >> {log}\n'
+                                   f'[ "$3" != update ] || [ "$(grep -c update {log})" -ge 3 ] || exit 100\n')
+    (tools / "dpkg-query").write_text("#!/bin/bash\nexit 1\n")  # nothing installed
+    for tool in tools.iterdir():
+        tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
+    script = (ROOT / "scripts" / "install.sh").read_text()
+    assert script.endswith('\nmain "$@"\n')
+    script = script.removesuffix('main "$@"\n') + 'sleep() { :; }\nSUDO=()\nsystem_packages validator\n'
+    run = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"})
+    assert run.returncode == 0, run.stderr
+    calls = log.read_text().splitlines()
+    assert [c.split()[2] for c in calls] == ["update", "update", "update", "install"]
+    assert all(c.startswith("-o DPkg::Lock::Timeout=600 ") for c in calls)
+    assert run.stdout.count("apt-get update failed; trying again in 30 s") == 2
+    from verathos.install import firewall
+
+    assert "DPkg::Lock::Timeout=600" in Path(firewall.__file__).read_text()
