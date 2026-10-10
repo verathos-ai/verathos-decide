@@ -921,3 +921,37 @@ def test_a_setup_connects_again_while_the_chain_refuses_it_then_gives_up_with_th
     with pytest.raises(SystemExit, match="cannot connect to the test chain: server rejected WebSocket connection"):
         common.connect("test")
     assert waits == list(common.CONNECT_WAITS_S)
+
+
+def test_ram_is_what_the_control_group_allows(tmp_path) -> None:
+    """In a container /proc/meminfo shows the host's memory: references placed in RAM by it would be killed for want
+    of memory again and again. The setup takes the control group's limit, less what the group uses besides the page
+    cache the kernel can reclaim; the tightest limit along the group's path (cgroup v2), or the memory group's (v1)."""
+    from verathos.install import host
+
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal:       263000000 kB\nMemFree:          100000 kB\nMemAvailable:   250000000 kB\n")
+    host_ram = (263000000 * 1024, 250000000 * 1024)
+    v2, own = tmp_path / "v2", tmp_path / "cgroup"
+    (v2 / "sub").mkdir(parents=True)
+    (v2 / "memory.max").write_text(f"{64 * GiB}\n")
+    (v2 / "memory.current").write_text(f"{10 * GiB}\n")
+    (v2 / "memory.stat").write_text(f"anon {6 * GiB}\ninactive_file {4 * GiB}\n")
+    own.write_text("0::/\n")
+    assert host.memory_available(meminfo, v2, own) == (64 * GiB, 58 * GiB)
+    (v2 / "sub" / "memory.max").write_text("max\n")
+    own.write_text("0::/sub\n")  # no limit of its own: its parent's holds
+    assert host.memory_available(meminfo, v2, own) == (64 * GiB, 58 * GiB)
+    (v2 / "memory.max").write_text("max\n")
+    assert host.memory_available(meminfo, v2, own) == host_ram
+    v1 = tmp_path / "v1"
+    group = v1 / "memory" / "docker" / "abc"
+    group.mkdir(parents=True)
+    (group / "memory.limit_in_bytes").write_text(f"{32 * GiB}\n")
+    (group / "memory.usage_in_bytes").write_text(f"{2 * GiB}\n")
+    (group / "memory.stat").write_text(f"cache {GiB}\ntotal_inactive_file {GiB}\n")
+    own.write_text("12:memory:/docker/abc\n11:cpu,cpuacct:/docker/abc\n")
+    assert host.memory_available(meminfo, v1, own) == (32 * GiB, 31 * GiB)
+    (group / "memory.limit_in_bytes").write_text("9223372036854771712\n")  # v1's "no limit"
+    assert host.memory_available(meminfo, v1, own) == host_ram
+    assert host.memory_available(meminfo, v1, tmp_path / "missing") == host_ram

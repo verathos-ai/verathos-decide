@@ -70,13 +70,72 @@ def driver_cuda_version() -> tuple[int, int] | None:
     return (int(match[1]), int(match[2])) if match else None
 
 
-def memory_available(meminfo: Path = Path("/proc/meminfo")) -> tuple[int, int]:
-    """(total, available) RAM in bytes."""
+def memory_available(meminfo: Path = Path("/proc/meminfo"), cgroups: Path = Path("/sys/fs/cgroup"),
+                     own: Path = Path("/proc/self/cgroup")) -> tuple[int, int]:
+    """(total, available) RAM in bytes: the machine's, within this process's control group limit where one is set (a
+    container's: /proc/meminfo shows the host's memory there)."""
     values = {}
     for line in meminfo.read_text().splitlines():
         key, _, rest = line.partition(":")
         values[key] = int(rest.split()[0]) * 1024
-    return values["MemTotal"], values["MemAvailable"]
+    total, available = values["MemTotal"], values["MemAvailable"]
+    limited = memory_limit(cgroups, own)
+    if limited is not None and limited[0] < total:
+        limit, used = limited
+        total, available = limit, max(0, min(available, limit - used))
+    return total, available
+
+
+def memory_limit(cgroups: Path = Path("/sys/fs/cgroup"),
+                 own: Path = Path("/proc/self/cgroup")) -> tuple[int, int] | None:
+    """(limit, used) of the memory this process's control group may use, the tightest limit along its path (cgroup
+    v2), or its memory group's (v1); used leaves out the page cache the kernel can reclaim (inactive files). None
+    where no limit is set or none can be read."""
+    try:
+        lines = own.read_text().splitlines()
+    except OSError:
+        return None
+    found: list[tuple[int, int]] = []
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, controllers, path = parts
+        if controllers == "":  # v2: memory.max at each level from the group up to the root
+            group = cgroups / path.lstrip("/")
+            for level in [group, *group.parents]:
+                if not level.is_relative_to(cgroups):
+                    break
+                limit = _read_bytes(level / "memory.max")
+                if limit is not None:
+                    found.append((limit, _used(level / "memory.current", level / "memory.stat", "inactive_file")))
+        elif "memory" in controllers.split(","):  # v1
+            group = cgroups / "memory" / path.lstrip("/")
+            limit = _read_bytes(group / "memory.limit_in_bytes")
+            if limit is not None and limit < 1 << 60:  # v1 writes "no limit" as a huge number
+                found.append((limit, _used(group / "memory.usage_in_bytes", group / "memory.stat",
+                                           "total_inactive_file")))
+    return min(found, default=None, key=lambda limit_used: limit_used[0] - limit_used[1])
+
+
+def _read_bytes(path: Path) -> int | None:
+    try:
+        text = path.read_text().strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None  # "max": no limit
+
+
+def _used(current: Path, stat: Path, inactive: str) -> int:
+    used = _read_bytes(current) or 0
+    try:
+        for line in stat.read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key == inactive and value.strip().isdigit():
+                return max(0, used - int(value))
+    except OSError:
+        pass
+    return used
 
 
 def detect_public_ip(timeout_s: float = 5.0) -> str | None:
