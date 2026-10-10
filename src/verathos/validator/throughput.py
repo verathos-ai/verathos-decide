@@ -105,17 +105,26 @@ class Throughput:
             return
 
         def run() -> None:
-            st = bt.Subtensor(network=network)
+            st: bt.Subtensor | None = None
             while True:  # at once, then every interval: a restarted auditor tests and routes from the start
-                try:
-                    neurons, _ = validator_chain.snapshot(st, self.netuid)
-                    epoch = st.get_current_block() // self.policy.epoch_blocks
-                    self.update_slots(asyncio.run(self._refresh(neurons, catalogs(), epoch)), neurons, epoch)
-                except Exception:
-                    log.exception("throughput slot refresh failed")
+                st = self.slot_round(st, network, catalogs)
                 time.sleep(interval_s)
 
         threading.Thread(target=run, name="throughput-slots", daemon=True).start()
+
+    def slot_round(self, st: bt.Subtensor | None, network: str,
+                   catalogs: Callable[[], Mapping[str, int]]) -> bt.Subtensor | None:
+        """One round of ``start_slot_refresh`` over ``st`` (connecting first without one). -> the connection for the
+        next round: None after a failure, so the next round connects again."""
+        try:
+            st = st or bt.Subtensor(network=network)
+            neurons, _ = validator_chain.snapshot(st, self.netuid)
+            epoch = st.get_current_block() // self.policy.epoch_blocks
+            self.update_slots(asyncio.run(self._refresh(neurons, catalogs(), epoch)), neurons, epoch)
+            return st
+        except Exception:
+            log.exception("throughput slot refresh failed")
+            return None
 
     async def _refresh(self, neurons: list[Neuron], catalogs: Mapping[str, int],
                        epoch: int) -> list[DiscoveredMiner]:

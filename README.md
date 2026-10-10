@@ -55,8 +55,9 @@ Clef-Flash reads images as well as text ([Images](docs/GATEWAY.md#images)); answ
 
 All three are active from the start: they share the emission equally while users pay for none of them, and what users
 pay moves the shares ([Models](docs/SCORING.md#models)). The scores pay the catalog's miner share of the miners'
-emission, the [usage pool](docs/SCORING.md#usage-pool) pays the hotkeys that served paying users on top when the
-catalog sets one, and validators set the rest on the subnet owner's UID, which the chain does not pay out
+emission, the [usage pool](docs/SCORING.md#usage-pool) pays the hotkeys that served paying users on top when the catalog
+sets one, [referrals](docs/SCORING.md#referrals) pay the hotkeys whose codes brought users who buy credit, and
+validators set the rest on the subnet owner's UID, which the chain does not pay out
 ([Weights](docs/SCORING.md#weights)). `active` models are scored; `candidate` models, which a catalog can list before
 activating them, are checked by validators but score zero. A miner serves one model per GPU: by default the active
 model that pays best on it now, from each model's share of the emission and the capacity serving it on the network

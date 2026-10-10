@@ -62,6 +62,7 @@ from verathos.gateway.config import GatewayConfig
 from verathos.gateway.limits import RateLimiter
 from verathos.gateway.logs import Throttle
 from verathos.gateway.media import CanonicalImage, Decoders, DecodersBusy, DecodingUnavailable
+from verathos.gateway.referrals import Referrals
 from verathos.gateway.router import Endpoint, Outcome, Router
 from verathos.gateway.routes import stale_after_s
 from verathos.gateway.sampler import Sampler
@@ -123,11 +124,15 @@ class Gateway:
     clock: Callable[[], float] = time.monotonic
     stats: ModelStats = field(default_factory=ModelStats)
     decoders: Decoders | None = None  # by default from the configuration
+    referrals: Referrals | None = None  # by default on the accounts' database, under the configuration
 
     def __post_init__(self) -> None:
         if self.decoders is None:
             self.decoders = Decoders(self.config.media_workers, self.config.max_media_in_flight,
                                      self.config.media_timeout_s)
+        if self.referrals is None:
+            self.referrals = Referrals(self.accounts.engine, netuid=self.config.netuid, site=self.config.referral_site,
+                                       reserved_names=self.config.referral_reserved, catalog=self.catalog)
 
     def body_limit(self) -> int:
         """The most a request's body may hold: a text model's ``max_body_bytes``, or an active image model's

@@ -13,6 +13,7 @@ from verathos.catalog import Gateway
 from verathos.miner.engine import engine_tls
 from verathos.protocol import tls
 from verathos.protocol.manifest import MAX_HOSTS, axon_base, endpoint_url, public_ip
+from verathos.protocol.referral import site_origin
 
 _PEER = re.compile(r"^(?:https://)?(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})/?$")
 
@@ -73,6 +74,8 @@ class MinerConfig(BaseModel):
     auto_update: bool = Field(False, description="Update the code to each new release of the repository it was "
                               "installed from (release tags), at a quiet moment, and exit for the process manager to "
                               "start it (the installer turns it on; verathos.update)")
+    referral_site: str | None = Field(None, description="The web app the referral commands talk to (https://host; "
+                                      "verathos-miner referral)")
 
     @field_validator("network")
     @classmethod
@@ -88,6 +91,11 @@ class MinerConfig(BaseModel):
     @classmethod
     def _mirrors(cls, value: list[str]) -> list[str]:
         return [tls.https_url(v, what="catalog mirror") for v in value]
+
+    @field_validator("referral_site")
+    @classmethod
+    def _site(cls, value: str | None) -> str | None:
+        return None if value is None else site_origin(value)
 
     @field_validator("peers")
     @classmethod

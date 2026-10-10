@@ -1128,3 +1128,40 @@ def test_under_pressure_recomputes_reach_as_many_endpoints_as_they_can_in_an_unp
     first, second = asyncio.run(one_test()), asyncio.run(one_test())
     assert 20 < len(first) < 200 and all(n == 1 for n in first.values())  # coverage first: no second checks
     assert set(first) != set(second)  # and not the same endpoints every time
+
+
+def test_the_auditors_slot_refresh_connects_again_after_the_chain_failed_it(tmp_path, monkeypatch, caplog) -> None:
+    """A connection that cannot be made (a node's handshake timeout) fails one round, not the refresh: the next round
+    connects again, and a working connection is kept."""
+    from types import SimpleNamespace
+
+    from verathos.validator import throughput as throughput_module
+
+    auditor_kp = kp()
+    auditor = Auditor(netuid=405, keypair=auditor_kp, chain=FakeChain(head=5 * 180), policy=AuditPolicy(),
+                      catalog=catalog.load, references={}, db_path=tmp_path / "throughput.sqlite")
+    throughput = Throughput(netuid=405, policy=auditor.policy, auditor_hotkey=auditor_kp.ss58_address,
+                            chain=auditor.chain, auditor=auditor)
+    chain = SimpleNamespace(get_current_block=lambda: 5 * auditor.policy.epoch_blocks + 3)
+    attempts: list[str] = []
+
+    def subtensor(network: str):
+        attempts.append(network)
+        if len(attempts) == 1:
+            raise TimeoutError("handshake timed out")
+        return chain
+
+    async def no_endpoints(neurons, catalogs, epoch):
+        return []
+
+    updated: list[int] = []
+    monkeypatch.setattr(throughput_module.bt, "Subtensor", subtensor)
+    monkeypatch.setattr(throughput_module.validator_chain, "snapshot", lambda st, netuid: ([], None))
+    monkeypatch.setattr(throughput, "_refresh", no_endpoints)
+    monkeypatch.setattr(throughput, "update_slots", lambda slots, neurons, epoch: updated.append(epoch))
+    with caplog.at_level("ERROR"):
+        st = throughput.slot_round(None, "test", dict)
+    assert st is None and updated == [] and "throughput slot refresh failed" in caplog.text
+    st = throughput.slot_round(st, "test", dict)
+    assert st is chain and updated == [5]
+    assert throughput.slot_round(st, "test", dict) is chain and len(attempts) == 2 and updated == [5, 5]

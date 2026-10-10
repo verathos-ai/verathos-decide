@@ -280,9 +280,16 @@ sets (`set_weights mechid=0 uids=3 -> True`; in a dry run the weights themselves
 dry run (mechanism 0 configured dry): weights {0: 0.41, 1: 0.3363, 12: 0.2537}
 ```
 
-With the catalog's usage pool it also logs the period it pays and what it pays
-(`usage pool: period 412 sized 0.061235 (burned), paid 0.058870 to 9 UIDs`), and an error if it refuses the auditor's
-record of a period.
+With the catalog's usage pool it also logs the period it pays and what it pays (`usage pool: period 412 sized 0.061235
+(burned), paid 0.058870 to 9 UIDs`), and an error if it refuses the auditor's record of a period. With its referral
+pool, the period it pays, what the referrers referred, what it pays and why it pays a referrer nothing (`holds no UID`,
+`the subnet owner's`, `excluded`, `not serving`), and an error if it refuses the record (with why: its figures, the
+catalog's parameters, the chain at the period's end, or a rewritten earlier period or a code moved to another coldkey):
+
+```
+  referrals: period 1284 sized 0.024811, 14 referrers referred 8,412.00 USD over 30 periods; paid 0.022106 to 12 UIDs; not paid: 1 excluded, 1 holds no UID
+  referrals: the auditor's record of period 1285 is refused (it rewrites the sum of code alice in the period ending at block 9244800): no referral weights this period
+```
 
 A validator restarted in an epoch it already scored (or, light, whose weights it set) starts with the next one.
 
@@ -354,6 +361,7 @@ command has `--no-service`, `--config` or `--home` where the setup had them.
 | `epoch ...: no weights set: no results of the source verified by block ...` | light: the reason follows. The auditor's axon unreachable, or its results not out yet, cost that epoch only, and the weights set before stay on chain; `not signed within 300 s of this machine's clock`: sync the clock (NTP); `it lists no weights` or `it is not signed`: the auditor runs an older release; `names no TLS pin for the auditor`: the committed catalog does not name the auditor's certificate yet; `certificate pin ... is not the pinned ...`: the source serves another certificate than the catalog (or its commitment) names, as during a rotation; `commits no TLS pin`: the `source_hotkey` validator publishes no identity |
 | `epoch ...: no weights set by block ...: the source's results are verified, but ...` | light: the auditor's results are fine and this validator could not set them. `setting them on chain failed`: the `weights not set: ...` line before it says why, such as the chain's limit of unrevealed commits (nothing to do); otherwise this hotkey's registration or validator permit, as the reason says |
 | `catalog ... names ... as the auditor's TLS pin, but this service's certificate has pin ...` | the auditor: commit a catalog naming its pin, `commit-catalog` on its machine (`SUBNET_ADMIN.md`) |
+| `another auditor with this hotkey runs at https://...` | the auditor runs on two machines: the one at that address, where the hotkey's axon points, answers as the auditor, so this one does not start, or stops at its next epoch. Keep one and stop the other for good (`systemctl disable --now verathos-validator` on its machine, or its process manager's stop): to run this one, stop that one first, then start this one, which points the axon at itself |
 | `no egress_ips configured` | full: set the public addresses its requests to miners come from (`--egress-ip`, or `egress_ips` in `validator.json`) |
 | every endpoint `request failed: ConnectTimeout` | miners' firewalls drop this validator's requests: they leave from an address it does not publish ([Egress addresses](#egress-addresses-and-miners-firewalls)) |
 | `this is the subnet owner's hotkey: its validator is the auditor ... runs in full mode` | the owner's validator is never light: `install.sh validator --full` |
@@ -641,9 +649,10 @@ Per epoch a full validator:
    and latency), each model's user demand, and any proven wrong answers;
 6. one at a time: takes the source's results for the models it did not check;
 7. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
-   probation, scales the miners' weights to the catalog's miner share for the epoch, adds the usage pool's weights
-   from the period record the verdicts state (checked against its node), gives the subnet owner's UID the rest
-   (`SCORING.md`), and sets weights on the catalog's mechanism, or `mechid` (retried once per block, up to 10 times).
+   probation, scales the miners' weights to the catalog's miner share for the epoch, adds the usage pool's or the
+   referral pool's weights from the period record the verdicts state (checked against its node; a referral record
+   also against the last one it accepted), gives the subnet owner's UID the rest (`SCORING.md`), and sets weights on
+   the catalog's mechanism, or `mechid` (retried once per block, up to 10 times).
 
 Nothing a miner returns can stop the epoch: replies are size- and time-bounded and every malformed reply is
 recorded against that endpoint. Chain errors are retried every block, and an epoch that fails part way leaves no
@@ -713,9 +722,18 @@ unanswered, not_audited), its checks, declared and proven capacity, how ready us
 scores, and, from the auditor, the hotkey's results in its last 10 tests (at most 64 endpoints each). `GET /v1/network` serves every hotkey's status of
 the last epoch at once (without the test results, built once per epoch), `weights`, per UID exactly the weights the
 validator set after the epoch (the subnet owner's UID's included), `mechanism`, the mechanism they are set on,
-`miner_share`, the epoch's miner share, and `usage_share`, the usage pool's (`SCORING.md`), for network dashboards and
-light validators. The validator publishes it
-before it sets those weights, and a restarted one serves the last epoch's until its next.
+`miner_share`, the epoch's miner share, and `usage_share` and `referral_share`, what the usage and referral pools
+pay (`SCORING.md`), for network dashboards and light validators. The validator publishes it before it sets those
+weights, and a restarted one serves the last epoch's until its next.
+
+A hotkey is listed for its endpoints and, with the referral pool, for its codes in the record the epoch pays, so a
+referrer without endpoints is listed too. Each hotkey's `weight` comes with its parts: `serving_weight` (from its
+scores), `usage_weight` and `referral_weight`; a referrer has `referral`: `codes` (each code's referred micro-USD per
+period of the window, oldest first), `referred_micros` (their sum, at least 0), `share` (its part of the miner emission
+by the record) and `unpaid` (why it is paid nothing this epoch, or null). The network document's `referral` names the
+record paid: `period`, `first_block`, `end_block`, `window_periods`, `payout_per_usd`, `share` (what it sizes, before
+the miner share's limit), `referred_micros` (every referrer's) and `rate_per_usd` (what a referred USD earns over its
+window at this epoch's rate). The record itself is in the auditor's verdicts (`THROUGHPUT_AUDIT.md`), signed.
 
 Both documents are signed with the validator's hotkey: the status's fields plus `netuid`, `auditor` (the signing
 hotkey) and `issued_ms`, signed as canonical JSON (sorted keys, no whitespace) under the domain `verathos/status/v1`
@@ -746,7 +764,9 @@ If the validator's hotkey is the auditor, it also:
 
 The auditor database is `state_dir/throughput.sqlite`. Keep the auditor running continuously: a test it misses is
 not run, and endpoints keep the credit of their last test for `credit_ttl_epochs` (the gateway's routes keep it
-until the next confirmed test). A test running when it restarts is void.
+until the next confirmed test). A test running when it restarts is void. To move the auditor to another machine, stop
+the old one first: an auditor does not start while another with its hotkey answers at the hotkey's axon, and stops at
+its next epoch once another one moved the axon.
 
 ### The auditor's GPU for a model that reads images
 

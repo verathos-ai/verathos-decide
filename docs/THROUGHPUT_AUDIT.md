@@ -272,6 +272,32 @@ start for it, then come without it. The record lists:
 A validator recomputes `period_emission`, `basis` and `share` from these, and checks against its own node the burns
 and the end block's state that it still holds.
 
+With the catalog's referral pool (`SCORING.md`, Referrals), the gateways post the referred accounts' top-ups and
+refunds as they count (`POST /v1/gateway/referrals`, signed by a catalog gateway, `GATEWAY.md`), with the codes'
+registrations and moves. The auditor takes a registration or a move only if the hotkey it names signed it for its
+netuid (the first registration of a code stands), and an entry only of a registered code, each once however often it
+is posted, in the period in which it arrives, never in one whose close has begun; an entry of a code it does not know
+is answered with the code (`unknown_codes`), and the gateway sends its registrations and moves again. When a period
+closes, the auditor takes the registrations and moves that arrived before its end once each, in the order they
+arrived: a code belongs to the coldkey that owned the hotkey registering it (and follows it through the chain's
+coldkey swaps), and a move takes it only to a hotkey of that coldkey, decided once. The verdicts of
+every epoch of a period state the record of the period before (`referral`), closed once its end block is final; the
+first verdicts of a period wait up to 20 blocks after its start for it, then come without it. The record lists:
+
+- `codes`: each code with entries in the window (the period and the `window_periods - 1` before it), with its hotkey at
+  the period's end, that hotkey's coldkey at the end block, and its entries' sum in each period of the window, oldest
+  first (`periods`, micro-USD, signed);
+- `referrers`: per hotkey, `referred_micros` (its codes' sums over the window, at least 0), `cap` and `share`;
+- `share`: the caps' sum, at most `max_share` (the catalog's `share`);
+- the inputs: `payout_per_usd`, `max_share`, `window_periods`; `emission` and `period_emission` as in the usage record;
+  `tao_usd` (TAO in USD, read from CoinGecko when the period closed, if anything was referred) and `alpha_tao` (the
+  subnet's `SubnetMovingPrice` at the end block); `owner_hotkey` and `owner_coldkey`, the subnet owner at the end block.
+
+A validator recomputes the sums, caps and shares from these, checks the end block's state its node still holds, and
+compares the record with the last one it accepted (`SCORING.md`, Referrals). A new period length or window starts the windows afresh: entries
+from before the last period recorded under the old ones do not count, so no dollar counts in more periods than one
+window holds.
+
 The verdicts for the current epoch and the two before are served once their tests are settled (404 otherwise);
 once served, an epoch's verdicts do not change.
 Validators wait up to 5 minutes for them, then use the last verdicts they hold while those still cover a test in
@@ -357,12 +383,15 @@ The auditor needs:
   image in about 30 microseconds (an i9-14900K);
 - with a usage pool in `burned` mode, a node that holds the state of the last 200 blocks: the auditor reads every
   block's events as it is finalized, over a connection of its own; blocks it falls further behind on are recorded as
-  unscanned. In `revenue` mode it reads TAO's price in USD from CoinGecko once per period.
+  unscanned. In `revenue` mode, and with a referral pool once anything was referred, it reads TAO's price in USD from
+  CoinGecko once per period.
 
 Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers, without the
 requests with images), `verdicts` (as served), `demand` (users' input tokens per model), `shares` (the models'
 emission shares), `users` (what users got from each endpoint) and `paid` (paid input tokens per endpoint), the last
 30 epochs, more than the last 10 tests a hotkey's status lists; with a usage pool, `paid`, `burns`, `unscanned` and
-`usage` (the period records) from the start of the period before when that is earlier). A catalog with another
+`usage` (the period records) from the start of the period before when that is earlier; with a referral pool,
+`referral_codes` and `referral_moves` (every registration and move taken, kept), `referral_entries` and `referral` (the
+period records), for a window and a period more). A catalog with another
 `epoch_blocks` renumbers it (a test by its selection block, the rest by the first block of its epoch; the verdicts
 served for the old epochs are dropped), so credits, test rates, demand and wrong answers carry on.

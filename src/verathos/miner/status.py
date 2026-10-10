@@ -154,6 +154,12 @@ class StatusWatcher:
             if status.usage_share:
                 out.append(f"  usage pool {status.usage_share:.2%} of the miners' emission, to the hotkeys that served "
                            f"paying users: this hotkey's part {status.usage_weight:.4%}")
+            if status.referral is not None:
+                r = status.referral
+                out.append(f"  referrals: {r.referred_micros / 1_000_000:,.2f} USD referred over the window with "
+                           f"{', '.join(sorted(r.codes))}; " + (f"not paid this epoch: {r.unpaid}" if r.unpaid else
+                                                                 f"this hotkey's part {status.referral_weight:.4%} of "
+                                                                 "the miners' emission"))
             seen = set()
             for e in status.endpoints:
                 if e.endpoint_id in listed:

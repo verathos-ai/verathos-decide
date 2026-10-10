@@ -6,10 +6,11 @@ routes exist. Every call is logged, and every credit with its caller.
 
 Two tokens, two scopes. The admin token (``admin_token_file``) reaches everything. The account service's token
 (``accounts_token_file``), for the web app that signs users up, reaches only the accounts named with
-``accounts_prefix``, which it creates prepaid: their keys, usage and ledger, changes other than ``prepaid``, and
+``accounts_prefix``, which it creates prepaid: their keys, usage, ledger and referral, changes other than ``prepaid``,
 credit of kind grant or top-up within ``accounts_max_credit`` per entry and ``accounts_max_credit_per_hour`` (per
-process; reaching a cap is logged as an error); and the network's usage totals and series. Requests, state and routes
-are the admin token's only.
+process; reaching a cap is logged as an error), refunds and negative adjustments; the network's usage totals and
+series; and referral codes (registrations, look-ups, moves) and referrers' figures. Requests, state, routes and
+revoking a code are the admin token's only.
 
     GET  /admin/v1/state       routes, catalog, and what is waiting to be written (usage) or sent (samples, counts)
     GET  /admin/v1/routes      every routable endpoint as the router sees it: capacity, cap, in flight, breaker
@@ -32,15 +33,28 @@ Accounts, for the service that signs users up (amounts in micro-USD; ``name``: `
     GET    /admin/v1/accounts/{name}/usage/series?days=&bucket=
                                                     the same per UTC day or week, every bucket of the range, all time
                                                     from the account's first usage (``Accounts.account_series``)
-    POST   /admin/v1/accounts/{name}/credits        {"amount", "kind", "reference", "note"} -> 201, or 200 with the
-                                                    entry already recorded under ``reference``; 409 if it records
-                                                    another one
+    POST   /admin/v1/accounts/{name}/credits        {"amount", "kind", "reference", "note", "refund_of"} -> 201, or
+                                                    200 with the entry already recorded under ``reference``; 409 if it
+                                                    records another one
     GET    /admin/v1/accounts/{name}/credits?limit= the ledger, newest first, and the balance
     GET    /admin/v1/usage/totals                   every account's answered requests and input tokens (all time, 24
                                                     hours, 30 days; per model), paid usage, top-ups and the accounts
                                                     that topped up (``Accounts.totals``)
     GET    /admin/v1/usage/series?days=&bucket=     the same per UTC day or week: requests and input tokens per model,
                                                     paid usage and top-ups (``Accounts.series``)
+
+Referrals (``gateway.referrals``):
+
+    POST   /admin/v1/referral-codes                 {"registration", "signature"} -> 201 with the code, 200 if its
+                                                    hotkey has it already
+    GET    /admin/v1/referral-codes/{code}          the code it reads as (any case, folded), with its hotkey
+    DELETE /admin/v1/referral-codes/{code}          revokes it (the admin token only)
+    POST   /admin/v1/referral-codes/move            {"move", "signature"} -> 200 with the codes the new hotkey holds
+    PUT    /admin/v1/accounts/{name}/referral       {"code"} -> 201, or 200 if the account has that code already;
+                                                    409 once it has another or a top-up
+    GET    /admin/v1/accounts/{name}/referral       its referral or null, and whether it topped up
+    GET    /admin/v1/referrers/{hotkey}?days=       per UTC day and code: accounts referred, paying, top-ups, refunds
+                                                    and what counted (``Referrals.referrer``)
 """
 
 from __future__ import annotations
@@ -71,7 +85,9 @@ from pydantic import (
 
 from verathos.gateway.accounts import Conflict
 from verathos.gateway.app import Checked, Gateway, Rejected, check_request, forward
+from verathos.gateway.referrals import Refused
 from verathos.gateway.upstream import Exchange, UpstreamFailure
+from verathos.protocol.referral import SignedMove, SignedRegistration
 
 log = logging.getLogger("verathos.gateway.admin")
 MIN_TOKEN_CHARS = 32
@@ -131,9 +147,10 @@ class NewKey(BaseModel):
 class NewCredit(BaseModel):
     model_config = ConfigDict(extra="forbid")
     amount: Annotated[StrictInt, Field(ge=-MAX_CREDIT, le=MAX_CREDIT)]
-    kind: Literal["grant", "topup", "adjust"]
+    kind: Literal["grant", "topup", "adjust", "refund"]
     reference: Annotated[str, Field(min_length=1, max_length=128)]
     note: Annotated[str, Field(max_length=256)] | None = None
+    refund_of: Annotated[str, Field(min_length=1, max_length=128)] | None = None  # a refund: the top-up it returns
 
     @field_validator("amount")
     @classmethod
@@ -141,6 +158,11 @@ class NewCredit(BaseModel):
         if value == 0:
             raise ValueError("an entry is at least one micro-USD")
         return value
+
+
+class NewReferral(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: Annotated[str, Field(min_length=1, max_length=64)]
 
 
 def error(status: int, kind: str, message: str) -> JSONResponse:
@@ -186,10 +208,12 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
     credited: collections.deque[tuple[float, int]] = collections.deque()  # the account service's credit, last hour
 
     def reaches(request: Request) -> bool:
-        """Whether the caller's scope reaches this call: the account service only its own accounts' routes and the
-        network's usage."""
+        """Whether the caller's scope reaches this call: the account service only its own accounts' routes, the
+        network's usage, and referral codes and referrers' figures (revoking a code aside)."""
         if request.state.scope == "admin" or request.url.path in ("/admin/v1/usage/totals", "/admin/v1/usage/series"):
             return True
+        if request.url.path.startswith(("/admin/v1/referral-codes", "/admin/v1/referrers/")):
+            return request.method != "DELETE"
         parts = request.url.path.split("/")  # "", "admin", "v1", "accounts", name, ...
         return parts[1:4] == ["admin", "v1", "accounts"] and (
             len(parts) == 4 or parts[4].startswith(g.config.accounts_prefix))
@@ -215,11 +239,13 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
 
     def over_cap(request: Request, name: str, new: NewCredit) -> JSONResponse | tuple[float, int] | None:
         """The account service's credit limits (kinds, per entry, per hour): the refusal, or the share of the hour's
-        cap the entry holds until it is known to be new; None for the admin token."""
-        if request.state.scope == "admin":
+        cap the entry holds until it is known to be new; None for the admin token, and for entries that take credit
+        back (refunds, negative adjustments)."""
+        if request.state.scope == "admin" or new.kind == "refund" or (new.kind == "adjust" and new.amount < 0):
             return None
         if new.kind not in ("grant", "topup"):
-            return error(403, "forbidden", "the account service records grants and top-ups only")
+            return error(403, "forbidden", "the account service records grants, top-ups, refunds and negative "
+                                           "adjustments only")
         now = time.monotonic()
         while credited and credited[0][0] < now - 3600:
             credited.popleft()
@@ -365,12 +391,12 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
         held = None if recorded else over_cap(request, name, new)  # a repeat records nothing more
         if isinstance(held, JSONResponse):
             return held
-        log.info("credit %r of %d micro-USD (%s) to %s by the %s", new.reference, new.amount, new.kind, name,
-                 request.state.caller)
+        log.info("credit %r of %d micro-USD (%s%s) to %s by the %s", new.reference, new.amount, new.kind,
+                 f" of {new.refund_of!r}" if new.refund_of else "", name, request.state.caller)
         created = False
         try:
             entry, created = await accounts.add_credit(name, new.amount, kind=new.kind, reference=new.reference,
-                                                       note=new.note)
+                                                       note=new.note, refund_of=new.refund_of)
         except LookupError as exc:
             return error(404, "not_found", str(exc))
         except ValueError as exc:
@@ -401,6 +427,75 @@ def admin_app(g: Gateway, *, token: str, accounts_token: str | None = None) -> F
         if isinstance(account, JSONResponse):
             return account
         return {"balance": account["balance"], "credits": await accounts.credits(name, max(1, min(limit, 1000)))}
+
+    referrals = g.referrals
+
+    @app.post("/admin/v1/referral-codes")
+    async def register_code(request: Request):
+        signed = await parse(request, SignedRegistration)
+        if isinstance(signed, JSONResponse):
+            return signed
+        try:
+            code, created = await referrals.register(signed)
+        except Refused as r:
+            return error(r.status, r.kind, r.message)
+        if created:
+            log.info("referral code %r registered for %s by the %s", code["code"], code["hotkey"],
+                     request.state.caller)
+        return JSONResponse(jsonable_encoder(code), status_code=201 if created else 200)
+
+    @app.post("/admin/v1/referral-codes/move")
+    async def move_codes(request: Request):
+        signed = await parse(request, SignedMove)
+        if isinstance(signed, JSONResponse):
+            return signed
+        try:
+            answer, moved = await referrals.move(signed)
+        except Refused as r:
+            return error(r.status, r.kind, r.message)
+        if moved:
+            log.info("referral codes %s moved from %s to %s by the %s", ", ".join(moved), answer["from_hotkey"],
+                     answer["to_hotkey"], request.state.caller)
+        return answer
+
+    @app.get("/admin/v1/referral-codes/{code}")
+    async def get_code(code: str):
+        found = await referrals.code(code)
+        return error(404, "not_found", f"no referral code {code!r}") if found is None else found
+
+    @app.delete("/admin/v1/referral-codes/{code}")
+    async def revoke_code(code: str, request: Request):
+        found = await referrals.revoke(code)
+        if found is None:
+            return error(404, "not_found", f"no referral code {code!r}")
+        log.info("referral code %r of %s revoked by the %s", found["code"], found["hotkey"], request.state.caller)
+        return found
+
+    @app.put("/admin/v1/accounts/{name}/referral")
+    async def refer(name: str, request: Request):
+        new = await parse(request, NewReferral)
+        if isinstance(new, JSONResponse):
+            return new
+        try:
+            referral, created = await referrals.refer(name, new.code)
+        except LookupError as exc:
+            return error(404, "not_found", str(exc))
+        except Refused as r:
+            return error(r.status, r.kind, r.message)
+        return JSONResponse(jsonable_encoder(referral), status_code=201 if created else 200)
+
+    @app.get("/admin/v1/accounts/{name}/referral")
+    async def get_referral(name: str):
+        found = await referrals.referral(name)
+        return error(404, "not_found", f"no account {name!r}") if found is None else found
+
+    @app.get("/admin/v1/referrers/{hotkey}")
+    async def referrer(hotkey: str, days: str | None = None):
+        try:
+            count = series_days(days)
+            return await referrals.referrer(hotkey, 30 if count is None else count)
+        except ValueError as exc:
+            return error(400, "invalid_request", str(exc))
 
     return app
 

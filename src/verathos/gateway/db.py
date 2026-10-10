@@ -25,6 +25,7 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
+    Text,
     false,
     func,
 )
@@ -92,11 +93,53 @@ credits = Table(
     "credits", metadata,
     Column("id", ID, primary_key=True, autoincrement=True),
     Column("account_id", ID, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True),
-    Column("amount", BigInteger, nullable=False),  # micro-USD; negative only for an adjustment
-    Column("kind", String(16), nullable=False),  # grant | topup | adjust
+    Column("amount", BigInteger, nullable=False),  # micro-USD; negative for a refund, either sign for an adjustment
+    Column("kind", String(16), nullable=False),  # grant | topup | adjust | refund
     Column("reference", String(128), nullable=False, unique=True),  # the payment or grant it records, once
     Column("note", String(256), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("refund_of", String(128), nullable=True),  # a refund: the reference of the account's top-up it returns
+)
+BOUGHT = ("topup", "refund")  # the credit kinds whose sum is what an account bought
+
+# Referral codes, each bound to a hotkey by that hotkey's signed registration (``protocol.referral``); never deleted, so
+# a code is never given out twice. A revoked code takes no new accounts, and its accounts' top-ups stop counting.
+referral_codes = Table(
+    "referral_codes", metadata,
+    Column("code", String(24), primary_key=True),
+    Column("folded", String(24), nullable=False, unique=True),
+    Column("hotkey", String(64), nullable=False, index=True),
+    Column("registration", Text, nullable=False),  # the signed registration as taken (JSON)
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("revoked_at", DateTime(timezone=True), nullable=True),
+    Column("reported_at", DateTime(timezone=True), nullable=True),  # when the auditor took the registration
+)
+
+referral_moves = Table(  # every code of a hotkey moved to another hotkey of its coldkey, signed by the new one
+    "referral_moves", metadata,
+    Column("id", ID, primary_key=True, autoincrement=True),
+    Column("from_hotkey", String(64), nullable=False),
+    Column("to_hotkey", String(64), nullable=False),
+    Column("move", Text, nullable=False),  # the signed move as taken (JSON)
+    Column("signature", String(256), nullable=False, unique=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("reported_at", DateTime(timezone=True), nullable=True),
+)
+
+referrals = Table(  # the code an account was referred with: one, set once
+    "referrals", metadata,
+    Column("account_id", ID, ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True),
+    Column("code", String(24), ForeignKey("referral_codes.code"), nullable=False, index=True),
+    Column("referred_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+referral_reports = Table(  # each top-up and refund of a referred account, as it counts for its code
+    "referral_reports", metadata,
+    Column("credit_id", ID, ForeignKey("credits.id", ondelete="CASCADE"), primary_key=True),
+    Column("code", String(24), nullable=False),
+    Column("amount", BigInteger, nullable=False),  # micro-USD it counts: 0 for none; a refund's is negative
+    Column("reported_at", DateTime(timezone=True), nullable=True, index=True),  # when the auditor took it
+    Column("entry_id", String(64), nullable=False, unique=True),  # its id at the auditor: random, linked to nothing
 )
 
 

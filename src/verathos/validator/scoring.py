@@ -58,6 +58,8 @@ class ScoreState:
     waited: dict[str, int] = field(default_factory=dict)  # references one at a time: model -> epochs in a row not run
     usage_record: dict | None = None  # the usage pool's latest record taken (``validator.usage``), as JSON
     usage_refused: str | None = None  # why that record was refused, if it was
+    referral_record: dict | None = None  # the referral pool's last record accepted (``validator.referral``), as JSON
+    referral_refused: dict | None = None  # a record refused: {first_block, end_block, why}
     last_epoch: int | None = None  # the last epoch scored, so a restart does not score it again
     scale: int = SCORE_SCALE
 

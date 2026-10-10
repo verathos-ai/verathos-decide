@@ -534,11 +534,17 @@ def main() -> None:
 
         firewall_setup.main(sys.argv[2:])
         return
+    if sys.argv[1:2] == ["referral"]:
+        from verathos.miner import referral
+
+        referral.main(sys.argv[2:])
+        return
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(epilog="Set up this machine as a miner: verathos-miner init. Remove it: "
                                             "verathos-miner uninstall. Its firewall: verathos-miner firewall "
-                                            "install|status|remove.")
+                                            "install|status|remove. Referral codes: verathos-miner referral "
+                                            "code|move|status|dashboard.")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--remeasure", action="store_true",
                         help="Measure every endpoint's capacity again (after changing its hardware)")

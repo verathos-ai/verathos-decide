@@ -9,8 +9,9 @@ Validators check every endpoint's answers against a reference computation (see `
 audit (see `THROUGHPUT_AUDIT.md`) checks the capacity each endpoint declares. An endpoint's score is the capacity it
 proves, so hardware pays by its throughput per cost. The scores split the catalog's miner share of the mechanism's
 miner emission (0.59 in the shipped catalog); with the catalog's usage pool, the hotkeys whose endpoints answered
-paying users get more on top, by the paid input tokens they answered; validators set the rest as weight on the subnet
-owner's UID, which the chain does not pay out (`SCORING.md`).
+paying users get more on top, by the paid input tokens they answered, and with its referral pool, referrers get more
+by what the users they brought paid ([Referrals](#referrals)); validators set the rest as weight on the subnet owner's
+UID, which the chain does not pay out (`SCORING.md`).
 
 ## Requirements
 
@@ -726,6 +727,51 @@ git pull && VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"
 
 Then restart the miner. Catalog changes (new models, tolerances, audit policy) need no update: the miner picks up a
 new commitment by itself. Releases carry code changes, such as support for a new engine family.
+
+## Referrals
+
+With the catalog's referral pool, a hotkey earns for the users it brings: accounts that sign up with one of its
+referral codes (a link `https://<site>/r/<code>`, or the code typed at sign-up) count for it from then on, and each
+dollar they top up earns the hotkey up to `payout_per_usd` (0.3) dollars of emission, paid over the next
+`window_periods` (30) periods of about a day, within the pool's `share` of the miner emission (`SCORING.md`,
+Referrals). Any registered hotkey but the subnet owner's can refer, serving or not; owner-run miners are excluded. An
+account's referrer is fixed by its first top-up; a referred account's top-ups count for 365 days, up to 10,000 USD
+within 30 days (the catalog's `term_days` and `account_cap_usd`).
+
+On the machine that holds the hotkey (the coldkey is never needed), with the web app's address in `referral_site` of
+`miner.json`, or `--site https://<site>`:
+
+```bash
+verathos-miner referral code alice --config miner.json   # a readable code; without a name, a random one
+verathos-miner referral status --config miner.json       # the codes, 30 days of figures, the part of the pool
+verathos-miner referral dashboard --config miner.json    # a link to the referral page, valid for a day
+```
+
+```
+code alice registered for 5F...: https://<site>/r/alice
+```
+
+A hotkey that runs no miner names itself instead: `--wallet <wallet> --hotkey <hotkey> --netuid 96`. A hotkey holds at
+most 3 codes; a readable code is 4 to 24 characters of a-z, digits and single hyphens starting with a letter, unique
+however it is written (`a1ice` is `alice`), and may not name the network, a model or an official role. Codes cannot be
+deleted, sold or given to another coldkey. To bring them to another hotkey of the same coldkey (a new hotkey, a new
+registration), run on the machine of the new one: `verathos-miner referral move --from <old hotkey>`.
+
+`status` prints, per code, its link and the accounts it referred, then what they topped up, refunded and counted
+over the last days, and from the auditor's signed status the hotkey's referred sum over the window, its share of the
+miner emission, and whether it is paid this epoch (or why not: it holds no UID, or is excluded). The miner's log
+says the same once per epoch:
+
+```
+  referrals: 1,234.00 USD referred over the window with alice, x7k2m9pq; this hotkey's part 0.2312% of the miners' emission
+```
+
+The figures are counts and sums per day, never an account, an e-mail or an address; the dashboard link lets anyone
+holding it read them for a day. Every post, video or message that carries a code or link says that it is an ad and
+that its author earns rewards when users buy credit with it; offering referred users money or tokens is not allowed,
+and codes are revoked for breaches of the program's terms (the web app's referral page). Topping up one's own account
+with one's own code returns at most 0.3 of each dollar, as emission, for credit that can be neither withdrawn nor
+transferred.
 
 ## Checking a miner
 

@@ -5,6 +5,8 @@
     POST /v1/gateway/served    what each endpoint answered the gateway, per second, signed by a catalog gateway: its
                                answers, input tokens, how often it was considered for a user request and how often
                                it was not ready or refused, and how long its answers took
+    POST /v1/gateway/referrals the referral codes' signed registrations and moves, and the referred accounts' top-ups
+                               and refunds as they count, signed by a catalog gateway (``ReferralReport``)
 
 All of it over TLS, accepting the auditor's certificate by the pin the catalog names. A route is an endpoint listed in
 an accepted manifest, with the pin of its machine's TLS certificate, that has qualified and is credited in the
@@ -28,12 +30,17 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from verathos.protocol import signing
 from verathos.protocol.api import MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES
 from verathos.protocol.media import MAX_IMAGE_REQUEST_BYTES, MAX_IMAGE_TOKENS
+from verathos.protocol.referral import READABLE_LENGTH, SignedMove, SignedRegistration
 from verathos.protocol.tls import PIN_PATTERN
 
 ROUTES_PATH = "/v1/routes"
 ROUTES_DOMAIN = "verathos/routes/v1"
 SAMPLES_PATH = "/v1/gateway/samples"
 SERVED_PATH = "/v1/gateway/served"
+REFERRALS_PATH = "/v1/gateway/referrals"
+MAX_REFERRAL_ENTRIES = 5_000  # per post ...
+MAX_REFERRAL_SIGNED = 1_000  # ... and registrations or moves
+MAX_REFERRAL_MICROS = 10**12  # micro-USD one entry counts, either sign
 MAX_SAMPLES_PER_POST = 64
 # A post of samples, at most: one sample of the largest request an image model may take, with its response, fits.
 MAX_SAMPLES_BYTES = MAX_IMAGE_REQUEST_BYTES + (1 << 20)
@@ -155,3 +162,28 @@ class ServedCount(BaseModel):
 class ServedReport(BaseModel):
     report_id: str = Field("", max_length=64)  # the auditor takes a report once, even when it is posted again
     counts: list[ServedCount] = Field(min_length=1, max_length=MAX_SERVED_COUNTS)
+
+
+class ReferralEntry(BaseModel):
+    """A referred account's top-up or refund as it counts for its code: a top-up within the account's term and cap,
+    a refund (negative) at most what its top-up counted."""
+
+    id: str = Field(pattern=r"^[0-9a-f]{64}$")  # random, drawn once per entry: the auditor takes it once
+    code: str = Field(min_length=1, max_length=READABLE_LENGTH[1])
+    amount_micros: int = Field(ge=-MAX_REFERRAL_MICROS, le=MAX_REFERRAL_MICROS)
+    credited_ms: int = Field(ge=0)  # the start of the UTC hour the gateway credited it in
+
+    @model_validator(mode="after")
+    def _not_zero(self) -> ReferralEntry:
+        if self.amount_micros == 0:
+            raise ValueError("an entry counts at least one micro-USD")
+        return self
+
+
+class ReferralReport(BaseModel):
+    """What the gateway has not reported yet: codes' registrations and moves (before the entries that name them) and
+    entries. Every item is taken once, however often it is posted."""
+
+    codes: list[SignedRegistration] = Field(default_factory=list, max_length=MAX_REFERRAL_SIGNED)
+    moves: list[SignedMove] = Field(default_factory=list, max_length=MAX_REFERRAL_SIGNED)
+    entries: list[ReferralEntry] = Field(default_factory=list, max_length=MAX_REFERRAL_ENTRIES)
