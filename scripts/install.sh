@@ -265,11 +265,15 @@ verify_release() {
 }
 
 fetch_ref() {
-  # $3 from the source $2 into FETCH_HEAD of $1: a tag once it verifies (verify_release), a branch or commit as it is.
-  local repo="$1" source="$2" ref="$3" tag="${3#refs/tags/}"
-  if git -C "$repo" ls-remote "$source" "refs/tags/$tag" | awk -v r="refs/tags/$tag" '$2 == r { f = 1 } END { exit !f }'; then
+  # $3 from the source $2 into FETCH_HEAD of $1: a tag once it verifies (verify_release), a branch or commit as it is;
+  # a release's name (v<version>) only as its tag, never unverified.
+  local repo="$1" source="$2" ref="$3" tag="${3#refs/tags/}" listed
+  listed="$(git -C "$repo" ls-remote "$source" "refs/tags/$tag")" || die "cannot read $(shown "$source")"
+  if awk -v r="refs/tags/$tag" '$2 == r { f = 1 } END { exit !f }' <<<"$listed"; then
     git -C "$repo" fetch --quiet --tags --force "$source" "refs/tags/$tag" || die "cannot fetch $ref from $(shown "$source")"
     verify_release "$repo" "$tag"
+  elif [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    die "$tag is not a tag of $(shown "$source"): a release is installed only from its signed tag"
   else
     git -C "$repo" fetch --quiet --tags --force "$source" "$ref" || die "cannot fetch $ref from $(shown "$source")"
     echo "    note: $ref is not a release tag; it is installed unverified"

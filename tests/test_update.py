@@ -353,6 +353,20 @@ def test_the_installer_installs_a_tag_only_signed_by_a_key_it_holds(tmp_path, ke
     assert git(new, "rev-parse", "HEAD") == main
 
 
+
+def test_the_installer_takes_a_releases_name_only_as_its_signed_tag(tmp_path, keys) -> None:
+    """A branch named as a release (pushed by mistake, or what --ref names before the tag exists) is not installed
+    unverified, and a source whose tags cannot be listed stops the install, where both installed the ref as given."""
+    w = World(tmp_path, keys)
+    commit(w.origin, "1.0.7")
+    git(w.origin, "branch", "v1.0.7")
+    holds, new = allowed(keys, "release"), tmp_path / "new"
+    refused = fetch_code(tmp_path, holds, str(new), str(w.origin), "v1.0.7")
+    assert refused.returncode != 0 and not new.exists()
+    assert "v1.0.7 is not a tag of" in refused.stderr and "installed only from its signed tag" in refused.stderr
+    unread = fetch_code(tmp_path, holds, str(w.code), str(tmp_path / "nothing-there"), "v1.0.1")
+    assert unread.returncode != 0 and w.head() == w.v100
+
 def test_the_installer_defaults_to_the_newest_release_once_it_holds_a_key(tmp_path, keys) -> None:
     w = World(tmp_path, keys)
     main = commit(w.origin, "1.0.2")  # the default branch, ahead of the newest release
