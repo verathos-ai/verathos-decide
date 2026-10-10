@@ -383,3 +383,36 @@ def test_two_machines_end_to_end(tmp_path, monkeypatch) -> None:
     finally:
         for server in servers:
             server.should_exit = True
+
+
+def test_a_miner_whose_first_permit_read_fails_starts_and_reads_again_soon(monkeypatch, caplog) -> None:
+    """The chain failing the miner's first read of the permits ended its start (a process manager that saw that ten
+    times in a row stopped trying): it starts allowing the gateways and the auditor only, and reads again every
+    FIRST_RETRY_S until a read succeeds, then every refresh_s."""
+    import logging
+
+    validator, gateway = kp(), kp()
+    chain = FakeSubtensor({validator.ss58_address: 1e6}, "5Auditor")
+    reads = iter([ConnectionError("connection closed")])
+    metagraph = chain.metagraph
+
+    def flaky(netuid: int, lite: bool = True):
+        if (failure := next(reads, None)) is not None:
+            raise failure
+        return metagraph(netuid, lite)
+
+    chain.metagraph = flaky
+    monkeypatch.setattr(miner_chain.bt, "Subtensor", lambda *a, **k: chain)
+    monkeypatch.setattr(miner_chain.threading, "Thread", lambda target, daemon: SimpleNamespace(start=lambda: None))
+    slept: list[float] = []
+    monkeypatch.setattr(miner_chain.time, "sleep", slept.append)
+    with caplog.at_level(logging.WARNING, logger="verathos.miner.chain"):
+        permits = miner_chain.PermitAuthorizer("test", 405, lambda: {gateway.ss58_address}, refresh_s=600.0)
+    assert not permits(validator.ss58_address) and permits(gateway.ss58_address)
+    assert "permit refresh failed (ConnectionError: connection closed); keeping the previous set" in caplog.messages
+    loop = permits._loop
+    with pytest.raises(StopIteration):  # one round of the background loop, then the wait of the next
+        rounds = iter([1])
+        monkeypatch.setattr(miner_chain.time, "sleep", lambda s: (slept.append(s), next(rounds)))
+        loop()
+    assert slept == [miner_chain.FIRST_RETRY_S, 600.0] and permits(validator.ss58_address)

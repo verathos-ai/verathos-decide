@@ -20,10 +20,11 @@ from verathos.protocol.manifest import (
     SignedManifest,
     commitment_value,
 )
-from verathos.subnet.chain import CHAIN_ERRORS, one_line, serve_axon
+from verathos.subnet.chain import CHAIN_ERRORS, connect, one_line, serve_axon
 from verathos.throughput.policy import BLOCK_TIME_S
 
 log = logging.getLogger(__name__)
+FIRST_RETRY_S = 30.0  # the permits read again this often until a read succeeds
 
 
 def own_endpoints(config: MinerConfig, endpoints: list[EndpointConfig],
@@ -69,17 +70,18 @@ class PermitAuthorizer:
     """Allows validators with a validator permit and at least ``min_stake()`` of stake, the metagraph's S (both
     refreshed in the background over its own chain connection), and the callers ``allowed`` names at the time of the
     request (the gateways and the auditor). It also follows the chain's head, for the epoch requests are counted in
-    (``epoch``)."""
+    (``epoch``). If the chain fails the first read, it starts with no validator allowed (the gateways and the auditor
+    are) and reads again every ``FIRST_RETRY_S`` until a read succeeds."""
 
     def __init__(self, network: str, netuid: int, allowed: Callable[[], Collection[str]],
                  min_stake: Callable[[], float] = lambda: 0.0, refresh_s: float = 600.0) -> None:
-        self._subtensor, self._netuid, self._allowed = bt.Subtensor(network=network), netuid, allowed
+        self._subtensor, self._netuid, self._allowed = connect(network), netuid, allowed
         self._min_stake = min_stake
         self._stake: dict[str, float] = {}  # validators with a permit -> their stake
         self._head = (0, time.monotonic())  # (block, when it was read)
         self._logged: tuple[int, ...] | None = None
         self._refresh_s = refresh_s
-        self.refresh()
+        self.try_refresh()
         threading.Thread(target=self._loop, daemon=True).start()
 
     def refresh(self) -> None:
@@ -96,7 +98,7 @@ class PermitAuthorizer:
 
     def _loop(self) -> None:
         while True:
-            time.sleep(self._refresh_s)
+            time.sleep(self._refresh_s if self._head[0] else FIRST_RETRY_S)  # sooner until the first read
             self.try_refresh()
 
     def try_refresh(self) -> None:
