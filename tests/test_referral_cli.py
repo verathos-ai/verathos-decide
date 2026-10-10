@@ -107,7 +107,12 @@ def test_the_status_shows_the_referrers_part_of_the_pool_from_the_auditors_recor
     assert cli.status_lines(hotkey, SITE, None, unpaid)[-1] == "  not paid this epoch: holds no UID"
     none = HotkeyStatus(hotkey=hotkey, epoch=45406, referral_share=0.004)
     assert "no top-up of this hotkey's referred accounts counts" in cli.status_lines(hotkey, SITE, None, none)[-1]
-    assert "off in the committed catalog" in cli.status_lines(hotkey, SITE, None, HotkeyStatus(hotkey=hotkey))[-1]
+    # scored without a pool: the pool is off, or the epoch was scored before the auditor followed a catalog with one
+    before = HotkeyStatus(hotkey=hotkey, epoch=45406)
+    assert cli.status_lines(hotkey, SITE, None, before)[-1] == ("referral pool in epoch 45406: off in the catalog the "
+                                                               "auditor scored that epoch under")
+    assert cli.status_lines(hotkey, SITE, None, HotkeyStatus(hotkey=hotkey))[-1] == (
+        "referral pool: the auditor's last epoch does not list this hotkey")
 
 
 def test_the_command_names_the_hotkey_and_the_site_and_refuses_what_is_not_a_code(tmp_path, monkeypatch,

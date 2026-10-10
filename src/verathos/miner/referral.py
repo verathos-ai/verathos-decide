@@ -148,9 +148,14 @@ def status_lines(hotkey: str, site: str, figures: dict[str, Any] | None, status:
         return lines
     r = status.referral
     if r is None:
-        lines.append(f"referral pool in epoch {status.epoch}: no top-up of this hotkey's referred accounts counts in "
-                     "the period it pays" if status.referral_share is not None else
-                     f"referral pool in epoch {status.epoch}: off in the committed catalog")
+        if status.epoch is None:
+            lines.append("referral pool: the auditor's last epoch does not list this hotkey")
+        elif status.referral_share is not None:
+            lines.append(f"referral pool in epoch {status.epoch}: no top-up of this hotkey's referred accounts counts "
+                         "in the period it pays")
+        else:  # a catalog committed since takes effect once the auditor follows it
+            lines.append(f"referral pool in epoch {status.epoch}: off in the catalog the auditor scored that epoch "
+                         "under")
         return lines
     sums = ", ".join(f"{code} {usd(sum(periods))}" for code, periods in sorted(r.codes.items()))
     lines.append(f"referral pool in epoch {status.epoch}: {usd(r.referred_micros)} referred over the window ({sums}); "
