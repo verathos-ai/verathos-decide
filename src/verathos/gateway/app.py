@@ -336,6 +336,9 @@ def screen(g: Gateway, body: bytes) -> Screened:
     if parsed.images and (token := ENGINE_IMAGES[model.engine.name].image_token).encode() in text_body:
         raise Rejected(400, "invalid_request", f"a request with images may not hold {token} in its text",
                        model=model.model_id)
+    # the request as the miners receive it, with every object's keys in the canonical body's order: the auditor
+    # recomputes this from the samples, and a model reads a state's keys in the order they come
+    forwarded = json.loads(text_body)
     return Screened(parsed, model, forwarded, text_body, sent_images(parsed.images or [], model))
 
 

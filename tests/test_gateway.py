@@ -498,6 +498,20 @@ def test_a_wrong_answer_served_to_users_is_proven_by_its_sample(tmp_path) -> Non
     assert evidence.hotkey == s.miners["10.0.0.1"][0].ss58_address
 
 
+
+def test_an_honest_answer_to_a_state_whose_keys_are_not_sorted_passes_its_sample(tmp_path) -> None:
+    """The miner computes the canonical body, whose keys are sorted; a model reads a state's keys in the order they
+    come, so the sample the auditor recomputes must be that body too, not the client's order."""
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    for i in range(5):
+        state = {"page": "product", "goal": f"buy the shoes {i}", "elements": [{"text": "Add to cart", "id": "add"}]}
+        assert asyncio.run(s.post({**REQUEST, "state": state})).status_code == 200
+    asyncio.run(s.sampler.flush())
+    asyncio.run(s.auditor.check_samples(Checks({"kev-4b": MockEngine("kev-4b")}, {})))
+    s.auditor.chain.head_block = 4 * 180 + 1
+    s.auditor.follower.poll()
+    assert s.auditor.verdicts(4).verdicts.invalid == []
+
 # ---- parts ----
 
 def test_the_router_spreads_by_capacity_and_respects_caps_and_breakers() -> None:
