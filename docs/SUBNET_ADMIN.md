@@ -343,8 +343,9 @@ Raise it from the subnet owner coldkey (AdminUtils `sudo_set_weights_version_key
 `btcli sudo set --netuid 96 --param weights_version --value 1000000`), and only once the validators that should keep
 setting weights run a release at or above it.
 
-To publish a release: set `__version__` to the new version in a commit, tag that commit `v<version>` with a tag
-signed by the release key ([Signing releases](#signing-releases)) and push the tag to the repository installs come
+To publish a release: set `__version__` to the new version in a commit on `dev`, tag that commit `v<version>` with a
+tag signed by the release key ([Signing releases](#signing-releases)), move `main` to it
+([Releases](../CONTRIBUTING.md#releases)) and push the tag to the repository installs come
 from. Miners and validators set up by the installer (`auto_update`) find it within an hour and install it within the
 hour after, each at a random time and a quiet moment of its own (`MINING.md`, `VALIDATING.md`), then restart; a tag
 that is not signed by a key their code lists, or whose code names another version, is never installed. The auditor

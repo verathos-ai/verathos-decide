@@ -28,7 +28,7 @@ Local changes stop both the installer's updates and the self-update.
 
 ```bash
 uv venv -p 3.12 .venv
-VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway,test]" ruff
+VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway,test]" ruff==0.16.10
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check src tests scripts
 (cd native/loadgen && cargo test)
@@ -38,3 +38,4 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway,test]" ruff
   Landlock (README.md, Development).
 - The docs state what the code does, with its exact commands, options and log lines: change them with the code.
 - `scripts/install.sh` keeps a copy of `release/allowed_signers` (`release_signers`); the tests keep them equal.
+- Pull requests go to `dev`; what they need and how commit messages read: [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -1,0 +1,60 @@
+name: Bug report
+description: A miner, validator, reference machine, the gateway or the installer does not do what the docs say.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Report a vulnerability privately
+        ([SECURITY.md](https://github.com/verathos-ai/verathos-decide/security/policy)), not here. Remove keys,
+        tokens and addresses you do not want public from everything you paste.
+  - type: dropdown
+    id: role
+    attributes:
+      label: Role
+      options:
+        - miner
+        - light validator
+        - full validator
+        - reference machine
+        - gateway
+        - auditor
+        - other
+    validations:
+      required: true
+  - type: dropdown
+    id: setup
+    attributes:
+      label: Set up with
+      options:
+        - scripts/install.sh
+        - Docker
+        - manual installation
+    validations:
+      required: true
+  - type: input
+    id: release
+    attributes:
+      label: Release
+      description: >-
+        The version that ran (`~/verathos-decide/.venv/bin/python -c 'import verathos; print(verathos.__version__)'`,
+        or the image tag), and the commit if it is not a release.
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Network and machine
+      placeholder: finney, Ubuntu 24.04, 2x H100 80GB
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what happened, and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      render: text
