@@ -390,7 +390,7 @@ same paths on the miner machine.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone https://github.com/verathos-ai/verathos-decide && cd verathos-decide
+git clone --branch main https://github.com/verathos-ai/verathos-decide && cd verathos-decide
 uv venv -p 3.12 .venv
 VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"
 ```
@@ -757,7 +757,7 @@ the hotkey (and `coldkeypub.txt`), with [uv](https://docs.astral.sh/uv/getting-s
 registers a code:
 
 ```bash
-uvx --from git+https://github.com/verathos-ai/verathos-decide verathos-miner referral code alice \
+uvx --from git+https://github.com/verathos-ai/verathos-decide@main verathos-miner referral code alice \
     --wallet <wallet> --hotkey <hotkey> --netuid 96 --site https://verathos.ai
 ```
 
