@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
+import json
+import re
 import time
 
 import httpx
@@ -19,7 +22,7 @@ from tests.test_throughput import kp
 from verathos import catalog
 from verathos.gateway import db
 from verathos.gateway.accounts import Accounts
-from verathos.gateway.referrals import MAX_CODES, Referrals, entry_id, reserved
+from verathos.gateway.referrals import MAX_CODES, Referrals, reserved
 from verathos.protocol.gateway import ReferralReport
 from verathos.protocol.referral import (
     CodeMove,
@@ -331,6 +334,14 @@ class Ledger:
     def decide(self, pool=POOL) -> list[float]:
         return [micros / USD for micros in self.run(self.referrals.decide(pool, 180))]
 
+    def entry_ids(self) -> dict[str, str]:
+        """Each decided credit's reference -> the id its entry goes to the auditor under."""
+        async def read():
+            async with self.engine.connect() as conn:
+                return dict((await conn.execute(select(db.credits.c.reference, db.referral_reports.c.entry_id).join(
+                    db.referral_reports, db.referral_reports.c.credit_id == db.credits.c.id))).all())
+        return self.run(read())
+
 
 def test_top_ups_count_from_the_referral_within_the_term_and_until_the_code_is_revoked(tmp_path) -> None:
     ledger = Ledger(tmp_path)
@@ -497,8 +508,7 @@ def test_what_counts_is_reported_once_with_the_codes_registrations_and_moves(tmp
     assert [c.registration.code for c in report.codes] == ["alice"] and report.codes[0].verify()
     assert report.moves[0].move.to_hotkey == new.ss58_address and report.moves[0].verify()
     assert [(e.code, e.amount_micros) for e in report.entries] == [("alice", 5 * USD), ("alice", 995 * USD)]
-    assert report.entries[0].id == entry_id(pay) and report.entries[0].credited_ms == int(
-        (ledger.t0 + dt.timedelta(seconds=10)).timestamp() * 1000)
+    assert report.entries[0].credited_ms == int((ledger.t0 + dt.timedelta(seconds=10)).timestamp() * 1000)
     assert ledger.run(ledger.referrals.report(post)) == 0  # taken: nothing more
     ledger.credit("u_1", -5, at_s=40, kind="refund", refund_of=pay)
     ledger.decide()
@@ -512,6 +522,137 @@ def test_what_counts_is_reported_once_with_the_codes_registrations_and_moves(tmp
     assert ledger.run(ledger.referrals.report(post)) == 3
     assert ([c.registration.code for c in posted[-1].codes], len(posted[-1].moves),
             [e.amount_micros for e in posted[-1].entries]) == (["alice"], 1, [7 * USD])
+
+
+def test_an_entry_is_named_by_a_random_id_drawn_once_and_kept_for_every_post(tmp_path) -> None:
+    """An entry's id is drawn at random when its credit is decided and kept with it: the same credit in another
+    ledger gets another id, so nothing of the credit gives it, and every post of the entry names it alike, after a
+    failed post or an auditor that started over."""
+    def named(path) -> str:
+        ledger = Ledger(path)
+        ledger.code("alice")
+        ledger.account("u_1", "alice")
+        reference = ledger.credit("u_1", 5, at_s=10, reference="tao:5120344:7")
+        ledger.decide()
+        kept = ledger.entry_ids()[reference]
+        posted: list[ReferralReport] = []
+
+        async def post(report: ReferralReport, answer=None, fail: bool = False):
+            posted.append(report)
+            if fail:
+                raise httpx.ConnectError("the auditor is down")
+            return answer or {}
+        with pytest.raises(httpx.ConnectError):
+            ledger.run(ledger.referrals.report(lambda r: post(r, fail=True)))
+        ledger.run(ledger.referrals.report(lambda r: post(r, {"unknown_codes": ["alice"]})))
+        assert ledger.run(ledger.referrals.report(post)) == 2  # the registration again, with the entry
+        assert [[e.id for e in r.entries] for r in posted] == [[kept]] * 3
+        assert ledger.entry_ids() == {reference: kept} and ledger.run(ledger.referrals.report(post)) == 0
+        return kept
+    first, second = named(tmp_path / "a"), named(tmp_path / "b")
+    assert first != second and all(re.fullmatch(r"[0-9a-f]{64}", id_) for id_ in (first, second))
+
+
+def hashes(text: str) -> set[str]:
+    """``text`` hashed with every algorithm hashlib guarantees, in hex (the extendable ones to 32 and 64 bytes)."""
+    found = set()
+    for name in hashlib.algorithms_guaranteed:
+        digest = hashlib.new(name, text.encode())
+        found |= {digest.hexdigest(n) for n in (32, 64)} if name.startswith("shake") else {digest.hexdigest()}
+    return found
+
+
+def test_nothing_reported_to_the_auditor_is_or_hashes_to_a_credits_reference(tmp_path) -> None:
+    """A top-up's reference names its payment (a TAO top-up's, the transfer on chain): no field of a post to the
+    auditor is a reference or a hash of one, nor holds one."""
+    ledger = Ledger(tmp_path)
+    ledger.code("alice")
+    ledger.account("u_1", "alice")
+    tao = ledger.credit("u_1", 5, at_s=10, reference="tao:5120344:7")
+    references = [tao, ledger.credit("u_1", 3, at_s=20, reference=f"x402:base:0x{'ab' * 20}:0x{'cd' * 32}"),
+                  ledger.credit("u_1", -2, at_s=30, kind="refund", refund_of=tao, reference=f"refund:{tao}")]
+    new = kp()
+    ledger.run(ledger.referrals.move(SignedMove.model_validate(move(new, ledger.miner.ss58_address,
+                                                                     new.ss58_address))))
+    ledger.decide()
+    posted: list[ReferralReport] = []
+
+    async def post(report: ReferralReport):
+        posted.append(report)
+        return {}
+    while ledger.run(ledger.referrals.report(post)):
+        pass
+    assert [len(r.entries) for r in posted] == [3] and posted[0].codes and posted[0].moves
+
+    def fields(value) -> list[str]:
+        if isinstance(value, dict):
+            return [f for v in value.values() for f in fields(v)]
+        if isinstance(value, list):
+            return [f for v in value for f in fields(v)]
+        return [str(value)]
+    linked = set(references).union(*map(hashes, references))
+    bodies = [r.model_dump_json() for r in posted]
+    assert not linked & {f for body in bodies for f in fields(json.loads(body))}
+    assert not [x for x in linked for body in bodies if x in body]
+
+
+def test_the_reports_kept_get_random_ids_when_the_database_is_upgraded(tmp_path) -> None:
+    """A database from before the ids (0005) is upgraded in place: every report kept gets a random id of its own,
+    those the auditor has not taken go to it under theirs, and an id is required and unique."""
+    from alembic import command
+    from sqlalchemy import insert, text
+    from sqlalchemy.exc import IntegrityError
+
+    url = f"sqlite+aiosqlite:///{tmp_path}/old.db"
+    command.upgrade(db.alembic_config(url), "0005")
+    miner, references = kp(), ["tao:5120344:7", "tao:5120399:2", "tao:5120402:0"]
+
+    async def old_rows():
+        engine = db.create_engine(url)
+        async with engine.begin() as conn:
+            await conn.execute(text("INSERT INTO accounts (name, rate_rps, burst) VALUES ('u_1', 1, 1)"))
+            for reference in references:
+                await conn.execute(text("INSERT INTO credits (account_id, amount, kind, reference) VALUES "
+                                        "(1, 5000000, 'topup', :reference)"), {"reference": reference})
+            await conn.execute(text("INSERT INTO referral_codes (code, folded, hotkey, registration, reported_at) "
+                                    "VALUES ('alice', 'alice', :hotkey, :registration, CURRENT_TIMESTAMP)"),
+                               {"hotkey": miner.ss58_address, "registration": json.dumps(registration(miner, "alice"))})
+            await conn.execute(text("INSERT INTO referrals (account_id, code) VALUES (1, 'alice')"))
+            await conn.execute(text("INSERT INTO referral_reports (credit_id, code, amount, reported_at) VALUES "
+                                    "(1, 'alice', 5000000, CURRENT_TIMESTAMP), (2, 'alice', 5000000, NULL), "
+                                    "(3, 'alice', 0, NULL)"))  # taken, not taken yet, counting nothing
+        await engine.dispose()
+
+    asyncio.run(old_rows())
+    db.upgrade(url)
+    engine = db.create_engine(url)
+
+    async def kept() -> dict[int, str]:
+        async with engine.connect() as conn:
+            return dict((await conn.execute(select(db.referral_reports.c.credit_id,
+                                                   db.referral_reports.c.entry_id))).all())
+    ids = asyncio.run(kept())
+    assert sorted(ids) == [1, 2, 3] and len(set(ids.values())) == 3
+    assert all(re.fullmatch(r"[0-9a-f]{64}", id_) for id_ in ids.values())
+    assert not set(ids.values()) & set().union(*map(hashes, references))
+    posted: list[ReferralReport] = []
+
+    async def post(report: ReferralReport):
+        posted.append(report)
+        return {}
+    assert asyncio.run(Referrals(engine, netuid=405, site=SITE).report(post)) == 1
+    assert [e.id for e in posted[0].entries] == [ids[2]]
+
+    async def report_with(entry_id: str | None) -> None:
+        async with engine.begin() as conn:
+            await conn.execute(text("INSERT INTO credits (account_id, amount, kind, reference) VALUES "
+                                    "(1, 1000000, 'topup', 'tao:5120500:1')"))
+            await conn.execute(insert(db.referral_reports).values(credit_id=4, code="alice", amount=USD,
+                                                                  entry_id=entry_id))
+    for taken in (ids[1], None):
+        with pytest.raises(IntegrityError):
+            asyncio.run(report_with(taken))
+    asyncio.run(engine.dispose())
 
 
 # ---- the view token ----

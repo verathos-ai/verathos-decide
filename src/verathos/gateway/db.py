@@ -139,6 +139,7 @@ referral_reports = Table(  # each top-up and refund of a referred account, as it
     Column("code", String(24), nullable=False),
     Column("amount", BigInteger, nullable=False),  # micro-USD it counts: 0 for none; a refund's is negative
     Column("reported_at", DateTime(timezone=True), nullable=True, index=True),  # when the auditor took it
+    Column("entry_id", String(64), nullable=False, unique=True),  # its id at the auditor: random, linked to nothing
 )
 
 

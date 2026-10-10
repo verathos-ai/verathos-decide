@@ -25,9 +25,10 @@ once (``referral_reports``) and reported once.
 The reporter. Every ``REPORT_S`` one gateway process (PostgreSQL's advisory lock ``LOCK_KEY``; the others skip the
 round) decides the new credits of referred accounts, then posts what the auditor has not taken, signed by the gateway:
 registrations and moves in the order they happened, then, once every registration is out, entries
-(``protocol.gateway.ReferralReport``). The auditor takes every item once, so a post whose answer was lost is sent again
-as it is. If it no longer knows a code an entry names (its database started over), every registration and move goes
-again, then those entries. An entry counts at most ``MAX_REFERRAL_MICROS``.
+(``protocol.gateway.ReferralReport``). An entry's id is drawn at random when its credit is decided and kept with it,
+so it leads back to no credit or payment. The auditor takes every item once, so a post whose answer was lost is sent
+again as it is. If it no longer knows a code an entry names (its database started over), every registration and move
+goes again, then those entries. An entry counts at most ``MAX_REFERRAL_MICROS``.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import secrets
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
@@ -138,11 +140,6 @@ def counted(kind: str, amount: int, refund_of: str | None, created: dt.datetime,
     near = sum(e.counted for e in earlier
                if e.kind == "topup" and abs((e.created - created).total_seconds()) < window_s)
     return max(0, min(amount, round(pool.account_cap_usd * 1_000_000) - near, MAX_REFERRAL_MICROS))
-
-
-def entry_id(reference: str) -> str:
-    """How a credit is named to the auditor: the SHA-256 of its reference."""
-    return hashlib.sha256(reference.encode()).hexdigest()
 
 
 class Referrals:
@@ -423,7 +420,8 @@ class Referrals:
                                  _utc(r.revoked_at) if r.revoked_at is not None else None, earlier[r.account_id],
                                  pool, window_s)
                 earlier[r.account_id].append(Decided(r.kind, r.reference, r.refund_of, created, amount))
-                decided.append({"credit_id": r.id, "code": r.code, "amount": amount})
+                decided.append({"credit_id": r.id, "code": r.code, "amount": amount,
+                                "entry_id": secrets.token_hex(32)})  # its id at the auditor, kept for every post
             if decided:
                 await conn.execute(insert(referral_reports), decided)
         if decided:
@@ -457,8 +455,8 @@ class Referrals:
             if later is not None:
                 moves = [m for m in moves if _utc(m.created_at) < _utc(later.created_at)]
             entries = [] if later is not None else (await conn.execute(  # entries once their codes are out
-                select(referral_reports.c.credit_id, referral_reports.c.code, referral_reports.c.amount,
-                       credits.c.reference, credits.c.created_at)
+                select(referral_reports.c.credit_id, referral_reports.c.entry_id, referral_reports.c.code,
+                       referral_reports.c.amount, credits.c.created_at)
                 .join(credits, credits.c.id == referral_reports.c.credit_id)
                 .where(referral_reports.c.reported_at.is_(None), referral_reports.c.amount != 0)
                 .order_by(referral_reports.c.credit_id).limit(MAX_REFERRAL_ENTRIES))).all()
@@ -467,7 +465,7 @@ class Referrals:
             report = ReferralReport(
                 codes=[SignedRegistration.model_validate_json(c.registration) for c in codes],
                 moves=[SignedMove.model_validate_json(m.move) for m in moves],
-                entries=[ReferralEntry(id=entry_id(e.reference), code=e.code, amount_micros=int(e.amount),
+                entries=[ReferralEntry(id=e.entry_id, code=e.code, amount_micros=int(e.amount),
                                        credited_ms=int(_utc(e.created_at).timestamp() * 1000)) for e in entries])
             answer = await post(report)
             unknown = set(answer.get("unknown_codes") or []) if isinstance(answer, dict) else set()
