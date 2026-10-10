@@ -366,3 +366,28 @@ def test_an_auditor_whose_axon_another_one_took_over_stops_at_the_next_epoch(tmp
         with pytest.raises(SystemExit, match="another auditor with this hotkey runs at"):
             run(tmp_path, monkeypatch, chain, owner, cat, started, once=False)
         assert started == []
+
+
+def test_a_validator_whose_epochs_keep_failing_still_takes_a_release(tmp_path, monkeypatch) -> None:
+    """The self-update applies a release where nothing is in flight: between epochs, and after a failed one too, so
+    a validator that fails every epoch (a chain change its release cannot read) takes the release that fixes it."""
+    from verathos.validator import __main__ as validator_main
+
+    owner = kp()
+    cat = catalog.Catalog.parse({**catalog.load().document(), "auditor": {"tls": tls.identity(tmp_path / "state").pin}})
+    chain, started = Chain(owner.ss58_address, ("127.0.0.1", free_port())), []
+    reached: list[str] = []
+
+    def updated() -> None:
+        reached.append("safe point")
+        raise Exited(75)  # the release is installed: the process exits for its manager to start it
+
+    monkeypatch.setattr(validator_main.self_update, "start", lambda enabled, role: SimpleNamespace(
+        at_safe_point=updated))
+
+    def failing(epoch: int) -> None:
+        raise RuntimeError("the chain answers what this release cannot read")
+
+    with pytest.raises(Exited) as exited:
+        run(tmp_path, monkeypatch, chain, owner, cat, started, once=False, on_epoch=failing)
+    assert exited.value.code == 75 and started == ["tests", "axon", 100] and reached == ["safe point"]

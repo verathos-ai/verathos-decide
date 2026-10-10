@@ -764,6 +764,8 @@ def main() -> None:
             if args.once:
                 raise
             log.exception("epoch step failed; retrying in one block")
+            if updater is not None:  # nothing is in flight here either: a release that ends the failures is taken
+                updater.at_safe_point()
             time.sleep(BLOCK_TIME_S)
     st.close()
 
