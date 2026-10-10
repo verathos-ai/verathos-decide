@@ -155,10 +155,10 @@ user with `--no-service`: [Without root](#without-root-pm2-or-another-process-ma
 
 ```bash
 # light (the default for a hotkey that is not the subnet owner's)
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- validator
 
 # full
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --full
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- validator --full
 ```
 
 On a machine of your own with Docker, a light or full validator and the reference machine its references run on also
@@ -170,7 +170,7 @@ the one set up before, else light), shows its plan with the mode and what it nee
 questions:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --yes \
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- validator --yes \
     --wallet validator --hotkey default
 ```
 
@@ -249,7 +249,7 @@ refused (uninstall them first, the configuration and state stay), so one copy ru
 to stop. Light validator, unattended:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --light \
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- validator --light \
     --yes --no-service --wallet validator --hotkey default
 ```
 
@@ -393,7 +393,7 @@ the validator's machine.
 On the GPU machine (Ubuntu 22.04 or 24.04 with the NVIDIA driver and one open TCP port), as root or with sudo:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- reference \
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- reference \
     --allow 203.0.113.9 --port 8443
 ```
 
@@ -437,7 +437,7 @@ Copy the file to the validator machine (`scp root@<gpu machine>:.verathos/refere
 validator's installer there with it:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --full \
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- validator --full \
     --remote-engines reference-engines.json
 ```
 
@@ -490,7 +490,7 @@ The validator uses the new engines from its next epoch.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone https://github.com/<org>/verathos verathos-decide && cd verathos-decide
+git clone https://github.com/verathos-ai/verathos-decide && cd verathos-decide
 uv venv -p 3.12 .venv
 VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"
 ```

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Install or update a Verathos miner, validator or reference machine (Ubuntu 22.04 or 24.04), then set it up.
 #
-#   curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
-#   curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator [--full]
-#   curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- reference \
+#   curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- miner
+#   curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- validator [--full]
+#   curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- reference \
 #       --allow <validator ip>
 #   bash ~/verathos-decide/scripts/install.sh uninstall [--purge]
 #
@@ -51,7 +51,7 @@
 #              --model <id>[,<id>...] --no-screens --device auto|cpu|gpu --public-ip <ip> --port <port>
 set -euo pipefail
 
-PUBLIC_REPOSITORY="https://github.com/<org>/verathos.git"
+PUBLIC_REPOSITORY="https://github.com/verathos-ai/verathos-decide.git"
 DEFAULT_DIR="$HOME/verathos-decide"
 PYTHON_VERSION="3.12"
 SOURCE_FILE=".install-source"  # where a checkout installed from a tarball came from
@@ -304,9 +304,6 @@ fetch_code() {
     source="$(cat "$dir/$SOURCE_FILE")"
   fi
   source="${source:-$PUBLIC_REPOSITORY}"
-  case "$source" in
-    *"<org>"*) die "no public repository is configured in this installer yet: pass --source <git url | git bundle | tarball>" ;;
-  esac
   if [ -e "$source" ]; then
     source="$(realpath -- "$source")"
   fi

@@ -42,8 +42,8 @@ Each machine runs one role, from a directory of its own holding the role's compo
 
 ```bash
 mkdir verathos && cd verathos
-curl -fsSL -O https://raw.githubusercontent.com/<org>/verathos/main/docker/compose.miner.yml \
-    -O https://raw.githubusercontent.com/<org>/verathos/main/docker/.env.example
+curl -fsSL -O https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/docker/compose.miner.yml \
+    -O https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/docker/.env.example
 cp .env.example .env    # then set what the role needs (below)
 docker compose up -d
 docker compose logs -f

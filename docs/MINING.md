@@ -34,7 +34,7 @@ The installer never creates, imports or reads a coldkey. Then, on the miner mach
 (as any user with `--no-service`):
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- miner
 ```
 
 On a machine of your own with Docker, the miner also runs as a container with the engines the catalog pins
@@ -54,7 +54,7 @@ engines and services:
 To answer on the command line instead, add `--yes` and the options:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner --yes \
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- miner --yes \
     --wallet miner --hotkey default --port 8091 --model kev-4b
 ```
 
@@ -282,10 +282,10 @@ Set up the workers first, then the primary with every worker's address:
 
 ```bash
 # on each worker
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner --worker \
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- miner --worker \
     --yes --wallet miner --hotkey default --port 8091
 # on the primary
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner --yes \
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- miner --yes \
     --wallet miner --hotkey default --port 8091 --peers 203.0.113.7:8091,198.51.100.7:8091
 ```
 
@@ -389,7 +389,7 @@ same paths on the miner machine.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone https://github.com/<org>/verathos verathos-decide && cd verathos-decide
+git clone https://github.com/verathos-ai/verathos-decide && cd verathos-decide
 uv venv -p 3.12 .venv
 VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"
 ```

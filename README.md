@@ -18,17 +18,17 @@ under `~/.bittensor/wallets/<wallet>/`; the coldkey stays elsewhere):
 
 ```bash
 # a miner: NVIDIA GPUs, a public IP address and one open TCP port (TLS)
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- miner
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- miner
 
 # a light validator: a hotkey with a validator permit, no GPU; it sets the weights the auditor publishes
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- validator
 
 # a full validator: it checks the miners' answers itself on reference models, on GPUs or in RAM
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- validator --full
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- validator --full
 
 # a reference machine: a GPU machine serving a full validator's engines over TLS, to its address only; the validator
 # then runs on a machine without a GPU (validator --full --remote-engines reference-engines.json)
-curl -LsSf https://raw.githubusercontent.com/<org>/verathos/main/scripts/install.sh | bash -s -- reference \
+curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/scripts/install.sh | bash -s -- reference \
     --allow <validator ip>
 ```
 
