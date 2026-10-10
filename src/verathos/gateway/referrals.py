@@ -142,6 +142,15 @@ def counted(kind: str, amount: int, refund_of: str | None, created: dt.datetime,
     return max(0, min(amount, round(pool.account_cap_usd * 1_000_000) - near, MAX_REFERRAL_MICROS))
 
 
+CREDITED_GRAIN_MS = 3_600_000  # credit times go to the hour: with the amount, a finer one could find the payment
+
+
+def credited_hour_ms(created_at: dt.datetime) -> int:
+    """When a credit was made, as sent to the auditor: the start of its UTC hour, in milliseconds."""
+    ms = int(_utc(created_at).timestamp() * 1000)
+    return ms - ms % CREDITED_GRAIN_MS
+
+
 class Referrals:
     """The referral ledger in the gateway's database (see the module). ``catalog`` gives the catalog followed: its
     model ids are reserved, and its referral pool decides what counts."""
@@ -471,7 +480,7 @@ class Referrals:
                 codes=[SignedRegistration.model_validate_json(c.registration) for c in codes],
                 moves=[SignedMove.model_validate_json(m.move) for m in moves],
                 entries=[ReferralEntry(id=e.entry_id, code=e.code, amount_micros=int(e.amount),
-                                       credited_ms=int(_utc(e.created_at).timestamp() * 1000)) for e in entries])
+                                       credited_ms=credited_hour_ms(e.created_at)) for e in entries])
             answer = await post(report)
             unknown = set(answer.get("unknown_codes") or []) if isinstance(answer, dict) else set()
             now = dt.datetime.now(dt.UTC)

@@ -523,7 +523,8 @@ def test_what_counts_is_reported_once_with_the_codes_registrations_and_moves(tmp
     assert [c.registration.code for c in report.codes] == ["alice"] and report.codes[0].verify()
     assert report.moves[0].move.to_hotkey == new.ss58_address and report.moves[0].verify()
     assert [(e.code, e.amount_micros) for e in report.entries] == [("alice", 5 * USD), ("alice", 995 * USD)]
-    assert report.entries[0].credited_ms == int((ledger.t0 + dt.timedelta(seconds=10)).timestamp() * 1000)
+    credited = int((ledger.t0 + dt.timedelta(seconds=10)).timestamp() * 1000)
+    assert report.entries[0].credited_ms == credited - credited % 3_600_000  # the start of its hour
     assert ledger.run(ledger.referrals.report(post)) == 0  # taken: nothing more
     ledger.credit("u_1", -5, at_s=40, kind="refund", refund_of=pay)
     ledger.decide()
@@ -609,6 +610,8 @@ def test_nothing_reported_to_the_auditor_is_or_hashes_to_a_credits_reference(tmp
     bodies = [r.model_dump_json() for r in posted]
     assert not linked & {f for body in bodies for f in fields(json.loads(body))}
     assert not [x for x in linked for body in bodies if x in body]
+    # the credit time goes to the hour: with the amount, a finer one could find the payment
+    assert {e.credited_ms % 3_600_000 for r in posted for e in r.entries} == {0}
 
 
 def test_the_reports_kept_get_random_ids_when_the_database_is_upgraded(tmp_path) -> None:

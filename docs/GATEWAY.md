@@ -530,15 +530,15 @@ no top-up: its first top-up fixes its referrer. Grants, the referred user's bonu
 
 Every 30 s the gateway posts to the auditor what it has not taken yet (`POST /v1/gateway/referrals`, signed by the
 gateway's hotkey as served counts are): `{"codes": [signed registrations], "moves": [signed moves], "entries": [{"id"
-(32 random bytes in hex, one per entry), "code", "amount_micros", "credited_ms"}]}`, up to 1,000 registrations or moves
-and 5,000 entries per post, an entry counting at most 1,000,000 USD. Registrations and moves go in the order they
-happened (the auditor takes a post's registrations before its moves), and entries once every registration is out. The
-auditor takes every item once, so a post whose answer was lost goes again as it was; if it answers with codes it does
-not know (its database started over), every registration and move goes again, then those entries. It counts each
-entry in the period in which it arrives (`THROUGHPUT_AUDIT.md`). No account, address or reference leaves the gateway,
-nor a hash of one: an entry's id is random and links to no credit or payment, and the auditor sees codes, amounts and
-when they were credited. One gateway database serves the subnet's gateway processes; a second one would keep codes of
-its own.
+(32 random bytes in hex, one per entry), "code", "amount_micros", "credited_ms" (the start of the UTC hour it was
+credited in)}]}`, up to 1,000 registrations or moves and 5,000 entries per post, an entry counting at most 1,000,000
+USD. Registrations and moves go in the order they happened (the auditor takes a post's registrations before its moves),
+and entries once every registration is out. The auditor takes every item once, so a post whose answer was lost goes
+again as it was; if it answers with codes it does not know (its database started over), every registration and move goes
+again, then those entries. It counts each entry in the period in which it arrives (`THROUGHPUT_AUDIT.md`). No account,
+address or reference leaves the gateway, nor a hash of one: an entry's id is random and links to no credit or payment,
+and the auditor sees codes, amounts and the hour they were credited in. One gateway database serves the subnet's gateway
+processes; a second one would keep codes of its own.
 
 ## Admin API
 

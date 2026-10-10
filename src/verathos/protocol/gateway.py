@@ -171,7 +171,7 @@ class ReferralEntry(BaseModel):
     id: str = Field(pattern=r"^[0-9a-f]{64}$")  # random, drawn once per entry: the auditor takes it once
     code: str = Field(min_length=1, max_length=READABLE_LENGTH[1])
     amount_micros: int = Field(ge=-MAX_REFERRAL_MICROS, le=MAX_REFERRAL_MICROS)
-    credited_ms: int = Field(ge=0)  # when the gateway credited it
+    credited_ms: int = Field(ge=0)  # the start of the UTC hour the gateway credited it in
 
     @model_validator(mode="after")
     def _not_zero(self) -> ReferralEntry:
