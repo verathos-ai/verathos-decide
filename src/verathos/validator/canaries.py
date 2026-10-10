@@ -9,6 +9,9 @@ For a model that reads images, its catalog's ``images.canary_share`` of the pool
 built-in font, or a small bar chart; a canonical PNG whose sides are multiples of the model's image token between 256
 and 512 px, asked two or three questions about what it shows with plain answers (a shape of a colour, how many, the
 largest or the tallest, the background, a word). Its state is an ordinary canary state.
+
+A canary is canonical (every object's keys sorted), as the gateway forwards users' requests: an engine reads keys in the
+order they come, so the miner and the reference read one order whatever release either runs.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import base64
 import hashlib
 import hmac
 import io
+import json
 import math
 import random
 import re
@@ -134,12 +138,18 @@ def canary_pool(secret: bytes, epoch: int, model_id: str, size: int,
             drawn = draw(rng, images)
             if len(drawn.png) <= IMAGE_BYTES:
                 qids = rng.sample(sorted(drawn.questions), k=rng.randint(2, 3))
-                pool.append({"model": model_id, "state": state, "images": [drawn.item()],
-                             "questions": {q: drawn.questions[q] for q in qids}})
+                pool.append(canonical({"model": model_id, "state": state, "images": [drawn.item()],
+                                       "questions": {q: drawn.questions[q] for q in qids}}))
                 continue
         qids = rng.sample(sorted(domain["questions"]), k=rng.randint(2, len(domain["questions"])))
-        pool.append({"model": model_id, "state": state, "questions": {q: domain["questions"][q] for q in qids}})
+        pool.append(canonical({"model": model_id, "state": state,
+                               "questions": {q: domain["questions"][q] for q in qids}}))
     return pool
+
+
+def canonical(request: dict[str, Any]) -> dict[str, Any]:
+    """``request`` with every object's keys in canonical order (``protocol.canonical``)."""
+    return json.loads(canonical_json(request))
 
 
 # ---- image canaries ----
