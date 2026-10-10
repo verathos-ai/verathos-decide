@@ -219,8 +219,13 @@ def record_of(document: Any) -> UsageRecord | None:
 
 # ---- the chain (bittensor SDK 10.x) ----
 
-def _hash(st: Any, block: int) -> str:
-    return st.substrate.get_block_hash(block)
+def block_hash(st: Any, block: int) -> str:
+    """The block's hash. Raises LookupError where the node holds no such block (yet): a read without its hash would be
+    of the chain's head, and the SDK keeps a missing hash for the connection's life."""
+    found = st.substrate.get_block_hash(block)
+    if not found:
+        raise LookupError(f"the chain's node holds no block {block}")
+    return found
 
 
 def _int(value: Any) -> int:
@@ -251,12 +256,12 @@ def burns_in(events: list[dict], block: int, netuid: int) -> list[Burn]:
 
 def burns_at(st: Any, block: int, netuid: int) -> list[Burn]:
     """The burns on ``netuid`` in ``block``. Raises when the node no longer holds the block's state."""
-    return burns_in(st.substrate.get_events(_hash(st, block)), block, netuid)
+    return burns_in(st.substrate.get_events(block_hash(st, block)), block, netuid)
 
 
 def emission_at(st: Any, block: int, netuid: int, mechanism: int) -> Emission:
     """The mechanism's miner emission per block as the chain's state at ``block`` sets it."""
-    at = _hash(st, block)
+    at = block_hash(st, block)
 
     def value(name: str, params: list) -> Any:
         return st.substrate.query("SubtensorModule", name, params, block_hash=at).value
@@ -271,14 +276,14 @@ def emission_at(st: Any, block: int, netuid: int, mechanism: int) -> Emission:
 
 def alpha_price_at(st: Any, block: int, netuid: int) -> float:
     """The subnet's moving alpha price in TAO at ``block`` (``SubnetMovingPrice``)."""
-    raw = st.substrate.query("SubtensorModule", "SubnetMovingPrice", [netuid], block_hash=_hash(st, block)).value
+    raw = st.substrate.query("SubtensorModule", "SubnetMovingPrice", [netuid], block_hash=block_hash(st, block)).value
     return _int(raw.get("bits", raw) if isinstance(raw, dict) else raw) / PRICE_SCALE
 
 
 def coldkeys_at(st: Any, hotkeys: Iterable[str], block: int) -> dict[str, str | None]:
     """Each hotkey's owner coldkey at ``block`` (``Owner``); None for a hotkey without one, which the chain reads as
     the zero account (``NO_OWNER``)."""
-    at = _hash(st, block)
+    at = block_hash(st, block)
 
     def owner(hotkey: str) -> str | None:
         value = st.substrate.query("SubtensorModule", "Owner", [hotkey], block_hash=at).value

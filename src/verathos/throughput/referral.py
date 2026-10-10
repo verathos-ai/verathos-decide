@@ -41,7 +41,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from verathos.catalog import MAX_PAYOUT_PER_USD, ReferralPool
-from verathos.throughput.usage import Emission, alpha_price_at, coldkeys_at, emission_at, period_blocks
+from verathos.throughput.usage import Emission, alpha_price_at, block_hash, coldkeys_at, emission_at, period_blocks
 
 MICROS = 1_000_000  # micro-USD per USD
 
@@ -235,7 +235,7 @@ def record_of(document: Any) -> ReferralRecord | None:
 
 def owner_at(st: Any, block: int, netuid: int) -> tuple[str | None, str | None]:
     """The subnet owner's hotkey and coldkey at ``block`` (``SubnetOwnerHotkey``, ``SubnetOwner``)."""
-    at = st.substrate.get_block_hash(block)
+    at = block_hash(st, block)
 
     def value(name: str) -> str | None:
         return st.substrate.query("SubtensorModule", name, [netuid], block_hash=at).value or None

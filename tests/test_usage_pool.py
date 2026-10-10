@@ -330,6 +330,41 @@ def test_a_validator_checks_the_burns_and_the_reference_block_its_node_still_hol
     assert contradiction(invented, pruned, 405) is None  # nothing it holds says otherwise
 
 
+
+class Behind(Substrate):
+    """A node that does not hold the blocks after ``head`` yet: no hash for them, and a read without a hash is of its
+    head, where the price has moved since."""
+
+    def __init__(self, head: int) -> None:
+        super().__init__({}, {**STORAGE, "SubnetMovingPrice": {"bits": 34359738}})
+        self.head = head
+
+    def get_block_hash(self, block: int) -> str | None:
+        return super().get_block_hash(block) if block <= self.head else None
+
+    def query(self, module: str, name: str, params: list, block_hash: str | None):
+        return super().query(module, name, params, block_hash or super().get_block_hash(self.head))
+
+    def get_metadata_storage_function(self, module: str, name: str, block_hash: str | None):
+        return name in self.storage
+
+
+def test_a_node_without_the_reference_block_checks_nothing_rather_than_its_head() -> None:
+    """A record's reference block that the node does not hold yet (a lagging node behind a load balancer) is not read
+    at the node's head: that would take the head's price for the block's and refuse a sound record for a whole
+    period. The reads raise, and what cannot be read is not checked."""
+    from verathos.throughput.usage import alpha_price_at, block_hash
+
+    st = SimpleNamespace(substrate=Behind(head=1079))
+    with pytest.raises(LookupError, match="holds no block 1080"):
+        block_hash(st, 1080)
+    with pytest.raises(LookupError):
+        alpha_price_at(st, 1080, 405)
+    cat = with_pool(REVENUE)
+    record = close(2, pool=cat.scoring.usage_pool, cat=cat, epoch_blocks=180, paid={}, coldkeys={}, emission=SN96,
+                   tao_usd=300.0, alpha_tao=0.004)
+    assert record.end_block == 1080 and contradiction(record, st, 405) is None
+
 # ---- the auditor ----
 
 class UsageChain(FakeChain):
