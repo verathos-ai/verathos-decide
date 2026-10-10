@@ -20,7 +20,7 @@ from typing import Any
 import bittensor as bt
 
 from verathos import catalog
-from verathos.subnet.chain import current_catalog
+from verathos.subnet.chain import CHAIN_ERRORS, current_catalog, one_line
 from verathos.throughput.policy import BLOCK_TIME_S, POLICY_WATCH_S
 
 log = logging.getLogger(__name__)
@@ -79,12 +79,17 @@ class CatalogFollower:
             log.warning("keeping the followed catalog in %s failed: %s", self._state_path, exc)
 
     def _wait(self, st: bt.Subtensor) -> catalog.Catalog:
+        """The committed catalog, waited for while it is unavailable or the chain fails the reads (a dropped
+        connection, which the SDK opens again; a node refusing under load)."""
         while True:
             try:
                 return current_catalog(st, self.netuid, self.store, self.mirrors)
             except catalog.CatalogUnavailable as exc:
                 log.error("%s; retrying in 60 s", exc)
-                time.sleep(60)
+            except CHAIN_ERRORS as exc:
+                log.error("the committed catalog could not be read from the chain (%s); retrying in 60 s",
+                          one_line(exc))
+            time.sleep(60)
 
     def accepted(self) -> dict[str, int]:
         """The digests of the catalogs a manifest may be built for, each with its mechanism."""

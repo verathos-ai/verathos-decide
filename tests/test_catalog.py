@@ -171,6 +171,35 @@ def test_the_catalog_follower_connects_again_after_the_chain_failed_it(tmp_path,
     assert follower.follow(st) is st and connections == ["test"] * 3  # kept while it serves
 
 
+
+def test_a_validator_or_gateway_that_starts_waits_for_the_catalog_through_chain_errors(tmp_path, monkeypatch,
+                                                                                      caplog) -> None:
+    """At start the follower reads the committed catalog over the process's connection: a read the chain fails is
+    tried again a minute later, as an unavailable catalog is, where the error ended the start."""
+    import logging
+
+    from verathos.validator import follow
+
+    reads: list[int] = []
+
+    def current_catalog(st, netuid, store, mirrors, block=None) -> catalog.Catalog:
+        reads.append(1)
+        if len(reads) == 1:
+            raise ConnectionError("connection closed")
+        if len(reads) == 2:
+            raise catalog.CatalogUnavailable("the subnet owner has not committed a catalog")
+        return catalog.load()
+
+    slept: list[float] = []
+    monkeypatch.setattr(follow, "current_catalog", current_catalog)
+    monkeypatch.setattr(follow.time, "sleep", slept.append)
+    with caplog.at_level(logging.ERROR, logger="verathos.validator.follow"):
+        follower = follow.CatalogFollower(None, "test", 405, catalog.CatalogStore(tmp_path), [],
+                                          state_path=tmp_path / "followed.json")
+    assert follower.catalog.digest() == catalog.load().digest() and len(reads) == 3 and slept == [60, 60]
+    assert ("the committed catalog could not be read from the chain (ConnectionError: connection closed); retrying "
+            "in 60 s") in caplog.messages
+
 def test_settings_this_code_does_not_know_are_found_before_publishing() -> None:
     document = catalog.load().document()
     mistyped = {**document, "scoring": {**document.get("scoring", {}), "min_model_shares": 0.0},
