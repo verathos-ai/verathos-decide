@@ -71,6 +71,21 @@ def test_canary_pool_is_deterministic_and_assignment_rotates() -> None:
     assert len(a) == 6 and a != assignment(secret, 8, "hk/gpu0", 20, 6)
 
 
+def test_canaries_are_canonical_so_engines_of_any_release_read_one_order() -> None:
+    """A canary's keys are sorted at every level, as the gateway forwards users' requests: the miner and the reference
+    read one order of it, whether or not their engines put a request in canonical order themselves."""
+    def sorted_everywhere(value: object) -> bool:
+        if isinstance(value, dict):
+            return list(value) == sorted(value) and all(sorted_everywhere(v) for v in value.values())
+        return all(sorted_everywhere(v) for v in value) if isinstance(value, list) else True
+
+    pools = [canary_pool(b"s" * 32, epoch, model, 16, limits) for epoch in range(5)
+             for model, limits in (("kev-4b", None), ("clef-flash", ImageLimits()))]
+    canaries = [c for pool in pools for c in pool]
+    assert any("images" in c for c in canaries) and all(len(c["questions"]) >= 2 for c in canaries)
+    assert all(sorted_everywhere(c) for c in canaries)
+
+
 # ---- image canaries ----
 
 IMAGE_QUESTIONS = {"background", "shape", "count", "largest", "tallest", "word"}

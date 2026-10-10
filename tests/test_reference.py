@@ -29,6 +29,7 @@ from verathos.install import validator as validator_setup
 from verathos.install.host import GiB
 from verathos.miner.engine import EngineError, HttpEngine
 from verathos.protocol import tls
+from verathos.protocol.canonical import canonical_json, digest
 from verathos.reference import front
 from verathos.reference.config import ReferenceConfig, api_key, engines_document
 from verathos.validator import __main__ as validator_main
@@ -230,6 +231,32 @@ def test_an_engine_that_does_not_answer_is_a_gateway_error_and_not_up() -> None:
 
     down, large, reachable, why = asyncio.run(run())
     assert (down, large, reachable) == (502, 413, False) and why.startswith("unreachable (ConnectError")
+
+
+def test_an_engine_gets_every_request_in_canonical_order() -> None:
+    """A receipt's request digest is one for every order of the request's keys, and a model reads keys in the order
+    they come: an engine gets the canonical order, from a miner and a validator alike, so its answer is the one the
+    digest names, whatever order the request was sent or recorded in."""
+    sent = {"model": "kev-4b", "state": {"title": "t", "body": {"z": 1, "a": [{"y": 1, "b": 2}]}},
+            "questions": {"q2": {"type": "yes_no", "instructions": "?"}, "q1": {"instructions": "!", "type": "yes_no"}}}
+    received: list[bytes] = []
+
+    def engine_app(request: httpx.Request) -> httpx.Response:
+        received.append(request.content)
+        return httpx.Response(200, json={"model": "kev-4b", "answers": {"q1": {"yes": 0.5, "no": 0.5}}})
+
+    async def run() -> None:
+        engine = HttpEngine("http://127.0.0.1:9")
+        engine._client = httpx.AsyncClient(transport=httpx.MockTransport(engine_app))
+        try:
+            await engine.answer(sent)
+            await engine.answer(json.loads(canonical_json(sent)))
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+    assert received == [canonical_json(sent)] * 2 and digest(sent) == digest(json.loads(received[0]))
+    assert list(json.loads(received[0])["questions"]) == ["q1", "q2"]
 
 
 # ---- placement ----

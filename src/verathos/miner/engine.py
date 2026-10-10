@@ -3,6 +3,11 @@
 An engine takes a SystemOne request body and returns a SystemOne response body. Production engines run as
 separate processes (one per GPU or Mac) and are reached over plain HTTP on the machine's loopback, or over https
 (``engine_tls``); the Kev server (``python -m kev.serve``) is one such engine.
+
+An engine gets a request as canonical JSON (``protocol.canonical``: every object's keys sorted), from a miner and from a
+validator's reference alike. A model reads a state's keys and the questions in the order they come, and a receipt's
+request digest does not tell orders apart: so the answer is the one the digest names, whatever order a caller sent the
+request in or a gateway recorded it in.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from pydantic import ValidationError
 
 from verathos.protocol import tls
 from verathos.protocol.api import SystemOneResponse
+from verathos.protocol.canonical import canonical_json
 
 GATEWAY_ERRORS = (502, 503, 504)
 REFUSED = {401: "refuses the key", 403: "refuses this machine's address", 404: "serves no such engine",
@@ -53,7 +59,7 @@ class HttpEngine:
                  max_connections: int = 256, tls_pin: str | None = None) -> None:
         self._base = base_url.rstrip("/")
         self._url = self._base + "/v1/systemone"
-        self._headers = {"Authorization": f"Bearer {api_key or 'local'}"}
+        self._headers = {"Authorization": f"Bearer {api_key or 'local'}", "Content-Type": "application/json"}
         accepts = engine_tls(self._base, tls_pin)
         limits = httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections)
         if accepts is None:
@@ -92,7 +98,8 @@ class HttpEngine:
 
     async def answer(self, request: dict[str, Any]) -> dict[str, Any]:
         try:
-            r = await self._client.post(self._url, json=request, headers=self._headers, extensions=self._extensions)
+            r = await self._client.post(self._url, content=canonical_json(request), headers=self._headers,
+                                        extensions=self._extensions)
         except httpx.HTTPError as e:
             raise EngineError(f"engine unreachable: {type(e).__name__}{': ' + str(e) if str(e) else ''}") from e
         if r.status_code != 200:
