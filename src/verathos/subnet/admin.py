@@ -207,10 +207,12 @@ def with_auditor(document: dict, validator_config: Path | None) -> dict:
 
 
 def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path | None, store_dir: Path | None,
-                   validator_config: Path | None = None) -> None:
+                   validator_config: Path | None = None, *, change_share: bool = False) -> None:
     """Validate the catalog (with the auditor's pin and egress addresses filled in from ``validator_config`` where it
     names none), put it in the owner validator's catalog store (``store_dir``, by default where that configuration
-    serves catalogs from: ``served_catalog_dir``), then commit its digest."""
+    serves catalogs from: ``served_catalog_dir``), then commit its digest. A catalog whose ``scoring.miner_share``
+    differs from the committed one's is refused unless ``change_share``: a catalog built from the shipped file, whose
+    change has no start, would move the share at once or drop the change under way."""
     store_dir = store_dir if store_dir is not None else served_catalog_dir(validator_config)
     if wallet.hotkey.ss58_address != st.get_subnet_owner_hotkey(netuid):
         raise SystemExit(f"{wallet.hotkey.ss58_address} is not the subnet owner hotkey")
@@ -234,6 +236,11 @@ def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path 
                          "(0 to count - 1): name an existing one, or add it first (setup-mechanisms)")
     store = catalog.CatalogStore(store_dir)
     previous = store.get(committed_catalog(st, netuid) or "")
+    if previous is not None and previous.scoring.miner_share != cat.scoring.miner_share and not change_share:
+        block = st.get_current_block()
+        raise SystemExit(f"this catalog changes scoring.miner_share. Committed: "
+                         f"{miner_share_line(previous, block // previous.epoch_blocks)}. This one: "
+                         f"{miner_share_line(cat, block // cat.epoch_blocks)}. Pass --change-miner-share to commit it")
     if previous is not None and previous.mechanism != cat.mechanism:
         print(f"the network moves from mechanism {previous.mechanism} to {cat.mechanism}: miners publish their "
               "manifests for it within minutes, and validators set weights there from the first epoch scored under "
@@ -268,6 +275,8 @@ def main() -> None:
     commit.add_argument("--catalog-dir", type=Path,
                         help="the owner validator's catalog_dir, where it serves catalogs from (default: the "
                         "catalog_dir of --validator-config, else ~/.verathos/catalog)")
+    commit.add_argument("--change-miner-share", action="store_true",
+                        help="commit a catalog whose scoring.miner_share differs from the committed catalog's")
     commit.add_argument("--validator-config", type=Path, default=Path("~/.verathos/validator.json"),
                         help="the auditor's configuration on this machine, whose certificate (in its state_dir) and "
                         "egress_ips fill in the catalog's auditor section where it names none")
@@ -285,7 +294,7 @@ def main() -> None:
         status(st, args.netuid)
     else:
         commit_catalog(st, bt.Wallet(name=args.wallet, hotkey=args.hotkey), args.netuid, args.file, args.catalog_dir,
-                       args.validator_config)
+                       args.validator_config, change_share=args.change_miner_share)
     st.close()
 
 

@@ -53,9 +53,9 @@ def catalog_file(tmp_path, mechanism: int = 0, auditor: dict | None = AUDITOR, *
     return path
 
 
-def commit(chain: Chain, path, tmp_path, validator_config=None) -> None:
+def commit(chain: Chain, path, tmp_path, validator_config=None, *, change_share: bool = False) -> None:
     admin.commit_catalog(chain, SimpleNamespace(hotkey=SimpleNamespace(ss58_address=OWNER)), 405, path,
-                         tmp_path / "store", validator_config)
+                         tmp_path / "store", validator_config, change_share=change_share)
 
 
 def test_commit_catalog_needs_the_auditors_pin_and_egress_and_the_gateways_egress(tmp_path) -> None:
@@ -145,12 +145,33 @@ def test_commit_catalog_states_the_miner_share_now_and_how_it_changes(tmp_path, 
     assert ("miner share 0.590000 in epoch 1000; the change to 0.15 over 2400 epochs has no start_epoch yet"
             in capsys.readouterr().out)
     path = catalog_file(tmp_path, miner_share={"from": 0.59, "to": 0.15, "start_epoch": 400, "epochs": 2400})
-    commit(chain, path, tmp_path)
+    commit(chain, path, tmp_path, change_share=True)
     assert ("miner share 0.480000 in epoch 1000; 0.59 until epoch 400, then linearly to 0.15 at epoch 2800"
             in capsys.readouterr().out)
     assert chain.commitments[-1] == catalog.commitment_value(catalog.load(path).digest())
-    commit(chain, catalog_file(tmp_path, miner_share=0.8), tmp_path)
+    commit(chain, catalog_file(tmp_path, miner_share=0.8), tmp_path, change_share=True)
     assert "miner share 0.800000 in epoch 1000\n" in capsys.readouterr().out
+
+
+def test_commit_catalog_changes_the_miner_share_only_when_told_to(tmp_path) -> None:
+    """A catalog built from the shipped file (its change without a start) would put the share back to where the
+    change starts, at once: a commit that changes scoring.miner_share takes --change-miner-share; one that keeps it
+    goes through."""
+    chain = Chain()
+    stepping = {"from": 0.59, "to": 0.15, "start_epoch": 400, "epochs": 2400}
+    commit(chain, catalog_file(tmp_path, miner_share=stepping), tmp_path)  # nothing committed before
+    before = list(chain.commitments)
+    with pytest.raises(SystemExit) as refused:
+        commit(chain, catalog_file(tmp_path), tmp_path)  # the shipped share: no start
+    assert str(refused.value) == (
+        "this catalog changes scoring.miner_share. Committed: miner share 0.480000 in epoch 1000; 0.59 until epoch "
+        "400, then linearly to 0.15 at epoch 2800. This one: miner share 0.590000 in epoch 1000; the change to 0.15 "
+        "over 2400 epochs has no start_epoch yet. Pass --change-miner-share to commit it")
+    assert chain.commitments == before
+    commit(chain, catalog_file(tmp_path, miner_share=stepping, canary_pool_size=8), tmp_path)  # the share kept
+    assert len(chain.commitments) == 2
+    commit(chain, catalog_file(tmp_path), tmp_path, change_share=True)
+    assert len(chain.commitments) == 3
 
 
 def test_commit_catalog_states_the_usage_pool_and_refuses_the_owner_coldkey_as_its_buyback(tmp_path, capsys) -> None:
@@ -197,7 +218,7 @@ def test_commit_catalog_needs_the_catalogs_mechanism_on_chain_and_says_when_the_
     commit(chain, catalog_file(tmp_path, mechanism=1), tmp_path)
     out = capsys.readouterr().out
     assert "the network moves from mechanism 0 to 1" in out and len(chain.commitments) == 2
-    commit(chain, catalog_file(tmp_path, mechanism=1, miner_share=0.8), tmp_path)
+    commit(chain, catalog_file(tmp_path, mechanism=1, miner_share=0.8), tmp_path, change_share=True)
     assert "moves" not in capsys.readouterr().out
 
 

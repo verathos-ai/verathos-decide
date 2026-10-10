@@ -245,7 +245,9 @@ To start the step-down, set `start_epoch` to the epoch it starts at, no earlier 
 (each epoch is scored under the catalog committed at its first block; an earlier one makes the share jump), and
 commit the catalog. `status` shows the current epoch and its share, and `commit-catalog` prints the share
 in the current epoch and when the change ends. Keep `start_epoch` and `epochs` in later catalogs, or the share jumps
-to what the new values give; changing `epoch_blocks` renumbers the epochs, so it moves the change too.
+to what the new values give; changing `epoch_blocks` renumbers the epochs, so it moves the change too. A catalog whose
+`miner_share` differs from the committed catalog's is refused unless `--change-miner-share` is given: one built from
+the shipped file, whose change has no `start_epoch`, would put the share back to `from` at once.
 
 ## Usage pool
 
