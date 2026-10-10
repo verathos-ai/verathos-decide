@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import signal
 
 import bittensor  # noqa: F401  (first, as the services import it: it silences the loggers that exist when it loads)
 import pytest
@@ -21,3 +22,13 @@ def lab_network(monkeypatch: pytest.MonkeyPatch) -> None:
     Only the test harness widens the rule; configuration cannot."""
     public = manifest.public_unicast
     monkeypatch.setattr(manifest, "public_unicast", lambda ip: public(ip) or any(ip in n for n in LAB_NETWORKS))
+
+
+@pytest.fixture(autouse=True)
+def runner_signals():
+    """An entry point run in this process installs its stop handlers (``verathos.stop``), which end the process with
+    status 0: the test runner gets its own back, so an interrupt or a timeout's SIGTERM still fails the run."""
+    saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    yield
+    for sig, handler in saved.items():
+        signal.signal(sig, handler)

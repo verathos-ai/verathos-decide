@@ -158,3 +158,17 @@ def test_every_long_running_process_stops_cleanly(tmp_path, role) -> None:
     code, sig = ENTRY_POINTS[role]
     status, err = stopped(tmp_path, textwrap.dedent(HOLD) + textwrap.dedent(code), sig)
     assert status == 0 and f"the {role} stopped ({sig.name})" in err and "Traceback" not in err
+
+
+def test_an_entry_point_run_in_the_test_process_leaves_the_runners_handlers(tmp_path, monkeypatch) -> None:
+    """The tests that run ``main`` in this process install the stop handlers; the ``runner_signals`` fixture puts the
+    runner's back after each test."""
+    from verathos import stop
+
+    stop.on_signals("a test", __import__("logging").getLogger("verathos.test"))
+    assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL
+
+
+def test_the_runners_handlers_are_back_after_a_test_installed_the_stop_handlers() -> None:
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
