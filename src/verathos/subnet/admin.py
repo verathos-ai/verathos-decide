@@ -8,7 +8,8 @@
                       owner's coldkey, it must name the auditor's TLS pin and egress addresses and each gateway's
                       egress addresses, and its models may read only text and, where their engine reads them, images
                       its processor takes as they are; run on the auditor's machine, it fills in the auditor's pin and
-                      egress addresses from the validator's configuration and certificate where the file names none
+                      egress addresses from the validator's configuration and certificate where the file names none,
+                      and stores the catalog in that configuration's catalog_dir, where the validator serves it
 
 The owner coldkey comes from a bittensor wallet (``--wallet``, password prompt) or, for unattended test networks,
 from a mnemonic in the OS keyring (``--keyring SERVICE:USER``).
@@ -159,14 +160,25 @@ def setup_mechanisms(st: bt.Subtensor, kp: Keypair, netuid: int, split: str) -> 
                {"netuid": netuid, "maybe_split": [first, SPLIT_SCALE - first]})
 
 
+def validator_settings(validator_config: Path | None) -> dict:
+    """The auditor's configuration on this machine (``validator_config``), or {} if there is none."""
+    if validator_config is not None and validator_config.expanduser().exists():
+        return json.loads(validator_config.expanduser().read_text())
+    return {}
+
+
+def served_catalog_dir(validator_config: Path | None) -> Path:
+    """Where the owner validator serves catalogs from: the ``catalog_dir`` of its configuration on this machine
+    (``validator_config``), else the default."""
+    return Path(validator_settings(validator_config).get("catalog_dir", catalog.DEFAULT_CACHE_DIR))
+
+
 def with_auditor(document: dict, validator_config: Path | None) -> dict:
     """``document`` with the auditor's pin and egress addresses filled in where it names none, from the auditor's
     configuration on this machine (``validator_config``: its ``egress_ips`` and the certificate in its
     ``state_dir``, created there if the auditor has not yet, so the service then serves it). Refuses a pin that differs
     from the certificate's, and a catalog that ends up without the auditor's pin."""
-    config: dict = {}
-    if validator_config is not None and validator_config.expanduser().exists():
-        config = json.loads(validator_config.expanduser().read_text())
+    config = validator_settings(validator_config)
     state_dir = Path(config.get("state_dir", "~/.verathos/validator"))
     served = tls.stored_pin(state_dir) if config else None
     auditor = dict(document.get("auditor") or {})
@@ -194,10 +206,12 @@ def with_auditor(document: dict, validator_config: Path | None) -> dict:
     return {**document, "auditor": auditor}
 
 
-def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path | None, store_dir: Path,
+def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path | None, store_dir: Path | None,
                    validator_config: Path | None = None) -> None:
     """Validate the catalog (with the auditor's pin and egress addresses filled in from ``validator_config`` where it
-    names none), put it in the owner validator's catalog store, then commit its digest."""
+    names none), put it in the owner validator's catalog store (``store_dir``, by default where that configuration
+    serves catalogs from: ``served_catalog_dir``), then commit its digest."""
+    store_dir = store_dir if store_dir is not None else served_catalog_dir(validator_config)
     if wallet.hotkey.ss58_address != st.get_subnet_owner_hotkey(netuid):
         raise SystemExit(f"{wallet.hotkey.ss58_address} is not the subnet owner hotkey")
     document = json.loads(path.read_text()) if path else catalog.load().document()
@@ -251,8 +265,9 @@ def main() -> None:
     commit.add_argument("--wallet", required=True, help="wallet name of the owner hotkey")
     commit.add_argument("--hotkey", required=True)
     commit.add_argument("--file", type=Path, help="catalog JSON to publish (default: the shipped catalog)")
-    commit.add_argument("--catalog-dir", type=Path, default=catalog.DEFAULT_CACHE_DIR,
-                        help="the owner validator's catalog_dir, where it serves catalogs from")
+    commit.add_argument("--catalog-dir", type=Path,
+                        help="the owner validator's catalog_dir, where it serves catalogs from (default: the "
+                        "catalog_dir of --validator-config, else ~/.verathos/catalog)")
     commit.add_argument("--validator-config", type=Path, default=Path("~/.verathos/validator.json"),
                         help="the auditor's configuration on this machine, whose certificate (in its state_dir) and "
                         "egress_ips fill in the catalog's auditor section where it names none")

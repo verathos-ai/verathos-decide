@@ -101,6 +101,26 @@ def test_commit_catalog_on_the_auditors_machine_fills_in_its_pin_and_egress(tmp_
         chain.commitments[-1].rsplit(":", 1)[1]).auditor.egress == ["9.9.9.9"]  # the file's own egress stays
 
 
+def test_commit_catalog_stores_the_catalog_where_the_auditors_configuration_serves_catalogs(tmp_path) -> None:
+    """A digest committed while the catalog sits where the owner validator does not serve it leaves every node that
+    starts waiting for it: by default the catalog goes to the catalog_dir of the auditor's configuration."""
+    from verathos.protocol import tls
+
+    chain = Chain()
+    state, served = tmp_path / "validator", tmp_path / "served"
+    tls.identity(state)
+    config = tmp_path / "validator.json"
+    config.write_text(json.dumps({"state_dir": str(state), "egress_ips": ["9.9.9.9"], "catalog_dir": str(served)}))
+    wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address=OWNER))
+    admin.commit_catalog(chain, wallet, 405, catalog_file(tmp_path, auditor=None), None, config)
+    digest = chain.commitments[-1].rsplit(":", 1)[1]
+    assert catalog.CatalogStore(served).get(digest) is not None
+    admin.commit_catalog(chain, wallet, 405, catalog_file(tmp_path, auditor=None, miner_share=0.8), tmp_path / "named",
+                         config)
+    assert catalog.CatalogStore(tmp_path / "named").get(chain.commitments[-1].rsplit(":", 1)[1]) is not None
+    assert admin.served_catalog_dir(tmp_path / "missing.json") == catalog.DEFAULT_CACHE_DIR
+
+
 def test_commit_catalog_creates_the_auditors_certificate_when_the_auditor_has_not_yet(tmp_path, capsys) -> None:
     """A catalog change the running auditor cannot read stops it before its service creates a certificate: run on the
     auditor's machine, commit-catalog creates it where the service then finds it."""

@@ -198,8 +198,10 @@ To publish a catalog:
    have and a model's input this code does not serve), fills in `auditor.tls` and `auditor.egress` where the file names
    none, from the auditor's configuration on this machine (`--validator-config`, default `~/.verathos/validator.json`:
    the certificate in its `state_dir` and its `egress_ips`), refuses an `auditor.tls` other than that certificate's,
-   stores the result in the owner validator's `catalog_dir` (`--catalog-dir`, default `~/.verathos/catalog`) and commits
-   its digest. Mirrors (`catalog_mirrors` in miner and validator configs) can serve the same file; every copy is checked
+   stores the result in the owner validator's `catalog_dir` (`--catalog-dir`, default the `catalog_dir` of
+   `--validator-config`, else `~/.verathos/catalog`) and commits its digest. Nodes that start take the committed
+   catalog from there (or a mirror) and wait until they can, so run it as the validator's user, or name its
+   configuration. Mirrors (`catalog_mirrors` in miner and validator configs) can serve the same file; every copy is checked
    against the digest.
 
 Miners and validators check the commitment every minute: miners re-publish their manifests (measuring again if a
