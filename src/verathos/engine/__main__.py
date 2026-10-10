@@ -14,11 +14,13 @@ import logging
 
 import uvicorn
 
+from verathos import stop
 from verathos.engine import code_version
 from verathos.engine.server import create_app
 from verathos.protocol.media import keep_out_of_dumps
 
 FAMILIES = ("clef",)
+log = logging.getLogger("verathos.engine")
 
 
 def main() -> None:
@@ -32,6 +34,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8010)
     args = parser.parse_args()
+    stop.on_signals("the engine", log)
     keep_out_of_dumps()  # users' requests are in memory, their images among them
 
     from verathos.engine import clef

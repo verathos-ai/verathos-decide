@@ -32,7 +32,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI
 
-from verathos import catalog, update
+from verathos import catalog, stop, update
 from verathos.miner import firewall
 from verathos.miner.admission import Admission, RequestBudget
 from verathos.miner.app import caller_request_bytes, create_app
@@ -551,6 +551,7 @@ def main() -> None:
     parser.add_argument("--no-publish", action="store_true",
                         help="Use the shipped catalog and write nothing on chain (local testing)")
     args = parser.parse_args()
+    stop.on_signals("the miner", log)
 
     config = MinerConfig.load(args.config)
     if not args.no_publish and not is_public(config.public_host):

@@ -32,7 +32,7 @@ from typing import Any, NamedTuple
 import bittensor as bt
 import httpx
 
-from verathos import __version__, catalog, release
+from verathos import __version__, catalog, release, stop
 from verathos import update as self_update
 from verathos.engine import code_version
 from verathos.protocol import tls
@@ -619,6 +619,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--once", action="store_true", help="Run one epoch immediately and exit")
     args = parser.parse_args()
+    stop.on_signals("the validator", log)
 
     cfg = ValidatorConfig.load(args.config)
     state_dir = cfg.state_dir.expanduser()

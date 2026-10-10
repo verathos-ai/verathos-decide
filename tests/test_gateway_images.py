@@ -425,6 +425,23 @@ def test_a_decoder_runs_apart_with_limits_and_none_of_the_gateways_secrets(monke
         worker.close()
 
 
+def test_a_decoder_outlives_an_interrupt_meant_for_the_gateway() -> None:
+    """A stop of the gateway reaches its workers too (Ctrl+C, pm2 stopping the process tree): a worker ignores the
+    interrupt, which would leave a traceback in the gateway's log, and ends when the gateway closes it."""
+    import os
+    import signal
+    import time
+
+    worker = _Worker(1 << 30)
+    try:
+        worker.ready(30)
+        os.kill(worker.process.pid, signal.SIGINT)
+        time.sleep(0.5)
+        assert worker.alive()
+    finally:
+        worker.close()
+
+
 def test_a_confined_worker_reads_no_file_makes_no_socket_signals_no_process_and_runs_nothing(tmp_path) -> None:
     import socket
     import subprocess

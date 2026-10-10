@@ -11,6 +11,7 @@ import os
 import sys
 from pathlib import Path
 
+from verathos import stop
 from verathos.protocol import tls
 from verathos.reference import front
 from verathos.reference.config import ReferenceConfig, api_key
@@ -29,6 +30,7 @@ def main() -> None:
                                             "Remove it: verathos-reference uninstall.")
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
+    stop.on_signals("the reference front", log)
 
     config = ReferenceConfig.load(args.config)
     identity = tls.identity(config.state_dir)

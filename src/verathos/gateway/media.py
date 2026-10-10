@@ -410,7 +410,11 @@ def serve(memory_bytes: int) -> None:
     """Take jobs from stdin until it closes, one at a time, confined and under the resource limits (see the module).
     Where it cannot be confined, it returns without its ready mark."""
     import resource
+    import signal
 
+    # A stop of the gateway reaches its workers too (Ctrl+C, pm2 stopping the process tree); the gateway ends them by
+    # closing their input, so an interrupt here would only leave a traceback in its log.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     keep_out_of_dumps()
     from PIL import Image
 

@@ -38,6 +38,7 @@ import uvicorn
 from pydantic import ValidationError
 
 from verathos import catalog as catalog_module
+from verathos import stop
 from verathos.gateway import db
 from verathos.gateway.accounts import Accounts, Conflict
 from verathos.gateway.admin import AccountChange, ByPort, NewAccount, NewCredit, admin_app, read_token
@@ -309,6 +310,7 @@ def main() -> None:
     args = parser.parse_args()
     config = GatewayConfig.load(args.config)
     if args.command == "serve":
+        stop.on_signals("the gateway", log)  # uvicorn takes them while it serves, then raises them again
         run(serve(config))
     elif args.command == "db":
         db.upgrade(config.database_url)
