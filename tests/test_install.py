@@ -898,3 +898,26 @@ def test_a_full_setup_runs_the_references_one_at_a_time_or_as_services_by_the_me
     manager, config, out = run(10, "--references", "sequential")
     assert manager.removed == ["verathos-reference-kev-4b", "verathos-reference-kev-9b"]
     assert config["reference_mode"] == "sequential" and [s.name for s in manager.applied] == [setup.VALIDATOR]
+
+
+def test_a_setup_connects_again_while_the_chain_refuses_it_then_gives_up_with_the_reason(monkeypatch, capsys) -> None:
+    import bittensor as bt
+
+    waits: list[int] = []
+    refusals = iter(["server rejected WebSocket connection: HTTP 429"] * 2)
+
+    def subtensor(network: str):
+        if (refusal := next(refusals, None)) is not None:
+            raise OSError(refusal)
+        return f"connected to {network}"
+
+    monkeypatch.setattr(bt, "Subtensor", subtensor)
+    monkeypatch.setattr(common.time, "sleep", waits.append)
+    assert common.connect("test") == "connected to test" and waits == [5, 15]
+    assert capsys.readouterr().out.count("HTTP 429); trying again in") == 2
+
+    refusals = iter(["server rejected WebSocket connection: HTTP 429"] * 10)
+    waits.clear()
+    with pytest.raises(SystemExit, match="cannot connect to the test chain: server rejected WebSocket connection"):
+        common.connect("test")
+    assert waits == list(common.CONNECT_WAITS_S)

@@ -242,13 +242,20 @@ def register_command(network: str, netuid: int, wallet: str, hotkey: str) -> str
     return f"btcli subnet register --netuid {netuid} --wallet.name {wallet} --wallet.hotkey {hotkey}{extra}"
 
 
+CONNECT_WAITS_S = (5, 15, 30, 60)  # a public node refuses connections for a while under load (HTTP 429)
+
+
 def connect(network: str):
     import bittensor as bt
 
-    try:
-        return bt.Subtensor(network=network)
-    except Exception as exc:
-        raise SystemExit(f"cannot connect to the {network} chain: {exc}") from None
+    for wait in (*CONNECT_WAITS_S, None):
+        try:
+            return bt.Subtensor(network=network)
+        except Exception as exc:
+            if wait is None:
+                raise SystemExit(f"cannot connect to the {network} chain: {exc}") from None
+            warn(f"cannot connect to the {network} chain ({exc}); trying again in {wait} s")
+            time.sleep(wait)
 
 
 # ---- running and waiting ----
