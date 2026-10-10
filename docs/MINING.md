@@ -153,8 +153,9 @@ another choice: --model <id> for every GPU, or one per GPU in order, as in --mod
 ```
 
 Without the network's numbers (the auditor's validator unreachable or of an older release, a status not signed as
-above, or no endpoint scored yet, as on a new subnet), each GPU keeps the model it served before, else takes the
-first active model that fits, and the setup says why in one line.
+above, or no endpoint scored yet, as on a new subnet), each GPU keeps the model it served before, else takes one of
+the active models that fit, spread over them by the hotkey (weighted by their shares of the emission where the
+network's numbers give them), so new miners do not all serve the same model; the setup says why in one line.
 
 The setup never chooses a candidate. `--model` names one model for every GPU (`--model kev-9b`), or one per GPU in
 the order of their numbers, which mixes models on one machine (`--model kev-4b,clef-flash` on two GPUs); `auto`

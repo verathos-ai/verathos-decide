@@ -313,12 +313,13 @@ def init(argv: list[str]) -> None:
     manual = {e["gpu"] for e in record.engines.values() if e.get("manual", e["model"] not in scored)}
     market, why = read_market(st, netuid, wallet.hotkey.ss58_address, set(record.engines), cat)
     info(plan.market_line(market) if market else f"choosing models without the network's numbers: {why}; each GPU "
-         "keeps the model it served before, else takes the first active model that fits")
+         "keeps the model it served before, else one of the active models that fit, spread by the hotkey")
     measured = measured_capacity(Path(existing.get("state_dir", home / "miner")).expanduser(), record.engines,
                                  cat.audit_policy().capacity_margin)
     requested = plan.parse_models(args.model)
     choices = choose_models(ui, gpus, list(models), need, requested, previous, scored, manual=manual, market=market,
-                            measured=measured, relative={m: models[m].relative_speed for m in models})
+                            measured=measured, relative={m: models[m].relative_speed for m in models},
+                            seed=wallet.hotkey.ss58_address)
     chosen = {g: c.model for g, c in choices.items()}
 
     step("Network")

@@ -53,13 +53,15 @@ def models(choices: dict[int, plan.Choice]) -> dict[int, str]:
     return {i: c.model for i, c in choices.items()}
 
 
-def test_without_the_networks_numbers_each_gpu_gets_the_requested_model_or_keeps_its_model_or_the_first_that_fits(
+def test_without_the_networks_numbers_each_gpu_gets_the_requested_model_or_keeps_its_model_or_a_spread_one(
 ) -> None:
     offered = ["kev-4b", "kev-9b"]
     gpus = [gpu(0, 80), gpu(1, 24)]
-    assert models(plan.choose_models(gpus, offered, MINER_NEED, [], {})) == {0: "kev-4b", 1: "kev-4b"}
+    chosen = plan.choose_models(gpus, offered, MINER_NEED, [], {}, seed="5Hotkey")
+    assert chosen == plan.choose_models(gpus, offered, MINER_NEED, [], {}, seed="5Hotkey")  # the same at every setup
+    assert all(c.reason == plan.SPREAD and c.model in offered for c in chosen.values())
     kept = plan.choose_models(gpus, offered, MINER_NEED, [], {0: "kev-9b", 1: "kev-9b"})
-    assert models(kept) == {0: "kev-9b", 1: "kev-4b"} and [c.reason for c in kept.values()] == [plan.BEFORE, plan.FIRST]
+    assert models(kept)[0] == "kev-9b" and [c.reason for c in kept.values()] == [plan.BEFORE, plan.SPREAD]
     assert models(plan.choose_models(gpus[:1], offered, MINER_NEED, ["kev-9b"], {})) == {0: "kev-9b"}
     assert models(plan.choose_models(gpus, offered, MINER_NEED, ["kev-9b", "kev-4b"], {})) == {0: "kev-9b",
                                                                                               1: "kev-4b"}
@@ -110,16 +112,18 @@ def test_the_plan_says_why_each_gpu_serves_its_model_what_else_fits_and_how_to_c
     a100, rtx_4090 = gpu(0, 80), gpu(1, 23.99, "NVIDIA GeForce RTX 4090")
     offer = plan.offer_line(OFFERED, NEED, SCORED)
     assert offer.startswith("models: kev-4b (about 15 GiB), kev-9b (about 26 GiB), clef-flash (about 21 GiB; candidate")
-    first, how = plan.choice_lines([a100], {0: plan.Choice("kev-4b", plan.FIRST)}, OFFERED, NEED, SCORED)
-    assert first == "GPU 0: kev-4b, the first active model that fits. Also fit: kev-9b, clef-flash (candidate)"
+    first, how = plan.choice_lines([a100], {0: plan.Choice("kev-4b", plan.SPREAD)}, OFFERED, NEED, SCORED)
+    assert first == ("GPU 0: kev-4b, spread over the active models that fit, while the network proves no capacity on "
+                     "them. Also fit: kev-9b, clef-flash (candidate)")
     assert how.endswith("one per GPU in order, as in --model kev-9b")
     chosen = {0: plan.Choice("kev-4b", plan.REQUESTED), 1: plan.Choice("clef-flash", plan.REQUESTED)}
     first, second, how = plan.choice_lines([a100, rtx_4090], chosen, OFFERED, NEED, SCORED)
     assert first == "GPU 0: kev-4b, as --model asks. Also fit: kev-9b, clef-flash (candidate)"
     assert second == "GPU 1: clef-flash (candidate), as --model asks. Also fit: kev-4b"
     assert how.endswith("--model kev-9b,clef-flash")
-    first, = plan.choice_lines([gpu(0, 20)], {0: plan.Choice("kev-4b", plan.FIRST)}, OFFERED, NEED, SCORED)
-    assert first == "GPU 0: kev-4b, the first active model that fits. No other catalog model fits"
+    first, = plan.choice_lines([gpu(0, 20)], {0: plan.Choice("kev-4b", plan.SPREAD)}, OFFERED, NEED, SCORED)
+    assert first == ("GPU 0: kev-4b, spread over the active models that fit, while the network proves no capacity on "
+                     "them. No other catalog model fits")
     first, _ = plan.choice_lines([a100], {0: plan.Choice("clef-flash", plan.MANUAL)}, OFFERED, NEED, SCORED)
     assert first.startswith("GPU 0: clef-flash (candidate), as chosen by hand before (--model auto lets the setup "
                             "choose)")
@@ -1022,3 +1026,19 @@ def test_a_container_setup_says_how_its_services_start_again_after_a_restart() -
                                                   "/etc/supervisor/supervisord.conf (a container starts no services "
                                                   "by itself)")
     assert services.Systemd().start_line() is None
+
+
+def test_new_miners_spread_over_the_models_until_the_network_proves_capacity_on_them() -> None:
+    offered = ["kev-4b", "kev-9b"]
+    a100 = [gpu(0, 80)]
+    picks = [plan.choose_models(a100, offered, MINER_NEED, [], {}, seed=f"5Hotkey{n}")[0].model for n in range(200)]
+    assert set(picks) == set(offered) and 60 < picks.count("kev-4b") < 140  # without a market: about even
+    empty = plan.Market(shares={"kev-4b": 0.3, "kev-9b": 0.0}, capacity={}, held={}, median_speed=10.0)
+    weighted = {plan.choose_models(a100, offered, MINER_NEED, [], {}, market=empty, seed=f"5Hotkey{n}")[0].model
+                for n in range(50)}
+    assert weighted == {"kev-4b"}  # in proportion to the shares: none to a model the network pays nothing
+    proven = plan.Market(shares={"kev-4b": 0.3, "kev-9b": 0.3}, capacity={"kev-4b": 500.0}, held={}, median_speed=10.0)
+    paid = plan.choose_models(a100, offered, MINER_NEED, [], {}, market=proven, seed="5Hotkey1",
+                              relative={"kev-4b": 1.0, "kev-9b": 0.7})
+    assert paid[0].reason == plan.PAYS and paid[0].model == "kev-9b"  # once capacity is proven, the market decides
+    assert plan.choose_models(a100, offered, MINER_NEED, ["kev-4b"], {}, seed="5Hotkey1")[0].model == "kev-4b"

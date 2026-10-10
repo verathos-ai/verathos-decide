@@ -3,6 +3,7 @@ reference engine runs (all resident, or one at a time) and which ports the engin
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from statistics import median
@@ -63,12 +64,13 @@ def fitting(models: Iterable[str], need: dict[str, int], gpu: Gpu) -> list[str]:
 AUTO = "auto"  # in --model: the setup chooses that GPU's model
 SWITCH_RATIO = 1.2  # a GPU leaves the model the setup chose for it before only for one paying this many times as much
 ADVICE_RATIO = 1.1  # the plan names a model paying this many times as much as the one a GPU serves
-REQUESTED, ANSWERED, MANUAL, PAYS, KEPT, BEFORE, FIRST = (
-    "requested", "answered", "manual", "pays", "kept", "before", "first")
+REQUESTED, ANSWERED, MANUAL, PAYS, KEPT, BEFORE, SPREAD = (
+    "requested", "answered", "manual", "pays", "kept", "before", "spread")
 BY_HAND = (REQUESTED, ANSWERED, MANUAL)
 WHY = {REQUESTED: "as --model asks", ANSWERED: "as chosen",
        MANUAL: f"as chosen by hand before (--model {AUTO} lets the setup choose)", PAYS: "pays best",
-       KEPT: "as set up before", BEFORE: "as set up before", FIRST: "the first active model that fits"}
+       KEPT: "as set up before", BEFORE: "as set up before",
+       SPREAD: "spread over the active models that fit, while the network proves no capacity on them"}
 
 
 @dataclass
@@ -167,11 +169,25 @@ def _named(model: str, offered: list[str], need: dict[str, int], gpu: Gpu) -> st
     return model
 
 
+def spread(models: list[str], weights: Mapping[str, float], key: str) -> str:
+    """One of ``models``, drawn by ``key`` in proportion to ``weights`` (equal where none is positive): the same for the
+    same key, and spread over the models across keys."""
+    w = [max(weights.get(m, 0.0), 0.0) for m in models]
+    if sum(w) <= 0:
+        w = [1.0] * len(models)
+    point = int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big") / 2**64 * sum(w)
+    for model, part in zip(models, w, strict=True):
+        if point < part:
+            return model
+        point -= part
+    return models[-1]
+
+
 def choose_models(gpus: list[Gpu], offered: list[str], need: dict[str, int], requested: list[str],
                   previous: Mapping[int, str], scored: Collection[str] | None = None, *,
                   manual: Collection[int] = (), answered: Mapping[int, str] | None = None,
                   market: Market | None = None, measured: Mapping[int, tuple[str, float]] | None = None,
-                  relative: Mapping[str, float] | None = None) -> dict[int, Choice]:
+                  relative: Mapping[str, float] | None = None, seed: str = "") -> dict[int, Choice]:
     """The model each GPU serves, and why.
 
     A model named for a GPU is served: ``requested`` (``--model``: one for every GPU, or one per GPU in order),
@@ -181,7 +197,9 @@ def choose_models(gpus: list[Gpu], offered: list[str], need: dict[str, int], req
     of the emission (``Market.pays``), at the GPU's speed (``gpu_speeds``, from this machine's ``measured`` capacity)
     times the model's ``relative`` speed, counting the GPUs given a model before it (those named first, then in
     order), so a machine spreads over models where that pays more; a GPU keeps its ``previous`` model unless another
-    pays ``SWITCH_RATIO`` times as much. Without a market: its previous model, else the first active model that fits.
+    pays ``SWITCH_RATIO`` times as much. Without a market, or while the network proves no capacity on the models a GPU
+    fits (a new network): its previous model, else one of them by ``spread``, so that new miners do not all serve the
+    same model; ``seed`` (the hotkey) makes the choice the same at every setup.
     Candidates (offered, not scored) are served only when named."""
     scored = offered if scored is None else [m for m in offered if m in scored]
     if requested and len(requested) not in (1, len(gpus)):
@@ -230,8 +248,9 @@ def choose_models(gpus: list[Gpu], offered: list[str], need: dict[str, int], req
                             + (f"; with --model it can serve {', '.join(others)} ({CANDIDATE})" if others else ""))
         before = previous.get(gpu.index) if previous.get(gpu.index) in active else None
         found = options(gpu)
-        if market is None:
-            model, reason = (before, BEFORE) if before else (active[0], FIRST)
+        if market is None or not any(market.capacity.get(m, 0.0) > 0 for m in active):
+            weights = market.shares if market is not None else {}
+            model, reason = (before, BEFORE) if before else (spread(active, weights, f"{seed}:{gpu.index}"), SPREAD)
         else:
             pays = found["pays"]
             best = max(active, key=lambda m: pays[m])

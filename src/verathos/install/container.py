@@ -743,13 +743,13 @@ def miner(env: Mapping[str, str], data: Path = DATA, home: Path = ENGINES) -> Ru
     manual = {e["gpu"] for e in record.engines.values() if e.get("manual", e["model"] not in scored)}
     market, why = setup.read_market(st, netuid, hotkey, set(record.engines), cat)
     info(plan.market_line(market) if market else f"choosing models without the network's numbers: {why}; each GPU "
-         "keeps the model it served before, else takes the first active model that fits")
+         "keeps the model it served before, else one of the active models that fit, spread by the hotkey")
     state_dir = data / "miner"
     measured = setup.measured_capacity(state_dir, record.engines, cat.audit_policy().capacity_margin)
     choices = from_options(lambda: setup.choose_models(
         common.Prompter(assume_yes=True), gpus, list(models), need, plan.parse_models(value(env, "MODEL")), previous,
         scored, manual=manual, market=market, measured=measured,
-        relative={m: models[m].relative_speed for m in models}))
+        relative={m: models[m].relative_speed for m in models}, seed=hotkey))
     chosen = {g: c.model for g, c in choices.items()}
 
     step("Network")
