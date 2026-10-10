@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import ipaddress
-import json
 from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from verathos import configfile
 from verathos.protocol.referral import fold, site_origin
 from verathos.protocol.tls import chain_network, https_url
 
@@ -141,4 +141,5 @@ class GatewayConfig(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> GatewayConfig:
-        return cls.model_validate(json.loads(path.read_text()))
+        """The configuration in ``path``; raises SystemExit saying what is wrong, never with the values there."""
+        return configfile.load(cls, path)

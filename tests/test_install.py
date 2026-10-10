@@ -955,3 +955,34 @@ def test_ram_is_what_the_control_group_allows(tmp_path) -> None:
     (group / "memory.limit_in_bytes").write_text("9223372036854771712\n")  # v1's "no limit"
     assert host.memory_available(meminfo, v1, own) == host_ram
     assert host.memory_available(meminfo, v1, tmp_path / "missing") == host_ram
+
+
+def test_an_invalid_configuration_says_what_is_wrong_without_its_values(tmp_path) -> None:
+    """A configuration holds keys (an engine's, a reference's) and the gateway's database password: an invalid one
+    stops the process naming the file and the place, where the validation error showed the values around it."""
+    import json
+
+    from verathos.gateway.config import GatewayConfig
+    from verathos.miner.config import MinerConfig
+    from verathos.validator.config import ValidatorConfig
+
+    secret = "sk-" + "f00d" * 12
+    miner = tmp_path / "miner.json"
+    miner.write_text(json.dumps({"netuid": 96, "wallet_name": "w", "hotkey_name": "h", "public_host": "203.0.113.5",
+                                 "port": "not a port", "endpoints": [{"endpoint_id": "gpu0", "model_id": "kev-4b",
+                                                                      "engine_url": "http://127.0.0.1:8010",
+                                                                      "engine_api_key": secret}]}))
+    validator = tmp_path / "validator.json"
+    validator.write_text(json.dumps({"netuid": 96, "wallet_name": "w", "hotkey_name": "h", "references": {
+        "kev-4b": {"url": "http://10.0.0.7:8101", "api_key": secret}}}))
+    gateway = tmp_path / "gateway.json"
+    gateway.write_text(json.dumps({"netuid": 96, "wallet_name": "w", "hotkey_name": "h", "port": 0,
+                                   "database_url": f"postgresql+asyncpg://gateway:{secret}@127.0.0.1/gateway"}))
+    for model, path, where in ((MinerConfig, miner, "port"), (ValidatorConfig, validator, "references.kev-4b"),
+                               (GatewayConfig, gateway, "port")):
+        with pytest.raises(SystemExit) as stopped:
+            model.load(path)
+        assert str(stopped.value).startswith(f"{path}: {where}") and secret not in str(stopped.value)
+    (tmp_path / "broken.json").write_text('{"netuid": 96,')
+    with pytest.raises(SystemExit, match="broken.json is not JSON: line 1"):
+        MinerConfig.load(tmp_path / "broken.json")

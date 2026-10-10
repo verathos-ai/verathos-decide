@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from verathos import configfile
 from verathos.catalog import Gateway
 from verathos.miner.engine import engine_tls
 from verathos.protocol import tls
@@ -139,4 +139,5 @@ class MinerConfig(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> MinerConfig:
-        return cls.model_validate(json.loads(path.read_text()))
+        """The configuration in ``path``; raises SystemExit saying what is wrong, never with the values there."""
+        return configfile.load(cls, path)

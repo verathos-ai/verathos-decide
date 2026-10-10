@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ipaddress
-import json
 import os
 import secrets
 from pathlib import Path
@@ -12,6 +11,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, field_validator
 
+from verathos import configfile
 from verathos.protocol.manifest import axon_base, public_ip
 from verathos.protocol.tls import loopback_url
 
@@ -76,7 +76,8 @@ class ReferenceConfig(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> ReferenceConfig:
-        return cls.model_validate(json.loads(path.read_text()))
+        """The configuration in ``path``; raises SystemExit saying what is wrong, never with the values there."""
+        return configfile.load(cls, path)
 
     def base_url(self) -> str:
         return axon_base(self.public_host, self.port)

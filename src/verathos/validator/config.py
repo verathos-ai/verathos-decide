@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ipaddress
-import json
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -11,6 +10,7 @@ from urllib.parse import urlsplit
 from bittensor_wallet import Keypair
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from verathos import configfile
 from verathos.miner.engine import HttpEngine, engine_tls
 from verathos.protocol.callers import egress_addresses
 from verathos.protocol.manifest import public_ip
@@ -140,4 +140,5 @@ class ValidatorConfig(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> ValidatorConfig:
-        return cls.model_validate(json.loads(path.read_text()))
+        """The configuration in ``path``; raises SystemExit saying what is wrong, never with the values there."""
+        return configfile.load(cls, path)
