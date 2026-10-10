@@ -62,15 +62,14 @@ def post_json(url: str, body: bytes) -> tuple[int, Any]:
     """POST ``body`` (JSON) to the web app. -> (the status, the answer's JSON or its text)."""
     with tls.sync_client(timeout=30.0) as client:
         r = client.post(url, content=body, headers={"Content-Type": "application/json"},
-                        extensions=tls.use(tls.authenticated(url)))
+                        extensions=tls.use(tls.CA))
     return r.status_code, _answer(r)
 
 
 def get_with_token(url: str, token: str) -> tuple[int, Any]:
     """GET ``url`` of the web app with a view token. -> (the status, the answer's JSON or its text)."""
     with tls.sync_client(timeout=30.0) as client:
-        r = client.get(url, headers={"Authorization": f"Referral {token}"},
-                       extensions=tls.use(tls.authenticated(url)))
+        r = client.get(url, headers={"Authorization": f"Referral {token}"}, extensions=tls.use(tls.CA))
     return r.status_code, _answer(r)
 
 

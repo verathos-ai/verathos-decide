@@ -159,3 +159,31 @@ def test_a_miner_logs_its_part_as_a_referrer_each_epoch() -> None:
         update={"unpaid": "excluded"})})
     assert "  referrals: 5.00 USD referred over the window with alice; not paid this epoch: excluded" in (
         watcher.lines(unpaid))
+
+
+def test_the_web_app_is_reached_only_with_a_public_cas_certificate(monkeypatch) -> None:
+    """The web app's answers are not signed, so its certificate is what tells it from someone on the path, even at an
+    IP address (where documents signed otherwise accept any certificate): the view token goes nowhere else."""
+    from types import SimpleNamespace
+
+    from verathos.protocol import tls
+
+    asked: list[dict] = []
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, **kwargs):
+            asked.append(kwargs["extensions"])
+            return SimpleNamespace(status_code=200, json=lambda: {})
+
+        get = post
+
+    monkeypatch.setattr(cli.tls, "sync_client", lambda **kwargs: Client())
+    cli.post_json("https://203.0.113.7/api/referral/codes", b"{}")
+    cli.get_with_token("https://203.0.113.7/api/referral/dashboard", "token")
+    assert asked == [tls.use(tls.CA)] * 2
