@@ -247,7 +247,7 @@ def add_gateway_routes(app: FastAPI, auditor: Auditor, *, probation: Callable[[]
                 report = ServedReport.model_validate_json(body)
             except ValidationError as e:
                 return JSONResponse({"error": f"invalid report: {e.error_count()} errors"}, status_code=422)
-            return {"taken": await asyncio.to_thread(auditor.accept_served, report.counts, report.report_id)}
+            return {"taken": await asyncio.to_thread(auditor.accept_served, report.counts, report.report_id, gateway)}
 
     @app.post(REFERRALS_PATH)
     async def post_referrals(request: Request):

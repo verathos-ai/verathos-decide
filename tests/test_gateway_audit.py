@@ -389,6 +389,29 @@ def test_what_an_endpoint_answers_the_gateway_during_a_test_counts_as_delivered(
     assert auditor.accept_served([ServedCount(hotkey="unknown", endpoint_id="gpu0", second=start, answered=5)]) == 0
 
 
+def test_served_counts_dated_off_the_auditors_clock_are_logged_as_dropped(tmp_path, caplog) -> None:
+    """A gateway whose clock runs ahead loses every served count it posts (demand, users' answers in tests): the
+    auditor says so, naming the gateway."""
+    import logging
+    import time as time_module
+
+    from verathos.protocol.gateway import ServedCount
+
+    auditor = _auditor(tmp_path)
+    auditor.update_slots([Slot("hk", "gpu0", "https://x/e/gpu0", "kev-4b", 20.0, tls=PIN)])
+    now = int(time_module.time())
+    ahead = [ServedCount(hotkey="hk", endpoint_id="gpu0", second=now + 30 + i, answered=3) for i in range(4)]
+    with caplog.at_level(logging.WARNING, logger="verathos.throughput.auditor"):
+        assert auditor.accept_served(ahead, gateway="5Gateway") == 0
+    assert "served counts of gateway 5Gateway dropped: 4 dated" in caplog.text and "check both clocks" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="verathos.throughput.auditor"):
+        assert auditor.accept_served([ServedCount(hotkey="hk", endpoint_id="gpu0", second=now - 2, answered=3),
+                                      ServedCount(hotkey="other", endpoint_id="gpu0", second=now + 60, answered=1)],
+                                     gateway="5Other") == 1
+    assert "dropped" not in caplog.text  # unknown endpoints are not about clocks
+
+
 def test_answers_to_users_in_a_test_count_once_the_gateways_sample_of_them_is_checked(tmp_path) -> None:
     """An endpoint cannot answer users with junk while a test runs and give the test its GPU: its answers to users in
     the test count as delivered only once the gateways' sample of them passes the check; a wrong one is evidence, and

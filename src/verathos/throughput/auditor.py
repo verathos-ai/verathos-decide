@@ -1534,11 +1534,13 @@ class Auditor:
 
     # ---- gateway served counts ----
 
-    def accept_served(self, counts: list[ServedCount], report_id: str = "") -> int:
+    def accept_served(self, counts: list[ServedCount], report_id: str = "", gateway: str = "") -> int:
         """Add what the gateway's endpoints answered per second (known endpoints, recent seconds), their input tokens
         to the epoch's demand per model, and their offers, refusals and durations to the epoch's user tallies;
-        -> counts taken. A report is taken once: a gateway posting it again (its answer was lost) adds nothing."""
-        now, taken = time.time(), 0
+        -> counts taken. A report is taken once: a gateway posting it again (its answer was lost) adds nothing. Counts
+        of known endpoints dated ahead of this host's clock, or older than ``SERVED_KEEP_S``, are logged: the two
+        clocks differ."""
+        now, taken, untimely = time.time(), 0, []
         if report_id:
             with self._demand_lock:
                 if report_id in self._reports:
@@ -1552,7 +1554,10 @@ class Auditor:
             demand, users = self._demand.setdefault(epoch, {}), self._users.setdefault(epoch, {})
             for c in counts:
                 key = (c.hotkey, c.endpoint_id)
-                if key not in model_of or not now - SERVED_KEEP_S <= c.second <= now + 5:
+                if key not in model_of:
+                    continue
+                if not now - SERVED_KEEP_S <= c.second <= now + 5:
+                    untimely.append(c.second - now)
                     continue
                 if c.answered or c.attempts:
                     second = self._served.setdefault(key, {}).setdefault(c.second, [0, 0])
@@ -1577,6 +1582,10 @@ class Auditor:
                     del per[second]
                 if not per:
                     del self._served[key]
+        if untimely and (times := _throttled(f"untimely served counts {gateway}")):
+            log.warning("served counts of gateway %s dropped: %d dated %.0f to %.0f s from this host's clock, beyond "
+                        "what is taken (%d s back, 5 s ahead): check both clocks (%d times since last logged)",
+                        gateway or "?", len(untimely), min(untimely), max(untimely), SERVED_KEEP_S, times)
         return taken
 
     def served_in(self, hotkey: str, endpoint_id: str, start_s: float, end_s: float, *,

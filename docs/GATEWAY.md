@@ -217,7 +217,9 @@ view of the miners does not take a model off the gateway. Once the current table
    | `state_dir`, `catalog_dir` | `~/.verathos/gateway`, `~/.verathos/catalog` | last routes, catalogs |
 
 6. Schema: `verathos-gateway --config gateway.json db upgrade` (after every update; the gateway does not start on
-   an older schema).
+   an older schema). Keep the machine's clock synchronised (NTP), as the auditor's: miners refuse requests signed
+   more than 60 s off their clock, which the gateway counts against them, and the auditor drops served counts dated
+   more than 5 s ahead of its own (it logs `served counts of gateway ... dropped`).
 7. Run `verathos-gateway --config gateway.json serve` under a supervisor, behind a reverse proxy that terminates
    TLS, as an active and a standby process (below). `GET /ready` answers 200 once the gateway has routes and finds
    its hotkey among the catalog's gateways. Every request holds a connection from the proxy and one to a miner: at
