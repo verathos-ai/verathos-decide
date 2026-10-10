@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/verathos-ai/verathos-decide/security/policy
+    about: Report it privately, as SECURITY.md says; never in a public issue.
+  - name: Running a miner or a validator
+    url: https://github.com/verathos-ai/verathos-decide#documentation
+    about: Mining, validating, Docker, scoring and the throughput audit.

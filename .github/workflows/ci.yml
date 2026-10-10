@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ruff:
+    name: ruff
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - run: uvx ruff@0.16.10 check src tests scripts
+
+  pytest:
+    name: pytest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      # The firewall's tests run nft in a user and network namespace, which Ubuntu 24.04 restricts with AppArmor.
+      - name: nftables in unprivileged namespaces
+        run: |
+          [ -x /usr/sbin/nft ] || { sudo apt-get update && sudo apt-get install -y --no-install-recommends nftables; }
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Environment
+        run: |
+          uv venv -p 3.12 .venv
+          VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway,test,clef]" --torch-backend cpu
+      # The Clef engine's tests read the pinned clef-flash release's code, tokenizer and configs, not its weights.
+      - name: clef-flash release files
+        run: |
+          .venv/bin/python - <<'EOF'
+          from huggingface_hub import snapshot_download
+          from verathos import catalog
+          model = catalog.load().get("clef-flash")
+          snapshot_download(model.hf_repo, revision=model.hf_revision, allow_patterns=["*.py", "*.json", "*.jinja"])
+          EOF
+      # The end-to-end throughput tests drive in-process miners with the load generator.
+      - name: Load generator
+        run: |
+          (cd native/loadgen && rustup toolchain install --no-self-update)
+          .venv/bin/verathos-build-loadgen
+      - run: .venv/bin/python -m pytest -q -rs
+
+  cargo-test:
+    name: cargo-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: native/loadgen
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update
+      - run: cargo test --locked

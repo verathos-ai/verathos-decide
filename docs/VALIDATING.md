@@ -491,7 +491,7 @@ The validator uses the new engines from its next epoch.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone https://github.com/verathos-ai/verathos-decide && cd verathos-decide
+git clone --branch main https://github.com/verathos-ai/verathos-decide && cd verathos-decide
 uv venv -p 3.12 .venv
 VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain]"
 ```

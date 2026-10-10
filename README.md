@@ -107,7 +107,7 @@ docs/
 
 ```bash
 uv venv -p 3.12 .venv
-VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway,test]" ruff
+VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway,test]" ruff==0.16.10
 .venv/bin/python -m pytest
 .venv/bin/ruff check src tests scripts
 (cd native/loadgen && cargo test)
@@ -117,6 +117,9 @@ The test suite runs on CPU. It includes an end-to-end throughput test (miners, a
 in-process miners. The Clef engine's tests also need the `clef` extra and the pinned clef-flash release's code,
 tokenizer and configs in the Hugging Face cache (not its weights), and the gateway's image tests Linux with Landlock,
 as the gateway's image decoders do; without them they are skipped.
+
+Pull requests go to the `dev` branch: [Contributing](CONTRIBUTING.md). Vulnerabilities are reported privately:
+[Security](SECURITY.md).
 
 ## License
 
