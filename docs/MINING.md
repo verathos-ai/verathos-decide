@@ -752,11 +752,25 @@ verathos-miner referral dashboard --config miner.json    # a link to the referra
 code alice registered for 5F...: https://<site>/r/alice
 ```
 
-A hotkey that runs no miner names itself instead: `--wallet <wallet> --hotkey <hotkey> --netuid 96`. A hotkey holds at
-most 3 codes; a readable code is 4 to 24 characters of a-z, digits and single hyphens starting with a letter, unique
-however it is written (`a1ice` is `alice`), and may not name the network, a model or an official role. Codes cannot be
-deleted, sold or given to another coldkey. To bring them to another hotkey of the same coldkey (a new hotkey, a new
-registration), run on the machine of the new one: `verathos-miner referral move --from <old hotkey>`.
+A hotkey that runs no miner needs no GPU, no checkout and nothing running afterwards: on any machine that holds
+the hotkey (and `coldkeypub.txt`), with [uv](https://docs.astral.sh/uv/getting-started/installation/), one command
+registers a code:
+
+```bash
+uvx --from git+https://github.com/verathos-ai/verathos-decide verathos-miner referral code alice \
+    --wallet <wallet> --hotkey <hotkey> --netuid 96 --site https://verathos.ai
+```
+
+`status` and `dashboard` work the same way; the pool's part in `status` reads the chain, for which add
+`--with bittensor==10.5.0` after `uvx` (the dashboard shows it without). The hotkey must stay registered: once the
+subnet is full, a new registration replaces the UID with the lowest emission that is out of its immunity period,
+so a referrer whose users top up nothing can lose its UID, and its codes with it until moved to a new hotkey of the
+same coldkey.
+
+A hotkey holds at most 3 codes; a readable code is 4 to 24 characters of a-z, digits and single hyphens starting with a
+letter, unique however it is written (`a1ice` is `alice`), and may not name the network, a model or an official role.
+Codes cannot be deleted, sold or given to another coldkey. To bring them to another hotkey of the same coldkey (a new
+hotkey, a new registration), run on the machine of the new one: `verathos-miner referral move --from <old hotkey>`.
 
 `status` prints, per code, its link and the accounts it referred, then what they topped up, refunded and counted
 over the last days, and from the auditor's signed status the hotkey's referred sum over the window, its share of the

@@ -27,7 +27,7 @@ clef = ["torch>=2.10,<2.11", "torchvision", "transformers>=5.10,<6", "huggingfac
         "pillow>=12.3,<12.4", "fastapi>=0.115", "uvicorn>=0.30"]
 
 [project.scripts]
-verathos-miner = "verathos.miner.__main__:main"
+verathos-miner = "verathos.miner.cli:main"
 verathos-validator = "verathos.validator.__main__:main"
 verathos-reference = "verathos.reference.__main__:main"
 verathos-build-loadgen = "verathos.throughput.loadgen:build"

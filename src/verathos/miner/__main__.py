@@ -534,11 +534,6 @@ def main() -> None:
 
         firewall_setup.main(sys.argv[2:])
         return
-    if sys.argv[1:2] == ["referral"]:
-        from verathos.miner import referral
-
-        referral.main(sys.argv[2:])
-        return
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(epilog="Set up this machine as a miner: verathos-miner init. Remove it: "

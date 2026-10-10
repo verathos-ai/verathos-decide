@@ -137,10 +137,10 @@ def test_the_command_names_the_hotkey_and_the_site_and_refuses_what_is_not_a_cod
                                                  "engine_url": "http://127.0.0.1:8008"}]}))
     from types import SimpleNamespace
 
-    import bittensor as bt
+    import bittensor_wallet
 
     miner = kp()
-    monkeypatch.setattr(bt, "Wallet", lambda name, hotkey: SimpleNamespace(hotkey=miner))
+    monkeypatch.setattr(bittensor_wallet, "Wallet", lambda name, hotkey: SimpleNamespace(hotkey=miner))
     with pytest.raises(SystemExit) as done:
         cli.main(["dashboard", "--config", str(config), "--hours", "2"])
     assert done.value.code == 0 and capsys.readouterr().out.startswith(f"{SITE}/referrals#")
@@ -187,3 +187,27 @@ def test_the_web_app_is_reached_only_with_a_public_cas_certificate(monkeypatch) 
     cli.post_json("https://203.0.113.7/api/referral/codes", b"{}")
     cli.get_with_token("https://203.0.113.7/api/referral/dashboard", "token")
     assert asked == [tls.use(tls.CA)] * 2
+
+
+def test_the_referral_commands_run_without_the_bittensor_sdk(monkeypatch, capsys) -> None:
+    import sys
+
+    from verathos.miner import cli
+
+    for name in [m for m in sys.modules if m == "bittensor" or m.startswith("bittensor.")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setitem(sys.modules, "bittensor", None)  # importing it fails: uvx installs the base package only
+    monkeypatch.setattr(sys, "argv", ["verathos-miner", "referral", "--help"])
+    with pytest.raises(SystemExit) as exit_:
+        cli.main()
+    assert exit_.value.code == 0 and "code" in capsys.readouterr().out
+    from pathlib import Path
+
+    from verathos.miner import referral
+
+    status, why = referral.auditor_status("test", 405, "5Hotkey", Path("/nonexistent"), [])
+    assert status is None and "--with bittensor==" in why  # the site's figures stay; how to get the pool part
+    monkeypatch.delitem(sys.modules, "verathos.miner.__main__", raising=False)  # as in a fresh process
+    monkeypatch.setattr(sys, "argv", ["verathos-miner", "status"])
+    with pytest.raises(ImportError):  # every other command is the miner's, which needs it
+        cli.main()

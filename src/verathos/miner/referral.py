@@ -167,8 +167,13 @@ def status_lines(hotkey: str, site: str, figures: dict[str, Any] | None, status:
 
 def auditor_status(network: str, netuid: int, hotkey: str, catalog_dir: Path,
                    mirrors: list[str]) -> tuple[HotkeyStatus | None, str | None]:
-    """The hotkey's status at the auditor, signed by the subnet owner hotkey. -> (status, why there is none)."""
-    import bittensor as bt
+    """The hotkey's status at the auditor, signed by the subnet owner hotkey. -> (status, why there is none). Finding
+    the auditor reads the chain, which needs the Bittensor SDK (the ``chain`` extra)."""
+    try:
+        import bittensor as bt
+    except ImportError:
+        return None, ("reading the chain needs the Bittensor SDK: with uvx add --with bittensor==10.5.0; the "
+                      "dashboard link (referral dashboard) shows the pool part without it")
 
     from verathos.catalog import CatalogStore
     from verathos.protocol.http import get_json
@@ -230,9 +235,9 @@ def main(argv: list[str]) -> None:
         parser.error("move needs --from <the hotkey whose codes move here>")
     if not 0 < args.hours <= 24 or not 1 <= args.days <= 400:
         parser.error("--hours is at most 24, --days 1 to 400")
-    import bittensor as bt
+    from bittensor_wallet import Wallet  # the base package's: no Bittensor SDK needed
 
-    keypair = bt.Wallet(name=wallet, hotkey=hotkey).hotkey
+    keypair = Wallet(name=wallet, hotkey=hotkey).hotkey
     sys.exit(run(args, keypair, netuid, network, site, catalog_dir, mirrors))
 
 
