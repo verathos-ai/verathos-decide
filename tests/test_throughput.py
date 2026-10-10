@@ -1165,3 +1165,28 @@ def test_the_auditors_slot_refresh_connects_again_after_the_chain_failed_it(tmp_
     st = throughput.slot_round(st, "test", dict)
     assert st is chain and updated == [5]
     assert throughput.slot_round(st, "test", dict) is chain and len(attempts) == 2 and updated == [5, 5]
+
+
+def test_the_auditors_own_verdicts_failing_in_its_store_are_an_unavailable_feed(monkeypatch, caplog) -> None:
+    """The auditor reads its verdicts from its own store: the store failing (a full disk) is an unavailable feed, as
+    the auditor's service failing is for other validators, so the epoch is scored without them (or with the last
+    ones), where the error failed the epoch and the validator ran its canaries again every block."""
+    import logging
+    import sqlite3
+    from types import SimpleNamespace
+
+    from verathos.throughput import feed
+    from verathos.validator import throughput as throughput_module
+
+    def full(epoch: int):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(throughput_module, "VERDICTS_WAIT_S", 0.0)
+    validator = Throughput(netuid=405, policy=AuditPolicy(), auditor_hotkey="5Auditor", chain=None,
+                           auditor=SimpleNamespace(verdicts=full))
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(validator.verdicts(None, 50)) is None
+    assert "throughput verdicts for epoch 50 unavailable: OperationalError: database or disk is full" in caplog.text
+    last = feed.Verdicts(netuid=405, auditor="5Auditor", epoch=49, credits=[], invalid=[])
+    validator._last = last
+    assert asyncio.run(validator.verdicts(None, 50)) is last

@@ -175,7 +175,10 @@ class Throughput:
 
     async def _fetch(self, client: httpx.AsyncClient, epoch: int) -> feed.Verdicts:
         if self.auditor is not None:
-            signed = self.auditor.verdicts(epoch)
+            try:
+                signed = self.auditor.verdicts(epoch)
+            except Exception as exc:  # its store failing (a full disk) is an unavailable feed too, not a failed epoch
+                raise feed.VerdictsUnavailable(f"{type(exc).__name__}: {exc}") from None
             if signed is None:
                 raise feed.VerdictsUnavailable("the epoch's tests are not settled yet")
             return signed.verdicts
