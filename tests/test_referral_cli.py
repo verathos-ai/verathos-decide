@@ -205,6 +205,7 @@ def test_the_referral_commands_run_without_the_bittensor_sdk(monkeypatch, capsys
 
     from verathos.miner import referral
 
+    monkeypatch.delitem(sys.modules, "verathos.subnet.chain", raising=False)  # as in a fresh process
     status, why = referral.auditor_status("test", 405, "5Hotkey", Path("/nonexistent"), [])
     assert status is None and "--with bittensor==" in why  # the site's figures stay; how to get the pool part
     monkeypatch.delitem(sys.modules, "verathos.miner.__main__", raising=False)  # as in a fresh process

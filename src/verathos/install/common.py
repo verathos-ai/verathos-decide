@@ -246,11 +246,11 @@ CONNECT_WAITS_S = (5, 15, 30, 60)  # a public node refuses connections for a whi
 
 
 def connect(network: str):
-    import bittensor as bt
+    from verathos.subnet.chain import subtensor
 
     for wait in (*CONNECT_WAITS_S, None):
         try:
-            return bt.Subtensor(network=network)
+            return subtensor(network)
         except Exception as exc:
             if wait is None:
                 raise SystemExit(f"cannot connect to the {network} chain: {exc}") from None

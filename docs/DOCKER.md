@@ -136,7 +136,7 @@ the validator there. It keeps its certificate and key across restarts and update
 | `COMPOSE_FILE` | | the role's compose file |
 | `IMAGE_REGISTRY`, `VERATHOS_VERSION` | `ghcr.io/verathos-ai`, - | the images: registry and owner (`local`: the ones `docker/build.sh` built on this machine), and the release |
 | `DATA_DIR` | `./data` | configuration, state and weights |
-| `NETWORK`, `NETUID` | `finney`, 96 | `test` (405), or a `wss://` subtensor node |
+| `NETWORK`, `NETUID` | `finney`, 96 | `test` (405), a `wss://` subtensor node, or several separated by commas, the first used while it answers |
 | `WALLETS_DIR`, `WALLET`, `HOTKEY` | `~/.bittensor/wallets`, -, `default` | the wallet whose hotkey and `coldkeypub.txt` the container reads |
 | `PUBLIC_IP`, `PORT` | detected; 8091 (miner, validator), 8443 (reference machine) | the address callers reach this machine at, and its port |
 | `HF_TOKEN` | | a Hugging Face token for the downloads |

@@ -20,7 +20,7 @@ from typing import Any
 import bittensor as bt
 
 from verathos import catalog
-from verathos.subnet.chain import CHAIN_ERRORS, current_catalog, one_line
+from verathos.subnet.chain import CHAIN_ERRORS, current_catalog, one_line, subtensor
 from verathos.throughput.policy import BLOCK_TIME_S, POLICY_WATCH_S
 
 log = logging.getLogger(__name__)
@@ -114,7 +114,7 @@ class CatalogFollower:
         follow it if it changed; the current one stays while a new one is unavailable. -> the connection for the next
         round: None after a failure, so the next round connects again."""
         try:
-            st = st or bt.Subtensor(network=self.network)
+            st = st or subtensor(self.network)
             new = current_catalog(st, self.netuid, self.store, self.mirrors)
         except Exception as exc:
             log.error("committed catalog unavailable, keeping %s: %s", self.catalog.digest()[:12], exc)

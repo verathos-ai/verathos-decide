@@ -24,6 +24,7 @@ from verathos.miner.engine import Engine
 from verathos.protocol import tls
 from verathos.protocol.manifest import Endpoint
 from verathos.protocol.receipts import issued_receipt, parse_response, signed_answers
+from verathos.subnet.chain import subtensor
 from verathos.throughput import feed
 from verathos.throughput.auditor import Auditor, Slot
 from verathos.throughput.chain import SubtensorChainView
@@ -117,7 +118,7 @@ class Throughput:
         """One round of ``start_slot_refresh`` over ``st`` (connecting first without one). -> the connection for the
         next round: None after a failure, so the next round connects again."""
         try:
-            st = st or bt.Subtensor(network=network)
+            st = st or subtensor(network)
             neurons, _ = validator_chain.snapshot(st, self.netuid)
             epoch = st.get_current_block() // self.policy.epoch_blocks
             self.update_slots(asyncio.run(self._refresh(neurons, catalogs(), epoch)), neurons, epoch)

@@ -47,6 +47,7 @@ from verathos.miner.config import MinerConfig
 from verathos.miner.nftables import FirewallError
 from verathos.protocol.callers import Caller, allowlist, validator_identity
 from verathos.protocol.manifest import is_public
+from verathos.subnet.chain import subtensor
 from verathos.throughput.policy import BLOCK_TIME_S
 
 log = logging.getLogger("verathos.miner")
@@ -583,7 +584,7 @@ def chain_neurons(network: str, netuid: int) -> Callable[[], Sequence[Neuron]]:
 
     def read() -> Sequence[Neuron]:
         try:
-            connection[0] = connection[0] or bt.Subtensor(network=network)
+            connection[0] = connection[0] or subtensor(network)
             return snapshot(connection[0], netuid)[0]
         except Exception:
             connection[0] = None

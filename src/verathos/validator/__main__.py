@@ -38,7 +38,7 @@ from verathos.engine import code_version
 from verathos.protocol import tls
 from verathos.protocol.callers import ValidatorIdentity
 from verathos.protocol.manifest import axon_base
-from verathos.subnet.chain import CHAIN_ERRORS, connect, one_line
+from verathos.subnet.chain import CHAIN_ERRORS, connect, one_line, subtensor
 from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.throughput.referral import contradiction as referral_contradiction
@@ -598,7 +598,7 @@ def watch_egress(cfg: ValidatorConfig, wallet: bt.Wallet, current: CatalogFollow
         watch = egress_module.Egress(named, None, publish, detect_public_ip)
     else:
         def publish(identity: ValidatorIdentity) -> None:
-            st = bt.Subtensor(network=cfg.network)  # its own: the epoch loop holds the other
+            st = subtensor(cfg.network)  # its own: the epoch loop holds the other
             try:
                 chain.publish_identity(st, wallet, cfg.netuid, identity)
             finally:

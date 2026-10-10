@@ -13,6 +13,7 @@ from typing import Any
 import bittensor as bt
 
 from verathos.protocol.manifest import axon_base
+from verathos.subnet.chain import subtensor
 from verathos.throughput import referral, usage
 
 log = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ class SubtensorChainView:
 
     def _st(self) -> bt.Subtensor:
         if self._subtensor is None:
-            self._subtensor = bt.Subtensor(network=self._network)
+            self._subtensor = subtensor(self._network)
         return self._subtensor
 
     def _rpc(self, method: str, params: list) -> object:

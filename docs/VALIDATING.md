@@ -184,7 +184,7 @@ curl -LsSf https://raw.githubusercontent.com/verathos-ai/verathos-decide/main/sc
 | `--dry-run` | compute weights without setting them; `--no-dry-run` sets them again |
 | `--egress-ip` | full: a public address its requests to miners come from (repeat for several); default: as configured, else the machine's detected public IPv4 address |
 | `--remote-engines` | full: the file a reference machine writes: its references, and the auditor's screens, replace local ones ([Engines on a GPU machine of their own](#engines-on-a-gpu-machine-of-their-own)); repeat for several machines; a later run keeps them, `''` removes them |
-| `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), a `wss://` subtensor node, or a node on this machine (`local`, `ws://127.0.0.1:<port>`) |
+| `--network`, `--netuid` | `finney` and 96 by default; `test` (netuid 405), a `wss://` subtensor node, or a node on this machine (`local`, `ws://127.0.0.1:<port>`); several separated by commas, the first used while it answers (`wss://<your node>,finney`) |
 | `--no-auto-update` | the validator does not update its code by itself to each new release; `--auto-update` turns that on again (off for the subnet owner's validator) ([Update](#update)) |
 | `--no-service` | no root, no system packages and no services: print the commands to run under a process manager you run ([Without root](#without-root-pm2-or-another-process-manager)) |
 | `--source`, `--ref`, `--dir` | as for miners (`MINING.md`) |

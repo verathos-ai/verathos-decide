@@ -40,3 +40,23 @@ def test_an_error_that_is_no_refusal_by_the_chain_stops_the_start(monkeypatch) -
     monkeypatch.setattr(bt, "Subtensor", subtensor)
     with pytest.raises(ValueError, match="not a network"):
         chain.connect("finny", sleep=lambda s: pytest.fail("tried again"))
+
+
+def test_a_network_can_name_several_nodes_the_first_used_while_it_answers(monkeypatch) -> None:
+    import bittensor as bt
+    from bittensor.core.settings import NETWORK_MAP
+
+    from verathos.protocol.tls import chain_network
+    from verathos.subnet import chain as subnet_chain
+
+    assert chain_network("wss://node.example.org:443,finney") == "wss://node.example.org:443,finney"
+    assert chain_network("finney") == "finney"
+    for refused in ("wss://node.example.org,ws://203.0.113.5:9944", "finney,", "ws://203.0.113.5:9944"):
+        with pytest.raises(ValueError, match="wss://"):
+            chain_network(refused)
+    made = []
+    monkeypatch.setattr(bt, "Subtensor", lambda **kw: made.append(kw) or "client")
+    assert subnet_chain.subtensor("wss://node.example.org:443, finney") == "client"
+    assert made == [{"network": "wss://node.example.org:443", "fallback_endpoints": [NETWORK_MAP["finney"]]}]
+    subnet_chain.subtensor("finney")
+    assert made[-1] == {"network": "finney"}  # one network: the client as before

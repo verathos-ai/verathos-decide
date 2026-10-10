@@ -29,6 +29,17 @@ def one_line(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
+def subtensor(network: str) -> bt.Subtensor:
+    """A client for ``network``: one network (a name or a URL), or several separated by commas, the first used while
+    it answers and the others in turn when it does not (an operated node first, then a public one)."""
+    from bittensor.core.settings import NETWORK_MAP
+
+    first, *rest = [part.strip() for part in network.split(",")]
+    if not rest:
+        return bt.Subtensor(network=first)
+    return bt.Subtensor(network=first, fallback_endpoints=[NETWORK_MAP.get(n, n) for n in rest])
+
+
 def connect(network: str, *, sleep: Callable[[float], None] = time.sleep) -> bt.Subtensor:
     """A connection to the chain for a process that runs on. While the node refuses one (a public node answers HTTP 429
     under load) or cannot be reached, it is tried again after 5, 15 and 30 s, then every 60 s, each failure logged in
@@ -36,7 +47,7 @@ def connect(network: str, *, sleep: Callable[[float], None] = time.sleep) -> bt.
     that exits within seconds of its start ten times in a row."""
     for attempt in itertools.count():
         try:
-            return bt.Subtensor(network=network)
+            return subtensor(network)
         except CHAIN_ERRORS as exc:
             wait = CONNECT_WAITS_S[min(attempt, len(CONNECT_WAITS_S) - 1)]
             log.warning("cannot connect to the %s chain (%s); trying again in %d s", network, one_line(exc), wait)

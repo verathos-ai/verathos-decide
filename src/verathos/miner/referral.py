@@ -170,7 +170,7 @@ def auditor_status(network: str, netuid: int, hotkey: str, catalog_dir: Path,
     """The hotkey's status at the auditor, signed by the subnet owner hotkey. -> (status, why there is none). Finding
     the auditor reads the chain, which needs the Bittensor SDK (the ``chain`` extra)."""
     try:
-        import bittensor as bt
+        from verathos.subnet.chain import subtensor  # the Bittensor SDK's
     except ImportError:
         return None, ("reading the chain needs the Bittensor SDK: with uvx add --with bittensor==10.5.0; the "
                       "dashboard link (referral dashboard) shows the pool part without it")
@@ -180,7 +180,7 @@ def auditor_status(network: str, netuid: int, hotkey: str, catalog_dir: Path,
     from verathos.protocol.status import MAX_STATUS_BYTES, STATUS_DOMAIN, STATUS_PATH, unverified
     from verathos.subnet.chain import axon_url, current_catalog
 
-    st = bt.Subtensor(network=network)
+    st = subtensor(network)
     try:
         owner = st.get_subnet_owner_hotkey(netuid)
         url = axon_url(st, netuid, owner)

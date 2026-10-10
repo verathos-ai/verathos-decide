@@ -55,7 +55,7 @@ from verathos.protocol.manifest import (
 )
 from verathos.protocol.media import ImageLimits
 from verathos.protocol.status import ThroughputOutcome
-from verathos.subnet.chain import CHAIN_ERRORS, committed_catalog, connect, current_catalog, one_line
+from verathos.subnet.chain import CHAIN_ERRORS, committed_catalog, connect, current_catalog, one_line, subtensor
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.follow import ScheduleFollower
 from verathos.throughput.measure import (
@@ -422,7 +422,7 @@ class Publisher:
         On-chain publication is retried until it succeeds. -> the chain connection for the next round (None after a
         failure: a new one then)."""
         try:
-            st = st or bt.Subtensor(network=self.config.network)
+            st = st or subtensor(self.config.network)
             if committed_catalog(st, self.config.netuid) != self.catalog.digest():
                 cat = current_catalog(st, self.config.netuid, store, self.config.catalog_mirrors)
                 if self.adopt(cat):

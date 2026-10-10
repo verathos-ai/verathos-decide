@@ -156,7 +156,7 @@ def test_the_catalog_follower_connects_again_after_the_chain_failed_it(tmp_path,
             raise ConnectionError("connection closed")
         return second
 
-    monkeypatch.setattr(follow, "bt", SimpleNamespace(Subtensor=connect))
+    monkeypatch.setattr(follow, "subtensor", connect)
     monkeypatch.setattr(follow, "current_catalog", current_catalog)
     follower = follow.CatalogFollower(None, "test", 405, catalog.CatalogStore(tmp_path), [],
                                       state_path=tmp_path / "followed.json")

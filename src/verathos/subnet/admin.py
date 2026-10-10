@@ -29,7 +29,7 @@ from bittensor_wallet import Keypair
 
 from verathos import __version__, catalog, release
 from verathos.protocol import tls
-from verathos.subnet.chain import committed_catalog, current_catalog
+from verathos.subnet.chain import committed_catalog, current_catalog, subtensor
 
 MAX_UIDS_TWO_MECHANISMS = 128  # chain rule: max UIDs x mechanism count <= 256
 SPLIT_SCALE = 65535
@@ -286,7 +286,7 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
-    st = bt.Subtensor(network=args.network)
+    st = subtensor(args.network)
     if args.command == "status":
         status(st, args.netuid)
     elif args.command == "setup-mechanisms":

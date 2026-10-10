@@ -318,14 +318,18 @@ def https_url(value: str, *, what: str = "url") -> str:
 
 
 def chain_network(value: str) -> str:
-    """``value`` if the chain node it names is reached over TLS or on this machine: a network name the bittensor client
-    maps to such a node (``finney``, ``test``, ``local``), a ``wss://`` URL, or a ``ws://`` URL on loopback; raises
-    ValueError otherwise (for validators)."""
+    """``value`` if every chain node it names is reached over TLS or on this machine: a network name the bittensor
+    client maps to such a node (``finney``, ``test``, ``local``), a ``wss://`` URL, or a ``ws://`` URL on loopback, or
+    several of them separated by commas (the first used while it answers); raises ValueError otherwise."""
     from bittensor.core.settings import NETWORK_MAP
 
-    url = NETWORK_MAP.get(value, value)
-    parts = urlsplit(url)
-    if parts.scheme == "wss" and parts.hostname or parts.scheme == "ws" and loopback_url(url):
+    def reached_safely(name: str) -> bool:
+        url = NETWORK_MAP.get(name, name)
+        parts = urlsplit(url)
+        return bool(parts.scheme == "wss" and parts.hostname or parts.scheme == "ws" and loopback_url(url))
+
+    names = [part.strip() for part in value.split(",")]
+    if all(names) and all(reached_safely(name) for name in names):
         return value
     raise ValueError(f"network {value!r}: a chain node is reached over wss:// (finney, test or a wss:// URL), plain "
                      "ws:// only on this machine (local or ws://127.0.0.1:<port>): every connection between machines "
