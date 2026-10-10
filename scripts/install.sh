@@ -363,7 +363,8 @@ install_tarball() {
 python_environment() {
   local dir="$1"
   say "Python environment"
-  [ -x "$dir/.venv/bin/python" ] || uv venv --quiet -p "$PYTHON_VERSION" "$dir/.venv"
+  # none yet, or one whose interpreter is gone (a container that lost uv's Pythons): made anew
+  "$dir/.venv/bin/python" -c "" 2>/dev/null || uv venv --quiet --clear -p "$PYTHON_VERSION" "$dir/.venv"
   VIRTUAL_ENV="$dir/.venv" uv pip install --quiet -e "$dir[server,chain]"
 }
 
