@@ -46,7 +46,8 @@ def main() -> None:
     engine = clef.load(args.repo, args.revision, device=args.device, dtype=args.dtype)
     served = {"id": args.repo, "revision": args.revision, "device": args.device, "dtype": args.dtype,
               "code": code_version()}
-    uvicorn.run(create_app(engine, [served]), host=args.host, port=args.port, log_level="info")
+    # no line per request (a miner's engine answers many a second); uvicorn's start and stop lines stay
+    uvicorn.run(create_app(engine, [served]), host=args.host, port=args.port, log_level="info", access_log=False)
 
 
 if __name__ == "__main__":

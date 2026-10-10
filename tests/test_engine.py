@@ -134,3 +134,26 @@ def test_a_request_given_up_before_its_pass_is_not_run() -> None:
     engine.hold.set()
     assert held.result(5) == "HOLD" and kept.result(5) == "KEPT"
     assert ["gone"] not in engine.runs
+
+
+def test_the_engine_logs_no_line_per_request(monkeypatch) -> None:
+    """A miner's engine answers many requests a second: a log line for each fills a log that nothing rotates (pm2)."""
+    import sys
+    import types
+
+    import verathos.engine
+    from verathos import stop
+    from verathos.engine import __main__ as engine_main
+
+    fake = types.ModuleType("verathos.engine.clef")
+    fake.load = lambda *args, **kwargs: object()
+    monkeypatch.setitem(sys.modules, "verathos.engine.clef", fake)
+    monkeypatch.setattr(verathos.engine, "clef", fake, raising=False)
+    monkeypatch.setattr(stop, "on_signals", lambda what, logger: None)
+    monkeypatch.setattr(engine_main, "create_app", lambda engine, served: "app")
+    ran: list[dict] = []
+    monkeypatch.setattr(engine_main.uvicorn, "run", lambda app, **kwargs: ran.append(kwargs))
+    monkeypatch.setattr(sys, "argv", ["verathos-engine", "clef", "--repo", "r/m", "--revision", "abc",
+                                      "--device", "cpu"])
+    engine_main.main()
+    assert ran and ran[0]["access_log"] is False and ran[0]["host"] == "127.0.0.1"
