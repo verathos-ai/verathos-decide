@@ -79,6 +79,11 @@ class Logs:
     def new_lines(self, name: str) -> list[str]:
         raise NotImplementedError
 
+    def start_line(self) -> str | None:
+        """What starts the services again after the machine restarts, where they do not start by themselves (systemd
+        starts enabled units at boot)."""
+        return None
+
 
 class Systemd(Logs):
     name = "systemd"
@@ -287,6 +292,11 @@ class Supervisor(Logs):
 
     def restart_command(self, names: list[str]) -> str:
         return f"supervisorctl restart {' '.join(names)}"
+
+    def start_line(self) -> str | None:
+        """What starts the services again after the machine restarts, where they do not start by themselves."""
+        return (f"after a restart of the container: supervisord -c {self.main_conf} (a container starts no "
+                "services by itself)")
 
 
 Manager = Systemd | Supervisor

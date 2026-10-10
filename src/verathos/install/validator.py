@@ -468,6 +468,8 @@ def init(argv: list[str]) -> None:
     info("self-update off: the auditor is updated by hand" if owner else common.update_line(auto_update))
     info(f"configuration: {config_path}; state: {config['state_dir']} (keep it: canary secret and score history)")
     info(f"status:  {manager.status_command(record.services)}")
+    if start := manager.start_line():
+        info(start)
     info(f"logs:    {manager.log_command(VALIDATOR)}")
     info("each epoch logs its miners and endpoints, one line per endpoint checked, and the weights set")
     info(f"after editing the configuration: {manager.restart_command([VALIDATOR])}")
@@ -619,6 +621,8 @@ def init_light(ui: Prompter, manager: Manager | None, record: common.Record, exi
     info(common.update_line(auto_update))
     info(f"configuration: {config_path}; state: {config['state_dir']}")
     info(f"status:  {manager.status_command(record.services)}")
+    if start := manager.start_line():
+        info(start)
     info(f"logs:    {manager.log_command(VALIDATOR)}")
     info("each epoch, once the subnet owner's validator has published its results (from about 60% into the epoch), "
          "logs the weights set: the number of UIDs and the highest weights")

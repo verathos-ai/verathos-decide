@@ -473,6 +473,8 @@ def init(argv: list[str]) -> None:
     info(common.update_line(auto_update))
     info(f"configuration: {config_path}; state: {config['state_dir']}")
     info(f"status:  {manager.status_command(record.services)}")
+    if start := manager.start_line():
+        info(start)
     info(f"logs:    {manager.log_command(MINER)}")
     info(f"after editing the configuration: {manager.restart_command([MINER])}")
     address = urlsplit(axon_base(public_ip, port)).netloc

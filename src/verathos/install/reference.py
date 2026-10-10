@@ -377,6 +377,8 @@ def init(argv: list[str]) -> None:
     step("Done")
     handover(document, engines_path, identity.pin, key_file)
     info(f"status:  {manager.status_command(record.services)}")
+    if start := manager.start_line():
+        info(start)
     info(f"logs:    {manager.log_command(FRONT)} (the front; each engine under its own name)")
     for line in common.script_commands(ROLE, home):
         info(line)

@@ -1013,3 +1013,12 @@ def test_the_installer_waits_for_another_apt_holding_its_lock(tmp_path) -> None:
     from verathos.install import firewall
 
     assert "DPkg::Lock::Timeout=600" in Path(firewall.__file__).read_text()
+
+
+def test_a_container_setup_says_how_its_services_start_again_after_a_restart() -> None:
+    """A container starts no services by itself: a node set up under supervisord stays down after the container
+    restarts until supervisord is started again, which the setup's last lines say; systemd starts its units at boot."""
+    assert services.Supervisor().start_line() == ("after a restart of the container: supervisord -c "
+                                                  "/etc/supervisor/supervisord.conf (a container starts no services "
+                                                  "by itself)")
+    assert services.Systemd().start_line() is None
