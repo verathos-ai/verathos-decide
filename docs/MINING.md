@@ -782,11 +782,10 @@ says the same once per epoch:
 ```
 
 The figures are counts and sums per day, never an account, an e-mail or an address; the dashboard link lets anyone
-holding it read them for a day. Every post, video or message that carries a code or link says that it is an ad and
-that its author earns rewards when users buy credit with it; offering referred users money or tokens is not allowed,
-and codes are revoked for breaches of the program's terms (the web app's referral page). Topping up one's own account
-with one's own code returns at most 0.3 of each dollar, as emission, for credit that can be neither withdrawn nor
-transferred.
+holding it read them for a day. Self-referral, fake or automated accounts and spam forfeit rewards, and codes are
+revoked for breaches of the program's terms (the web app's referral page); where the law requires it, a referrer says
+that it benefits when it shares its link. Topping up one's own account with one's own code returns at most 0.3 of each
+dollar, as emission, for credit that can be neither withdrawn nor transferred.
 
 ## Checking a miner
 
