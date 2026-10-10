@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
+import time
+from collections.abc import Callable
 
 import bittensor as bt
 from async_substrate_interface.errors import ConnectionClosed, InvalidHandshake, SubstrateRequestException
@@ -18,9 +21,27 @@ log = logging.getLogger(__name__)
 CHAIN_ERRORS = (OSError, ConnectionClosed, InvalidHandshake, SubstrateRequestException)
 
 
+CONNECT_WAITS_S = (5, 15, 30, 60)  # then every 60 s: a public node refuses connections for a while under load
+
+
 def one_line(exc: BaseException) -> str:
     """An exception as its type and message."""
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+
+def connect(network: str, *, sleep: Callable[[float], None] = time.sleep) -> bt.Subtensor:
+    """A connection to the chain for a process that runs on. While the node refuses one (a public node answers HTTP 429
+    under load) or cannot be reached, it is tried again after 5, 15 and 30 s, then every 60 s, each failure logged in
+    one line: a process that exited instead would be restarted by its manager, but supervisord gives up on a program
+    that exits within seconds of its start ten times in a row."""
+    for attempt in itertools.count():
+        try:
+            return bt.Subtensor(network=network)
+        except CHAIN_ERRORS as exc:
+            wait = CONNECT_WAITS_S[min(attempt, len(CONNECT_WAITS_S) - 1)]
+            log.warning("cannot connect to the %s chain (%s); trying again in %d s", network, one_line(exc), wait)
+            sleep(wait)
+    raise AssertionError("unreachable")
 
 
 def serve_axon(subtensor: bt.Subtensor, wallet: bt.Wallet, netuid: int, host: str, port: int) -> int:

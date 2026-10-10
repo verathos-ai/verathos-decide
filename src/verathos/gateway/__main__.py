@@ -64,6 +64,7 @@ from verathos.protocol import tls
 from verathos.protocol.gateway import Routes
 from verathos.protocol.http import raise_open_file_limit
 from verathos.protocol.media import keep_out_of_dumps
+from verathos.subnet.chain import connect
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.follow import ScheduleFollower
 from verathos.throughput.policy import AuditPolicy
@@ -89,7 +90,7 @@ async def serve(config: GatewayConfig) -> None:
         raise SystemExit("the database schema is not current: run `verathos-gateway db upgrade` first")
     keypair = bt.Wallet(name=config.wallet_name, hotkey=config.hotkey_name).hotkey
     chain = SubtensorChainView(config.network, config.netuid)
-    st = await asyncio.to_thread(bt.Subtensor, network=config.network)
+    st = await asyncio.to_thread(connect, config.network)
     auditor_hotkey = await asyncio.to_thread(st.get_subnet_owner_hotkey, config.netuid)
     state_dir = config.state_dir.expanduser()
     store = catalog_module.CatalogStore(config.catalog_dir)

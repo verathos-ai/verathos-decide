@@ -234,6 +234,7 @@ for it (`install.sh miner --yes`, with `--source` naming where the code came fro
 
 | Problem | What to do |
 |---|---|
+| `cannot connect to the finney chain (...); trying again in ... s` | the chain's node refuses connections (a public node answers HTTP 429 under load) or cannot be reached: the process waits for it and starts once it connects; if it lasts, name another node with `network` (a `wss://` URL) |
 | `curl: command not found` | minimal images lack it: `apt-get update && apt-get install -y curl`, then the command again |
 | `hotkey ... is not registered on netuid 96` | register it ([1. Register](#1-register)) and run the command again; `--no-publish` tries the machine first |
 | `coldkeypub.txt not found` | copy `~/.bittensor/wallets/<wallet>/coldkeypub.txt` from the machine holding the wallet |

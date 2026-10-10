@@ -55,7 +55,7 @@ from verathos.protocol.manifest import (
 )
 from verathos.protocol.media import ImageLimits
 from verathos.protocol.status import ThroughputOutcome
-from verathos.subnet.chain import CHAIN_ERRORS, committed_catalog, current_catalog, one_line
+from verathos.subnet.chain import CHAIN_ERRORS, committed_catalog, connect, current_catalog, one_line
 from verathos.throughput.chain import SubtensorChainView
 from verathos.throughput.follow import ScheduleFollower
 from verathos.throughput.measure import (
@@ -558,7 +558,7 @@ def main() -> None:
         raise SystemExit(f"public_host {config.public_host} is not a public address: validators refuse endpoints "
                          "there")
     wallet = bt.Wallet(name=config.wallet_name, hotkey=config.hotkey_name)
-    subtensor = bt.Subtensor(network=config.network)
+    subtensor = connect(config.network)
     cat = catalog.load() if args.no_publish else resolve_catalog(subtensor, config)
     identity = tls.identity(config.state_dir)
     log.info("TLS certificate %s, pin %s (the manifest names it; validators, gateways and the auditor accept this "

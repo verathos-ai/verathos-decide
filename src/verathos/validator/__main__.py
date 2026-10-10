@@ -38,6 +38,7 @@ from verathos.engine import code_version
 from verathos.protocol import tls
 from verathos.protocol.callers import ValidatorIdentity
 from verathos.protocol.manifest import axon_base
+from verathos.subnet.chain import connect
 from verathos.throughput.feed import Credit, Verdicts, published_shares
 from verathos.throughput.policy import BLOCK_TIME_S
 from verathos.throughput.referral import contradiction as referral_contradiction
@@ -625,7 +626,7 @@ def main() -> None:
     state_dir = cfg.state_dir.expanduser()
     state_dir.mkdir(parents=True, exist_ok=True)
     wallet = bt.Wallet(name=cfg.wallet_name, hotkey=cfg.hotkey_name)
-    st = bt.Subtensor(network=cfg.network)
+    st = connect(cfg.network)
     log.info("verathos %s, weights version key %d", __version__, release.weights_version_key())
     current = CatalogFollower(st, cfg.network, cfg.netuid, catalog.CatalogStore(cfg.catalog_dir), cfg.catalog_mirrors,
                               state_path=cfg.state_dir.expanduser() / "catalog_followed.json")
