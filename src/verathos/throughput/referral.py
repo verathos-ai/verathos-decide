@@ -17,9 +17,9 @@ the period into a ``ReferralRecord`` and states it with every verdicts document 
 - ``share``: the caps' sum, at most ``max_share``: what the referrers get of the mechanism's miner emission in every
   epoch of period ``k + 1``, at most what the epoch's miner share leaves (``validator.referral``);
 - the inputs: ``payout_per_usd``, ``max_share`` (the catalog's ``share``) and ``window_periods``; ``emission`` and
-  ``period_emission`` (``throughput.usage``); ``tao_usd`` (from ``TAO_USD_URL`` when the period closed, once anything
-  was referred) and ``alpha_tao`` (``SubnetMovingPrice`` at the reference block); and the subnet owner's hotkey and
-  coldkey at the reference block, whose hotkeys are paid nothing.
+  ``period_emission`` (``throughput.usage``); ``tao_usd`` (from ``TAO_USD_SOURCES`` when the period closed, once
+  anything was referred) and ``alpha_tao`` (``SubnetMovingPrice`` at the reference block); and the subnet owner's
+  hotkey and coldkey at the reference block, whose hotkeys are paid nothing.
 
 A referred USD counts in at most ``window_periods`` periods at most ``payout_per_usd / window_periods`` of it each:
 it earns at most ``payout_per_usd`` USD of emission, however it is timed or split over accounts and codes.

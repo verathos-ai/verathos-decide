@@ -13,8 +13,8 @@ with them (``usage``):
 - ``basis``, in alpha. ``burned``: what ``buyback_coldkey`` burned on the subnet in the period, its ``AlphaBurned``
   events each listed with its block and position (``burns``; blocks the auditor's node no longer held when it read
   them are listed in ``unscanned`` and their burns do not count). ``revenue``: the period's paid input tokens per model
-  at the catalog's ``prices`` (``revenue_usd``), converted at ``tao_usd`` (USD per TAO, read from ``TAO_USD_URL`` when
-  the period closed) and ``alpha_tao`` (the subnet's moving alpha price in TAO at the reference block);
+  at the catalog's ``prices`` (``revenue_usd``), converted at ``tao_usd`` (USD per TAO, read from ``TAO_USD_SOURCES``
+  when the period closed) and ``alpha_tao`` (the subnet's moving alpha price in TAO at the reference block);
 - ``share``: ``fraction x basis / period_emission``, at most 1, rounded to ``SHARE_DIGITS``: the share of the
   mechanism's miner emission the pool pays in every epoch of period ``k + 1``, at most what the epoch's miner share
   leaves (``validator.usage``).
@@ -43,7 +43,14 @@ RAO = 10**9  # rao per alpha (and per TAO)
 U16_MAX = 65535  # the owner cut and the mechanisms' split are parts of it
 MINER_PART = 0.5  # of what a block emits to a subnet's participants after the owner cut, the miners' part
 PRICE_SCALE = 2**32  # SubnetMovingPrice is a fixed-point number with 32 fractional bits
-TAO_USD_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bittensor&vs_currencies=usd"
+TAO_USD_SOURCES = (  # public tickers, tried in order: the first price within TAO_USD_BOUNDS is taken
+    ("CoinGecko", "https://api.coingecko.com/api/v3/simple/price?ids=bittensor&vs_currencies=usd",
+     lambda data: data["bittensor"]["usd"]),
+    ("Kraken", "https://api.kraken.com/0/public/Ticker?pair=TAOUSD",
+     lambda data: next(iter(data["result"].values()))["c"][0]),  # the last trade's price
+    ("Coinbase", "https://api.coinbase.com/v2/prices/TAO-USD/spot", lambda data: data["data"]["amount"]),
+)
+TAO_USD_BOUNDS = (10.0, 10_000.0)  # a price outside them is a ticker's error, not the market
 TOKENS_PER_PRICE = 1_000_000  # a model's price is in USD per million input tokens
 NO_OWNER = "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM"  # the zero account: ``Owner`` of a hotkey nobody owns
 
@@ -292,11 +299,20 @@ def coldkeys_at(st: Any, hotkeys: Iterable[str], block: int) -> dict[str, str | 
 
 
 def tao_usd(fetch: Callable[..., Any] = get_json) -> float:
-    """TAO's price in USD from ``TAO_USD_URL``. Raises if it does not give a positive number."""
-    price = float(fetch(TAO_USD_URL, limit=4096, timeout=15, tls=CA)["bittensor"]["usd"])
-    if not (math.isfinite(price) and price > 0):
-        raise ValueError(f"not a price: {price}")
-    return price
+    """TAO's price in USD from the first of ``TAO_USD_SOURCES`` that gives one within ``TAO_USD_BOUNDS``. Raises
+    if none does, with what each said."""
+    low, high = TAO_USD_BOUNDS
+    failures = []
+    for name, url, parse in TAO_USD_SOURCES:
+        try:
+            price = float(parse(fetch(url, limit=16384, timeout=15, tls=CA)))
+        except Exception as exc:
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
+            continue
+        if math.isfinite(price) and low <= price <= high:
+            return price
+        failures.append(f"{name}: {price} is outside {low} to {high}")
+    raise ValueError("no TAO price: " + "; ".join(failures))
 
 
 def contradiction(record: UsageRecord, st: Any, netuid: int) -> str | None:

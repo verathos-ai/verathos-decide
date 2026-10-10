@@ -516,3 +516,28 @@ def test_a_new_period_length_starts_periods_of_other_blocks_and_nothing_is_paid_
     stated = Verdicts(netuid=405, auditor="a", epoch=6, credits=[], invalid=[], usage=first.model_dump(mode="json"))
     longer = with_pool({**BURNED, "period_epochs": 3})  # epoch 6 is the first of period 2, of blocks [1080, 1620)
     assert take(ScoreState(), stated, longer, 6) is None and usage_weights(first, longer, 6, HOTKEYS) == {}
+
+
+def test_the_tao_price_falls_back_to_the_next_ticker_and_takes_only_a_price_within_the_bounds() -> None:
+    from verathos.throughput import usage as usage_module
+
+    coingecko, kraken, coinbase = (url for _, url, _ in usage_module.TAO_USD_SOURCES)
+    answers = {coingecko: ConnectionError("blocked"),
+               kraken: {"error": [], "result": {"TAOUSD": {"c": ["123456.0", "1.0"]}}},  # out of bounds
+               coinbase: {"data": {"base": "TAO", "currency": "USD", "amount": "301.25"}}}
+
+    def fetch(url, **_):
+        answer = answers[url]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    assert usage_module.tao_usd(fetch) == 301.25
+    answers[kraken] = {"error": [], "result": {"TAOUSD": {"c": ["299.5", "1.0"]}}}
+    assert usage_module.tao_usd(fetch) == 299.5  # the first good one
+    answers[coingecko] = {"bittensor": {"usd": 300.0}}
+    assert usage_module.tao_usd(fetch) == 300.0
+    for url in answers:
+        answers[url] = ValueError("down")
+    with pytest.raises(ValueError, match="no TAO price: CoinGecko: ValueError: down; Kraken"):
+        usage_module.tao_usd(fetch)
