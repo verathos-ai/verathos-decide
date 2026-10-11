@@ -259,8 +259,19 @@ class Accounts:
             return [dict(r._mapping) for r in rows]
 
     async def list_keys(self, account: str) -> list[dict[str, Any]]:
+        """The account's keys, oldest first, each with what it was used for so far: its answered requests, input
+        tokens and cost (micro-USD), 0 for a key never used."""
+        owner = select(accounts.c.id).where(accounts.c.name == account).scalar_subquery()
+        used = (select(usage_daily.c.key_id, func.sum(usage_daily.c.requests).label("requests"),
+                       func.sum(usage_daily.c.input_tokens).label("input_tokens"),
+                       func.sum(usage_daily.c.cost).label("cost"))
+                .where(usage_daily.c.account_id == owner).group_by(usage_daily.c.key_id).subquery())
         query = (select(api_keys.c.prefix, api_keys.c.name, api_keys.c.created_at, api_keys.c.expires_at,
-                        api_keys.c.revoked_at).join(accounts, api_keys.c.account_id == accounts.c.id)
+                        api_keys.c.revoked_at, func.coalesce(used.c.requests, 0).label("requests"),
+                        func.coalesce(used.c.input_tokens, 0).label("input_tokens"),
+                        func.coalesce(used.c.cost, 0).label("cost"))
+                 .join(accounts, api_keys.c.account_id == accounts.c.id)
+                 .outerjoin(used, used.c.key_id == api_keys.c.id)
                  .where(accounts.c.name == account).order_by(api_keys.c.created_at))
         async with self.engine.connect() as conn:
             return [dict(r._mapping) for r in await conn.execute(query)]

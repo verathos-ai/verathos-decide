@@ -197,6 +197,16 @@ def test_keys_and_rate_limits(tmp_path) -> None:
     assert asyncio.run(s.post()).status_code == 401
 
 
+def test_each_key_lists_the_requests_it_was_used_for(tmp_path) -> None:
+    s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")})
+    asyncio.run(s.accounts.create_key("acme", "second"))
+    assert [asyncio.run(s.post()).status_code for _ in range(2)] == [200, 200]  # both with the first key
+    asyncio.run(s.meter.flush())
+    listed = {k["name"]: k for k in asyncio.run(s.accounts.list_keys("acme"))}
+    assert listed["prod"]["requests"] == 2 and listed["prod"]["input_tokens"] > 0 and listed["prod"]["cost"] > 0
+    assert (listed["second"]["requests"], listed["second"]["input_tokens"], listed["second"]["cost"]) == (0, 0, 0)
+
+
 def test_monthly_quota_and_bad_requests(tmp_path) -> None:
     s = Setup(tmp_path, {"10.0.0.1": MockEngine("kev-4b")}, monthly_quota=2)
     assert [asyncio.run(s.post()).status_code for _ in range(2)] == [200, 200]
