@@ -257,20 +257,18 @@ With the catalog's usage pool (`SCORING.md`), the verdicts of every epoch of a p
 before (`usage`), closed once its end block is final; the first verdicts of a period wait up to 20 blocks after its
 start for it, then come without it. The record lists:
 
-- `served`: per hotkey, the paid input tokens its endpoints answered in the period (the epochs' `paid_served`), with
-  its coldkey at the end block; `paid_input_tokens`, the same per model;
+- `served`: per hotkey, the paid input tokens its endpoints answered in the period per model (the epochs'
+  `paid_served`), with its coldkey at the end block; `paid_input_tokens`, the same per model;
 - `emission`: the chain's state at the end block that sets the mechanism's miner emission per block (the subnet's
   alpha out per block, the owner cut if the subnet has it on, the mechanism count and split; miners get half of what
   the owner cut leaves), and `period_emission`, that over the period's blocks in alpha;
-- `burned` mode: `burns`, every `AlphaBurned` event of `buyback_coldkey` on the subnet in the period (block, position
-  among the block's events, hotkey, amount in rao), and `unscanned`, block ranges the auditor's node no longer held when
-  it read them (their burns do not count); `revenue` mode: `prices` per model, `revenue_usd`, `tao_usd` (TAO in USD, the
-  first price between 10 and 10,000 USD from CoinGecko, Kraken and Coinbase when the period closed) and `alpha_tao` (the
-  subnet's `SubnetMovingPrice` at the end block);
+- `prices` per model, `revenue_usd`, `tao_usd` (TAO in USD, the first price between 10 and 10,000 USD from
+  CoinGecko, Kraken and Coinbase when the period closed) and `alpha_tao` (the subnet's `SubnetMovingPrice` at the end
+  block);
 - `basis` (alpha), `fraction` and `share`, the period's usage share.
 
-A validator recomputes `period_emission`, `basis` and `share` from these, and checks against its own node the burns
-and the end block's state that it still holds.
+A validator recomputes `period_emission`, `revenue_usd`, `basis` and `share` from these, and checks against its own
+node the end block's state that it still holds.
 
 With the catalog's referral pool (`SCORING.md`, Referrals), the gateways post the referred accounts' top-ups and
 refunds as they count (`POST /v1/gateway/referrals`, signed by a catalog gateway, `GATEWAY.md`), with the codes'
@@ -381,16 +379,14 @@ The auditor needs:
   Clef-Flash mix a request with an image is 5.8 KB larger (a PNG of 2.0 to 6.5 KB in base64, and its question), and a
   quarter of the requests carry one: their bodies average 7.0 KB against 5.5 KB without images. The load generator draws an
   image in about 30 microseconds (an i9-14900K);
-- with a usage pool in `burned` mode, a node that holds the state of the last 200 blocks: the auditor reads every
-  block's events as it is finalized, over a connection of its own; blocks it falls further behind on are recorded as
-  unscanned. In `revenue` mode, and with a referral pool once anything was referred, it reads TAO's price in USD once per period
-  from CoinGecko, Kraken or Coinbase, the first between 10 and 10,000 USD.
+- with a usage pool, and with a referral pool once anything was referred, TAO's price in USD once per period from
+  CoinGecko, Kraken or Coinbase, the first between 10 and 10,000 USD.
 
 Its database is `state_dir/throughput.sqlite` (tables `tests`, `results`, `samples` (gateway answers, without the
 requests with images), `verdicts` (as served), `demand` (users' input tokens per model), `shares` (the models'
 emission shares), `users` (what users got from each endpoint) and `paid` (paid input tokens per endpoint), the last
-30 epochs, more than the last 10 tests a hotkey's status lists; with a usage pool, `paid`, `burns`, `unscanned` and
-`usage` (the period records) from the start of the period before when that is earlier; with a referral pool,
+30 epochs, more than the last 10 tests a hotkey's status lists; with a usage pool, `paid` and `usage` (the period
+records) from the start of the period before when that is earlier; with a referral pool,
 `referral_codes` and `referral_moves` (every registration and move taken, kept), `referral_entries` and `referral` (the
 period records), for a window and a period more). A catalog with another
 `epoch_blocks` renumbers it (a test by its selection block, the rest by the first block of its epoch; the verdicts

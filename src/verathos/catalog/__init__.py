@@ -135,6 +135,9 @@ class CatalogModel(BaseModel):
         return [m for m in self.input_modalities if m in MODALITIES]
 
 
+MAX_PAYOUT_PER_USD = 0.9  # a paid USD never earns this much emission or more: paying oneself must lose money
+
+
 class MinerShareChange(BaseModel):
     """The miners' share moving linearly from ``from`` to ``to`` over ``epochs`` epochs from ``start_epoch`` on:
     ``from`` until then, and throughout while ``start_epoch`` is null."""
@@ -152,37 +155,30 @@ class MinerShareChange(BaseModel):
 
 
 class UsagePool(BaseModel):
-    """Weight on top of the scores' for the hotkeys whose endpoints answered paying users, in proportion to the paid
-    input tokens they answered in a period, sized from that period and set over each epoch of the next. ``burned``:
-    the alpha ``buyback_coldkey`` burned on the subnet in the period; ``revenue``: the period's paid usage in USD at
-    the models' prices, converted to alpha. Either times ``fraction``, as a share of the mechanism's miner emission
-    over a period, at most what the miner share leaves."""
+    """Weight on top of the scores' for the hotkeys whose endpoints answered paying users, sized from what they paid in
+    a period and set over each epoch of the next: the period's paid usage in USD at the models' prices, converted to
+    alpha, times ``fraction``, as a share of the mechanism's miner emission over a period, at most what the miner share
+    and the referral pool's share leave. A hotkey's part is what users paid for its endpoints' answers: its paid input
+    tokens at each model's price."""
 
-    mode: Literal["burned", "revenue"]
-    fraction: float = Field(gt=0, le=1, description="Share of the period's burned alpha (burned) or of its revenue in "
-                            "alpha (revenue) the pool pays")
+    fraction: float = Field(0.6, gt=0, le=MAX_PAYOUT_PER_USD, description="Share of the period's paid usage, in "
+                            "alpha, the pool pays")
     period_epochs: int = Field(40, ge=1, le=MAX_PERIOD_EPOCHS, description="Epochs per period: each period's pool is "
                                "paid over the epochs of the next")
-    buyback_coldkey: str | None = Field(None, description="The coldkey whose AlphaBurned events on the subnet count "
-                                        "(burned mode)")
     excluded: list[str] = Field(default_factory=list, max_length=256, description="Hotkeys and coldkeys whose "
                                 "endpoints get no usage pay; their part stays on the subnet owner's UID")
 
-    @model_validator(mode="after")
-    def _check(self) -> UsagePool:
-        if self.mode == "burned" and not self.buyback_coldkey:
-            raise ValueError("usage_pool in burned mode names its buyback_coldkey")
-        for key in [k for k in (self.buyback_coldkey, *self.excluded) if k is not None]:
+    @field_validator("excluded")
+    @classmethod
+    def _ss58(cls, value: list[str]) -> list[str]:
+        for key in value:
             if not is_ss58(key):
                 raise ValueError(f"usage_pool: {key!r} is not an ss58 address")
-        return self
+        return value
 
     def period(self, epoch: int) -> int:
         """The period ``epoch`` falls in: epochs ``period x period_epochs`` up to the next period's first."""
         return epoch // self.period_epochs
-
-
-MAX_PAYOUT_PER_USD = 0.9  # a referred USD never earns this much emission or more: self-referral must lose money
 
 
 class ReferralPool(BaseModel):
@@ -248,9 +244,10 @@ class Scoring(BaseModel):
         "the subnet owner's UID, whose incentive the chain does not pay out. A number, or a linear change "
         "{from, to, start_epoch, epochs}")
     usage_pool: UsagePool | None = Field(None, description="Usage weight for the hotkeys that served paying users, "
-                                         "out of what the miner share leaves; absent: none")
+                                         "out of what the miner share and the referral pool's share leave; absent: "
+                                         "none")
     referral_pool: ReferralPool | None = Field(None, description="Referral weight for referrers, out of what the "
-                                               "miner share leaves; absent: none. Not together with a usage pool")
+                                               "miner share leaves; absent: none")
     revision_transition_epochs: int = Field(3, ge=0, description="Epochs after a model's pinned weights or engine "
                                             "change in place during which its answers are not checked, while miners "
                                             "and references update")
@@ -268,11 +265,18 @@ class Scoring(BaseModel):
 
     @model_validator(mode="after")
     def _pools(self) -> Scoring:
-        # paid usage of money a referrer was rewarded for would pay twice: the two pools run together only once the
-        # usage pool weighs such usage less
-        if self.usage_pool is not None and self.referral_pool is not None:
-            raise ValueError("a referral_pool and a usage_pool do not run together")
+        # a referred USD earns its referrer up to payout_per_usd and, spent, the hotkeys that answered it up to the
+        # usage pool's fraction: together under MAX_PAYOUT_PER_USD, referring oneself and serving oneself still loses
+        if (self.usage_pool is not None and self.referral_pool is not None
+                and self.usage_pool.fraction + self.referral_pool.payout_per_usd > MAX_PAYOUT_PER_USD + 1e-9):
+            raise ValueError(f"usage_pool.fraction and referral_pool.payout_per_usd add up to at most "
+                             f"{MAX_PAYOUT_PER_USD}: a referred USD earns both")
         return self
+
+    def usage_cap_at(self, epoch: int) -> float:
+        """The most the usage pool pays in ``epoch``: what the miner share and the referral pool's share leave."""
+        referral = self.referral_pool.share if self.referral_pool is not None else 0.0
+        return round(max(0.0, 1.0 - self.miner_share_at(epoch) - referral), SHARE_DIGITS)
 
     def miner_share_at(self, epoch: int) -> float:
         """``miner_share`` in ``epoch``, rounded to ``SHARE_DIGITS`` decimals, so every validator sets the same."""

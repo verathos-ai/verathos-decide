@@ -117,7 +117,7 @@ endpoints is on probation inherits the remaining probation, so renaming an endpo
 
 A UID's value is the sum of its endpoints' EMAs, normalised over all UIDs. Endpoints whose UID now belongs to another
 hotkey are ignored. The miners' values are then scaled to sum to the epoch's miner share, the catalog's
-`scoring.miner_share` (0.59 in the shipped catalog), the weights of the [usage pool](#usage-pool) and of
+`scoring.miner_share` (0.15 in the shipped catalog), the weights of the [usage pool](#usage-pool) and of
 [referrals](#referrals) are added, and the subnet owner's UID gets the rest; the weights are set on the catalog's
 mechanism (`SUBNET_ADMIN.md`) once per epoch. The chain pays the subnet owner hotkey no incentive: it burns it, or
 recycles it under the subnet's `RecycleOrBurn` setting (`SUBNET_ADMIN.md`). The share is a constant or moves linearly
@@ -136,36 +136,46 @@ names) publishes for the epoch (`GET /v1/network`, signed), exactly as the sourc
 ## Usage pool
 
 The catalog's `scoring.usage_pool` (absent in the shipped catalog: off) pays the hotkeys whose endpoints answered
-paying users, on top of their scores, out of what the miner share leaves. Time runs in periods of `period_epochs`
-epochs (default 40, about a day); a period's pool is sized and recorded when it ends and paid over the epochs of the
-next.
+paying users, on top of their scores, out of what the miner share and the referral pool's share leave. Time runs in
+periods of `period_epochs` epochs (default 40, about a day); a period's pool is sized and recorded when it ends and paid
+over the epochs of the next.
 
-- **Size.** `burned`: the alpha the catalog's `buyback_coldkey` burned on the subnet in the period (its `AlphaBurned`
-  events). `revenue`: the period's paid usage at the models' `price`, counted when it is spent, in alpha at TAO's
-  price in USD when the period closed and the subnet's moving alpha price at the period's end. Either times
-  `fraction`, divided by the mechanism's miner emission over a period, at most 1, rounded to 6 decimals: the
-  period's usage share.
-- **Cap.** Each epoch of the next period pays the usage share, at most `1 - miner_share` of that epoch; beyond it
-  nothing more is paid.
-- **Split.** A hotkey gets `usage share x the paid input tokens its endpoints answered in the period / all of them`.
-  Paid input tokens are those of answers to accounts paying with bought credit (`GATEWAY.md`); free credit, the demo
-  and admin requests count none. Hotkeys the catalog's `excluded` lists, by hotkey or by coldkey, and hotkeys that
-  hold no UID now get nothing.
+- **Size.** The period's paid usage at the models' `price`, counted when it is spent, in alpha at TAO's price in USD
+  when the period closed and the subnet's moving alpha price at the period's end, times `fraction`, divided by the
+  mechanism's miner emission over a period, at most 1, rounded to 6 decimals: the period's usage share.
+- **Cap.** Each epoch of the next period pays the usage share, at most `1 - miner_share` of that epoch less the
+  referral pool's `share` (kept for referrals whether or not they fill it); beyond it nothing more is paid.
+- **Split.** A hotkey gets `usage share x what users paid for its endpoints' answers in the period / what they paid in
+  all`: its paid input tokens at each model's `price`. Paid input tokens are those of answers to accounts paying with
+  bought credit (`GATEWAY.md`), as the miners signed them in their receipts; free credit, the demo and admin requests
+  count none. Hotkeys the catalog's `excluded` lists, by hotkey or by coldkey, and hotkeys that hold no UID now get
+  nothing.
 
-The subnet owner's UID keeps whatever the scores and the usage pool leave: the parts of excluded and departed hotkeys,
+| Setting | Default | Range | Meaning |
+|---|---|---|---|
+| `fraction` | 0.6 | (0, 0.9] | share of the period's paid usage, in alpha, the pool pays |
+| `period_epochs` | 40 | 1 to 400 | epochs per period |
+| `excluded` | [] | at most 256 | hotkeys and coldkeys paid nothing |
+
+With a referral pool, `fraction` and its `payout_per_usd` add up to at most 0.9: a referred USD earns its referrer up to
+`payout_per_usd` and, spent, the hotkeys that answer it up to `fraction`, so referring and serving oneself loses at
+least a tenth of every USD.
+
+The subnet owner's UID keeps whatever the scores and the pools leave: the parts of excluded and departed hotkeys,
 and a period's whole pool if nobody paid in it. Without the pool, or without paid usage, the weights are exactly what
 they are without it.
 
-`burned` mode is supply-neutral: the alpha it pays the miners was bought and destroyed before, and is no longer burned
-on the owner's UID. `revenue` mode is not: it pays the miners alpha the owner's UID would burn, whether or not any
-was bought, so as revenue grows less is burned.
+The pool follows what users paid, not what is done with the money: the alpha it pays comes from the emission the
+owner's UID would burn. The operator's rule turns the revenue into buybacks of the subnet's alpha, most of it burned
+and the platform's fee locked, which takes at least as much alpha out of supply as the pool pays; the website's
+economics page lists each buyback with its transaction next to the revenue.
 
-The auditor records each period (`THROUGHPUT_AUDIT.md`): the paid input tokens per hotkey, the burns or the revenue and
+The auditor records each period (`THROUGHPUT_AUDIT.md`): the paid input tokens per hotkey and model, the revenue and
 the prices, and the miners' emission at the period's end block, and states the record, signed, with every verdicts
-document of the next period. Every full validator sets the same weights from it: it recomputes the record's figures from
-its inputs, and checks what its own node still holds of the burns and of the end block's emission and price (a pruned
-node keeps about 256 blocks; the rest it takes on the auditor's word, as it takes capacity). A record that fails either
-pays nothing at that validator for the period. A light validator sets the weights its source publishes, usage weights
+document of the next period. Every full validator sets the same weights from it: it recomputes the record's figures
+from its inputs, and checks what its own node still holds of the end block's emission and price (a pruned node keeps
+about 256 blocks; the rest it takes on the auditor's word, as it takes capacity). A record that fails either pays
+nothing at that validator for the period. A light validator sets the weights its source publishes, usage weights
 included. The network document states the epoch's `usage_share`, the share the usage weights sum to, and each hotkey's
 status its `usage_weight`.
 
@@ -173,7 +183,7 @@ status its `usage_weight`.
 
 The catalog's `scoring.referral_pool` (absent in the shipped catalog: off) pays referrers, hotkeys whose referral codes
 brought accounts that buy credit (`GATEWAY.md`, [Referrals](GATEWAY.md#referrals)), on top of their scores, out of what
-the miner share leaves. It does not run together with a usage pool. Time runs in periods of `period_epochs` epochs
+the miner share leaves; with a usage pool, its `share` is kept for it. Time runs in periods of `period_epochs` epochs
 (default 40, about a day); a period's record is closed when it ends and paid over the epochs of the next.
 
 - **What counts.** The top-ups of a code's referred accounts, at the USD they were credited at, less their refunds,
@@ -203,7 +213,7 @@ subnet owner's UID keeps what it does not pay, and the parts of referrers not pa
 | Setting | Default | Range | Meaning |
 |---|---|---|---|
 | `share` | 0.10 | (0, 0.5] | at most this share of the mechanism's miner emission per period |
-| `payout_per_usd` | 0.3 | (0, 0.9] | at most this many USD of emission per referred USD, over its window |
+| `payout_per_usd` | 0.3 | (0, 0.9] | at most this many USD of emission per referred USD, over its window; with a usage pool, at most 0.9 less its `fraction` |
 | `window_periods` | 30 | 1 to 90 | periods a top-up counts in |
 | `period_epochs` | 40 | 1 to 400 | epochs per period |
 | `term_days` | 365 | 30 to 1,095, or null | days after its referral an account's top-ups count; null: for life |

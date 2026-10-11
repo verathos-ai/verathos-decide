@@ -233,7 +233,7 @@ def test_the_miner_share_is_a_number_or_a_linear_change_and_the_same_for_every_v
         return catalog.Catalog.parse({**document, "scoring": {**document["scoring"], "miner_share": share}})
 
     shipped = catalog.load().scoring
-    assert shipped.miner_share_at(0) == shipped.miner_share_at(10**7) == 0.59  # not started: the owner starts it
+    assert shipped.miner_share_at(0) == shipped.miner_share_at(10**7) == 0.15  # flat
     without = {**document, "scoring": {k: v for k, v in document["scoring"].items() if k != "miner_share"}}
     assert catalog.Catalog.parse(without).scoring.miner_share_at(5) == 1.0  # older catalogs: everything to miners
     assert with_share(0.7).scoring.miner_share_at(5) == 0.7

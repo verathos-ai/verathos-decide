@@ -87,8 +87,10 @@ def test_the_referral_pool_is_off_in_the_shipped_catalog_and_its_settings_are_ch
                          ({"period_epochs": 0}, "period_epochs")):
         with pytest.raises(ValidationError, match=why):
             with_referrals(invalid)
-    with pytest.raises(ValidationError, match="do not run together"):
-        with_referrals({}, usage={"mode": "revenue", "fraction": 0.9})
+    both = with_referrals({}, usage={})  # 0.3 per referred USD and 0.6 of the paid usage: 0.9 together
+    assert both.scoring.usage_pool.fraction + both.scoring.referral_pool.payout_per_usd == pytest.approx(0.9)
+    with pytest.raises(ValidationError, match="add up to at most 0.9"):
+        with_referrals({}, usage={"fraction": 0.9})
     assert with_referrals({"rate": 1}).unknown_settings() == ["scoring.referral_pool.rate"]
 
 

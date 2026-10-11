@@ -424,8 +424,8 @@ def test_the_auditor_publishes_exactly_the_weights_it_sets_and_light_validators_
     network = NetworkStatus.model_validate_json(board.network())
     assert network.hotkeys == [] and network.epoch == 100  # no endpoint this epoch, yet weights are set
     assert network.weights == dict(zip(published["uids"], published["weights"]))
-    assert network.miner_share == CAT.scoring.miner_share_at(100) == 0.59  # the shipped share, not stepping down yet
-    assert network.weights == pytest.approx({0: 0.41, 1: 0.75 * 0.59, 2: 0.25 * 0.59})
+    assert network.miner_share == CAT.scoring.miner_share_at(100) == 0.15  # the shipped share
+    assert network.weights == pytest.approx({0: 0.85, 1: 0.75 * 0.15, 2: 0.25 * 0.15})
     follower.step()
     assert chain.set[-1] == published
 
@@ -461,18 +461,17 @@ def test_the_usage_pool_is_part_of_what_the_auditor_sets_and_light_validators_se
     """The hotkeys that served paying users get the period's usage share on top of their scores; the auditor
     publishes the weights with it and the share, and a light validator sets exactly those."""
     from verathos.throughput.feed import Verdicts
-    from verathos.throughput.usage import Burn, Emission, close
+    from verathos.throughput.usage import Emission, close
 
     document = CAT.document()
-    buyback = kp().ss58_address
-    pooled = catalog.Catalog.parse({**document, "scoring": {**document["scoring"], "usage_pool": {
-        "mode": "burned", "fraction": 1.0, "period_epochs": 2, "buyback_coldkey": buyback}}})
+    pooled = catalog.Catalog.parse({**document, "scoring": {**document["scoring"], "miner_share": 0.59,
+                                                             "usage_pool": {"period_epochs": 2}}})
     emission = Emission(alpha_out=10**9, owner_cut=11796, mechanism=0, mechanisms=1)
+    million = 1_000_000  # paid kev-4b tokens: 20 USD in all, 24.7 alpha at these prices
     record = close(49, pool=pooled.scoring.usage_pool, cat=pooled, epoch_blocks=BLOCKS,  # epoch 100 pays period 49
-                   paid={(hotkey, "gpu0", "kev-4b"): n for hotkey, n in (("hkA", 300), ("hkB", 100), ("hkZ", 100))},
-                   coldkeys={}, emission=emission,
-                   burns=[Burn(block=50 * 2 * BLOCKS - 9, event_index=0, coldkey=buyback, hotkey="hkX",
-                               amount=40 * 10**9)])
+                   paid={(hotkey, "gpu0", "kev-4b"): n * million for hotkey, n in (("hkA", 300), ("hkB", 100),
+                                                                                     ("hkZ", 100))},
+                   coldkeys={}, emission=emission, tao_usd=300.0, alpha_tao=0.0027)
 
     def verdicts(auditor: str, epoch: int) -> Verdicts:
         return Verdicts(netuid=405, auditor=auditor, epoch=epoch, credits=[], invalid=[],

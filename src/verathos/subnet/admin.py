@@ -4,12 +4,12 @@
                       the epoch and the miner share in it, the usage pool, the referral pool
     setup-mechanisms  mechanism count 2 and the emission split (owner coldkey)
     commit-catalog    publish a catalog file: store it where the owner's validator serves it, commit its digest; the
-                      mechanism it names must exist on chain, a usage pool's buyback coldkey must not be the subnet
-                      owner's coldkey, it must name the auditor's TLS pin and egress addresses and each gateway's
-                      egress addresses, and its models may read only text and, where their engine reads them, images
-                      its processor takes as they are; run on the auditor's machine, it fills in the auditor's pin and
-                      egress addresses from the validator's configuration and certificate where the file names none,
-                      and stores the catalog in that configuration's catalog_dir, where the validator serves it
+                      mechanism it names must exist on chain, it must name the auditor's TLS pin and egress addresses
+                      and each gateway's egress addresses, and its models may read only text and, where their engine
+                      reads them, images its processor takes as they are; run on the auditor's machine, it fills in
+                      the auditor's pin and egress addresses from the validator's configuration and certificate where
+                      the file names none, and stores the catalog in that configuration's catalog_dir, where the
+                      validator serves it
 
 The owner coldkey comes from a bittensor wallet (``--wallet``, password prompt) or, for unattended test networks,
 from a mnemonic in the OS keyring (``--keyring SERVICE:USER``).
@@ -85,12 +85,11 @@ def usage_pool_line(cat: catalog.Catalog, epoch: int) -> str:
     pool = cat.scoring.usage_pool
     if pool is None:
         return "usage pool: off"
-    basis = (f"{pool.fraction:g} of the alpha {pool.buyback_coldkey} burns on the subnet" if pool.mode == "burned"
-             else f"{pool.fraction:g} of the paid usage's revenue in alpha")
     period = pool.period(epoch)
-    return (f"usage pool ({pool.mode}): {basis} in each period of {pool.period_epochs} epochs, paid over the next "
-            f"period to the hotkeys that served paying users, {len(pool.excluded)} hotkeys or coldkeys excluded; "
-            f"epoch {epoch} is in period {period}, which pays period {period - 1}'s")
+    return (f"usage pool: {pool.fraction:g} of each period's paid usage in alpha, the period of {pool.period_epochs} "
+            f"epochs, paid over the next period to the hotkeys that served paying users by what they paid, at most "
+            f"{cat.scoring.usage_cap_at(epoch):g} of the miner emission, {len(pool.excluded)} hotkeys or coldkeys "
+            f"excluded; epoch {epoch} is in period {period}, which pays period {period - 1}'s")
 
 
 def referral_pool_line(cat: catalog.Catalog, epoch: int) -> str:
@@ -226,11 +225,6 @@ def commit_catalog(st: bt.Subtensor, wallet: bt.Wallet, netuid: int, path: Path 
     if problems := cat.input_problems():
         raise SystemExit("input this code does not serve: " + "; ".join(problems))
     cat.anchor_shares(strict=True)
-    pool = cat.scoring.usage_pool
-    if pool is not None and pool.buyback_coldkey is not None and pool.buyback_coldkey == st.substrate.query(
-            "SubtensorModule", "SubnetOwner", [netuid]).value:
-        raise SystemExit("the usage pool's buyback_coldkey is the subnet owner's coldkey: name the buyback's own "
-                         "coldkey, which signs its purchases and burns, funded with revenue only")
     if (count := st.get_mechanism_count(netuid)) <= cat.mechanism:
         raise SystemExit(f"the catalog names mechanism {cat.mechanism}, but netuid {netuid} has {count} mechanism(s) "
                          "(0 to count - 1): name an existing one, or add it first (setup-mechanisms)")

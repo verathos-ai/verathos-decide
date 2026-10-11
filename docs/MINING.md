@@ -8,8 +8,8 @@ measures each endpoint's capacity, publishes a signed manifest and answers signe
 Validators check every endpoint's answers against a reference computation (see `SCORING.md`), and the throughput
 audit (see `THROUGHPUT_AUDIT.md`) checks the capacity each endpoint declares. An endpoint's score is the capacity it
 proves, so hardware pays by its throughput per cost. The scores split the catalog's miner share of the mechanism's
-miner emission (0.59 in the shipped catalog); with the catalog's usage pool, the hotkeys whose endpoints answered
-paying users get more on top, by the paid input tokens they answered, and with its referral pool, referrers get more
+miner emission (0.15 in the shipped catalog); with the catalog's usage pool, the hotkeys whose endpoints answered
+paying users get more on top, by what the users paid for their answers, and with its referral pool, referrers get more
 by what the users they brought paid ([Referrals](#referrals)); validators set the rest as weight on the subnet owner's
 UID, which the chain does not pay out (`SCORING.md`).
 
@@ -135,10 +135,10 @@ emission (availability to users and latency left out). Where the hotkey already 
 other machines, or on this machine's GPUs placed before), it adds what the hotkey's part gains,
 `s ((H + x) / (C + x) - H / C)`. GPUs whose model is named by hand count first; then each GPU in order takes the
 active model that adds most, and the GPUs after it count it, so a machine with several GPUs spreads over the models
-where that pays more. For example, with each model at a third of the scores (0.197 of the emission at the shipped
-miner share of 0.59) and 300, 120 and 400 requests/s proven on kev-4b, kev-9b and clef-flash, an A100 whose
-measurement declares 13.9 requests/s of kev-4b adds about `0.197 x 13.9 / 313.9 = 0.87%` there,
-`0.197 x 11.3 / 131.3 = 1.7%` on kev-9b (11.3 = 13.9 x 0.81) and `0.197 x 10.0 / 410.0 = 0.48%` on clef-flash
+where that pays more. For example, with each model at a third of the scores (0.05 of the emission at the shipped
+miner share of 0.15) and 300, 120 and 400 requests/s proven on kev-4b, kev-9b and clef-flash, an A100 whose
+measurement declares 13.9 requests/s of kev-4b adds about `0.05 x 13.9 / 313.9 = 0.22%` there,
+`0.05 x 11.3 / 131.3 = 0.43%` on kev-9b (11.3 = 13.9 x 0.81) and `0.05 x 10.0 / 410.0 = 0.12%` on clef-flash
 (10.0 = 13.9 x 0.72): it serves kev-9b.
 
 On an update, a GPU keeps the model it serves unless another pays at least 1.2 times as much: a switch downloads the
@@ -146,9 +146,9 @@ model and measures again, and the numbers move with every epoch. When another pa
 plan says so and how to switch:
 
 ```
-the network in the auditor's epoch 45412: kev-4b 19.7% of the emission, 300.0 requests/s proven; kev-9b 19.7% of the emission, 210.0 requests/s proven; clef-flash 19.7% of the emission, 400.0 requests/s proven; the median endpoint 14.6 requests/s at relative speed 1
+the network in the auditor's epoch 45412: kev-4b 5.0% of the emission, 300.0 requests/s proven; kev-9b 5.0% of the emission, 210.0 requests/s proven; clef-flash 5.0% of the emission, 400.0 requests/s proven; the median endpoint 14.6 requests/s at relative speed 1
 GPU 0 (NVIDIA A100 80GB PCIe, 80 GiB): kev-4b, endpoint gpu0, engine on 127.0.0.1:8008
-GPU 0: kev-4b, as set up before: about 0.87% of the emission (its share 19.7%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 1.00%, clef-flash 0.48%. kev-9b would pay about 1.15x as much on GPU 0: --model kev-9b to switch
+GPU 0: kev-4b, as set up before: about 0.22% of the emission (its share 5.0%, 300.0 requests/s proven by other endpoints, about 13.9 on this GPU by its kev-4b measurement). Also fit: kev-9b 0.26%, clef-flash 0.12%. kev-9b would pay about 1.15x as much on GPU 0: --model kev-9b to switch
 another choice: --model <id> for every GPU, or one per GPU in order, as in --model kev-9b
 ```
 

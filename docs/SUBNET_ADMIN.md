@@ -228,73 +228,68 @@ within a minute; until then their requests to the auditor fail and are retried, 
 `scoring.miner_share` is the share of the mechanism's miner emission the scores pay the miners. Validators scale the
 miners' weights to sum to it and set the rest as weight on the subnet owner's UID (`SCORING.md`). The chain pays the
 subnet owner hotkey no incentive: it burns it, or recycles it if the subnet's `RecycleOrBurn` is set to recycle
-(AdminUtils `sudo_set_recycle_or_burn`). Without the setting the miners get all of it (1). It is a number in (0, 1],
-or a linear change, as in the shipped catalog:
+(AdminUtils `sudo_set_recycle_or_burn`). Without the setting the miners get all of it (1). It is a number in (0, 1]
+(0.15 in the shipped catalog), or a linear change:
 
 ```json
-"miner_share": {"from": 0.59, "to": 0.15, "start_epoch": null, "epochs": 2400}
+"miner_share": {"from": 0.5, "to": 0.15, "start_epoch": 50000, "epochs": 120}
 ```
 
 The share is `from` until `start_epoch`, then moves linearly to `to` over `epochs` epochs and stays there; while
 `start_epoch` is null it stays at `from`. `from` and `to` are in (0, 1] (either may be the larger), `epochs` at least
-1. 2400 epochs of 180 blocks are about 60 days. Every validator computes an epoch's share from the catalog and the
-epoch number (block // `epoch_blocks`) alone, rounded to 6 decimals, logs it each epoch, and the auditor publishes it
-in `GET /v1/network` (`miner_share`); light validators set the auditor's weights as published.
+1; 40 epochs of 180 blocks are about a day. Every validator computes an epoch's share from the catalog and the epoch
+number (block // `epoch_blocks`) alone, rounded to 6 decimals, logs it each epoch, and the auditor publishes it in
+`GET /v1/network` (`miner_share`); light validators set the auditor's weights as published.
 
-To start the step-down, set `start_epoch` to the epoch it starts at, no earlier than the epoch the commit falls in
-(each epoch is scored under the catalog committed at its first block; an earlier one makes the share jump), and
-commit the catalog. `status` shows the current epoch and its share, and `commit-catalog` prints the share
-in the current epoch and when the change ends. Keep `start_epoch` and `epochs` in later catalogs, or the share jumps
-to what the new values give; changing `epoch_blocks` renumbers the epochs, so it moves the change too. A catalog whose
-`miner_share` differs from the committed catalog's is refused unless `--change-miner-share` is given: one built from
-the shipped file, whose change has no `start_epoch`, would put the share back to `from` at once.
+A change starts at `start_epoch`, no earlier than the epoch the commit falls in (each epoch is scored under the catalog
+committed at its first block; an earlier one makes the share jump). `status` shows the current epoch and its share,
+and `commit-catalog` prints the share in the current epoch and when a change ends. Keep `start_epoch` and `epochs` in
+later catalogs, or the share jumps to what the new values give; changing `epoch_blocks` renumbers the epochs, so it
+moves the change too. A catalog whose `miner_share` differs from the committed catalog's is refused unless
+`--change-miner-share` is given.
 
 ## Usage pool
 
-`scoring.usage_pool` pays the hotkeys that served paying users on top of their scores, out of what the miner share
-leaves (`SCORING.md`). Without it, or with a miner share of 1, there is none.
+`scoring.usage_pool` pays the hotkeys that served paying users on top of their scores, sized from what users paid,
+out of what the miner share and the referral pool's share leave (`SCORING.md`). Without it, or with a miner share of
+1, there is none.
 
 ```json
-"usage_pool": {"mode": "burned", "fraction": 1.0, "period_epochs": 40,
-               "buyback_coldkey": "5...", "excluded": ["5...", "5..."]}
+"usage_pool": {"fraction": 0.6, "period_epochs": 40, "excluded": []}
 ```
 
 | Setting | Meaning |
 |---|---|
-| `mode` | `burned`: a period's pool is the alpha `buyback_coldkey` burned on the subnet in it; `revenue`: the period's paid usage, converted to alpha |
-| `fraction` | in (0, 1]: the share of that alpha the pool pays |
+| `fraction` | in (0, 0.9], default 0.6: the share of a period's paid usage, in alpha, the pool pays; with a referral pool, at most 0.9 less its `payout_per_usd` |
 | `period_epochs` | 1 to 400, default 40 (about a day): a period's pool is paid over the epochs of the next |
-| `buyback_coldkey` | `burned` mode: the coldkey whose `AlphaBurned` events on the subnet count |
-| `excluded` | hotkeys and coldkeys whose endpoints get no usage pay, such as the owner's own miners; their part stays on the owner's UID |
+| `excluded` | hotkeys and coldkeys whose endpoints get no usage pay; their part stays on the owner's UID |
 
-The buyback coldkey is the owner side's own coldkey, published, not the subnet owner's coldkey (`commit-catalog`
-refuses that one): it signs every period, so it holds only the revenue it spends. It buys alpha and burns it from
-its own stake, with `add_stake` and `burn_alpha`, or `add_stake_burn` in one call. A burn counts in the period whose
-blocks it is in. With `fraction` 1 the pool pays the miners what was burned; a part of the purchase kept rather than
-burned (a fee) is not paid. In `revenue` mode no coldkey is read: the pool follows the gateway's paid usage whether or
-not alpha is bought with it.
+The pool reads no wallet: it follows the gateways' paid usage (`GATEWAY.md`) at the models' prices, converted to alpha
+at TAO's price and the subnet's moving alpha price. The operator turns the revenue into buybacks of the subnet's alpha
+(`add_stake_burn` buys and burns in one call; the fee's alpha is bought with `add_stake_limit` and locked with
+`lock_stake`) and publishes each in the website's burn ledger (its `economics.burn_ledger_file`).
 
 To enable it:
 
-1. Keep the miner share below 1: the pool takes at most `1 - miner_share`. Validators of a release without the pool
-   ignore the setting and set their weights without it: enable it once the auditor and the full validators run one
-   with it (light validators set the auditor's weights, pool included, whatever their release).
-2. Publish the buyback coldkey and the excluded keys, and commit a catalog with `usage_pool`. `commit-catalog` prints
-   the pool and the current period. The auditor reads the burns from the start of the period it adopts the catalog
-   in (from blocks its node still holds); that period's record is the first, paid over the next period.
-3. Burn from the buyback coldkey. The auditor logs each period it closes (`usage pool: period ... closed`), and every
-   validator each epoch's usage share.
+1. Keep the miner share below 1: the pool takes at most `1 - miner_share` less the referral pool's `share`.
+   Validators of a release without the pool ignore the setting and set their weights without it: enable it once the
+   auditor and the full validators run one with it (light validators set the auditor's weights, pool included,
+   whatever their release).
+2. Commit a catalog with `usage_pool`. `commit-catalog` prints the pool, its cap and the current period. The auditor
+   closes the period that ended before it adopted the catalog first, then each period as its end block is final; each
+   record is paid over the next period.
+3. The auditor logs each period it closes (`usage pool: period ... closed`), and every validator each epoch's usage
+   share.
 
 A period is its blocks: a new `period_epochs` or `epoch_blocks` starts periods of other blocks, and a new period that
-overlaps one already recorded has no record (its pool is not paid), so nothing counts twice. A new `buyback_coldkey`
-applies to the periods closed after the change: only its burns count in them. Run it on the test network first, with
-a test buyback coldkey and a short `period_epochs`.
+overlaps one already recorded has no record (its pool is not paid), so nothing counts twice. Run it on the test network
+first, with a short `period_epochs` and paid test traffic.
 
 ## Referrals
 
 `scoring.referral_pool` pays referrers, the hotkeys whose codes brought accounts that buy credit, on top of their
 scores, out of what the miner share leaves (`SCORING.md`, Referrals; `GATEWAY.md`, Referrals). The shipped catalog has
-none; `commit-catalog` refuses one together with a usage pool, and a `payout_per_usd` above 0.9.
+none; `commit-catalog` refuses a `payout_per_usd` above 0.9, or above 0.9 less a usage pool's `fraction`.
 
 ```json
 "referral_pool": {"share": 0.10, "payout_per_usd": 0.3, "window_periods": 30, "period_epochs": 40,

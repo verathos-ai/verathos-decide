@@ -5,22 +5,20 @@ Period ``k`` is the epochs ``k x period_epochs`` up to the next period's first: 
 auditor closes the period into a ``UsageRecord`` and states it with every verdicts document of period ``k + 1``, signed
 with them (``usage``):
 
-- ``served``: per hotkey, the input tokens of the answers its endpoints gave paying users in the period (the
+- ``served``: per hotkey and model, the input tokens of the answers its endpoints gave paying users in the period (the
   verdicts' ``paid_served`` of its epochs, summed), with its coldkey at the reference block; ``paid_input_tokens``
   the same per model;
 - ``emission``: what the chain pays the mechanism's miners per block, read at the reference block, and
   ``period_emission``, that over the period's blocks, in alpha;
-- ``basis``, in alpha. ``burned``: what ``buyback_coldkey`` burned on the subnet in the period, its ``AlphaBurned``
-  events each listed with its block and position (``burns``; blocks the auditor's node no longer held when it read
-  them are listed in ``unscanned`` and their burns do not count). ``revenue``: the period's paid input tokens per model
-  at the catalog's ``prices`` (``revenue_usd``), converted at ``tao_usd`` (USD per TAO, read from ``TAO_USD_SOURCES``
-  when the period closed) and ``alpha_tao`` (the subnet's moving alpha price in TAO at the reference block);
+- ``basis``, in alpha: the period's paid input tokens at the catalog's ``prices`` (``revenue_usd``), converted at
+  ``tao_usd`` (USD per TAO, read from ``TAO_USD_SOURCES`` when the period closed) and ``alpha_tao`` (the subnet's
+  moving alpha price in TAO at the reference block);
 - ``share``: ``fraction x basis / period_emission``, at most 1, rounded to ``SHARE_DIGITS``: the share of the
   mechanism's miner emission the pool pays in every epoch of period ``k + 1``, at most what the epoch's miner share
-  leaves (``validator.usage``).
+  and the referral pool's share leave (``validator.usage``).
 
 A record states every input. Validators recompute its sums (``UsageRecord.inconsistency``) and check what their own
-node still holds (``contradiction``): the burns, and the emission and price at the reference block. What their node no
+node still holds (``contradiction``): the emission and the alpha price at the reference block. What their node no
 longer holds they take on the auditor's word, as they take its capacity credits.
 """
 
@@ -29,7 +27,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Iterable
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -53,16 +51,6 @@ TAO_USD_SOURCES = (  # public tickers, tried in order: the first price within TA
 TAO_USD_BOUNDS = (10.0, 10_000.0)  # a price outside them is a ticker's error, not the market
 TOKENS_PER_PRICE = 1_000_000  # a model's price is in USD per million input tokens
 NO_OWNER = "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM"  # the zero account: ``Owner`` of a hotkey nobody owns
-
-
-class Burn(BaseModel):
-    """One ``AlphaBurned`` event: ``coldkey`` destroyed ``amount`` rao of its alpha staked to ``hotkey``."""
-
-    block: int = Field(ge=0)
-    event_index: int = Field(ge=0)  # its position among the block's events
-    coldkey: str
-    hotkey: str
-    amount: int = Field(ge=0)  # rao
 
 
 class Emission(BaseModel):
@@ -89,7 +77,11 @@ class Emission(BaseModel):
 class Served(BaseModel):
     hotkey: str
     coldkey: str | None = None  # its owner at the reference block (None: not known there)
-    input_tokens: int = Field(ge=0)  # of the answers its endpoints gave paying users in the period
+    input_tokens: dict[str, int]  # per model, of the answers its endpoints gave paying users in the period
+
+    def paid_usd(self, prices: dict[str, float]) -> float:
+        """What users paid for these answers, at ``prices``."""
+        return revenue(self.input_tokens, prices)
 
 
 class UsageRecord(BaseModel):
@@ -99,7 +91,6 @@ class UsageRecord(BaseModel):
     period: int = Field(ge=0)
     first_block: int = Field(ge=0)
     end_block: int = Field(ge=0)  # the next period's first block: the reference block
-    mode: Literal["burned", "revenue"]
     fraction: float = Field(gt=0, le=1)
     emission: Emission
     period_emission: float = Field(ge=0)  # alpha
@@ -107,13 +98,10 @@ class UsageRecord(BaseModel):
     share: float = Field(ge=0, le=1)
     served: list[Served] = []
     paid_input_tokens: dict[str, int] = {}  # per model
-    buyback_coldkey: str | None = None
-    burns: list[Burn] = []
-    unscanned: list[tuple[int, int]] = []  # [first, end) block ranges not read: their burns do not count
     prices: dict[str, float] = {}  # per model, USD per million input tokens
-    revenue_usd: float | None = None
-    tao_usd: float | None = None
-    alpha_tao: float | None = None
+    revenue_usd: float = Field(ge=0)
+    tao_usd: float = Field(gt=0)
+    alpha_tao: float = Field(gt=0)
 
     def inconsistency(self) -> str | None:
         """Why the record's figures do not follow from its inputs; None if they do."""
@@ -122,24 +110,18 @@ class UsageRecord(BaseModel):
         if not _close(self.period_emission, self.emission.miner_alpha_per_block() * (self.end_block -
                                                                                     self.first_block)):
             return "its period emission is not its per-block emission over the period's blocks"
-        if sum(s.input_tokens for s in self.served) != sum(self.paid_input_tokens.values()):
+        per_model: dict[str, int] = {}
+        for served in self.served:
+            for model, tokens in served.input_tokens.items():
+                per_model[model] = per_model.get(model, 0) + tokens
+        if {m: n for m, n in per_model.items() if n} != {m: n for m, n in self.paid_input_tokens.items() if n}:
             return "its hotkeys' paid input tokens do not add up to its models'"
-        if self.mode == "burned":
-            if self.buyback_coldkey is None or any(b.coldkey != self.buyback_coldkey for b in self.burns):
-                return "it counts burns of another coldkey than its buyback coldkey"
-            if any(not self.first_block <= b.block < self.end_block for b in self.burns):
-                return "it counts burns outside its period"
-            if len({(b.block, b.event_index) for b in self.burns}) != len(self.burns):
-                return "it counts a burn twice"
-            basis = burned(self.burns)
-        else:
-            if self.tao_usd is None or self.alpha_tao is None or self.revenue_usd is None:
-                return "it lacks its revenue or prices"
-            if not _close(self.revenue_usd, revenue(self.paid_input_tokens, self.prices)):
-                return "its revenue is not its paid input tokens at its prices"
-            basis = in_alpha(self.revenue_usd, self.tao_usd, self.alpha_tao)
-        if not _close(self.basis, basis):
-            return "its basis does not follow from its burns or revenue"
+        if len({s.hotkey for s in self.served}) != len(self.served):
+            return "it lists a hotkey twice"
+        if not _close(self.revenue_usd, revenue(self.paid_input_tokens, self.prices)):
+            return "its revenue is not its paid input tokens at its prices"
+        if not _close(self.basis, in_alpha(self.revenue_usd, self.tao_usd, self.alpha_tao)):
+            return "its basis is not its revenue in alpha"
         if abs(self.share - sized_share(self.fraction, self.basis, self.period_emission)) > 10**-SHARE_DIGITS:
             return "its share does not follow from its basis"
         return None
@@ -153,11 +135,6 @@ def period_blocks(pool: UsagePool | ReferralPool, epoch_blocks: int, period: int
     """The period's first block and the next period's (its reference block)."""
     length = pool.period_epochs * epoch_blocks
     return period * length, (period + 1) * length
-
-
-def burned(burns: Iterable[Burn]) -> float:
-    """The alpha the burns destroyed."""
-    return sum(b.amount for b in burns) / RAO
 
 
 def revenue(paid_input_tokens: dict[str, int], prices: dict[str, float]) -> float:
@@ -180,38 +157,28 @@ def sized_share(fraction: float, basis: float, period_emission: float) -> float:
 
 
 def close(period: int, *, pool: UsagePool, cat: Catalog, epoch_blocks: int, paid: dict[tuple[str, str, str], int],
-          coldkeys: dict[str, str | None], emission: Emission, burns: list[Burn] | None = None,
-          unscanned: list[tuple[int, int]] | None = None, tao_usd: float | None = None,
-          alpha_tao: float | None = None) -> UsageRecord:
+          coldkeys: dict[str, str | None], emission: Emission, tao_usd: float, alpha_tao: float) -> UsageRecord:
     """The record of ``period``: ``paid`` holds the period's paid input tokens per (hotkey, endpoint, model),
-    ``coldkeys`` the served hotkeys' owners and ``emission`` the miners' emission, at the reference block; in burned
-    mode ``burns`` are the subnet's burns in the period (any coldkey's) and ``unscanned`` the ranges not read; in
-    revenue mode ``tao_usd`` and ``alpha_tao`` the prices."""
+    ``coldkeys`` the served hotkeys' owners, ``emission`` the miners' emission and ``alpha_tao`` the moving alpha
+    price, at the reference block, and ``tao_usd`` TAO's price when the period closed."""
     first, end = period_blocks(pool, epoch_blocks, period)
-    per_hotkey: dict[str, int] = {}
+    per_hotkey: dict[str, dict[str, int]] = {}
     per_model: dict[str, int] = {}
     for (hotkey, _, model), tokens in sorted(paid.items()):
-        per_hotkey[hotkey] = per_hotkey.get(hotkey, 0) + tokens
+        models = per_hotkey.setdefault(hotkey, {})
+        models[model] = models.get(model, 0) + tokens
         per_model[model] = per_model.get(model, 0) + tokens
     period_emission = emission.miner_alpha_per_block() * (end - first)
-    fields: dict[str, Any] = {}
-    if pool.mode == "burned":
-        counted = sorted((b for b in burns or [] if b.coldkey == pool.buyback_coldkey and first <= b.block < end),
-                         key=lambda b: (b.block, b.event_index))
-        basis = burned(counted)
-        fields = {"buyback_coldkey": pool.buyback_coldkey, "burns": counted,
-                  "unscanned": [(max(a, first), min(b, end)) for a, b in unscanned or [] if a < end and b > first]}
-    else:
-        prices = {model: m.price for model in per_model if (m := cat.get(model)) is not None}
-        usd = revenue(per_model, prices)
-        basis = in_alpha(usd, tao_usd or 0.0, alpha_tao or 0.0)
-        fields = {"prices": prices, "revenue_usd": usd, "tao_usd": tao_usd, "alpha_tao": alpha_tao}
-    return UsageRecord(period=period, first_block=first, end_block=end, mode=pool.mode, fraction=pool.fraction,
-                       emission=emission, period_emission=period_emission, basis=basis,
+    prices = {model: m.price for model in per_model if (m := cat.get(model)) is not None}
+    usd = revenue(per_model, prices)
+    basis = in_alpha(usd, tao_usd, alpha_tao)
+    return UsageRecord(period=period, first_block=first, end_block=end, fraction=pool.fraction, emission=emission,
+                       period_emission=period_emission, basis=basis,
                        share=sized_share(pool.fraction, basis, period_emission),
-                       served=[Served(hotkey=hk, coldkey=coldkeys.get(hk), input_tokens=n)
-                               for hk, n in sorted(per_hotkey.items())],
-                       paid_input_tokens=dict(sorted(per_model.items())), **fields)
+                       served=[Served(hotkey=hk, coldkey=coldkeys.get(hk), input_tokens=dict(sorted(models.items())))
+                               for hk, models in sorted(per_hotkey.items())],
+                       paid_input_tokens=dict(sorted(per_model.items())), prices=prices, revenue_usd=usd,
+                       tao_usd=tao_usd, alpha_tao=alpha_tao)
 
 
 def record_of(document: Any) -> UsageRecord | None:
@@ -240,30 +207,6 @@ def _int(value: Any) -> int:
     if isinstance(value, dict) and len(value) == 1:
         value = next(iter(value.values()))
     return int(value)
-
-
-def burns_in(events: list[dict], block: int, netuid: int) -> list[Burn]:
-    """The ``AlphaBurned(coldkey, hotkey, amount, netuid)`` events on ``netuid`` among a block's events."""
-    out = []
-    for index, event in enumerate(events):
-        if event.get("module_id") != "SubtensorModule" or event.get("event_id") != "AlphaBurned":
-            continue
-        values = event.get("attributes")
-        if isinstance(values, dict):
-            values = list(values.values())
-        try:
-            coldkey, hotkey, amount, net = values
-            if _int(net) == netuid:
-                out.append(Burn(block=block, event_index=index, coldkey=str(coldkey), hotkey=str(hotkey),
-                                amount=_int(amount)))
-        except (TypeError, ValueError):
-            log.warning("an AlphaBurned event at block %d is not (coldkey, hotkey, amount, netuid): %r", block, values)
-    return out
-
-
-def burns_at(st: Any, block: int, netuid: int) -> list[Burn]:
-    """The burns on ``netuid`` in ``block``. Raises when the node no longer holds the block's state."""
-    return burns_in(st.substrate.get_events(block_hash(st, block)), block, netuid)
 
 
 def emission_at(st: Any, block: int, netuid: int, mechanism: int) -> Emission:
@@ -316,32 +259,18 @@ def tao_usd(fetch: Callable[..., Any] = get_json) -> float:
 
 
 def contradiction(record: UsageRecord, st: Any, netuid: int) -> str | None:
-    """What the chain, as this node still holds it, says against ``record``: a listed burn it does not have, or
-    another emission or alpha price at the reference block. None if nothing; what the node no longer holds (or cannot
-    read now) is not checked."""
-    by_block: dict[int, list[Burn]] = {}
-    for burn in record.burns:
-        by_block.setdefault(burn.block, []).append(burn)
-    for block, listed in sorted(by_block.items()):
-        try:
-            held = burns_at(st, block, netuid)
-        except Exception:
-            continue  # beyond the node's state
-        if missing := [b for b in listed if b not in held]:
-            b = missing[0]
-            return (f"the chain has no burn of {b.amount} rao by {b.coldkey} at block {block} (event {b.event_index}) "
-                    "as the record lists")
+    """What the chain, as this node still holds it, says against ``record``: another emission or alpha price at the
+    reference block. None if nothing; what the node no longer holds (or cannot read now) is not checked."""
     try:
         emission = emission_at(st, record.end_block, netuid, record.emission.mechanism)
     except Exception:
         emission = None
     if emission is not None and emission != record.emission:
         return f"the chain's miner emission at block {record.end_block} is {emission}, not {record.emission}"
-    if record.mode == "revenue" and record.alpha_tao is not None:
-        try:
-            price = alpha_price_at(st, record.end_block, netuid)
-        except Exception:
-            price = None
-        if price is not None and not _close(price, record.alpha_tao):
-            return f"the chain's moving alpha price at block {record.end_block} is {price}, not {record.alpha_tao}"
+    try:
+        price = alpha_price_at(st, record.end_block, netuid)
+    except Exception:
+        price = None
+    if price is not None and not _close(price, record.alpha_tao):
+        return f"the chain's moving alpha price at block {record.end_block} is {price}, not {record.alpha_tao}"
     return None

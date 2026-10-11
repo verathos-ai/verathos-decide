@@ -1,6 +1,6 @@
 """Chain access for the throughput audit (bittensor SDK 10.x): head blocks, block hashes, finality and the
-auditor's axon; and for the usage and referral pools, the subnet's burns, its miners' emission, its alpha price, its
-owner and hotkeys' owners at a block (``throughput.usage``, ``throughput.referral``)."""
+auditor's axon; and for the usage and referral pools, the subnet's miners' emission, its alpha price, its owner and
+hotkeys' owners at a block (``throughput.usage``, ``throughput.referral``)."""
 
 from __future__ import annotations
 
@@ -81,10 +81,6 @@ class SubtensorChainView:
             except Exception:
                 self._reset()
                 raise
-
-    def burns(self, block: int, netuid: int) -> list[usage.Burn]:
-        """The burns on ``netuid`` in ``block``. Raises if the node no longer holds the block's state."""
-        return self._read(usage.burns_at, block, netuid)
 
     def emission(self, block: int, netuid: int, mechanism: int) -> usage.Emission:
         return self._read(usage.emission_at, block, netuid, mechanism)

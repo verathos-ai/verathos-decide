@@ -250,12 +250,7 @@
     "drift_window_tests": 8
   },
   "scoring": {
-    "miner_share": {
-      "from": 0.59,
-      "to": 0.15,
-      "start_epoch": null,
-      "epochs": 2400
-    },
+    "miner_share": 0.15,
     "canary_pool_size": 16,
     "canaries_per_endpoint": 10,
     "canary_spread_fraction": 0.6,

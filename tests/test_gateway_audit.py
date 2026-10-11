@@ -868,7 +868,7 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
     Store(tmp_path / "old.sqlite", epoch_blocks=180)  # today's, less what versions 5 on added
     db = sqlite3.connect(tmp_path / "old.sqlite")
     db.executescript("DROP TABLE demand; DROP TABLE users; DROP TABLE meta; DROP TABLE shares; DROP TABLE paid; "
-                     "DROP TABLE burns; DROP TABLE unscanned; DROP TABLE usage; DROP TABLE referral_codes; "
+                     "DROP TABLE usage; DROP TABLE referral_codes; "
                      "DROP TABLE referral_moves; DROP TABLE referral_entries; DROP TABLE referral; "
                      "DROP INDEX results_by_endpoint; DROP INDEX samples_by_test; "
                      "ALTER TABLE samples DROP COLUMN test_id; ALTER TABLE samples DROP COLUMN media; "
@@ -881,6 +881,30 @@ def test_an_auditor_database_one_version_old_is_migrated_not_dropped(tmp_path) -
     assert store.demand_ema(10) == {}
     assert {"test_id", "media"} <= {column[1] for column in store._query("PRAGMA table_info(samples)")}
     assert store.paid(0, 10) == {} and store.referral_recorded_through() == 0
+
+
+def test_an_auditor_database_with_the_buyback_burns_drops_them_and_keeps_the_rest(tmp_path) -> None:
+    """The usage pool once also counted a buyback coldkey's burns: a database of that version loses those tables, its
+    scan position and its period records (sized another way), and keeps its tests."""
+    import sqlite3
+
+    from verathos.throughput.auditor import SCHEMA_VERSION, Store
+
+    Store(tmp_path / "old.sqlite", epoch_blocks=180)
+    db = sqlite3.connect(tmp_path / "old.sqlite")
+    db.executescript("CREATE TABLE burns (block INTEGER, event_index INTEGER, coldkey TEXT, hotkey TEXT, "
+                     "amount INTEGER); CREATE TABLE unscanned (first_block INTEGER, end_block INTEGER); "
+                     "INSERT INTO meta VALUES ('burns_from', '720'), ('burns_scanned', '900'); "
+                     "INSERT INTO usage VALUES (360, 720, '{}'); "
+                     "INSERT INTO tests VALUES ('kept', 3, 560, 'h', 565, 'confirmed', ''); "
+                     f"PRAGMA user_version = {SCHEMA_VERSION - 1};")
+    db.close()
+    store = Store(tmp_path / "old.sqlite", epoch_blocks=180)
+    tables = {row[0] for row in store._query("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert "burns" not in tables and "unscanned" not in tables and store.recorded_through() == 0
+    assert store._query("SELECT key FROM meta WHERE key LIKE 'burns%'") == []
+    assert store._query("SELECT test_id FROM tests") == [("kept",)]
+    assert store._query("PRAGMA user_version")[0][0] == SCHEMA_VERSION
 
 
 def test_verdicts_take_a_few_queries_whatever_the_number_of_endpoints(tmp_path) -> None:

@@ -275,13 +275,13 @@ sets (`set_weights mechid=0 uids=3 -> True`; in a dry run the weights themselves
 
 ```
   emission shares: clef-flash 33.3%, kev-4b 33.3%, kev-9b 33.3%
-  miner share 0.590000: the miners' weights sum to it, the subnet owner's UID gets the rest
+  miner share 0.150000: the miners' weights sum to it, the subnet owner's UID gets the rest
   5CzN.../gpu0 epoch_verdict=insufficient answered=7/7 identity=True mean_abs=0.0013 proven_rps=7.6 users=1.00 score=0.191
-dry run (mechanism 0 configured dry): weights {0: 0.41, 1: 0.3363, 12: 0.2537}
+dry run (mechanism 0 configured dry): weights {0: 0.85, 1: 0.0855, 12: 0.0645}
 ```
 
 With the catalog's usage pool it also logs the period it pays and what it pays (`usage pool: period 412 sized 0.061235
-(burned), paid 0.058870 to 9 UIDs`), and an error if it refuses the auditor's record of a period. With its referral
+(1234.56 USD paid), paid 0.058870 to 9 UIDs`), and an error if it refuses the auditor's record of a period. With its referral
 pool, the period it pays, what the referrers referred, what it pays and why it pays a referrer nothing (`holds no UID`,
 `the subnet owner's`, `excluded`, `not serving`), and an error if it refuses the record (with why: its figures, the
 catalog's parameters, the chain at the period's end, or a rewritten earlier period or a code moved to another coldkey):
@@ -650,8 +650,8 @@ Per epoch a full validator:
    and latency), each model's user demand, and any proven wrong answers;
 6. one at a time: takes the source's results for the models it did not check;
 7. scores (`candidate` models are checked but weighted zero, `retired` models are skipped), updates the EMA and
-   probation, scales the miners' weights to the catalog's miner share for the epoch, adds the usage pool's or the
-   referral pool's weights from the period record the verdicts state (checked against its node; a referral record
+   probation, scales the miners' weights to the catalog's miner share for the epoch, adds the usage pool's and the
+   referral pool's weights from the period records the verdicts state (checked against its node; a referral record
    also against the last one it accepted), gives the subnet owner's UID the rest (`SCORING.md`), and sets weights on
    the catalog's mechanism, or `mechid` (retried once per block, up to 10 times).
 

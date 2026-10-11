@@ -399,8 +399,8 @@ async def run_epoch(cfg: ValidatorConfig, st: bt.Subtensor, wallet: bt.Wallet, s
     if sc.usage_pool is not None and record is None:
         log.info("  usage pool: no record of period %d: nothing paid", sc.usage_pool.period(epoch) - 1)
     elif record is not None:
-        log.info("  usage pool: period %d sized %.6f (%s), paid %.6f to %d UIDs", record.period, record.share,
-                 record.mode, usage_share, len(usage_by_uid))
+        log.info("  usage pool: period %d sized %.6f (%.2f USD paid), paid %.6f to %d UIDs", record.period,
+                 record.share, record.revenue_usd, usage_share, len(usage_by_uid))
     if egress is not None and egress.in_grace(began):
         unreached = egress_module.excused(results)
         for key in unreached:

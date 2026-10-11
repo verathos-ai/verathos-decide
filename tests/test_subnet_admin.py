@@ -142,6 +142,9 @@ def test_commit_catalog_creates_the_auditors_certificate_when_the_auditor_has_no
 def test_commit_catalog_states_the_miner_share_now_and_how_it_changes(tmp_path, capsys) -> None:
     chain = Chain()
     commit(chain, catalog_file(tmp_path), tmp_path)
+    assert "miner share 0.150000 in epoch 1000\n" in capsys.readouterr().out  # the shipped share: flat
+    path = catalog_file(tmp_path, miner_share={"from": 0.59, "to": 0.15, "start_epoch": None, "epochs": 2400})
+    commit(chain, path, tmp_path, change_share=True)
     assert ("miner share 0.590000 in epoch 1000; the change to 0.15 over 2400 epochs has no start_epoch yet"
             in capsys.readouterr().out)
     path = catalog_file(tmp_path, miner_share={"from": 0.59, "to": 0.15, "start_epoch": 400, "epochs": 2400})
@@ -154,19 +157,18 @@ def test_commit_catalog_states_the_miner_share_now_and_how_it_changes(tmp_path, 
 
 
 def test_commit_catalog_changes_the_miner_share_only_when_told_to(tmp_path) -> None:
-    """A catalog built from the shipped file (its change without a start) would put the share back to where the
-    change starts, at once: a commit that changes scoring.miner_share takes --change-miner-share; one that keeps it
-    goes through."""
+    """A catalog built from the shipped file would put the share back to the shipped one at once: a commit that
+    changes scoring.miner_share takes --change-miner-share; one that keeps it goes through."""
     chain = Chain()
     stepping = {"from": 0.59, "to": 0.15, "start_epoch": 400, "epochs": 2400}
     commit(chain, catalog_file(tmp_path, miner_share=stepping), tmp_path)  # nothing committed before
     before = list(chain.commitments)
     with pytest.raises(SystemExit) as refused:
-        commit(chain, catalog_file(tmp_path), tmp_path)  # the shipped share: no start
+        commit(chain, catalog_file(tmp_path), tmp_path)  # the shipped share
     assert str(refused.value) == (
         "this catalog changes scoring.miner_share. Committed: miner share 0.480000 in epoch 1000; 0.59 until epoch "
-        "400, then linearly to 0.15 at epoch 2800. This one: miner share 0.590000 in epoch 1000; the change to 0.15 "
-        "over 2400 epochs has no start_epoch yet. Pass --change-miner-share to commit it")
+        "400, then linearly to 0.15 at epoch 2800. This one: miner share 0.150000 in epoch 1000. Pass "
+        "--change-miner-share to commit it")
     assert chain.commitments == before
     commit(chain, catalog_file(tmp_path, miner_share=stepping, canary_pool_size=8), tmp_path)  # the share kept
     assert len(chain.commitments) == 2
@@ -174,25 +176,22 @@ def test_commit_catalog_changes_the_miner_share_only_when_told_to(tmp_path) -> N
     assert len(chain.commitments) == 3
 
 
-def test_commit_catalog_states_the_usage_pool_and_refuses_the_owner_coldkey_as_its_buyback(tmp_path, capsys) -> None:
+def test_commit_catalog_states_the_usage_pool_and_refuses_one_that_would_pay_a_referred_usd_twice(tmp_path,
+                                                                                               capsys) -> None:
     chain = Chain()
     commit(chain, catalog_file(tmp_path), tmp_path)
     assert "usage pool: off" in capsys.readouterr().out
-    buyback = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
-    pool = {"mode": "burned", "fraction": 1.0, "period_epochs": 40, "buyback_coldkey": buyback}
-    commit(chain, catalog_file(tmp_path, usage_pool=pool), tmp_path)
-    assert (f"usage pool (burned): 1 of the alpha {buyback} burns on the subnet in each period of 40 epochs, paid "
-            "over the next period to the hotkeys that served paying users, 0 hotkeys or coldkeys excluded; epoch "
-            "1000 is in period 25, which pays period 24's") in capsys.readouterr().out
-    with pytest.raises(SystemExit, match="buyback_coldkey is the subnet owner's coldkey"):
-        commit(chain, catalog_file(tmp_path, usage_pool={**pool, "buyback_coldkey": OWNER_COLDKEY}), tmp_path)
-    with pytest.raises(SystemExit, match="scoring.usage_pool.coldkey"):
-        commit(chain, catalog_file(tmp_path, usage_pool={**pool, "coldkey": buyback}), tmp_path)
-    with pytest.raises(ValueError, match="buyback_coldkey"):
-        commit(chain, catalog_file(tmp_path, usage_pool={"mode": "burned", "fraction": 1.0}), tmp_path)
+    commit(chain, catalog_file(tmp_path, usage_pool={"period_epochs": 40}), tmp_path)
+    assert ("usage pool: 0.6 of each period's paid usage in alpha, the period of 40 epochs, paid over the next period "
+            "to the hotkeys that served paying users by what they paid, at most 0.85 of the miner emission, 0 hotkeys "
+            "or coldkeys excluded; epoch 1000 is in period 25, which pays period 24's") in capsys.readouterr().out
+    with pytest.raises(SystemExit, match="scoring.usage_pool.buyback_coldkey"):
+        commit(chain, catalog_file(tmp_path, usage_pool={"buyback_coldkey": OWNER_COLDKEY}), tmp_path)
+    with pytest.raises(ValueError, match="add up to at most 0.9"):
+        commit(chain, catalog_file(tmp_path, usage_pool={"fraction": 0.7}, referral_pool={}), tmp_path)
     assert len(chain.commitments) == 2
-    commit(chain, catalog_file(tmp_path, usage_pool={"mode": "revenue", "fraction": 0.9}), tmp_path)
-    assert "usage pool (revenue): 0.9 of the paid usage's revenue in alpha" in capsys.readouterr().out
+    commit(chain, catalog_file(tmp_path, usage_pool={}, referral_pool={}), tmp_path)
+    assert "at most 0.75 of the miner emission" in capsys.readouterr().out  # the referrals' slice stays theirs
 
 
 def test_commit_catalog_refuses_an_invalid_or_mistyped_miner_share(tmp_path) -> None:
