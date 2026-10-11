@@ -70,7 +70,11 @@ digest proves, are fetched accepting any certificate.
    no route out) counts against nobody. A miner that answers busy (429, 503) is skipped for one second. A refusal of
    the request (another 4xx) counts against it if another miner then answers the same request; the gateway has
    checked everything a miner checks, so a refusal no other miner shares is also reported as refusing users (without
-   opening its breaker), and the user gets 503, not 400. A slow endpoint gets fewer requests on its own: they stay in
+   opening its breaker), and the user gets 503, not 400. All but the tokens: the gateway counts a state as 4
+   characters a token, the engines count its real tokens, so dense text (long numbers, some scripts) can pass the
+   gateway over the model's `max_state_tokens`, and the engines refuse it (413 or 422, which the miner answers as it
+   is). Two miners or more refusing a request so is the request's limit: the user gets 413 `too_large`, and no miner
+   is reported. A slow endpoint gets fewer requests on its own: they stay in
    flight longer. After 3 failures in a row an endpoint's circuit breaker opens for 5 s; one probe request then
    decides, and each failed probe doubles the time (up to 120 s). A probe that times out stays the one probe until
    its request is settled: it fails if another miner answers the request.
@@ -354,7 +358,7 @@ Every response to `POST /v1/systemone` carries `X-Request-Id` (the client's, if 
 | 402 | `insufficient_credit` | a prepaid account's balance is used up |
 | 404 | `model_not_found` | not an active model of the catalog |
 | 408 | `timeout` | the body took longer than `body_timeout_s` to arrive |
-| 413 | `too_large` | body, state, images, or the answers the questions would need, over the limits |
+| 413 | `too_large` | body, state, images, or the answers the questions would need, over the limits; or a state the miners' engines count over the model's tokens |
 | 429 | `rate_limited` | over the key's rate, or too many invalid keys from the address; `Retry-After` |
 | 429 | `quota_exceeded` | the month's quota is used up; `Retry-After` until the next month |
 | 500 | `internal` | a fault of the gateway |

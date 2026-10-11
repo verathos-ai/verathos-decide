@@ -69,6 +69,7 @@ log = logging.getLogger(__name__)
 IDENTITY_DOMAIN = "verathos/identity/v1"
 BODY_TIMEOUT_S = 10.0
 CALLER_CONCURRENCY = 1
+REQUEST_REFUSED = (413, 422)  # an engine's statuses for a request it cannot take: the miner answers them as they are
 
 
 @dataclass(frozen=True)
@@ -324,6 +325,9 @@ def create_app(
                 return error(499, "caller gone")
             response = await engines[endpoint_id].answer(raw)
         except EngineError as e:
+            if e.status in REQUEST_REFUSED:  # the request itself, such as a state over the model's tokens
+                log.info("engine %s refused a request: %s", endpoint_id, e)
+                return error(e.status, "the model's engine refuses this request")
             log.warning("engine %s failed: %s", endpoint_id, e)
             return error(502, "engine failure")
         finally:

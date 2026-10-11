@@ -67,7 +67,7 @@ class UpstreamFailure(Exception):
 
     def __init__(self, kind: str, blame: str, detail: str = "", *, exchange: Exchange | None = None) -> None:
         super().__init__(f"{kind}: {detail}" if detail else kind)
-        self.kind, self.blame, self.exchange = kind, blame, exchange
+        self.kind, self.blame, self.detail, self.exchange = kind, blame, detail, exchange
 
 
 class Upstream:

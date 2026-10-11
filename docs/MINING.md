@@ -580,7 +580,8 @@ largest request of the model's request mix or the largest canary, for a model th
 arrives its requests wait behind the test's; gateways and test traffic are not limited. The miner signs only well-formed
 answers (one distribution per question over its options, with the `noul`, `choice` and `score` derived from it; fields
 other than an answer type's own are dropped before signing): an engine that returns anything else gets an error back to
-the caller, never a signed receipt. The auditor recomputes a sample of the answers given to the subnet's gateway, as it
+the caller, never a signed receipt. An engine that refuses the request itself (413 or 422, as one refuses a state over
+the model's tokens as its tokenizer counts them) has the miner answer that status; any other engine failure is 502. The auditor recomputes a sample of the answers given to the subnet's gateway, as it
 does test answers: serve users the same model, at the same precision. The input tokens a receipt signs are checked
 against the reference's count too: users are billed for them and they set each model's share of the emission, so signing
 more or fewer than the reference counts is a wrong answer. A request's images count as the release counts them: (width /

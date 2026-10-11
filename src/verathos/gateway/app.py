@@ -257,7 +257,10 @@ class Screened:
         return len(self.text_body) + (self.model.images.max_tokens() if self.images else 0)
 
 
+TOO_LARGE = {"413", "422"}  # a miner's statuses for a request its engine cannot take (miner.app.REQUEST_REFUSED)
 NO_ANSWER = {  # why a forwarded request got no answer -> the API error
+    "too_large": (413, "too_large", "the state, instructions and criteria exceed what {model} accepts: its tokenizer "
+                  "counts more tokens in them than their length suggests, as in dense text such as long numbers", None),
     "rejected": (503, "unavailable", "the miners of {model} refused this request", 1),
     "busy": (503, "busy", "no capacity free for {model} right now", 1),
     "failed": (503, "unavailable", "no miner answered {model} in time", 1),
@@ -414,15 +417,18 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
                   counted: bool = True) -> Exchange | str:
     """Up to ``max_attempts`` attempts, each at another miner, within the request's deadline. -> the exchange (with
     its attempt's duration), or why there is none: busy (no endpoint could take it), rejected (the miners refused the
-    request, 4xx) or failed. A failure whose cause is unclear counts against a miner only once another miner has
-    answered. A refusal is unclear too, but the gateway has checked everything a miner checks, so one miner refusing a
-    request no other miner refused or answered is reported as refusing users (its breaker is not touched).
+    request, 4xx), too_large (two miners or more refused it, each as too large: 413 or 422, as an engine refuses a
+    state over the model's tokens, which the gateway counts only as 4 characters a token) or failed. A failure whose
+    cause is unclear counts against a miner only once another miner has answered. A refusal is unclear too, but the
+    gateway has checked everything a miner checks but the tokens, so one miner refusing a request no other miner
+    refused or answered is reported as refusing users (its breaker is not touched).
     ``attempts`` collects what each attempt did; ``counted``: the request is user traffic, so the miners' refusals of
     it are reported."""
     model_id, deadline = checked.parsed.model, started + g.config.request_timeout_s
     tried: set[str] = set()
     unclear: list[Endpoint] = []
     rejected: list[Endpoint] = []
+    too_large = True  # every refusal so far is of a request too large
     unsettled: list[Endpoint] = []  # breaker probes that ended counting neither way, yet
     try:
         result = "busy"
@@ -466,6 +472,7 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
                 elif failure.blame == "rejected":
                     unclear.append(endpoint)
                     rejected.append(endpoint)
+                    too_large = too_large and failure.detail in TOO_LARGE
                     result = "rejected" if result != "failed" else result
                 else:
                     unclear.append(endpoint)
@@ -490,6 +497,8 @@ async def forward(g: Gateway, checked: Checked, started: float, attempts: list[d
                 g.router.penalize(other, observe=counted)
             metrics.UPSTREAM_SECONDS.labels(model_id).observe(seconds)
             return dataclasses.replace(exchange, seconds=seconds)
+        if result == "rejected" and len(rejected) > 1 and too_large:
+            return "too_large"  # not the miners' failure: the request's, as their engines count its tokens
         if len(rejected) == 1:
             g.router.refused(rejected[0], observe=counted)
         return result
@@ -739,7 +748,8 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
             g.served.record(outcome.route, outcome.input_tokens, outcome.seconds, paid=paid)
             metrics.REQUESTS.labels(model, "answered").inc()
             return response
-        g.stats.record(model, "busy" if outcome == "busy" else "failed")
+        if outcome != "too_large":  # the request's limit, not the service's failure
+            g.stats.record(model, "busy" if outcome == "busy" else "failed")
         g.meter.record(principal, model, answered=False)
         status, kind, message, retry = NO_ANSWER[outcome]
         return reject(status, kind, message.format(model=model), request_id, retry, model=model)

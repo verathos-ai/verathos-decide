@@ -27,7 +27,12 @@ REFUSED = {401: "refuses the key", 403: "refuses this machine's address", 404: "
 
 
 class EngineError(Exception):
-    pass
+    """An engine without an answer; ``status`` is the HTTP status it answered with, if it answered (413 and 422 refuse
+    the request itself, as an engine refuses a state over the model's tokens as its tokenizer counts them)."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class Engine(Protocol):
@@ -103,7 +108,7 @@ class HttpEngine:
         except httpx.HTTPError as e:
             raise EngineError(f"engine unreachable: {type(e).__name__}{': ' + str(e) if str(e) else ''}") from e
         if r.status_code != 200:
-            raise EngineError(f"engine returned {r.status_code}: {r.text[:200]}")
+            raise EngineError(f"engine returned {r.status_code}: {r.text[:200]}", status=r.status_code)
         try:
             data = r.json()
             SystemOneResponse.model_validate(data)

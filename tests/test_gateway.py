@@ -1136,6 +1136,44 @@ def test_a_miner_refusing_requests_no_other_miner_takes_is_counted_and_users_are
     assert not s.router._pools["kev-4b"].endpoints[0].breaker.failures  # not a breaker failure on its own
 
 
+class TooLong(MockEngine):
+    """Kev counting a dense state's real tokens: over the model's limit, though within 4 characters a token."""
+
+    async def answer(self, request):
+        if "DENSE" in str(request.get("state")):
+            raise EngineError("engine returned 422: state is 70,001 tokens, over the 65,536-token limit", status=422)
+        return await super().answer(request)
+
+
+def test_a_state_the_engines_count_over_the_models_tokens_is_refused_to_the_user_as_too_large(tmp_path) -> None:
+    """The gateway admits a state by 4 characters a token, the engines count its tokens: miners answer an engine's
+    refusal as it is (not as their failure), and two refusing a request so is the request's limit, which the user gets
+    as such; one refusing alone stays the miner's, which may be refusing work."""
+    dense = {"model": "kev-4b", "state": "DENSE", "questions": {"q": {"type": "noul"}}}
+    s = Setup(tmp_path, {"10.0.0.1": TooLong("kev-4b"), "10.0.0.2": TooLong("kev-4b")})
+    r = asyncio.run(s.post(dense))
+    assert r.status_code == 413 and r.json()["error"]["type"] == "too_large" and "Retry-After" not in r.headers
+    assert "tokenizer" in r.json()["error"]["message"]
+    assert not any(n.refused for n in s.served._counts.values())  # nobody is reported as refusing users
+    assert s.gateway.stats.requests("kev-4b", 60) == (0, 0, 0)  # nor is it the service's failure
+    assert asyncio.run(s.post()).status_code == 200  # the miners answer the requests they can take
+    lone = Setup(tmp_path / "lone", {"10.0.0.1": TooLong("kev-4b")})
+    r = asyncio.run(lone.post(dense))
+    assert r.status_code == 503 and r.json()["error"]["type"] == "unavailable"
+
+
+def test_an_engine_answering_an_error_says_which() -> None:
+    from verathos.miner.engine import HttpEngine
+
+    engine = HttpEngine("http://127.0.0.1:9", "key")
+    engine._client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(422, json={"detail": "state is 70,001 tokens, over the 65,536-token limit"})))
+    with pytest.raises(EngineError) as refused:
+        asyncio.run(engine.answer({"model": "kev-4b", "state": "x", "questions": {"q": {"type": "noul"}}}))
+    assert refused.value.status == 422 and "70,001 tokens" in str(refused.value)
+    assert EngineError("down").status is None
+
+
 class Dropping(httpx.AsyncBaseTransport):
     """The auditor, reached through a connection that fails ``fails`` times: before the request is sent (a kept-alive
     connection the server closed), or after the auditor took it (its answer lost)."""
