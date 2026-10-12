@@ -15,7 +15,9 @@ Two paths:
   the linear layers; on a GPU, float32 is computed without TF32.
 - ``fast`` (CUDA, bfloat16): every question of every request of a pass is one row; rows sorted by length run
   right-padded under a token budget through ``verathos.engine.qwen35.Backbone`` in its noncausal mode (CUDA graphs for
-  small passes), and the readout runs on each row's last token in the release's precision.
+  small passes), and the readout runs on each row's last token in float32, as validators' references compute it (a
+  bfloat16 readout's weights cast exactly): in bfloat16 its logits round in steps of up to 0.125, which moves
+  probabilities by a few hundredths between two implementations of the same pass.
 
 A question's prompt carries the whole state, so a request costs as many prompts as it has questions: nothing can be
 shared between them, because the full-attention layers make every position depend on the question that follows.
@@ -216,9 +218,7 @@ class FastEngine:
         model.eval()
         self.backbone = Backbone(model.language_model, noncausal=True)
         del model.visual  # text only: the vision tower's memory is freed
-        weight = load_file(str(path / "readout.safetensors"))["weight"]
-        dtype = getattr(torch, config["readout_dtype"]) if "readout_dtype" in config else weight.dtype
-        self.readout = weight.to(device, dtype)
+        self.readout = load_file(str(path / "readout.safetensors"))["weight"].to(device, torch.float32)
         torch.cuda.empty_cache()
         self.device = torch.device(device)
         self.max_batch_tokens = max_batch_tokens
@@ -274,10 +274,7 @@ class FastEngine:
         lengths = lengths.to(self.device, non_blocking=True)
         hidden = self.forward(ids.to(self.device, non_blocking=True), lengths)
         last = hidden[torch.arange(len(rows), device=self.device), lengths[: len(rows)] - 1]
-        if self.readout.dtype == torch.float32:
-            logits = last.float() @ self.readout.T
-        else:
-            logits = torch.nn.functional.linear(last, self.readout).float()
+        logits = last.float() @ self.readout.T
         counts = torch.tensor([n for _, n in rows], device=self.device)[:, None]
         invalid = torch.arange(logits.shape[-1], device=self.device)[None] >= counts
         probabilities = torch.softmax(logits.masked_fill(invalid, float("-inf")) / self.temperature, dim=-1)
