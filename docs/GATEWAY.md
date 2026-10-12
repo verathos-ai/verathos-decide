@@ -353,7 +353,7 @@ Every response to `POST /v1/systemone` carries `X-Request-Id` (the client's, if 
 
 | Status | Type | When |
 |---|---|---|
-| 400 | `invalid_request` | not JSON (NaN and infinities included), not a SystemOne request, images to a model that reads text only or an image it cannot read ([Images](#images)), a request with images whose text holds the model's image token (`<|image_pad|>` for Clef), `videos` or `media_kwargs` |
+| 400 | `invalid_request` | not JSON (NaN and infinities included), not a SystemOne request, images to a model that reads text only or an image it cannot read ([Images](#images)), a request with images whose text holds the model's image token (`<|image_pad|>` for Clef), to Clef a question with an empty id and no instructions (the model reads no text for it), `videos` or `media_kwargs` |
 | 401 | `unauthorized` | missing, unknown, revoked or expired key, or a suspended account |
 | 402 | `insufficient_credit` | a prepaid account's balance is used up |
 | 404 | `model_not_found` | not an active model of the catalog |

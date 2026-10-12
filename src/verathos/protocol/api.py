@@ -32,6 +32,11 @@ STATE_CHARS_PER_TOKEN = 4  # a generous bound: tokens of these models average fe
 # Fields a request is refused for: no model is served videos, and engines set their own processor arguments.
 REFUSED_FIELDS = {"videos": "videos are not supported",
                   "media_kwargs": "media_kwargs is not accepted: engines set their own processor arguments"}
+# Engine families whose release reads text for every question: a question with an empty id and no instructions gives
+# it none (Clef's head averages no hidden states for it, and every answer of the request comes out NaN). Kev reads
+# such a question.
+QUESTION_TEXT_ENGINES = frozenset({"clef"})
+EMPTY_QUESTION = "questions: a question with an empty id needs instructions"
 ANSWER_FIELDS = {"noul": {"type", "noul", "probabilities", "confidence"},
                  "choice": {"type", "choice", "probabilities", "confidence"},
                  "score": {"type", "score", "probabilities", "confidence", "legend"}}
@@ -103,6 +108,12 @@ def prompt_chars(request: SystemOneRequest) -> int:
     criteria. A model's ``max_state_tokens`` bounds them all, at ``STATE_CHARS_PER_TOKEN``."""
     return len(text(request.state)) + sum(len(qid) + len(text(q.instructions)) + len(text(q.criteria))
                                           for qid, q in request.questions.items())
+
+
+def empty_question(questions: dict[str, Any]) -> bool:
+    """Whether a request's questions (as sent) hold one with an empty id and no instructions, which an engine of
+    ``QUESTION_TEXT_ENGINES`` cannot answer."""
+    return any(qid == "" and isinstance(q, dict) and q.get("instructions") in (None, "") for qid, q in questions.items())
 
 
 def question_keys(question: Noul | Choice | Score) -> list[str]:

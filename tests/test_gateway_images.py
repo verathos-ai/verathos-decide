@@ -22,7 +22,7 @@ from verathos.gateway.app import Rejected, check_request, with_images
 from verathos.gateway.media import CanonicalImage, Decoders, DecodersBusy, _Worker, landlock_abi
 from verathos.gateway.sampler import BATCH_BYTES, Sampler, batches
 from verathos.gateway.upstream import Exchange
-from verathos.protocol.api import MAX_RESPONSE_BYTES
+from verathos.protocol.api import EMPTY_QUESTION, MAX_RESPONSE_BYTES
 from verathos.protocol.canonical import canonical_json, digest
 from verathos.protocol.gateway import GatewaySample, Route
 from verathos.protocol.media import (
@@ -121,6 +121,28 @@ def test_a_request_with_images_whose_text_holds_the_image_token_is_refused(tmp_p
     assert engine.received == []  # none reached a miner
     text = {**REQUEST, "state": f"Look at {pad}."}
     assert asyncio.run(s.post(text)).status_code == 200 and engine.received == [text]
+
+
+def test_a_clef_question_with_an_empty_id_and_no_instructions_is_refused_and_kev_answers_it(tmp_path, setups) -> None:
+    """Clef's release reads no text for such a question and answers NaN for the whole request, which its miners refuse:
+    the gateway refuses it first. With instructions or an id the question is forwarded, and Kev answers it as it is."""
+    engine = Recording("clef-flash")
+    s = setups(tmp_path, engine)
+    for empty in ({"type": "noul"}, {"type": "noul", "instructions": None}, {"type": "noul", "instructions": ""},
+                  {"type": "choice", "criteria": {"a": "", "b": ""}}):
+        assert error(asyncio.run(s.post({**REQUEST, "questions": {**QUESTIONS, "": empty}}))) == (
+            400, "invalid_request", EMPTY_QUESTION)
+    assert engine.received == []  # none reached a miner
+    asked = [{**REQUEST, "questions": {"": {"type": "noul", "instructions": "Is it sunny?"}}},
+             {**REQUEST, "questions": {"q": {"type": "noul"}}}]
+    for request in asked:
+        assert asyncio.run(s.post(request)).status_code == 200
+    assert engine.received == asked
+    kev = Recording("kev-4b")
+    (tmp_path / "kev").mkdir()
+    s = setups(tmp_path / "kev", kev, model="kev-4b")
+    request = {"model": "kev-4b", "state": "s", "questions": {"": {"type": "noul"}}}
+    assert asyncio.run(s.post(request)).status_code == 200 and kev.received == [request]
 
 
 def test_images_are_forwarded_canonical_and_billed_their_exact_tokens(tmp_path, setups) -> None:
