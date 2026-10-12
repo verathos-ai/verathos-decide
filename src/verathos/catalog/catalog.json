@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "revision": "2026-10-09",
+  "revision": "2026-10-12",
   "mechanism": 0,
   "epoch_blocks": 180,
   "models": [
@@ -66,7 +66,7 @@
       },
       "first_test_rps": 55.0,
       "relative_speed": 1.0,
-      "price": 0.04,
+      "price": 0.03,
       "anchor_share": 0.333334
     },
     {
@@ -131,7 +131,7 @@
       },
       "first_test_rps": 45.0,
       "relative_speed": 0.81,
-      "price": 0.09,
+      "price": 0.035,
       "anchor_share": 0.333333
     },
     {
@@ -226,7 +226,7 @@
       },
       "first_test_rps": 40.0,
       "relative_speed": 0.72,
-      "price": 0.09,
+      "price": 0.035,
       "anchor_share": 0.333333
     }
   ],

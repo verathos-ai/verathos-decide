@@ -28,6 +28,7 @@ OWNER_COLDKEY = kp().ss58_address
 SN96 = Emission(alpha_out=10**9, owner_cut=11796, mechanism=0, mechanisms=1)  # 1 alpha per block, 18% owner cut
 TESTNET = Emission(alpha_out=10**9, owner_cut=11796, mechanism=1, mechanisms=2, split=[58982, 6553])
 MILLION = 1_000_000
+PRICE = {m.model_id: m.price for m in catalog.load().models}  # the shipped prices, USD per million input tokens
 
 
 def with_pool(pool: dict | None, miner_share=0.15, epoch_blocks: int = 180, referral: dict | None = None
@@ -93,8 +94,9 @@ def test_a_period_is_sized_from_its_paid_usage_at_the_models_prices_and_the_chai
     record = close(2, pool=pool, cat=cat, epoch_blocks=180, paid=tokens, coldkeys={"hkA": OTHER}, emission=SN96,
                    tao_usd=300.0, alpha_tao=0.004)
     assert (record.first_block, record.end_block) == (720, 1080)  # period 2 of 2 epochs of 180 blocks
-    assert record.revenue_usd == pytest.approx(500 * 0.04 + 120 * 0.09)  # USD per million input tokens
-    assert record.basis == pytest.approx(30.8 / 300.0 / 0.004)  # 25.67 alpha
+    revenue = 500 * PRICE["kev-4b"] + 120 * PRICE["kev-9b"]  # USD
+    assert record.revenue_usd == pytest.approx(revenue)
+    assert record.basis == pytest.approx(revenue / 300.0 / 0.004)  # alpha
     assert record.period_emission == pytest.approx(0.41 * 360, abs=0.05)
     assert record.share == round(0.6 * record.basis / record.period_emission, 6)
     assert record.paid_input_tokens == {"kev-4b": 500 * MILLION, "kev-9b": 120 * MILLION}
@@ -146,13 +148,15 @@ HOTKEYS = {0: "owner", 1: "hkA", 2: "hkB", 3: "hkC"}
 
 def test_usage_weights_split_the_share_by_what_users_paid_on_top_of_the_capacity_weights() -> None:
     cat = with_pool(POOL)
-    # hkA answered 300 million paid kev-4b tokens (12 USD), hkB 100 million kev-9b tokens (9 USD)
+    # hkA answered 300 million paid kev-4b tokens, hkB 100 million kev-9b tokens
     r = record(0.1, {"hkA": {"kev-4b": 300 * MILLION}, "hkB": {"kev-9b": 100 * MILLION}})
+    a, b = 300 * PRICE["kev-4b"], 100 * PRICE["kev-9b"]  # what their users paid, USD
     usage = usage_weights(r, cat, 6, HOTKEYS)  # epoch 6 is in period 3: it pays period 2
-    assert usage == pytest.approx({1: 0.1 * 12 / 21, 2: 0.1 * 9 / 21})  # by what was paid, not by tokens
+    assert usage == pytest.approx({1: 0.1 * a / (a + b), 2: 0.1 * b / (a + b)})  # by what was paid, not by tokens
     capacity = {2: 0.5, 3: 0.5}
     w = weights_to_set(capacity, HOTKEYS, "owner", 0.15, usage)
-    assert w == pytest.approx({0: 1 - 0.15 - 0.1, 1: 0.1 * 12 / 21, 2: 0.15 * 0.5 + 0.1 * 9 / 21, 3: 0.15 * 0.5})
+    paid_a, paid_b = 0.1 * a / (a + b), 0.1 * b / (a + b)
+    assert w == pytest.approx({0: 1 - 0.15 - 0.1, 1: paid_a, 2: 0.15 * 0.5 + paid_b, 3: 0.15 * 0.5})
     assert sum(w.values()) == pytest.approx(1.0)
     assert usage_weights(r, cat, 7, HOTKEYS) == usage  # every epoch of the period pays it alike
     assert usage_weights(r, cat, 8, HOTKEYS) == {} and usage_weights(r, cat, 5, HOTKEYS) == {}  # other periods: none
@@ -373,12 +377,12 @@ def test_the_auditor_records_a_periods_paid_usage_at_the_prices_of_its_end_and_s
     chain = UsageChain(4 * 180 + 1)
     auditor = usage_auditor(tmp_path, cat, chain)
     at(auditor, 4 * 180 + 1)  # period 2 (epochs 4 and 5) begins
-    serve(auditor, "hkA", 2 * MILLION, unpaid=500)  # kev-4b at 0.04 USD per million: 0.08 USD
-    serve(auditor, "hkB", MILLION, unpaid=5 * MILLION)  # kev-9b at 0.09: 0.09 USD
+    serve(auditor, "hkA", 2 * MILLION, unpaid=500)  # kev-4b
+    serve(auditor, "hkB", MILLION, unpaid=5 * MILLION)  # kev-9b
     for block in range(4 * 180 + 101, 6 * 180, 100):  # blocks 821 (epoch 4), 921 and 1021 (epoch 5)
         at(auditor, block)
         if block == 921:
-            serve(auditor, "hkA", MILLION)  # 0.04 USD more
+            serve(auditor, "hkA", MILLION)  # a million paid tokens more
     before = record_of(auditor.verdicts(5).verdicts.model_extra["usage"])  # the period before, closed on arrival
     assert (before.period, before.served, before.share) == (1, [], 0.0)  # nobody paid in it, as far as known
     at(auditor, 6 * 180 + 3)  # period 3 begins: period 2 closes once its end block is final
@@ -389,13 +393,14 @@ def test_the_auditor_records_a_periods_paid_usage_at_the_prices_of_its_end_and_s
     assert (r.period, r.first_block, r.end_block) == (2, 720, 1080)
     assert [(s.hotkey, s.coldkey, s.input_tokens) for s in r.served] == [
         ("hkA", OTHER, {"kev-4b": 3 * MILLION}), ("hkB", None, {"kev-9b": MILLION})]
-    assert r.revenue_usd == pytest.approx(0.21) and (r.tao_usd, r.alpha_tao) == (300.0, 0.004)
-    assert r.basis == pytest.approx(0.21 / 300.0 / 0.004) and r.inconsistency() is None
+    a, b = 3 * PRICE["kev-4b"], PRICE["kev-9b"]  # USD: three million kev-4b tokens, one million kev-9b
+    assert r.revenue_usd == pytest.approx(a + b) and (r.tao_usd, r.alpha_tao) == (300.0, 0.004)
+    assert r.basis == pytest.approx((a + b) / 300.0 / 0.004) and r.inconsistency() is None
     assert r.share == round(0.6 * r.basis / r.period_emission, 6)
     at(auditor, 7 * 180 + 1)
     assert record_of(auditor.verdicts(7).verdicts.model_extra["usage"]) == r  # every epoch of period 3 states it
     usage = usage_weights(take(ScoreState(), v, cat, 6), cat, 6, HOTKEYS)
-    assert usage == pytest.approx({1: r.share * 0.12 / 0.21, 2: r.share * 0.09 / 0.21})
+    assert usage == pytest.approx({1: r.share * a / (a + b), 2: r.share * b / (a + b)})
 
 
 def test_the_first_verdicts_of_a_period_wait_briefly_for_its_record_then_come_without_it(tmp_path) -> None:
@@ -417,7 +422,7 @@ def test_the_first_verdicts_of_a_period_wait_briefly_for_its_record_then_come_wi
     prices.append(300.0)
     at(auditor, 6 * 180 + 40)  # the price is back: the record is made, and the next verdicts state it
     at(auditor, 7 * 180 + 1)
-    assert record_of(auditor.verdicts(7).verdicts.model_extra["usage"]).revenue_usd == pytest.approx(0.04)
+    assert record_of(auditor.verdicts(7).verdicts.model_extra["usage"]).revenue_usd == pytest.approx(PRICE["kev-4b"])
 
 
 def test_a_new_period_length_starts_periods_of_other_blocks_and_nothing_is_paid_twice(tmp_path) -> None:

@@ -1061,11 +1061,13 @@ def test_chain_trouble_fetching_verdicts_is_an_unavailable_feed() -> None:
 def test_models_share_the_emission_by_what_users_pay_with_the_anchors_as_the_fallback() -> None:
     from verathos.validator.scoring import model_shares
 
-    # anchors 50/50, clef-flash a candidate; prices kev-4b 0.04, kev-9b 0.09; full at 10,000 tokens/s; floor 0.1
+    # anchors 50/50, clef-flash a candidate; full at 10,000 tokens/s; floor 0.1
     cat = two_active_and_a_candidate()
+    price = {m.model_id: m.price for m in cat.models}
     assert model_shares({}, cat) == {"kev-4b": pytest.approx(0.5), "kev-9b": pytest.approx(0.5)}
-    full = model_shares({"kev-4b": 30_000.0, "kev-9b": 10_000.0}, cat)  # revenue 1.2 against 0.9
-    assert full == {"kev-4b": pytest.approx(1.2 / 2.1), "kev-9b": pytest.approx(0.9 / 2.1)}
+    full = model_shares({"kev-4b": 30_000.0, "kev-9b": 10_000.0}, cat)  # by revenue: tokens x price
+    a, b = 30_000.0 * price["kev-4b"], 10_000.0 * price["kev-9b"]
+    assert full == {"kev-4b": pytest.approx(a / (a + b)), "kev-9b": pytest.approx(b / (a + b))}
     half = model_shares({"kev-4b": 5_000.0}, cat)  # half way: 0.5 x anchors + 0.5 x all to kev-4b
     assert half == {"kev-4b": pytest.approx(0.75), "kev-9b": pytest.approx(0.25)}
     lonely = model_shares({"kev-4b": 50_000.0}, cat)  # all demand on one model: the other keeps its floor

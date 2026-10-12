@@ -8,6 +8,7 @@ import contextlib
 import datetime as dt
 import errno
 import json
+import math
 import random
 
 import httpx
@@ -1290,10 +1291,11 @@ def test_only_answers_paid_from_bought_credit_count_as_paid_demand(tmp_path) -> 
     tokens = asyncio.run(s.post()).json()["usage"]["input_tokens"]  # the key cache is 0 s here, a minute in production
     assert paid_and_all() == (tokens, tokens)
     asyncio.run(s.accounts.add_credit("acme", 10, kind="grant", reference="promo"))  # free credit is spent first
+    price = catalog.load().get("kev-4b").price
     spent = 0.0
     while not paid_and_all()[0]:
-        spent += asyncio.run(s.post()).json()["usage"]["input_tokens"] * 0.04
-    assert 10 <= spent <= 10 + 2 * tokens * 0.04
+        spent += asyncio.run(s.post()).json()["usage"]["input_tokens"] * price
+    assert 10 <= spent <= 10 + 2 * tokens * price
     asyncio.run(s.post())
     s.served.clock = lambda: time_module.time() + 2  # those seconds are over
     asyncio.run(s.served.report())
@@ -1474,7 +1476,8 @@ def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
     first = asyncio.run(s.post(LONG))  # not prepaid: served without credit, its usage still costs
     assert first.status_code == 200
     asyncio.run(s.meter.flush())
-    cost = round(first.json()["usage"]["input_tokens"] * price)
+    exact = first.json()["usage"]["input_tokens"] * price  # micro-USD: whole ones are charged, the fraction carried
+    cost = math.floor(exact + 1e-9)
     (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
     assert cost > 0 and usage["cost"] == cost and balance() == -cost
 
@@ -1499,10 +1502,11 @@ def test_a_prepaid_account_is_served_while_its_credit_lasts(tmp_path) -> None:
     assert asyncio.run(s.post(LONG)).status_code == 200  # new credit applies at once in this process
     assert asyncio.run(s.post(LONG)).status_code == 402  # charged, though not written yet
     asyncio.run(s.meter.flush())
-    assert balance() == 1 - cost  # the answer accepted with credit left is charged: below zero by one answer
+    second = math.floor(2 * exact + 1e-9) - cost  # with the first answer's carried fraction
+    assert balance() == 1 - second  # the answer accepted with credit left is charged: below zero by one answer
 
     again, created = asyncio.run(s.accounts.add_credit("acme", cost + 1, kind="grant", reference="signup:acme"))
-    assert not created and again["id"] == entry["id"] and balance() == 1 - cost  # recorded once
+    assert not created and again["id"] == entry["id"] and balance() == 1 - second  # recorded once
     with pytest.raises(Conflict):
         asyncio.run(s.accounts.add_credit("acme", 5, kind="grant", reference="signup:acme"))
     for amount, kind in ((-5, "topup"), (0, "adjust"), (5, "gift")):
