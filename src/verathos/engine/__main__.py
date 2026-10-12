@@ -2,6 +2,7 @@
 
     verathos-engine clef --repo Cloudflare/clef-flash --revision <sha> --port 8010
     verathos-engine clef --repo Cloudflare/clef-flash --revision <sha> --port 8110 --device cpu --dtype float32
+    verathos-engine readout --repo vllm-sr/d3-flash --revision <sha> --port 8012
 
 Take ``--repo`` and ``--revision`` from the model's catalog entry (``hf_repo``, ``hf_revision``). Miners run their
 GPU in bfloat16 (the batched fast path); validators run the release's reference code in float32.
@@ -10,6 +11,7 @@ GPU in bfloat16 (the batched fast path); validators run the release's reference 
 from __future__ import annotations
 
 import argparse
+import importlib
 import logging
 
 import uvicorn
@@ -19,7 +21,7 @@ from verathos.engine import code_version
 from verathos.engine.server import create_app
 from verathos.protocol.media import keep_out_of_dumps
 
-FAMILIES = ("clef",)
+FAMILIES = ("clef", "readout")
 log = logging.getLogger("verathos.engine")
 
 
@@ -37,13 +39,12 @@ def main() -> None:
     stop.on_signals("the engine", log)
     keep_out_of_dumps()  # users' requests are in memory, their images among them
 
-    from verathos.engine import clef
-
+    family = importlib.import_module(f"verathos.engine.{args.family}")
     if args.device == "auto":
         import torch
 
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
-    engine = clef.load(args.repo, args.revision, device=args.device, dtype=args.dtype)
+    engine = family.load(args.repo, args.revision, device=args.device, dtype=args.dtype)
     served = {"id": args.repo, "revision": args.revision, "device": args.device, "dtype": args.dtype,
               "code": code_version()}
     # no line per request (a miner's engine answers many a second); uvicorn's start and stop lines stay

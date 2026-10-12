@@ -18,6 +18,10 @@ The fused kernels keep fp32 where the reference rounds to bf16 between steps, so
 
 Text requests use one position per token (all three rotary axes equal). Requests with images or videos pass
 ``inputs_embeds`` with the vision features merged in and 3-axis ``position_ids``.
+
+``noncausal`` backbones (decision models whose full-attention layers see the whole prompt, the linear layers staying
+causal) take each row's length with the pass: the full-attention layers mask the padding keys and nothing else, so
+padding still never reaches a real token, and the masks are inputs of the pass, so CUDA graphs still replay it.
 """
 
 from __future__ import annotations
@@ -99,7 +103,7 @@ class Backbone:
     The backbone references the module's weights without copying them (only the norm weights become fp32 1 + w),
     so a 9B model fits a 24 GB GPU with room for activations. The transformers layers are dropped."""
 
-    def __init__(self, text_model) -> None:
+    def __init__(self, text_model, *, noncausal: bool = False) -> None:
         import fla
 
         if fla.__version__ != FLA_VERSION:
@@ -126,6 +130,7 @@ class Backbone:
         self.final_norm = 1.0 + text_model.norm.weight.float()
         self.layers = [self._layer(layer) for layer in text_model.layers]
         del text_model.layers
+        self.noncausal = noncausal
         self.inv_freq = self.inv_freq.to(self.embed.device)
         self.dtype = self.embed.dtype
 
@@ -204,7 +209,9 @@ class Backbone:
         out = rms_norm_gated(out, z, m.norm_weight, None, activation="swish", eps=self.eps)
         return F.linear(out.reshape(B, T, -1), m.out_proj)
 
-    def _attention(self, m: AttentionLayer, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def _attention(self, m: AttentionLayer, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                   keys: torch.Tensor | None = None) -> torch.Tensor:
+        """``keys`` [B, 1, 1, T] (True on a row's real tokens) makes the attention noncausal over them."""
         B, T, _ = h.shape
         q_gate, k, v = F.linear(h, m.q), F.linear(h, m.k), F.linear(h, m.v)
         q, gate = q_gate.reshape(B, T, -1, 2 * self.head_dim).chunk(2, -1)
@@ -212,7 +219,12 @@ class Backbone:
         k = rms_norm(k.reshape(B, T, -1, self.head_dim), m.k_norm, None, eps=self.eps).transpose(1, 2)
         v = v.reshape(B, T, -1, self.head_dim).transpose(1, 2)
         q, k = self._rope(q, cos, sin), self._rope(k, cos, sin)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.head_dim**-0.5, enable_gqa=True)
+        if keys is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.head_dim**-0.5, enable_gqa=True)
+        else:  # a masked pass takes the memory-efficient kernel, which wants every query head's keys and values
+            groups = self.num_heads // self.num_kv_heads
+            k, v = k.repeat_interleave(groups, dim=1), v.repeat_interleave(groups, dim=1)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=keys, scale=self.head_dim**-0.5)
         out = out.transpose(1, 2).reshape(B, T, -1)
         return F.linear(out * torch.sigmoid(gate.reshape(B, T, -1)), m.o_proj)
 
@@ -222,13 +234,20 @@ class Backbone:
         *,
         inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Last hidden states [B, T, hidden] (after the final norm) for right-padded token ids [B, T]."""
+        """Last hidden states [B, T, hidden] (after the final norm) for right-padded token ids [B, T]; a noncausal
+        backbone also takes each row's length [B]."""
         x = F.embedding(input_ids, self.embed) if inputs_embeds is None else inputs_embeds
         B, T, _ = x.shape
         if position_ids is None:
             position_ids = torch.arange(T, device=x.device).expand(B, T)
         cos, sin = self.rotary(position_ids)
+        keys = None
+        if self.noncausal:
+            if lengths is None:
+                raise ValueError("a noncausal backbone needs each row's length")
+            keys = (torch.arange(T, device=x.device) < lengths[:, None])[:, None, None, :]
         mlp = None  # the previous layer's MLP output, added to the residual inside the next norm
         for layer in self.layers:
             if mlp is None:
@@ -238,7 +257,7 @@ class Backbone:
             if isinstance(layer.mixer, LinearLayer):
                 h = self._linear(layer.mixer, h)
             else:
-                h = self._attention(layer.mixer, h, cos, sin)
+                h = self._attention(layer.mixer, h, cos, sin, keys)
             h, x = rms_norm(h, layer.post_norm, None, residual=x, eps=self.eps, prenorm=True)
             mlp = F.linear(swiglu(F.linear(h, layer.gate), F.linear(h, layer.up)), layer.down)
         return rms_norm(mlp, self.final_norm, None, residual=x, eps=self.eps)
