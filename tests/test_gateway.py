@@ -38,8 +38,11 @@ from verathos.miner.app import create_app as miner_app
 from verathos.miner.config import MinerConfig
 from verathos.miner.engine import EngineError
 from verathos.protocol import tls
+from verathos.protocol.api import MAX_REQUEST_BYTES
+from verathos.protocol.canonical import canonical_json
 from verathos.protocol.gateway import Route, Routes, SignedRoutes
 from verathos.protocol.manifest import Endpoint, Manifest, SignedManifest
+from verathos.protocol.media import MAX_IMAGE_TOKENS
 from verathos.protocol.receipts import SignedReceipt
 from verathos.throughput.auditor import Checks, Slot
 
@@ -1044,6 +1047,40 @@ def test_usage_is_what_the_miner_signed_within_bounds(tmp_path) -> None:
     asyncio.run(s.meter.flush())  # writes, whatever the miner claimed
     (usage,) = asyncio.run(s.accounts.usage("acme", dt.date(2026, 1, 1)))
     assert usage["input_tokens"] == tokens
+
+
+def test_a_model_reading_a_prompt_per_question_is_billed_up_to_what_all_its_prompts_hold(tmp_path) -> None:
+    """A model whose engine reads one prompt per question, each with the whole state (``readout``): the input tokens a
+    miner signs are taken up to ``questions x (2 x request bytes + 512)`` rather than one per byte, the served report
+    carrying them is taken by the auditor (one answer of a long state's six questions counts more tokens than a text
+    request's bytes and the most image tokens), and ``/v1/models`` says which models count so."""
+    import time as time_module
+
+    class Greedy(MockEngine):
+        async def answer(self, request):
+            return {**await super().answer(request), "usage": {"input_tokens": 10 ** 20}}
+
+    document = catalog.load().document()
+    cat = catalog.Catalog.parse({**document, "models": [{**m, "engine": {**m["engine"], "name": "readout"}}
+                                                        if m["model_id"] == "kev-4b" else m
+                                                        for m in document["models"]]})
+    s = Setup(tmp_path, {"10.0.0.1": Greedy("kev-4b")}, cat=cat)
+    long = {**LONG, "state": LONG["state"] * 150,
+            "questions": {**REQUEST["questions"], **{f"n{i}": {"type": "noul"} for i in range(3)}}}
+    r = asyncio.run(s.post(long))
+    request_bytes = len(canonical_json({k: long[k] for k in ("model", "state", "questions")}))
+    assert r.status_code == 200
+    assert r.json()["usage"]["input_tokens"] == 6 * (2 * request_bytes + 512) > MAX_REQUEST_BYTES + MAX_IMAGE_TOKENS
+    s.served.clock = lambda: time_module.time() + 2  # that second is over
+    asyncio.run(s.served.report())
+    now, keypair = time_module.time(), s.miners["10.0.0.1"][0]
+    assert s.served.pending() == 0 and s.auditor.served_in(keypair.ss58_address, "gpu0", now - 60, now + 1) == 1
+
+    async def models():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=s.app), base_url="http://gw") as c:
+            return (await c.get("/v1/models")).json()["data"]
+    listed = {m["id"]: m["reads_state_per_question"] for m in asyncio.run(models())}
+    assert listed == {"kev-4b": True, "kev-9b": False, "clef-flash": False}
 
 
 def test_an_answer_is_billed_at_least_its_states_length_in_tokens(tmp_path) -> None:

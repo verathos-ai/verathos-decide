@@ -13,7 +13,8 @@ from types import SimpleNamespace
 import pytest
 
 from verathos.engine.readout import D3Family, FastEngine, PplxFamily, Prepared, decision_config, prepare, validate
-from verathos.protocol.api import distributions
+from verathos.protocol.api import PROMPT_TEMPLATE_TOKENS, distributions, most_input_tokens
+from verathos.protocol.canonical import canonical_json
 
 REPO, REVISION = "vllm-sr/d3-mini", "0e78bbdbe3cf480ed1461c185c9e0c4fa9258011"
 PPLX, PPLX_REVISION = "perplexity-ai/pplx-decider-v1.1-27b", "14c9d90137962d300f3de95633f7b6535e80c5ce"
@@ -160,6 +161,31 @@ def test_every_pplx_question_gets_the_prompt_and_tokens_its_server_gives_it(pplx
         assert [ours.sequences[k] for k in ours.keys] == rows
         assert [ours.options[k] for k in ours.keys] == list(batch.counts)
     assert accepted >= 2
+
+
+def test_every_prompt_fits_the_most_tokens_a_request_is_billed(d3, pplx) -> None:
+    """A model that reads one prompt per question is billed at most ``protocol.api.most_input_tokens`` of a request:
+    every question's prompt as each release writes it fits, also where one token per byte of the request would not (a
+    tiny request, a choice of 255 options, a state of dense numbers)."""
+    bodies = [*BODIES,
+              {"model": "m", "state": "", "questions": {"q": {"type": "choice",
+                                                               "criteria": {f"o{i}": None for i in range(255)}}}},
+              {"model": "m", "state": list(range(1000)), "questions": {"q": {"type": "noul"}}},
+              {"model": "m", "state": [0] * 2000, "questions": {"q": {"type": "noul"}, "r": {"type": "noul"}}}]
+    for prompts in (d3, pplx):
+        beyond_bytes = 0
+        for body in bodies:
+            try:
+                prepared = prepare(body, prompts)
+            except ValueError:
+                assert prompts is pplx and body in BODIES  # the score levels pplx's server refuses
+                continue
+            request_bytes = len(canonical_json(body))
+            tokens = [len(s) for s in prepared.sequences.values()]
+            assert max(tokens) <= 2 * request_bytes + PROMPT_TEMPLATE_TOKENS
+            assert sum(tokens) <= most_input_tokens(request_bytes, len(body["questions"]), True)
+            beyond_bytes += sum(tokens) > request_bytes
+        assert beyond_bytes >= 2
 
 
 # ---- on a CUDA GPU with the pinned weights ----

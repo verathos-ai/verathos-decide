@@ -72,6 +72,7 @@ from verathos.gateway.stats import DEGRADED_SUCCESS, ModelStats
 from verathos.gateway.upstream import Exchange, Upstream, UpstreamFailure
 from verathos.gateway.usage import UsageMeter, month_start
 from verathos.protocol.api import (
+    ANSWER_BYTES,
     EMPTY_QUESTION,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
@@ -81,6 +82,7 @@ from verathos.protocol.api import (
     Choice,
     SystemOneRequest,
     empty_question,
+    most_input_tokens,
     prompt_chars,
     question_keys,
     text,
@@ -208,7 +210,7 @@ def answer_bytes(request: SystemOneRequest) -> int:
     size = ANSWER_ENVELOPE_BYTES
     for qid, q in request.questions.items():
         keys = [json.dumps(k) for k in question_keys(q)]
-        size += len(json.dumps(qid)) + 128 + sum(len(k) + 24 for k in keys)
+        size += len(json.dumps(qid)) + ANSWER_BYTES + sum(len(k) + 24 for k in keys)
         if isinstance(q, Choice):
             size += max(len(k) for k in keys)  # the chosen option
     return size
@@ -239,7 +241,7 @@ class Checked:
     request_sha256: str
     price: float  # the model's, USD per million input tokens
     min_tokens: int  # billed at least, whatever the miner signs: one per 8 characters of the state, and the images'
-    max_tokens: int  # billed at most: one per byte of the request without its images, and the images' tokens
+    max_tokens: int  # billed at most: the text's ``protocol.api.most_input_tokens``, and the images' tokens
     image_tokens: int = 0  # the images' input tokens (``protocol.media.request_image_tokens``)
     cost: float = 1.0  # the load it puts on an endpoint, in requests of the model's mix (``gateway.router``)
 
@@ -254,10 +256,13 @@ class Screened:
     text_body: bytes  # their canonical JSON
     images: list[tuple[str, str]]  # (media type, base64) of each image as sent
 
+    def text_tokens(self) -> int:
+        """The most input tokens its text can be billed (``protocol.api.most_input_tokens``)."""
+        return most_input_tokens(len(self.text_body), len(self.parsed.questions), self.model.reads_per_question())
+
     def most_tokens(self) -> int:
-        """The most input tokens it can be billed: one per byte of it without its images, and the most image tokens
-        its model's limits allow."""
-        return len(self.text_body) + (self.model.images.max_tokens() if self.images else 0)
+        """The most input tokens it can be billed: its text's, and the most image tokens its model's limits allow."""
+        return self.text_tokens() + (self.model.images.max_tokens() if self.images else 0)
 
 
 TOO_LARGE = {"413", "422"}  # a miner's statuses for a request its engine cannot take (miner.app.REQUEST_REFUSED)
@@ -413,7 +418,7 @@ async def made_canonical(g: Gateway, screened: Screened) -> Checked:
                            model=model_id)
     min_tokens = len(text(screened.parsed.state)) // STATE_CHARS_PER_BILLED_TOKEN + image_tokens
     return Checked(forwarded, body, screened.parsed, sha256_hex(body), model.price, min_tokens,
-                   len(screened.text_body) + image_tokens, image_tokens, model.request_cost(image_tokens))
+                   screened.text_tokens() + image_tokens, image_tokens, model.request_cost(image_tokens))
 
 
 async def check_request(g: Gateway, body: bytes) -> Checked:
@@ -611,6 +616,7 @@ def create_app(g: Gateway, *, lifespan: Callable | None = None) -> FastAPI:
         return {"object": "list", "data": [] if cat is None else [{
             "id": m.model_id, "object": "model", "max_state_tokens": m.max_state_tokens,
             "input_modalities": m.modalities(), "images": m.images.document() if m.reads_images() else None,
+            "reads_state_per_question": m.reads_per_question(),
             "price": {"usd_per_million_input_tokens": m.price, "usd_per_million_output_tokens": 0},
             "available": states.get(m.model_id, "unavailable") != "unavailable",
             "state": states.get(m.model_id, "unavailable"), "latency_ms": g.stats.latency(m.model_id),

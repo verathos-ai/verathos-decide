@@ -459,8 +459,9 @@ CUDA_VISIBLE_DEVICES=3 /opt/clef/bin/verathos-engine readout --repo <hf_repo> --
 ```
 
 A model needs its bfloat16 weights plus about 3 GiB (an 8B model a 24 GB GPU, a 27B one an 80 GB GPU). Every question
-reads the whole state again, so a request costs about as many passes as it has questions. On an H100, requests of 150
-to 1,200 words with six questions:
+reads the whole state again, so a request costs about as many passes as it has questions; its receipt signs the tokens
+of all its prompts, as the release counts them, and users are billed those. On an H100, requests of 150 to 1,200 words
+with six questions:
 
 | Model | Requests per second | One request alone |
 |---|---|---|

@@ -27,6 +27,7 @@ from verathos.protocol.canonical import canonical_json
 JSONContent = str | dict | list | int | float | bool | None
 MAX_OPTIONS = 255
 MAX_RESPONSE_BYTES = 64 << 10  # a response (answers and receipt) larger than this is not a valid answer
+ANSWER_BYTES = 128  # a question's answer in a response besides its id and options' keys, as gateways estimate it
 MAX_REQUEST_BYTES = 1 << 20  # a request without its images (its canonical JSON), at most
 STATE_CHARS_PER_TOKEN = 4  # a generous bound: tokens of these models average fewer characters
 # Fields a request is refused for: no model is served videos, and engines set their own processor arguments.
@@ -36,6 +37,10 @@ REFUSED_FIELDS = {"videos": "videos are not supported",
 # it none (Clef's head averages no hidden states for it, and every answer of the request comes out NaN). Kev reads
 # such a question.
 QUESTION_TEXT_ENGINES = frozenset({"clef"})
+# Engine families whose release reads one prompt per question, each holding the whole state, so a request is billed the
+# tokens of all its prompts (``most_input_tokens``).
+PER_QUESTION_ENGINES = frozenset({"readout"})
+PROMPT_TEMPLATE_TOKENS = 512  # the most such a release's template (system prompt, labels, chat markup) adds to a prompt
 EMPTY_QUESTION = "questions: a question with an empty id needs instructions"
 ANSWER_FIELDS = {"noul": {"type", "noul", "probabilities", "confidence"},
                  "choice": {"type", "choice", "probabilities", "confidence"},
@@ -101,6 +106,15 @@ class SystemOneRequest(BaseModel):
 def text(value: JSONContent) -> str:
     """A request's content as the characters it counts: text as it is, anything else as canonical JSON."""
     return value if isinstance(value, str) else "" if value is None else canonical_json(value).decode()
+
+
+def most_input_tokens(request_bytes: int, questions: int, per_question: bool) -> int:
+    """The most input tokens a text request of ``request_bytes`` (its canonical JSON) with ``questions`` questions is
+    billed, in either lane: one per byte, or for a model of ``PER_QUESTION_ENGINES`` what all its questions' prompts
+    can hold. A token is at least one byte of a prompt, and a prompt is at most twice the request's bytes (a release
+    writes non-string values as JSON with spaced separators, at most half again their canonical bytes) and the
+    template."""
+    return questions * (2 * request_bytes + PROMPT_TEMPLATE_TOKENS) if per_question else request_bytes
 
 
 def prompt_chars(request: SystemOneRequest) -> int:

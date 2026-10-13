@@ -28,7 +28,7 @@ from bittensor_wallet import Keypair
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from verathos.protocol import signing
-from verathos.protocol.api import MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES
+from verathos.protocol.api import ANSWER_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, most_input_tokens
 from verathos.protocol.media import MAX_IMAGE_REQUEST_BYTES, MAX_IMAGE_TOKENS
 from verathos.protocol.referral import READABLE_LENGTH, SignedMove, SignedRegistration
 from verathos.protocol.tls import PIN_PATTERN
@@ -46,8 +46,10 @@ MAX_SAMPLES_PER_POST = 64
 MAX_SAMPLES_BYTES = MAX_IMAGE_REQUEST_BYTES + (1 << 20)
 MAX_SERVED_COUNTS = 20_000  # entries per post ...
 MAX_SERVED_BYTES = 8 << 20  # ... and bytes
-MAX_INPUT_TOKENS = MAX_REQUEST_BYTES + MAX_IMAGE_TOKENS  # one answer is billed at most: a token per byte of its
-# request without images, and its images' tokens
+# One answer is billed at most: a token per byte of its request without images, and its images' tokens; for a model
+# that reads one prompt per question, the prompts of as many questions as a response's answers can hold.
+MAX_INPUT_TOKENS = max(MAX_REQUEST_BYTES + MAX_IMAGE_TOKENS,
+                       most_input_tokens(MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES // ANSWER_BYTES, True))
 
 
 class Route(BaseModel):

@@ -29,7 +29,7 @@ from typing import Annotated, Any, Literal
 from bittensor_wallet import Keypair
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
-from verathos.protocol.api import MAX_OPTIONS, Noul, Question, Score
+from verathos.protocol.api import MAX_OPTIONS, PER_QUESTION_ENGINES, Noul, Question, Score
 from verathos.protocol.callers import egress_addresses
 from verathos.protocol.canonical import digest
 from verathos.protocol.http import get_json
@@ -149,6 +149,11 @@ class CatalogModel(BaseModel):
 
     def reads_images(self) -> bool:
         return "image" in self.input_modalities
+
+    def reads_per_question(self) -> bool:
+        """Whether its engine reads one prompt per question, each with the whole state (``PER_QUESTION_ENGINES``), so
+        a request is billed the tokens of all of them."""
+        return self.engine.name in PER_QUESTION_ENGINES
 
     def request_cost(self, image_tokens: int) -> float:
         """What answering a request with ``image_tokens`` costs relative to the model's mix, whose requests cost 1 on

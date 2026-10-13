@@ -79,11 +79,11 @@ digest proves, are fetched accepting any certificate.
    decides, and each failed probe doubles the time (up to 120 s). A probe that times out stays the one probe until
    its request is settled: it fails if another miner answers the request.
 7. **Response.** The answers, the input tokens the miner signed in its receipt (at most one per byte of the request
-   without its images, at least one per 8 characters of the state, each bound with the images' tokens added; the auditor
-   checks sampled counts against its reference, too many or too few being a wrong answer), the receipt itself and the
-   request id; with images, their tokens too (`usage.image_tokens`). Usage is counted per account, key, model and day,
-   and written every 5 s, with every account's answered requests and input tokens per model and hour (the network's
-   totals).
+   without its images, or for a model that reads one prompt per question, `questions × (2 × bytes + 512)`; at least
+   one per 8 characters of the state; each bound with the images' tokens added; the auditor checks sampled counts
+   against its reference, too many or too few being a wrong answer), the receipt itself and the request id; with
+   images, their tokens too (`usage.image_tokens`). Usage is counted per account, key, model and day, and written every
+   5 s, with every account's answered requests and input tokens per model and hour (the network's totals).
 8. **Report.** Every 5 s the gateway tells the auditor, per endpoint and second, the user requests it sent it and those
    it answered (with input tokens, the paid ones apart, and durations), how often it considered it for a request (drew
    it), and how often it was not ready then (busy, behind an open breaker, or its latest answer or timed-out attempt
@@ -320,8 +320,9 @@ curl -s https://<gateway>/v1/systemone -H "Authorization: Bearer $KEY" -H "Conte
 `GET /v1/models` (computed at most every 15 s) lists the catalog's active models, each with its state limit
 (`max_state_tokens`), the input it reads (`input_modalities`: `"text"`, a state of plain text or JSON, and `"image"`
 for a model that reads images, whose `images` gives its limits, formats and aspect ratio as in [Images](#images); null
-for a model that reads text only), price (`price.usd_per_million_input_tokens`; `usd_per_million_output_tokens` is
-0), license, weights
+for a model that reads text only), whether it reads one prompt per question, each with the whole state
+(`reads_state_per_question`: its input tokens are those of all the prompts, so a request's cost grows with its
+questions), price (`price.usd_per_million_input_tokens`; `usd_per_million_output_tokens` is 0), license, weights
 (`weights.repo`, `weights.revision`, `base_model`), whether it is `available` now (a routable endpoint that is not
 failing), and its `state` and `latency_ms` as `GET /v1/status` gives them.
 `GET /health` answers while the process runs.
@@ -476,11 +477,12 @@ reference of the account's top-up it returns, and returns at most what earlier r
 account bought is its top-ups less their refunds, which is what paid usage, the totals and the series count.
 
 Each process reads a prepaid account's balance at most 5 s before using it and subtracts what it charged since and what
-its requests in flight may cost at most (one token per byte of the request without its images, and the most image tokens
-the model's limits allow), reserved when a request is accepted, before its images are decoded, and settled to its real
-cost when it ends. New credit therefore applies within 5 s (at once when recorded through this process), and other
-processes' charges within about 10 s (they write every 5 s). A request is accepted while that remainder is positive, so
-a balance ends below zero by at most one request's cost per process.
+its requests in flight may cost at most (the most input tokens of the request's text, as step 7 of
+[How a request is served](#how-a-request-is-served) bounds them, and the most image tokens the model's limits allow),
+reserved when a request is accepted, before its images are decoded, and settled to its real cost when it ends. New
+credit therefore applies within 5 s (at once when recorded through this process), and other processes' charges within
+about 10 s (they write every 5 s). A request is accepted while that remainder is positive, so a balance ends below zero
+by at most one request's cost per process.
 
 ## Referrals
 
