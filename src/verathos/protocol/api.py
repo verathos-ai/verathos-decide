@@ -113,7 +113,8 @@ def prompt_chars(request: SystemOneRequest) -> int:
 def empty_question(questions: dict[str, Any]) -> bool:
     """Whether a request's questions (as sent) hold one with an empty id and no instructions, which an engine of
     ``QUESTION_TEXT_ENGINES`` cannot answer."""
-    return any(qid == "" and isinstance(q, dict) and q.get("instructions") in (None, "") for qid, q in questions.items())
+    return any(qid == "" and isinstance(q, dict) and q.get("instructions") in (None, "")
+               for qid, q in questions.items())
 
 
 def question_keys(question: Noul | Choice | Score) -> list[str]:
