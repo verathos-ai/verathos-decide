@@ -12,7 +12,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from verathos.engine.readout import D3Family, FastEngine, PplxFamily, Prepared, decision_config, prepare, validate
+from verathos.engine.readout import (
+    D3Family,
+    D3Reference,
+    FastEngine,
+    PplxFamily,
+    PplxReference,
+    Prepared,
+    decision_config,
+    prepare,
+    validate,
+)
 from verathos.protocol.api import PROMPT_TEMPLATE_TOKENS, distributions, most_input_tokens
 from verathos.protocol.canonical import canonical_json
 
@@ -161,6 +171,38 @@ def test_every_pplx_question_gets_the_prompt_and_tokens_its_server_gives_it(pplx
         assert [ours.sequences[k] for k in ours.keys] == rows
         assert [ours.options[k] for k in ours.keys] == list(batch.counts)
     assert accepted >= 2
+
+
+def test_both_paths_take_and_refuse_the_same_requests_with_the_same_reasons(d3, pplx) -> None:
+    """What miners run (``prepare``) and what validators' references run (the release's own runtime) take the same
+    requests and refuse the same ones with the same reasons: among them an empty question id (d3's runtime refuses it,
+    pplx's server takes it) and a prompt over the family's length limit, which d3's runtime alone would answer."""
+    runtime = d3.runtime
+    own = SimpleNamespace(tokenizer=d3.tokenizer, prompt="d3", codes=d3.codes, max_length=None,
+                          permutation_average=False)
+    own.text = lambda state, question: runtime.D3.text(own, state, question)
+    own.prepare = lambda state, questions: runtime.D3.prepare(own, state, questions)
+    d3_reference, pplx_reference = object.__new__(D3Reference), object.__new__(PplxReference)
+    d3_reference.prompts, d3_reference.d3, pplx_reference.prompts = d3, own, pplx
+    bodies = [*BODIES,
+              {"model": "m", "state": "s", "questions": {"": {"type": "noul", "instructions": "Is it?"}}},
+              {"model": "m", "state": "word " * 17000, "questions": {"q": {"type": "noul"}}},
+              {"model": "m", "state": "s",
+               "questions": {"q": {"type": "noul"}, "r": {"type": "choice", "criteria": {}}}}]
+
+    def verdict(run, *args) -> str:
+        try:
+            run(*args)
+            return "answered"
+        except ValueError as exc:
+            return str(exc)
+
+    for prompts, reference in ((d3, d3_reference), (pplx, pplx_reference)):
+        fast = [verdict(prepare, body, prompts) for body in bodies]
+        assert fast == [verdict(reference.prepare, body) for body in bodies]
+        assert "more than" in fast[-2] and fast[-1].startswith("r: ")
+    assert verdict(prepare, bodies[-3], d3) == "question IDs must be nonempty strings"
+    assert verdict(prepare, bodies[-3], pplx) == "answered"
 
 
 def test_every_prompt_fits_the_most_tokens_a_request_is_billed(d3, pplx) -> None:

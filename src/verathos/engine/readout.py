@@ -4,7 +4,9 @@
 others share this format; they differ in their prompts and answers, which each release ships as code.
 
 A prompt family is that code, loaded from the pinned revision, so every question's checks, its prompt, its tokens and
-the answer built from its option probabilities are exactly the release's; only the forward pass is ours:
+the answer built from its option probabilities are exactly the release's; only the forward pass is ours. Both paths
+below check a request with the same code (``prepare``): they refuse the same requests with the same reasons, a prompt
+over the family's ``max_length`` among them.
 - ``d3`` (vLLM Semantic Router): ``d3_format.py`` and ``d3_runtime.py``.
 - ``pplx`` (Perplexity): ``source/src/autojev``: ``model.py`` (prompt, options, answer) and ``server.py`` (its
   server's question checks).
@@ -87,6 +89,11 @@ class D3Family:
         self.tokenizer = AutoTokenizer.from_pretrained(str(path))
         self.codes, _ = self.format.answer_codes(self.tokenizer)
 
+    def check(self, questions: dict[str, Any]) -> None:
+        """The release's check of a request's questions as a whole (``D3.prepare``): ids are nonempty."""
+        if any(not qid for qid in questions):
+            raise ValueError("question IDs must be nonempty strings")
+
     def question(self, question: dict[str, Any]) -> Any:
         return self.runtime.normalize_question(question)
 
@@ -118,6 +125,9 @@ class PplxFamily:
         self.processor = AutoProcessor.from_pretrained(str(path))
         self.tokenizer = self.processor.tokenizer
         self.codes = decision_config(path)["codes"]
+
+    def check(self, questions: dict[str, Any]) -> None:
+        """Its server checks the questions one by one only (any id, an empty one too)."""
 
     def question(self, question: dict[str, Any]) -> dict[str, Any]:
         """The question as the release's server passes it to the model (its own checks, then ``exclude_none``)."""
@@ -168,6 +178,7 @@ def prepare(body: dict[str, Any], prompts: D3Family | PplxFamily, max_length: in
     """A request's questions checked and rendered by the release, each prompt tokenized as the release tokenizes it.
     Raises ValueError for a request the release refuses."""
     validate(body)
+    prompts.check(body["questions"])
     questions, texts = {}, []
     for qid, question in body["questions"].items():
         try:
@@ -319,10 +330,11 @@ class D3Reference:
             self.d3.fast = None
 
     def prepare(self, body: dict[str, Any]) -> tuple[str, Any]:
-        validate(body)
+        prepare(body, self.prompts)  # the fast path's checks: both refuse the same requests with the same reasons
         prepared = self.d3.prepare(body["state"], body["questions"])
-        if prepared.errors:
-            raise ValueError("; ".join(f"{k}: {e['message']}" for k, e in prepared.errors.items()))
+        if prepared.errors:  # the release refusing what those checks passed
+            qid, error = next(iter(prepared.errors.items()))
+            raise ValueError(f"{qid}: {error['message']}")
         return body["model"], prepared
 
     def passes(self, items: list[Any]) -> list[list[int]]:

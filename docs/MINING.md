@@ -452,7 +452,8 @@ reference.
 Code-readout models (d3, pplx-decider: full attention over the whole prompt, one prompt per question, a readout over 255
 answer codes) run on `verathos-engine readout`, set up as Clef above (the same environment works). It loads the prompt
 and answer code shipped in the model repository at the pinned revision and batches every question of the requests that
-arrive together:
+arrive together. It refuses what the release refuses (d3: an empty question id) and a question whose prompt exceeds
+16,384 tokens (d3) or 8,192 (pplx-decider, the release's limit), as validators' references do:
 
 ```bash
 CUDA_VISIBLE_DEVICES=3 /opt/clef/bin/verathos-engine readout --repo <hf_repo> --revision <hf_revision> --port 8012

@@ -5,6 +5,7 @@ import json
 import pytest
 
 from verathos import catalog
+from verathos.protocol.api import Noul
 from verathos.protocol.canonical import digest
 
 
@@ -345,6 +346,9 @@ def test_a_request_mix_carries_images_only_for_a_model_that_reads_them_and_withi
 def test_question_limits_are_a_range_within_the_protocol_and_absent_by_default() -> None:
     assert catalog.load().get("kev-4b").questions is None
     assert catalog.QuestionLimits().refused({}) is None
+    nameless = {"": Noul(type="noul", instructions="Is it?")}
+    assert catalog.QuestionLimits().refused(nameless) is None  # an empty id is the protocol's, unless a model says
+    assert "may not be empty" in catalog.QuestionLimits(empty_ids=False).refused(nameless)
     for levels in ((0, 10), (5, 4), (2, 256)):
         with pytest.raises(ValueError, match="score_levels"):
             catalog.QuestionLimits(score_levels=levels)

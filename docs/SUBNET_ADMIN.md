@@ -81,6 +81,18 @@ miners run a release that reads them, with engines that serve them (`MINING.md`;
 refuse a validator's image canary as larger than it takes from validators), and the auditor's reference and screen of
 the model run on a GPU (`VALIDATING.md`).
 
+`questions` limits the questions a model takes where its release takes less than the protocol: `score_levels`, the
+range of a score question's levels; `noul_criteria`, the keys a noul question's criteria may describe; `empty_ids`,
+whether a question's id may be empty. The gateway refuses a request outside them with the reason, before any miner
+(the miners' engines refuse it too, which the gateway could only report as too large). The code-readout releases need
+it, d3 so and pplx-decider without `empty_ids`:
+
+```json
+"questions": {"score_levels": [2, 10], "noul_criteria": ["false", "true"], "empty_ids": false}
+```
+
+Older nodes ignore it, and the catalog's digest covers it.
+
 `workload` is a model's standard request mix: miners measure and declare their capacity with it, and the auditor's
 tests send it (`THROUGHPUT_AUDIT.md`). `state_words` is the range of words of a request's state and `questions` its
 questions; for a model that reads images, `images` sets which of its requests carry images, here the shipped

@@ -44,7 +44,8 @@ digest proves, are fetched accepting any certificate.
    whose answers fit a response (64 KiB), and whose state is not in the form of the subnet's test requests or
    canaries (`throughput.workload.in_mix_form`, `validator.canaries.canary_like`: a miner relaying them through the
    gateway would have its answers to them counted as users'), with a body within the model's limit and images only
-   for a model that reads them, within its limits and made canonical by the gateway's decoders ([Images](#images)).
+   for a model that reads them, within its limits and made canonical by the gateway's decoders ([Images](#images)),
+   and with questions the model's catalog entry takes (`questions`: score levels, noul criteria, empty ids).
    Requests no miner could answer are refused here, so they cannot count against miners. A request is forwarded as
    its model, state and questions, with its canonical images (other top-level fields are dropped): its canonical JSON
    is the body every miner receives and its receipt binds.

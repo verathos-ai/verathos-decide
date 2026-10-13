@@ -69,6 +69,7 @@ class QuestionLimits(BaseModel):
                                           "levels")
     noul_criteria: list[str] | None = Field(None, description="The keys a noul question's criteria may describe "
                                             "(none listed: any)")
+    empty_ids: bool = Field(True, description="Whether a question's id may be empty")
 
     @model_validator(mode="after")
     def _check(self) -> QuestionLimits:
@@ -79,6 +80,8 @@ class QuestionLimits(BaseModel):
 
     def refused(self, questions: dict[str, Question]) -> str | None:
         """Why the model does not take one of ``questions``, or None."""
+        if not self.empty_ids and "" in questions:
+            return "questions: a question's id may not be empty for this model"
         low, high = self.score_levels
         for qid, question in questions.items():
             if isinstance(question, Score) and not low <= len(question.criteria) <= high:

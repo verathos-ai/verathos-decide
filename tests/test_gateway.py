@@ -940,10 +940,11 @@ def test_requests_no_miner_could_answer_are_refused_before_any_miner(tmp_path) -
 
 def test_questions_a_model_does_not_take_are_refused_with_the_reason_before_any_miner(tmp_path) -> None:
     """A model whose catalog entry limits its questions (a code-readout release: scores of 2 to 10 levels, noul
-    criteria describing only false and true): a request outside them is refused by the gateway with the reason, never
-    by the miners' engines (which the gateway could only take for a request too large); others are forwarded."""
+    criteria describing only false and true, no empty question id): a request outside them is refused by the gateway
+    with the reason, never by the miners' engines (which the gateway could only take for a request too large); others
+    are forwarded."""
     document = catalog.load().document()
-    limits = {"questions": {"score_levels": [2, 10], "noul_criteria": ["false", "true"]}}
+    limits = {"questions": {"score_levels": [2, 10], "noul_criteria": ["false", "true"], "empty_ids": False}}
     cat = catalog.Catalog.parse({**document, "models": [{**m, **limits} if m["model_id"] == "kev-4b" else m
                                                         for m in document["models"]]})
     s = Setup(tmp_path, {"10.0.0.1": Counting("kev-4b")}, cat=cat)
@@ -954,6 +955,9 @@ def test_questions_a_model_does_not_take_are_refused_with_the_reason_before_any_
         refused = asyncio.run(s.post({"model": "kev-4b", "state": "s", "questions": {"q": question}}))
         assert refused.status_code == 400 and refused.json()["error"]["type"] == "invalid_request"
         assert why in refused.json()["error"]["message"]
+    nameless = asyncio.run(s.post({"model": "kev-4b", "state": "s",
+                                   "questions": {"": {"type": "noul", "instructions": "Is it?"}}}))
+    assert nameless.status_code == 400 and "id may not be empty" in nameless.json()["error"]["message"]
     assert Counting.calls == 0
     taken = {"model": "kev-4b", "state": "s", "questions": {
         "s": {"type": "score", "criteria": ["low", "high"]}, "n": {"type": "noul", "criteria": {"true": "Yes"}}}}
