@@ -204,7 +204,9 @@ def test_each_key_lists_the_requests_it_was_used_for(tmp_path) -> None:
     assert [asyncio.run(s.post()).status_code for _ in range(2)] == [200, 200]  # both with the first key
     asyncio.run(s.meter.flush())
     listed = {k["name"]: k for k in asyncio.run(s.accounts.list_keys("acme"))}
-    assert listed["prod"]["requests"] == 2 and listed["prod"]["input_tokens"] > 0 and listed["prod"]["cost"] > 0
+    prod, price = listed["prod"], catalog.load().get("kev-4b").price  # micro-USD per input token
+    assert prod["requests"] == 2 and prod["input_tokens"] > 0
+    assert prod["cost"] == math.floor(prod["input_tokens"] * price + 1e-9)  # whole micro-USD, the fraction carried
     assert (listed["second"]["requests"], listed["second"]["input_tokens"], listed["second"]["cost"]) == (0, 0, 0)
 
 

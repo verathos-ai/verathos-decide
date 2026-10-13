@@ -271,14 +271,14 @@ def test_credit_is_reserved_before_images_are_decoded(tmp_path, setups) -> None:
     s.gateway.decoders.close()
     s.gateway.decoders = Holding()
     asyncio.run(s.accounts.set_account("acme", prepaid=True))
-    asyncio.run(s.accounts.add_credit("acme", 100, kind="grant", reference="100 micro-USD"))
+    asyncio.run(s.accounts.add_credit("acme", 1, kind="grant", reference="1 micro-USD"))  # less than any request holds
     request = {**REQUEST, "images": [item(encoded(256, 256), "image/png")]}
 
     async def two():
         first = asyncio.create_task(s.post(request))
         while not Holding.calls:
             await asyncio.sleep(0.01)
-        second = await s.post(request)  # the first holds more than the account's 100 micro-USD
+        second = await s.post(request)  # the first holds more than the account's 1 micro-USD
         Holding.go.set()
         return await first, second
 
