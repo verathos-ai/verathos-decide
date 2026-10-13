@@ -446,6 +446,25 @@ def test_clef_models_install_verathos_engine_and_others_are_refused(tmp_path) ->
         engines.engine_for(tmp_path, other)
 
 
+def test_code_readout_models_install_verathos_engine_readout_in_an_environment_of_their_own(tmp_path) -> None:
+    clef = catalog.load().get("clef-flash")
+    revision = "f6075bff3c0f7d5704e353d0fb2ebf94888d1691"
+    engine_pin = catalog.Engine(name="readout", source="https://huggingface.co/vllm-sr/d3-flash", revision=revision)
+    d3 = clef.model_copy(update={"model_id": "d3-flash", "hf_repo": "vllm-sr/d3-flash", "hf_revision": revision,
+                                 "engine": engine_pin})
+    assert plan.installable(d3)
+    engine = engines.engine_for(tmp_path, d3)
+    assert isinstance(engine, engines.ReadoutEngine) and engine.directory == tmp_path / "engines" / "verathos-readout"
+    miner = engine.command("miner", d3, 8012)
+    assert miner[1:4] == ["-m", "verathos.engine", "readout"]
+    assert miner[-4:] == ["--device", "cuda", "--dtype", "bfloat16"]
+    assert miner[miner.index("--repo") + 1] == "vllm-sr/d3-flash" and miner[miner.index("--revision") + 1] == revision
+    assert engine.command("reference", d3, 8112)[-4:] == ["--device", "auto", "--dtype", "float32"]
+    assert engines.engine_for(tmp_path, clef).directory != engine.directory
+    # d3-flash's 8.39B parameters: a 24 GB GPU, as clef-flash
+    assert 18 * GiB < plan.miner_memory(8_392_695_024, "readout") < 24 * GiB
+
+
 def test_a_9b_clef_model_fits_a_24_gb_gpu_but_not_a_20_gb_one() -> None:
     need = plan.miner_memory(9_400_000_000, "clef")
     assert 20 * GiB < need < 24 * GiB

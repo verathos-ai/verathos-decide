@@ -29,6 +29,7 @@ from typing import Annotated, Any, Literal
 from bittensor_wallet import Keypair
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
+from verathos.protocol.api import MAX_OPTIONS, Noul, Question, Score
 from verathos.protocol.callers import egress_addresses
 from verathos.protocol.canonical import digest
 from verathos.protocol.http import get_json
@@ -59,6 +60,35 @@ class Engine(BaseModel):
     revision: str = Field(pattern=r"^[0-9a-f]{40}$")
 
 
+class QuestionLimits(BaseModel):
+    """What a model's release takes of the protocol's questions, where it takes less than the protocol: a request
+    outside these is refused by the gateway, before any miner (whose engine would refuse it, which the gateway can
+    only take for a request too large)."""
+
+    score_levels: tuple[int, int] = Field((1, MAX_OPTIONS), description="Inclusive range of a score question's "
+                                          "levels")
+    noul_criteria: list[str] | None = Field(None, description="The keys a noul question's criteria may describe "
+                                            "(none listed: any)")
+
+    @model_validator(mode="after")
+    def _check(self) -> QuestionLimits:
+        low, high = self.score_levels
+        if not 1 <= low <= high <= MAX_OPTIONS:
+            raise ValueError(f"score_levels must be a range [low, high] with 1 <= low <= high <= {MAX_OPTIONS}")
+        return self
+
+    def refused(self, questions: dict[str, Question]) -> str | None:
+        """Why the model does not take one of ``questions``, or None."""
+        low, high = self.score_levels
+        for qid, question in questions.items():
+            if isinstance(question, Score) and not low <= len(question.criteria) <= high:
+                return f"{qid}: a score question takes {low} to {high} levels for this model"
+            if (isinstance(question, Noul) and self.noul_criteria is not None and question.criteria
+                    and set(question.criteria) - set(self.noul_criteria)):
+                return f"{qid}: a noul question's criteria may only describe {', '.join(self.noul_criteria)}"
+        return None
+
+
 class CatalogModel(BaseModel):
     model_id: str = Field(min_length=1, max_length=128)
     status: Literal["candidate", "active", "retired"]
@@ -84,6 +114,8 @@ class CatalogModel(BaseModel):
                                         "carries: text (its state and questions), and image for images")
     images: ImageLimits = Field(default_factory=ImageLimits, description="Limits of the images a request carries, "
                                 "for a model whose input_modalities list image")
+    questions: QuestionLimits | None = Field(None, description="The questions the model takes, where its release "
+                                             "takes fewer than the protocol (none: every question)")
 
     @field_validator("input_modalities")
     @classmethod

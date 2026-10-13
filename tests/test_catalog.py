@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from verathos import catalog
 from verathos.protocol.canonical import digest
 
@@ -338,3 +340,11 @@ def test_a_request_mix_carries_images_only_for_a_model_that_reads_them_and_withi
     assert catalog.Catalog.parse(with_models(**{"kev-4b": {"workload": {
         **catalog.load().get("kev-4b").workload.document(), "image": {}}}})).unknown_settings() == [
         "models.kev-4b.workload.image"]
+
+
+def test_question_limits_are_a_range_within_the_protocol_and_absent_by_default() -> None:
+    assert catalog.load().get("kev-4b").questions is None
+    assert catalog.QuestionLimits().refused({}) is None
+    for levels in ((0, 10), (5, 4), (2, 256)):
+        with pytest.raises(ValueError, match="score_levels"):
+            catalog.QuestionLimits(score_levels=levels)

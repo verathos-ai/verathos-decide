@@ -296,8 +296,9 @@ def screen(g: Gateway, body: bytes) -> Screened:
     limit (``prompt_chars``) and ``MAX_REQUEST_BYTES`` without its images, with answers that fit a response, whose
     state is not one of the subnet's test requests or canaries (a miner relaying them through the gateway would have
     its answers counted as users'), with images only to a model that reads them, within its limits as far as they
-    can be checked undecoded (``protocol.media.sent_image``), and, to a model whose engine reads text for every
-    question (``QUESTION_TEXT_ENGINES``), without a question with an empty id and no instructions. Raises Rejected."""
+    can be checked undecoded (``protocol.media.sent_image``), to a model whose engine reads text for every question
+    (``QUESTION_TEXT_ENGINES``) without a question with an empty id and no instructions, and within the questions the
+    model takes (its catalog's ``questions``). Raises Rejected."""
     text_limit = g.config.max_body_bytes
     if len(body) > text_limit and len(body.translate(None, BASE64_ALPHABET)) > text_limit:
         raise Rejected(413, "too_large", f"the body exceeds {text_limit} bytes besides its images' base64")
@@ -326,6 +327,8 @@ def screen(g: Gateway, body: bytes) -> Screened:
         raise Rejected(400, "invalid_request", f"{model.model_id} reads text only", model=model.model_id)
     if model.engine.name in QUESTION_TEXT_ENGINES and empty_question(raw["questions"]):
         raise Rejected(400, "invalid_request", EMPTY_QUESTION, model=model.model_id)
+    if model.questions is not None and (why := model.questions.refused(parsed.questions)):
+        raise Rejected(400, "invalid_request", why, model=model.model_id)
     if parsed.model not in g.router.models():
         raise Rejected(503, "unavailable", f"no miner serves {parsed.model} right now", 30, parsed.model)
     if prompt > STATE_CHARS_PER_TOKEN * model.max_state_tokens:

@@ -18,10 +18,12 @@ MINER_WEIGHTS_FACTOR = 1.25
 MINER_FIXED = 4 * GiB
 # The Clef engine references the bfloat16 weights without copies and its CUDA graphs share one pool: Clef-flash (9.4B
 # parameters, 17.5 GiB) peaked at 19.1-20.3 GB allocated on an A100, an H100 and an RTX 4090 with 525-token requests.
+# The readout engine is built the same way: d3-mini, d3-flash and the 27B models peaked 0.4-1.6 GB above their
+# bfloat16 weights on an H100 with requests of up to six 800-token questions.
 CLEF_MINER_FIXED = 3 * GiB
 REFERENCE_WEIGHTS_FACTOR = 1.1
 REFERENCE_FIXED = {"cpu": 2 * GiB, "gpu": 8 * GiB}
-INSTALLABLE_ENGINES = ("kev", "clef")
+INSTALLABLE_ENGINES = ("kev", "clef", "readout")
 
 
 class PlanError(ValueError):
@@ -30,7 +32,7 @@ class PlanError(ValueError):
 
 def miner_memory(parameters: int, engine: str = "kev") -> int:
     """GPU memory the ``engine`` family needs to serve a model of ``parameters`` in bfloat16."""
-    if engine == "clef":
+    if engine in ("clef", "readout"):
         return parameters * 2 + CLEF_MINER_FIXED
     return int(parameters * 2 * MINER_WEIGHTS_FACTOR) + MINER_FIXED
 

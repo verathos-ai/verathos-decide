@@ -188,3 +188,22 @@ def test_fast_engine_answers_stay_within_the_drift_bounds_of_the_float32_referen
                 if ranked[0] - ranked[1] >= 0.2:
                     assert max(ours[qid], key=ours[qid].get) == max(r, key=r.get)
         assert max(diffs) <= 0.05 and sum(diffs) / len(diffs) <= 0.005
+
+
+def test_both_families_answers_are_well_formed_systemone_answers(d3, pplx) -> None:
+    """What miners sign: one distribution per question over its own options whose visible fields agree with it
+    (``protocol.api.well_formed``), built by each family's own answer code from any option probabilities."""
+    import random
+
+    from verathos.protocol.api import SystemOneRequest, well_formed
+
+    rng = random.Random(0)
+    request = SystemOneRequest.model_validate(BODIES[0])
+    for prompts in (d3, pplx):
+        item = prepare(BODIES[0], prompts)
+        for _ in range(20):
+            answers = {}
+            for qid in item.keys:
+                raw = [rng.random() + 1e-9 for _ in range(item.options[qid])]
+                answers[qid] = prompts.answer(item.questions[qid], [v / sum(raw) for v in raw])
+            assert well_formed(request, answers)

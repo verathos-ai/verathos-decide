@@ -210,6 +210,11 @@ What it does (a full validator; light, see below):
    | Kev-9B | active | about 42 GiB | about 48 GiB |
    | Clef-flash | active | about 41 GiB | about 47 GiB |
 
+   Code-readout models (`verathos-engine readout`) run their release's own code in float32, about as Clef-flash per
+   parameter (d3-flash, 8.4B: 33 GiB of RAM measured); while pplx-decider's own loader reads its 27B weights, the
+   process's resident memory peaks at about 143 GiB (the mapped checkpoint files included), more than the plan's
+   estimate of about 109 GiB.
+
 5. installs each model's engine without the fused kernels (they change float32 results): the Kev engine at
    `engine.revision` for Kev models, `verathos-engine` from this code for Clef models, which runs the model
    repository's own inference code; then downloads the weights at `hf_revision` and the base model at

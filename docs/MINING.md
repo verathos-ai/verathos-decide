@@ -449,6 +449,27 @@ The backbone's matrix multiplications are most of the work, so a GPU's bfloat16 
 cards accumulate bfloat16 in fp32 at half their fp16 rate. Answers from all of them stay within 0.016 of the float32
 reference.
 
+Code-readout models (d3, pplx-decider: full attention over the whole prompt, one prompt per question, a readout over 255
+answer codes) run on `verathos-engine readout`, set up as Clef above (the same environment works). It loads the prompt
+and answer code shipped in the model repository at the pinned revision and batches every question of the requests that
+arrive together:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 /opt/clef/bin/verathos-engine readout --repo <hf_repo> --revision <hf_revision> --port 8012
+```
+
+A model needs its bfloat16 weights plus about 3 GiB (an 8B model a 24 GB GPU, a 27B one an 80 GB GPU). Every question
+reads the whole state again, so a request costs about as many passes as it has questions. On an H100, requests of 150
+to 1,200 words with six questions:
+
+| Model | Requests per second | One request alone |
+|---|---|---|
+| d3-mini (4.5B) | 11.6 | 86 ms |
+| d3-flash (8.4B) | 7.2 | 141 ms |
+| d3, pplx-decider v1.1 (27B) | 2.2 | 465 ms |
+
+Answers stay within 0.012 (d3) and 0.023 (pplx-decider) of the float32 reference.
+
 A model whose catalog entry lists `image` in its `input_modalities` also gets requests with images, which the gateway
 has made canonical (`GATEWAY.md`, Images); in the shipped catalog, Clef-Flash does. The bfloat16 engine runs them in
 passes of their own, without CUDA graphs: their images through the release's vision tower, whose features take the

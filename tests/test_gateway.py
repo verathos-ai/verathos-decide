@@ -935,6 +935,28 @@ def test_requests_no_miner_could_answer_are_refused_before_any_miner(tmp_path) -
     assert Counting.calls == 0
 
 
+def test_questions_a_model_does_not_take_are_refused_with_the_reason_before_any_miner(tmp_path) -> None:
+    """A model whose catalog entry limits its questions (a code-readout release: scores of 2 to 10 levels, noul
+    criteria describing only false and true): a request outside them is refused by the gateway with the reason, never
+    by the miners' engines (which the gateway could only take for a request too large); others are forwarded."""
+    document = catalog.load().document()
+    limits = {"questions": {"score_levels": [2, 10], "noul_criteria": ["false", "true"]}}
+    cat = catalog.Catalog.parse({**document, "models": [{**m, **limits} if m["model_id"] == "kev-4b" else m
+                                                        for m in document["models"]]})
+    s = Setup(tmp_path, {"10.0.0.1": Counting("kev-4b")}, cat=cat)
+    Counting.calls = 0
+    for question, why in (({"type": "score", "criteria": [f"level {i}" for i in range(11)]}, "2 to 10 levels"),
+                          ({"type": "score", "criteria": ["only"]}, "2 to 10 levels"),
+                          ({"type": "noul", "criteria": {"yes": "Yes"}}, "only describe false, true")):
+        refused = asyncio.run(s.post({"model": "kev-4b", "state": "s", "questions": {"q": question}}))
+        assert refused.status_code == 400 and refused.json()["error"]["type"] == "invalid_request"
+        assert why in refused.json()["error"]["message"]
+    assert Counting.calls == 0
+    taken = {"model": "kev-4b", "state": "s", "questions": {
+        "s": {"type": "score", "criteria": ["low", "high"]}, "n": {"type": "noul", "criteria": {"true": "Yes"}}}}
+    assert asyncio.run(s.post(taken)).status_code == 200 and Counting.calls == 1
+
+
 def test_request_bodies_held_at_once_are_bounded(tmp_path) -> None:
     s = Setup(tmp_path, {"10.0.0.1": Slow("kev-4b", 0.3)}, credited=100.0)
     s.config.max_in_flight_bytes = 1 << 20

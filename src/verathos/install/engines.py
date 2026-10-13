@@ -10,6 +10,8 @@ GPU, references compute float32.
 - ``clef``: ``verathos-engine`` from this release's code with the ``clef`` extra, which runs the inference code the
   model repository ships at ``hf_revision``; miners add ``flash-linear-attention`` at the version the fast path pins
   (``verathos.engine.qwen35.FLA_VERSION``), references run the release's own code without it.
+- ``readout``: the same for code-readout models (d3, pplx-decider: ``verathos.engine.readout``), in an environment
+  of its own.
 Weights are the catalog's ``hf_repo`` at ``hf_revision`` and, for an adapter, ``base_repo`` at ``base_revision``, kept
 in the setup's Hugging Face cache; the engine then runs offline, so it serves exactly the pinned revisions.
 """
@@ -134,9 +136,11 @@ class ClefEngine:
     """``verathos-engine clef`` from this release's code, under ``<home>/engines/verathos-clef``. Its source is this
     release, so the directory is shared by every Clef model and follows the code when it is updated."""
 
+    family = "clef"
+
     def __init__(self, home: Path, engine: catalog.Engine) -> None:
         self.engine = engine
-        self.directory = home / "engines" / "verathos-clef"
+        self.directory = home / "engines" / f"verathos-{self.family}"
 
     def environment(self, purpose: str) -> Path:
         return self.directory / (".venv" if purpose == "miner" else ".venv-reference")
@@ -163,7 +167,7 @@ class ClefEngine:
         # the reference's device is its CUDA_VISIBLE_DEVICES (environment_variables): a GPU when one is visible
         device = ["--device", "cuda", "--dtype", "bfloat16"] if purpose == "miner" else \
             ["--device", "auto", "--dtype", "float32"]
-        return [str(self.python(purpose)), "-m", "verathos.engine", "clef", "--repo", model.hf_repo,
+        return [str(self.python(purpose)), "-m", "verathos.engine", self.family, "--repo", model.hf_repo,
                 "--revision", model.hf_revision, "--host", "127.0.0.1", "--port", str(port), *device]
 
     @staticmethod
@@ -175,7 +179,14 @@ class ClefEngine:
                 "VERATHOS_ENGINE_CODE": code_version()}
 
 
-ENGINES = {"kev": KevEngine, "clef": ClefEngine}
+class ReadoutEngine(ClefEngine):
+    """``verathos-engine readout`` from this release's code, under ``<home>/engines/verathos-readout``, set up as the
+    Clef engine is."""
+
+    family = "readout"
+
+
+ENGINES = {"kev": KevEngine, "clef": ClefEngine, "readout": ReadoutEngine}
 
 
 def engine_for(home: Path, model: catalog.CatalogModel) -> KevEngine | ClefEngine:
