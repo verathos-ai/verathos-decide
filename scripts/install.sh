@@ -238,9 +238,7 @@ release_signers() {
 # the code it runs. Format: ssh-keygen(1), ALLOWED SIGNERS. scripts/install.sh holds a copy (release_signers), which
 # the tests keep the same. Adding and rotating keys: docs/SUBNET_ADMIN.md, Signing releases.
 #
-# PLACEHOLDER: no release signing key yet. Until a key's line replaces the one below, no release is installed by the
-# self-update or as the installer's default.
-verathos-release namespaces="git" ssh-ed25519 REPLACE_WITH_THE_RELEASE_SIGNING_PUBLIC_KEY
+verathos-release namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA7pWYysUPrBGrcYGk0BPMaWN9Li0S+czHKLlmsn3bal
 EOF
 }
 

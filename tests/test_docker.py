@@ -392,15 +392,17 @@ def test_the_build_script_builds_both_images_of_this_checkout_tagged_with_its_ve
         assert refused.returncode != 0 and why in refused.stderr, (args, refused.stderr)
 
 
+NO_KEY_SIGNERS = ('# a release keys file before its key: only the placeholder\n'
+                  'verathos-release namespaces="git" ssh-ed25519 REPLACE_WITH_THE_RELEASE_SIGNING_PUBLIC_KEY\n')
+
 def release_repo(tmp_path: Path, signers: str | None = None) -> tuple[Path, Callable[..., str]]:
     """A repository holding the build script and the Dockerfile at version 1.2.3, its release keys ``signers`` (default:
-    the shipped placeholder), committed; -> the repository and its git."""
+    a file that lists no key yet), committed; -> the repository and its git."""
     repo = tmp_path / "repo"
     for path in ("docker/build.sh", "docker/Dockerfile", "release/allowed_signers"):
         (repo / path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / path, repo / path)
-    if signers is not None:
-        (repo / "release" / "allowed_signers").write_text(signers)
+    (repo / "release" / "allowed_signers").write_text(NO_KEY_SIGNERS if signers is None else signers)
     (repo / "src" / "verathos").mkdir(parents=True)
     (repo / "src" / "verathos" / "__init__.py").write_text('__version__ = "1.2.3"  # the release\n')
 
@@ -426,7 +428,7 @@ def test_the_build_script_builds_a_commit_as_it_is_and_a_release_only_when_its_t
     assert "is not a release tag; it is built as it is, unverified" in built.stdout
     assert f"-t local/verathos-engines:1.2.3-{commit[:12]} " in built.stdout
     assert f"--build-arg REVISION={commit}" in built.stdout and str(repo) + " " not in built.stdout  # an export
-    git("tag", "v1.2.3")  # a release tag the shipped placeholder key cannot verify
+    git("tag", "v1.2.3")  # a release tag a file without a key cannot verify
     refused = build("v1.2.3", "--dry-run", script=script)
     assert refused.returncode != 0 and "lists no release signing key yet" in refused.stderr
     git("tag", "v1.2.4")

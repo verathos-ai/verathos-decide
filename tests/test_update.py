@@ -45,6 +45,10 @@ def plain_git(monkeypatch) -> None:
 
 
 SHIPPED_SIGNERS = (ROOT / update.SIGNERS).read_text()
+# the release signing key the code ships
+RELEASE_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA7pWYysUPrBGrcYGk0BPMaWN9Li0S+czHKLlmsn3bal"
+NO_KEY_SIGNERS = ('# a release keys file before its key: only the placeholder\n'
+                  'verathos-release namespaces="git" ssh-ed25519 REPLACE_WITH_THE_RELEASE_SIGNING_PUBLIC_KEY\n')
 
 
 def git(cwd: Path, *args: str, stdin: str | None = None) -> str:
@@ -232,7 +236,7 @@ def test_the_release_keys_are_the_valid_public_keys_the_allowed_signers_list() -
              f"truncated ssh-ed25519 {base64.b64encode(blob('ssh-ed25519').encode()[:15]).decode()}",
              "release ssh-ed25519 REPLACE_WITH_THE_RELEASE_SIGNING_PUBLIC_KEY"]
     assert update.signing_keys("\n".join(lines)) == [f"ssh-ed25519 {ed}", f"sk-ssh-ed25519@openssh.com {sk}"]
-    assert update.signing_keys(SHIPPED_SIGNERS) == [] and "PLACEHOLDER" in SHIPPED_SIGNERS
+    assert update.signing_keys(NO_KEY_SIGNERS) == [] and update.signing_keys(SHIPPED_SIGNERS) == [RELEASE_KEY]
     tag = "object 1f\ntype commit\ntag v1.0.1\n\nv1.0.1\n"
     assert update.signature(tag) is None
     assert update.signature(tag + "-----BEGIN SSH SIGNATURE-----\nU1NI\n-----END SSH SIGNATURE-----\n") == "SSH"
@@ -297,9 +301,8 @@ def test_a_release_rotating_the_key_is_signed_by_the_old_one_and_nodes_follow_it
     assert caplog.messages[-1].startswith("self-update: v1.0.4 is not signed by a key release/allowed_signers lists")
 
 
-def test_the_shipped_placeholder_lists_no_key_and_nothing_is_installed_until_a_key_is_added(tmp_path, keys,
-                                                                                            caplog) -> None:
-    w = World(tmp_path, keys, signers=SHIPPED_SIGNERS)
+def test_a_signers_file_without_a_key_installs_nothing_until_a_key_is_added(tmp_path, keys, caplog) -> None:
+    w = World(tmp_path, keys, signers=NO_KEY_SIGNERS)
     for _ in range(3):
         w.updater.poll()
     refusals = [m for m in caplog.messages if "lists no release signing key" in m]
@@ -310,7 +313,7 @@ def test_the_shipped_placeholder_lists_no_key_and_nothing_is_installed_until_a_k
     w.now = update.STAGGER_S
     w.updater.at_safe_point()
     assert w.head() == w.v100 and w.installs == [] and w.exits == []
-    added = World(tmp_path / "added", keys, signers=SHIPPED_SIGNERS + allowed(keys, "release"))  # placeholder kept
+    added = World(tmp_path / "added", keys, signers=NO_KEY_SIGNERS + allowed(keys, "release"))  # placeholder kept
     assert added.updater.check().tag == "v1.0.1"
 
 
@@ -376,10 +379,10 @@ def test_the_installer_defaults_to_the_newest_release_once_it_holds_a_key(tmp_pa
     assert git(tmp_path / "new", "rev-parse", "HEAD") == w.v101
     updated = fetch_code(tmp_path, holds, str(w.code), "", "")  # the checkout of 1.0.0, from its origin
     assert updated.returncode == 0 and w.head() == w.v101
-    unverified = fetch_code(tmp_path, SHIPPED_SIGNERS, str(tmp_path / "placeholder"), str(w.origin), "")
+    unverified = fetch_code(tmp_path, NO_KEY_SIGNERS, str(tmp_path / "placeholder"), str(w.origin), "")
     assert unverified.returncode == 0 and git(tmp_path / "placeholder", "rev-parse", "HEAD") == main
     assert "note: HEAD is not a release tag; it is installed unverified" in unverified.stdout
-    refused = fetch_code(tmp_path, SHIPPED_SIGNERS, str(tmp_path / "asked"), str(w.origin), "v1.0.1")
+    refused = fetch_code(tmp_path, NO_KEY_SIGNERS, str(tmp_path / "asked"), str(w.origin), "v1.0.1")
     assert refused.returncode != 0
     assert "cannot verify v1.0.1: this installer holds no release signing key yet" in refused.stderr
 

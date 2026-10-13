@@ -359,7 +359,7 @@ Tags are signed with SSH keys (`git tag -s` with `gpg.format=ssh`) and checked b
 allowed signers file: git 2.34 and OpenSSH 8.2 or newer do both, as Ubuntu 22.04 and later and macOS ship them, with no
 other package. GPG is not on macOS, nor in minimal Ubuntu images.
 
-While the file lists no key, as the shipped placeholder, no release can be verified: nodes do not update by
+While the file lists no key (only a placeholder line), no release can be verified: nodes do not update by
 themselves (`self-update: ... lists no release signing key`) and the installer installs the default branch.
 
 The release key signs nothing else and is kept offline like the owner coldkey, with a passphrase (or on a hardware
@@ -370,8 +370,8 @@ ssh-keygen -t ed25519 -C verathos-release -f ~/.ssh/verathos-release
 printf 'verathos-release namespaces="git" %s\n' "$(cut -d' ' -f1,2 ~/.ssh/verathos-release.pub)"
 ```
 
-The printed line replaces the placeholder line in `release/allowed_signers` and in `release_signers` of
-`scripts/install.sh`, committed before the first release is tagged. Sign each release, check it with the keys of the
+The printed line goes into `release/allowed_signers` and into `release_signers` of `scripts/install.sh` (the
+release key's line is there since v1.0.0), committed before the release that first needs it is tagged. Sign each release, check it with the keys of the
 release before it (the ones nodes hold) and push it:
 
 ```bash
@@ -382,7 +382,7 @@ git push origin v1.0.1
 ```
 
 The first release is checked against the file it carries itself (`git show v1.0.0:release/allowed_signers`). Nodes
-installed from code with the placeholder do not update by themselves: their operators run the installer once.
+installed from code without a key (before v1.0.0) do not update by themselves: their operators run the installer once.
 
 To rotate the key: create the new key and, in a release, replace the old key's line with the new one in both
 copies; sign that release with the old key, and every later release with the new one. A node more than one release
