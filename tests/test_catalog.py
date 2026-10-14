@@ -218,7 +218,8 @@ def test_a_models_relative_speed_is_positive_and_one_when_absent() -> None:
 
     document = catalog.load().document()
     assert {m.model_id: m.relative_speed for m in catalog.load().models} == {"kev-4b": 1.0, "kev-9b": 0.81,
-                                                                            "clef-flash": 0.72}
+                                                                            "clef-flash": 0.72, "d3-flash": 0.23,
+                                                                            "d3-mini": 0.37}
     without = [{k: v for k, v in m.items() if k != "relative_speed"} for m in document["models"]]
     assert {m.relative_speed for m in catalog.Catalog.parse({**document, "models": without}).models} == {1.0}
     for speed in (0, -1.0):
@@ -269,7 +270,8 @@ def test_models_read_text_until_their_entry_lists_image() -> None:
 
     shipped = catalog.load()
     assert {m.model_id: m.reads_images() for m in shipped.models} == {"kev-4b": False, "kev-9b": False,
-                                                                       "clef-flash": True}
+                                                                       "clef-flash": True, "d3-flash": False,
+                                                                       "d3-mini": False}
     assert shipped.get("clef-flash").images == ImageLimits()  # the defaults, written out
     assert all("input_modalities" not in m and "images" not in m for m in shipped.document()["models"]
                if m["model_id"] != "clef-flash")

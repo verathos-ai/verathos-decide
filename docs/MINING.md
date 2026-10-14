@@ -107,16 +107,18 @@ What it does:
 | `kev-4b` | active | about 15 GiB | Kev | 1.0 |
 | `kev-9b` | active | about 26 GiB | Kev | 0.81 |
 | `clef-flash` | active | about 21 GiB | `verathos-engine` (Clef) | 0.72 |
+| `d3-flash` | candidate | about 21 GiB | `verathos-engine` (readout) | 0.23 |
+| `d3-mini` | candidate | about 12 GiB | `verathos-engine` (readout) | 0.37 |
 
 These are the shipped catalog's models; the installer reads the catalog on chain and lists its models with the memory
-each needs. All three are active from the start and share the miners' emission equally while users pay for none of them
-(`SCORING.md`). Active models are scored. A candidate, which a catalog can list before activating it, is checked by
-validators but scores zero until the subnet owner activates it: serving one helps measure it and earns nothing yet. The
-relative speed is the catalog's `relative_speed`: the requests/s of the model's standard mix one GPU serves, relative to
-the other models, as the subnet owner measured them on one reference GPU (`SUBNET_ADMIN.md`). How the models compare
-differs by GPU: kev-9b serves 0.81 times kev-4b's requests on an H100, and clef-flash 0.72 times (its mix with
-images; 0.79 times the same mix without them); on an A100 kev-9b serves 0.68-0.82 times and clef-flash 0.65 times
-without images, on an RTX 5090 kev-9b 0.55 times.
+each needs. The three active models share the miners' emission equally while users pay for none of them (`SCORING.md`);
+d3-flash and d3-mini are candidates until the subnet owner activates them. Active models are scored. A candidate, which
+a catalog can list before activating it, is checked by validators but scores zero until the subnet owner activates it:
+serving one helps measure it and earns nothing yet. The relative speed is the catalog's `relative_speed`: the requests/s
+of the model's standard mix one GPU serves, relative to the other models, as the subnet owner measured them on one
+reference GPU (`SUBNET_ADMIN.md`). How the models compare differs by GPU: kev-9b serves 0.81 times kev-4b's requests on
+an H100, and clef-flash 0.72 times (its mix with images; 0.79 times the same mix without them); on an A100 kev-9b serves
+0.68-0.82 times and clef-flash 0.65 times without images, on an RTX 5090 kev-9b 0.55 times.
 
 Each GPU serves one model: by default the active model that pays best on it now. The setup reads the auditor's
 network status (`GET /v1/network` on the subnet owner's axon, built once per epoch) and uses it only if the subnet

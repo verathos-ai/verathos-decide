@@ -1106,7 +1106,8 @@ def test_the_engines_of_the_shipped_catalog_are_installed_for_references_and_min
     for family in (engines.KevEngine, engines.ClefEngine):
         monkeypatch.setattr(family, "install", install)
     container.install_engines(tmp_path)
-    assert installed == [("kev", "reference"), ("kev", "miner"), ("clef", "reference"), ("clef", "miner")]
+    assert installed == [("kev", "reference"), ("kev", "miner"), ("clef", "reference"), ("clef", "miner"),
+                         ("readout", "reference"), ("readout", "miner")]
     for family in (engines.KevEngine, engines.ClefEngine):
         monkeypatch.setattr(family, "install", lambda self, purpose: None)
     shutil.rmtree(tmp_path / "engines" / "verathos-clef")

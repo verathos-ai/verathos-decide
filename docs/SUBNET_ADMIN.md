@@ -129,10 +129,12 @@ interleaved, each right after its engine started, and kev-4b once more at the en
 | `kev-4b` | 1.0 | 32.0 requests/s of the standard mix within 2 s (30.9-32.0, at concurrency 16-32; 29.8 at the end) |
 | `kev-9b` | 0.81 | 25.9 requests/s (23.6-26.0, at concurrency 8-32); 0.82 on an A100 80GB SXM4, 0.68 on an A100 80GB PCIe, 0.55 on an RTX 5090 |
 | `clef-flash` | 0.72 | 23.1 requests/s of its mix with images (22.1-23.2, at concurrency 32); 25.0 of the same mix without images in an earlier session that day (24.8-25.8, kev-4b 31.6-32.0 there); without images 0.65 on an A100 80GB SXM4 (9.5 against kev-4b's 14.2-15.1) |
+| `d3-flash` | 0.23 | 7.0 requests/s of the standard mix (six questions, each reading the state; 6.9-7.2, at concurrency 2-4), measured 2026-10-14 on an H100 80GB against kev-4b's 31.0 (28.4-32.0) that session |
+| `d3-mini` | 0.37 | 11.4 requests/s (10.5-11.5, at concurrency 2-16), the same session |
 
 A single measurement can settle a step below a model's best (kev-9b's 23.6 above, at concurrency 8): take the median
 of several. Each model's `first_test_rps` is about 1.7 times its rate on the reference GPU, to a multiple of 5 (55,
-45 and 40), so a first test can ask a faster GPU for more than the reference serves. The ratio differs by GPU: a
+45, 40, 10 and 20), so a first test can ask a faster GPU for more than the reference serves. The ratio differs by GPU: a
 larger model costs relatively less on a larger GPU. Re-measure on the reference GPU when an engine gets faster, and
 replace an estimate once the model's standard mix is measured.
 

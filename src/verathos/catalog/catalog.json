@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "revision": "2026-10-13",
+  "revision": "2026-10-14",
   "mechanism": 0,
   "epoch_blocks": 180,
   "models": [
@@ -228,6 +228,158 @@
       "relative_speed": 0.72,
       "price": 0.02,
       "anchor_share": 0.333333
+    },
+    {
+      "model_id": "d3-flash",
+      "status": "candidate",
+      "engine": {
+        "name": "readout",
+        "source": "https://huggingface.co/vllm-sr/d3-flash",
+        "revision": "f6075bff3c0f7d5704e353d0fb2ebf94888d1691"
+      },
+      "hf_repo": "vllm-sr/d3-flash",
+      "hf_revision": "f6075bff3c0f7d5704e353d0fb2ebf94888d1691",
+      "base_repo": "Qwen/Qwen3.5-9B",
+      "base_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "license": "apache-2.0",
+      "max_state_tokens": 16384,
+      "questions": {
+        "score_levels": [
+          2,
+          10
+        ],
+        "noul_criteria": [
+          "false",
+          "true"
+        ],
+        "empty_ids": false
+      },
+      "workload": {
+        "state_words": [
+          150,
+          1200
+        ],
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which team should handle this?",
+            "criteria": {
+              "billing": "Charges and refunds",
+              "technical": "Bugs or outages",
+              "sales": "Pricing and plans",
+              "logistics": "Shipping and delivery",
+              "privacy": "Data and account deletion",
+              "other": "Everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this?",
+            "criteria": [
+              "Can wait",
+              "This week",
+              "Today",
+              "Right now"
+            ]
+          },
+          "churn": {
+            "type": "noul",
+            "instructions": "Does the customer threaten to cancel?"
+          },
+          "bug": {
+            "type": "noul",
+            "instructions": "Is a product bug reported?"
+          },
+          "refund": {
+            "type": "noul",
+            "instructions": "Is a refund requested?"
+          },
+          "angry": {
+            "type": "noul",
+            "instructions": "Is the customer angry?"
+          }
+        }
+      },
+      "first_test_rps": 10.0,
+      "relative_speed": 0.23,
+      "price": 0.02,
+      "anchor_share": 0.0
+    },
+    {
+      "model_id": "d3-mini",
+      "status": "candidate",
+      "engine": {
+        "name": "readout",
+        "source": "https://huggingface.co/vllm-sr/d3-mini",
+        "revision": "0e78bbdbe3cf480ed1461c185c9e0c4fa9258011"
+      },
+      "hf_repo": "vllm-sr/d3-mini",
+      "hf_revision": "0e78bbdbe3cf480ed1461c185c9e0c4fa9258011",
+      "base_repo": "Qwen/Qwen3.5-4B",
+      "base_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+      "license": "apache-2.0",
+      "max_state_tokens": 16384,
+      "questions": {
+        "score_levels": [
+          2,
+          10
+        ],
+        "noul_criteria": [
+          "false",
+          "true"
+        ],
+        "empty_ids": false
+      },
+      "workload": {
+        "state_words": [
+          150,
+          1200
+        ],
+        "questions": {
+          "department": {
+            "type": "choice",
+            "instructions": "Which team should handle this?",
+            "criteria": {
+              "billing": "Charges and refunds",
+              "technical": "Bugs or outages",
+              "sales": "Pricing and plans",
+              "logistics": "Shipping and delivery",
+              "privacy": "Data and account deletion",
+              "other": "Everything else"
+            }
+          },
+          "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this?",
+            "criteria": [
+              "Can wait",
+              "This week",
+              "Today",
+              "Right now"
+            ]
+          },
+          "churn": {
+            "type": "noul",
+            "instructions": "Does the customer threaten to cancel?"
+          },
+          "bug": {
+            "type": "noul",
+            "instructions": "Is a product bug reported?"
+          },
+          "refund": {
+            "type": "noul",
+            "instructions": "Is a refund requested?"
+          },
+          "angry": {
+            "type": "noul",
+            "instructions": "Is the customer angry?"
+          }
+        }
+      },
+      "first_test_rps": 20.0,
+      "relative_speed": 0.37,
+      "price": 0.015,
+      "anchor_share": 0.0
     }
   ],
   "throughput_audit": {
