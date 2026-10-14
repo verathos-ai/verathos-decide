@@ -20,6 +20,7 @@ from verathos.engine.readout import (
     PplxReference,
     Prepared,
     decision_config,
+    device_index,
     prepare,
     validate,
 )
@@ -73,6 +74,16 @@ def test_passes_keep_every_group_within_the_token_budget_and_the_rows_of_a_pass(
 def test_requests_the_engine_does_not_serve_are_refused_before_a_pass(body) -> None:
     with pytest.raises(ValueError):
         validate(body)
+
+
+def test_a_reference_on_a_gpu_names_its_device_index(monkeypatch) -> None:
+    """The releases' own runtimes call torch.cuda.set_device, which refuses a bare "cuda": a reference placed on a GPU
+    passes the index its process uses (the GPU its CUDA_VISIBLE_DEVICES leaves it, 0); other devices pass unchanged."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    assert device_index("cuda") == "cuda:0"
+    assert device_index("cuda:1") == "cuda:1" and device_index("cpu") == "cpu"
 
 
 def test_a_checkpoint_of_another_format_is_refused(tmp_path) -> None:

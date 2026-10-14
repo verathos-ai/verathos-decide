@@ -386,8 +386,19 @@ class PplxReference:
         return out
 
 
+def device_index(device: str) -> str:
+    """``device`` with the CUDA index this process uses when it names none: the releases' own runtimes call
+    ``torch.cuda.set_device``, which refuses a bare ``cuda``."""
+    if device != "cuda":
+        return device
+    import torch
+
+    return f"cuda:{torch.cuda.current_device()}"
+
+
 def reference(path: Path, device: str, dtype: str):
     """The release's own runtime for its prompt family."""
+    device = device_index(device)
     if device.startswith("cuda") and dtype == "float32":
         import torch
 
