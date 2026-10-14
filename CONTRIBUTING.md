@@ -31,7 +31,7 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[server,chain,gateway,test]" ruff==0.
 ```bash
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check src tests scripts
-(cd native/loadgen && cargo test)
+(cd native/loadgen && cargo test -- --include-ignored)
 ```
 
 The tests run on CPU. Some need more and are skipped without it (`pytest -rs` lists them with the reason):
@@ -44,10 +44,11 @@ The tests run on CPU. Some need more and are skipped without it (`pytest -rs` li
 | Gateway image tests | Linux with Landlock |
 | Docker tests | `docker compose` |
 | Clef engine tests on a GPU | `VERATHOS_GPU_TESTS=1`, a CUDA GPU and the pinned weights |
+| Real-time load tests (a shortfall measurement and two load generator tests) | an uncontended machine: skipped where `CI=true`, and `cargo test` runs the two only with `-- --include-ignored` |
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every push to `dev` and `main` and on every pull
-request: ruff (job `ruff`), the tests with all of the above but a GPU (`pytest`) and the load generator's tests
-(`cargo-test`).
+request: ruff (job `ruff`), the tests with all of the above but a GPU and the real-time load tests (`pytest`) and the load
+generator's tests but the real-time ones (`cargo-test`): shared runners lag behind the offered rates.
 
 ## Pull requests
 

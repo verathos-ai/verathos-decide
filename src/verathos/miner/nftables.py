@@ -65,11 +65,11 @@ def addresses(lines: Iterable[str]) -> list[str]:
             address = ipaddress.ip_address(value)
         except ValueError:
             raise ValueError(f"{value[:64]!r} is not an IP address") from None
-        if str(address) != value:
-            raise ValueError(f"{value!r}: write the address as {address}")
         if address.is_multicast or address.is_unspecified or address.is_loopback or (
                 address.version == 6 and address.ipv4_mapped is not None):
             raise ValueError(f"{value} is not a unicast address")
+        if str(address) != value:
+            raise ValueError(f"{value!r}: write the address as {address}")
         out.add(address)
     if not out:
         raise ValueError("no address: an empty allowlist would drop every caller")

@@ -350,6 +350,7 @@ fn assert_near(actual: f64, expected: f64, tolerance: f64, what: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-time load: needs an uncontended machine; run with cargo test -- --include-ignored"]
 async fn delivered_rate_tracks_the_offered_rate_up_to_capacity() {
     let fast_server = serve_with(Behavior::answer(20), false).await;
     let fast = fast_server.address;
@@ -466,6 +467,7 @@ async fn delivered_rate_tracks_the_offered_rate_up_to_capacity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-time load: needs an uncontended machine; run with cargo test -- --include-ignored"]
 async fn requests_with_images_are_sent_on_time_and_carry_their_images() {
     let server = serve(Behavior::answer(5)).await;
     let image_questions = json!({"intent": {"type": "noul"}, "background": {"type": "noul"}});

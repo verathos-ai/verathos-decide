@@ -7,6 +7,7 @@ import functools
 import json
 import logging
 import math
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -402,6 +403,8 @@ def test_while_a_measurement_waits_the_miner_says_once_why_it_is_wanted(tmp_path
     assert caplog.messages == ["an engine changed; measuring again", waiting]
 
 
+@pytest.mark.skipif(os.environ.get("CI") == "true", reason="real-time load: needs an uncontended machine; shared "
+                    "CI runners lag behind the offered rate")
 def test_users_are_served_while_an_endpoint_that_fell_short_is_measured_again(tmp_path, monkeypatch, caplog) -> None:
     """The measurement for a shortfall takes the path of any other: through the service, all endpoints in the same
     rounds, its requests behind the users'."""

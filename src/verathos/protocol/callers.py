@@ -43,10 +43,10 @@ def egress_address(value: str) -> str:
         normal = public_ip(value)
     except ValueError:
         raise ValueError(f"{value!r} is not an IP address") from None
-    if normal != value:
-        raise ValueError(f"{value!r}: write the address as {normal}")
     if not is_public(value):
         raise ValueError(f"{value} is not a public unicast address")
+    if normal != value:
+        raise ValueError(f"{value!r}: write the address as {normal}")
     return value
 
 
